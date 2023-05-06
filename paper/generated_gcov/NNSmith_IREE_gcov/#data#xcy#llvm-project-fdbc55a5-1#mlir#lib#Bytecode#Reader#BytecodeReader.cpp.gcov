@@ -1,0 +1,3275 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Bytecode/Reader/BytecodeReader.cpp
+        -:    0:Graph:../tools/mlir/lib/Bytecode/Reader/CMakeFiles/obj.MLIRBytecodeReader.dir/BytecodeReader.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Bytecode/Reader/CMakeFiles/obj.MLIRBytecodeReader.dir/BytecodeReader.cpp.gcda
+        -:    0:Runs:325595
+        -:    1://===- BytecodeReader.cpp - MLIR Bytecode Reader --------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:// TODO: Support for big-endian architectures.
+        -:   10:// TODO: Properly preserve use lists of values.
+        -:   11:
+        -:   12:#include "mlir/Bytecode/BytecodeReader.h"
+        -:   13:#include "../Encoding.h"
+        -:   14:#include "mlir/AsmParser/AsmParser.h"
+        -:   15:#include "mlir/Bytecode/BytecodeImplementation.h"
+        -:   16:#include "mlir/IR/BuiltinDialect.h"
+        -:   17:#include "mlir/IR/BuiltinOps.h"
+        -:   18:#include "mlir/IR/OpImplementation.h"
+        -:   19:#include "mlir/IR/Verifier.h"
+        -:   20:#include "llvm/ADT/MapVector.h"
+        -:   21:#include "llvm/ADT/ScopeExit.h"
+        -:   22:#include "llvm/ADT/SmallString.h"
+        -:   23:#include "llvm/ADT/StringExtras.h"
+        -:   24:#include "llvm/Support/MemoryBufferRef.h"
+        -:   25:#include "llvm/Support/SaveAndRestore.h"
+        -:   26:
+        -:   27:#define DEBUG_TYPE "mlir-bytecode-reader"
+        -:   28:
+        -:   29:using namespace mlir;
+        -:   30:
+        -:   31:/// Stringify the given section ID.
+function _ZL8toStringN4mlir8bytecode7Section2IDE called 0 returned 0% blocks executed 0%
+    #####:   32:static std::string toString(bytecode::Section::ID sectionID) {
+    #####:   33:  switch (sectionID) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:   34:  case bytecode::Section::kString:
+    #####:   35:    return "String (0)";
+call    0 never executed
+    #####:   36:  case bytecode::Section::kDialect:
+    #####:   37:    return "Dialect (1)";
+call    0 never executed
+    #####:   38:  case bytecode::Section::kAttrType:
+    #####:   39:    return "AttrType (2)";
+call    0 never executed
+    #####:   40:  case bytecode::Section::kAttrTypeOffset:
+    #####:   41:    return "AttrTypeOffset (3)";
+call    0 never executed
+    #####:   42:  case bytecode::Section::kIR:
+    #####:   43:    return "IR (4)";
+call    0 never executed
+    #####:   44:  case bytecode::Section::kResource:
+    #####:   45:    return "Resource (5)";
+call    0 never executed
+    #####:   46:  case bytecode::Section::kResourceOffset:
+    #####:   47:    return "ResourceOffset (6)";
+call    0 never executed
+    #####:   48:  default:
+    #####:   49:    return ("Unknown (" + Twine(static_cast<unsigned>(sectionID)) + ")").str();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:   50:  }
+        -:   51:}
+        -:   52:
+        -:   53:/// Returns true if the given top-level section ID is optional.
+        -:   54:static bool isSectionOptional(bytecode::Section::ID sectionID) {
+        -:   55:  switch (sectionID) {
+        -:   56:  case bytecode::Section::kString:
+        -:   57:  case bytecode::Section::kDialect:
+        -:   58:  case bytecode::Section::kAttrType:
+        -:   59:  case bytecode::Section::kAttrTypeOffset:
+        -:   60:  case bytecode::Section::kIR:
+        -:   61:    return false;
+        -:   62:  case bytecode::Section::kResource:
+        -:   63:  case bytecode::Section::kResourceOffset:
+        -:   64:    return true;
+        -:   65:  default:
+        -:   66:    llvm_unreachable("unknown section ID");
+        -:   67:  }
+        -:   68:}
+        -:   69:
+        -:   70://===----------------------------------------------------------------------===//
+        -:   71:// EncodingReader
+        -:   72://===----------------------------------------------------------------------===//
+        -:   73:
+        -:   74:namespace {
+        -:   75:class EncodingReader {
+        -:   76:public:
+    #####:   77:  explicit EncodingReader(ArrayRef<uint8_t> contents, Location fileLoc)
+    #####:   78:      : dataIt(contents.data()), dataEnd(contents.end()), fileLoc(fileLoc) {}
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+        -:   79:  explicit EncodingReader(StringRef contents, Location fileLoc)
+        -:   80:      : EncodingReader({reinterpret_cast<const uint8_t *>(contents.data()),
+        -:   81:                        contents.size()},
+        -:   82:                       fileLoc) {}
+        -:   83:
+        -:   84:  /// Returns true if the entire section has been read.
+    #####:   85:  bool empty() const { return dataIt == dataEnd; }
+        -:   86:
+        -:   87:  /// Returns the remaining size of the bytecode.
+    #####:   88:  size_t size() const { return dataEnd - dataIt; }
+branch  0 never executed
+branch  1 never executed
+        -:   89:
+        -:   90:  /// Align the current reader position to the specified alignment.
+function _ZN12_GLOBAL__N_114EncodingReader7alignToEj called 0 returned 0% blocks executed 0%
+    #####:   91:  LogicalResult alignTo(unsigned alignment) {
+    #####:   92:    if (!llvm::isPowerOf2_32(alignment))
+branch  0 never executed
+branch  1 never executed
+    #####:   93:      return emitError("expected alignment to be a power-of-two");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:   94:
+        -:   95:    // Shift the reader position to the next alignment boundary.
+    #####:   96:    while (uintptr_t(dataIt) & (uintptr_t(alignment) - 1)) {
+branch  0 never executed
+branch  1 never executed
+    #####:   97:      uint8_t padding;
+    #####:   98:      if (failed(parseByte(padding)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   99:        return failure();
+    #####:  100:      if (padding != bytecode::kAlignmentByte) {
+branch  0 never executed
+branch  1 never executed
+    #####:  101:        return emitError("expected alignment byte (0xCB), but got: '0x" +
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  102:                         llvm::utohexstr(padding) + "'");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  103:      }
+        -:  104:    }
+        -:  105:
+        -:  106:    // TODO: Check that the current data pointer is actually at the expected
+        -:  107:    // alignment.
+        -:  108:
+    #####:  109:    return success();
+        -:  110:  }
+        -:  111:
+        -:  112:  /// Emit an error using the given arguments.
+        -:  113:  template <typename... Args>
+        -:  114:  InFlightDiagnostic emitError(Args &&...args) const {
+        -:  115:    return ::emitError(fileLoc).append(std::forward<Args>(args)...);
+        -:  116:  }
+    #####:  117:  InFlightDiagnostic emitError() const { return ::emitError(fileLoc); }
+        -:  118:
+        -:  119:  /// Parse a single byte from the stream.
+        -:  120:  template <typename T>
+    #####:  121:  LogicalResult parseByte(T &value) {
+    #####:  122:    if (empty())
+    #####:  123:      return emitError("attempting to parse a byte at the end of the bytecode");
+    #####:  124:    value = static_cast<T>(*dataIt++);
+    #####:  125:    return success();
+        -:  126:  }
+------------------
+_ZN12_GLOBAL__N_114EncodingReader9parseByteIN4mlir20AsmResourceEntryKindEEENS2_13LogicalResultERT_:
+function _ZN12_GLOBAL__N_114EncodingReader9parseByteIN4mlir20AsmResourceEntryKindEEENS2_13LogicalResultERT_ called 0 returned 0% blocks executed 0%
+    #####:  121:  LogicalResult parseByte(T &value) {
+    #####:  122:    if (empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  123:      return emitError("attempting to parse a byte at the end of the bytecode");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  124:    value = static_cast<T>(*dataIt++);
+    #####:  125:    return success();
+        -:  126:  }
+------------------
+_ZN12_GLOBAL__N_114EncodingReader9parseByteIbEEN4mlir13LogicalResultERT_:
+function _ZN12_GLOBAL__N_114EncodingReader9parseByteIbEEN4mlir13LogicalResultERT_ called 0 returned 0% blocks executed 0%
+    #####:  121:  LogicalResult parseByte(T &value) {
+    #####:  122:    if (empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  123:      return emitError("attempting to parse a byte at the end of the bytecode");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  124:    value = static_cast<T>(*dataIt++);
+    #####:  125:    return success();
+        -:  126:  }
+------------------
+_ZN12_GLOBAL__N_114EncodingReader9parseByteImEEN4mlir13LogicalResultERT_:
+function _ZN12_GLOBAL__N_114EncodingReader9parseByteImEEN4mlir13LogicalResultERT_ called 0 returned 0% blocks executed 0%
+    #####:  121:  LogicalResult parseByte(T &value) {
+    #####:  122:    if (empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  123:      return emitError("attempting to parse a byte at the end of the bytecode");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  124:    value = static_cast<T>(*dataIt++);
+    #####:  125:    return success();
+        -:  126:  }
+------------------
+_ZN12_GLOBAL__N_114EncodingReader9parseByteIhEEN4mlir13LogicalResultERT_:
+function _ZN12_GLOBAL__N_114EncodingReader9parseByteIhEEN4mlir13LogicalResultERT_ called 0 returned 0% blocks executed 0%
+    #####:  121:  LogicalResult parseByte(T &value) {
+    #####:  122:    if (empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  123:      return emitError("attempting to parse a byte at the end of the bytecode");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  124:    value = static_cast<T>(*dataIt++);
+    #####:  125:    return success();
+        -:  126:  }
+------------------
+        -:  127:  /// Parse a range of bytes of 'length' into the given result.
+function _ZN12_GLOBAL__N_114EncodingReader10parseBytesEmRN4llvm8ArrayRefIhEE called 0 returned 0% blocks executed 0%
+    #####:  128:  LogicalResult parseBytes(size_t length, ArrayRef<uint8_t> &result) {
+    #####:  129:    if (length > size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  130:      return emitError("attempting to parse ", length, " bytes when only ",
+call    0 never executed
+    #####:  131:                       size(), " remain");
+call    0 never executed
+call    1 never executed
+        -:  132:    }
+    #####:  133:    result = {dataIt, length};
+    #####:  134:    dataIt += length;
+    #####:  135:    return success();
+        -:  136:  }
+        -:  137:  /// Parse a range of bytes of 'length' into the given result, which can be
+        -:  138:  /// assumed to be large enough to hold `length`.
+function _ZN12_GLOBAL__N_114EncodingReader10parseBytesEmPh called 0 returned 0% blocks executed 0%
+    #####:  139:  LogicalResult parseBytes(size_t length, uint8_t *result) {
+    #####:  140:    if (length > size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  141:      return emitError("attempting to parse ", length, " bytes when only ",
+call    0 never executed
+    #####:  142:                       size(), " remain");
+call    0 never executed
+call    1 never executed
+        -:  143:    }
+    #####:  144:    memcpy(result, dataIt, length);
+    #####:  145:    dataIt += length;
+    #####:  146:    return success();
+        -:  147:  }
+        -:  148:
+        -:  149:  /// Parse an aligned blob of data, where the alignment was encoded alongside
+        -:  150:  /// the data.
+function _ZN12_GLOBAL__N_114EncodingReader21parseBlobAndAlignmentERN4llvm8ArrayRefIhEERm called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult parseBlobAndAlignment(ArrayRef<uint8_t> &data,
+        -:  152:                                      uint64_t &alignment) {
+    #####:  153:    uint64_t dataSize;
+    #####:  154:    if (failed(parseVarInt(alignment)) || failed(parseVarInt(dataSize)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  155:        failed(alignTo(alignment)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  156:      return failure();
+    #####:  157:    return parseBytes(dataSize, data);
+call    0 never executed
+        -:  158:  }
+        -:  159:
+        -:  160:  /// Parse a variable length encoded integer from the byte stream. The first
+        -:  161:  /// encoded byte contains a prefix in the low bits indicating the encoded
+        -:  162:  /// length of the value. This length prefix is a bit sequence of '0's followed
+        -:  163:  /// by a '1'. The number of '0' bits indicate the number of _additional_ bytes
+        -:  164:  /// (not including the prefix byte). All remaining bits in the first byte,
+        -:  165:  /// along with all of the bits in additional bytes, provide the value of the
+        -:  166:  /// integer encoded in little-endian order.
+function _ZN12_GLOBAL__N_114EncodingReader11parseVarIntERm called 0 returned 0% blocks executed 0%
+    #####:  167:  LogicalResult parseVarInt(uint64_t &result) {
+        -:  168:    // Parse the first byte of the encoding, which contains the length prefix.
+    #####:  169:    if (failed(parseByte(result)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  170:      return failure();
+        -:  171:
+        -:  172:    // Handle the overwhelmingly common case where the value is stored in a
+        -:  173:    // single byte. In this case, the first bit is the `1` marker bit.
+    #####:  174:    if (LLVM_LIKELY(result & 1)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  175:      result >>= 1;
+    #####:  176:      return success();
+        -:  177:    }
+        -:  178:
+        -:  179:    // Handle the overwhelming uncommon case where the value required all 8
+        -:  180:    // bytes (i.e. a really really big number). In this case, the marker byte is
+        -:  181:    // all zeros: `00000000`.
+    #####:  182:    if (LLVM_UNLIKELY(result == 0))
+branch  0 never executed
+branch  1 never executed
+    #####:  183:      return parseBytes(sizeof(result), reinterpret_cast<uint8_t *>(&result));
+call    0 never executed
+    #####:  184:    return parseMultiByteVarInt(result);
+call    0 never executed
+        -:  185:  }
+        -:  186:
+        -:  187:  /// Parse a signed variable length encoded integer from the byte stream. A
+        -:  188:  /// signed varint is encoded as a normal varint with zigzag encoding applied,
+        -:  189:  /// i.e. the low bit of the value is used to indicate the sign.
+function _ZN12_GLOBAL__N_114EncodingReader17parseSignedVarIntERm called 0 returned 0% blocks executed 0%
+    #####:  190:  LogicalResult parseSignedVarInt(uint64_t &result) {
+    #####:  191:    if (failed(parseVarInt(result)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  192:      return failure();
+        -:  193:    // Essentially (but using unsigned): (x >> 1) ^ -(x & 1)
+    #####:  194:    result = (result >> 1) ^ (~(result & 1) + 1);
+    #####:  195:    return success();
+        -:  196:  }
+        -:  197:
+        -:  198:  /// Parse a variable length encoded integer whose low bit is used to encode an
+        -:  199:  /// unrelated flag, i.e: `(integerValue << 1) | (flag ? 1 : 0)`.
+    #####:  200:  LogicalResult parseVarIntWithFlag(uint64_t &result, bool &flag) {
+    #####:  201:    if (failed(parseVarInt(result)))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  202:      return failure();
+    #####:  203:    flag = result & 1;
+    #####:  204:    result >>= 1;
+    #####:  205:    return success();
+        -:  206:  }
+        -:  207:
+        -:  208:  /// Skip the first `length` bytes within the reader.
+function _ZN12_GLOBAL__N_114EncodingReader9skipBytesEm called 0 returned 0% blocks executed 0%
+    #####:  209:  LogicalResult skipBytes(size_t length) {
+    #####:  210:    if (length > size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  211:      return emitError("attempting to skip ", length, " bytes when only ",
+call    0 never executed
+    #####:  212:                       size(), " remain");
+call    0 never executed
+call    1 never executed
+        -:  213:    }
+    #####:  214:    dataIt += length;
+    #####:  215:    return success();
+        -:  216:  }
+        -:  217:
+        -:  218:  /// Parse a null-terminated string into `result` (without including the NUL
+        -:  219:  /// terminator).
+function _ZN12_GLOBAL__N_114EncodingReader25parseNullTerminatedStringERN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  220:  LogicalResult parseNullTerminatedString(StringRef &result) {
+    #####:  221:    const char *startIt = (const char *)dataIt;
+    #####:  222:    const char *nulIt = (const char *)memchr(startIt, 0, size());
+branch  0 never executed
+branch  1 never executed
+    #####:  223:    if (!nulIt)
+branch  0 never executed
+branch  1 never executed
+    #####:  224:      return emitError(
+call    0 never executed
+call    1 never executed
+    #####:  225:          "malformed null-terminated string, no null character found");
+call    0 never executed
+        -:  226:
+    #####:  227:    result = StringRef(startIt, nulIt - startIt);
+    #####:  228:    dataIt = (const uint8_t *)nulIt + 1;
+    #####:  229:    return success();
+        -:  230:  }
+        -:  231:
+        -:  232:  /// Parse a section header, placing the kind of section in `sectionID` and the
+        -:  233:  /// contents of the section in `sectionData`.
+function _ZN12_GLOBAL__N_114EncodingReader12parseSectionERN4mlir8bytecode7Section2IDERN4llvm8ArrayRefIhEE called 0 returned 0% blocks executed 0%
+    #####:  234:  LogicalResult parseSection(bytecode::Section::ID &sectionID,
+        -:  235:                             ArrayRef<uint8_t> &sectionData) {
+    #####:  236:    uint8_t sectionIDAndHasAlignment;
+    #####:  237:    uint64_t length;
+    #####:  238:    if (failed(parseByte(sectionIDAndHasAlignment)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  239:        failed(parseVarInt(length)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  240:      return failure();
+        -:  241:
+        -:  242:    // Extract the section ID and whether the section is aligned. The high bit
+        -:  243:    // of the ID is the alignment flag.
+    #####:  244:    sectionID = static_cast<bytecode::Section::ID>(sectionIDAndHasAlignment &
+        -:  245:                                                   0b01111111);
+    #####:  246:    bool hasAlignment = sectionIDAndHasAlignment & 0b10000000;
+        -:  247:
+        -:  248:    // Check that the section is actually valid before trying to process its
+        -:  249:    // data.
+    #####:  250:    if (sectionID >= bytecode::Section::kNumSections)
+branch  0 never executed
+branch  1 never executed
+    #####:  251:      return emitError("invalid section ID: ", unsigned(sectionID));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  252:
+        -:  253:    // Process the section alignment if present.
+    #####:  254:    if (hasAlignment) {
+branch  0 never executed
+branch  1 never executed
+    #####:  255:      uint64_t alignment;
+    #####:  256:      if (failed(parseVarInt(alignment)) || failed(alignTo(alignment)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  257:        return failure();
+        -:  258:    }
+        -:  259:
+        -:  260:    // Parse the actual section data.
+    #####:  261:    return parseBytes(static_cast<size_t>(length), sectionData);
+call    0 never executed
+        -:  262:  }
+        -:  263:
+        -:  264:private:
+        -:  265:  /// Parse a variable length encoded integer from the byte stream. This method
+        -:  266:  /// is a fallback when the number of bytes used to encode the value is greater
+        -:  267:  /// than 1, but less than the max (9). The provided `result` value can be
+        -:  268:  /// assumed to already contain the first byte of the value.
+        -:  269:  /// NOTE: This method is marked noinline to avoid pessimizing the common case
+        -:  270:  /// of single byte encoding.
+function _ZN12_GLOBAL__N_114EncodingReader20parseMultiByteVarIntERm called 0 returned 0% blocks executed 0%
+    #####:  271:  LLVM_ATTRIBUTE_NOINLINE LogicalResult parseMultiByteVarInt(uint64_t &result) {
+        -:  272:    // Count the number of trailing zeros in the marker byte, this indicates the
+        -:  273:    // number of trailing bytes that are part of the value. We use `uint32_t`
+        -:  274:    // here because we only care about the first byte, and so that be actually
+        -:  275:    // get ctz intrinsic calls when possible (the `uint8_t` overload uses a loop
+        -:  276:    // implementation).
+    #####:  277:    uint32_t numBytes =
+    #####:  278:        llvm::countTrailingZeros<uint32_t>(result, llvm::ZB_Undefined);
+branch  0 never executed
+branch  1 never executed
+    #####:  279:    assert(numBytes > 0 && numBytes <= 7 &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  280:           "unexpected number of trailing zeros in varint encoding");
+        -:  281:
+        -:  282:    // Parse in the remaining bytes of the value.
+    #####:  283:    if (failed(parseBytes(numBytes, reinterpret_cast<uint8_t *>(&result) + 1)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  284:      return failure();
+        -:  285:
+        -:  286:    // Shift out the low-order bits that were used to mark how the value was
+        -:  287:    // encoded.
+    #####:  288:    result >>= (numBytes + 1);
+    #####:  289:    return success();
+        -:  290:  }
+        -:  291:
+        -:  292:  /// The current data iterator, and an iterator to the end of the buffer.
+        -:  293:  const uint8_t *dataIt, *dataEnd;
+        -:  294:
+        -:  295:  /// A location for the bytecode used to report errors.
+        -:  296:  Location fileLoc;
+        -:  297:};
+        -:  298:} // namespace
+        -:  299:
+        -:  300:/// Resolve an index into the given entry list. `entry` may either be a
+        -:  301:/// reference, in which case it is assigned to the corresponding value in
+        -:  302:/// `entries`, or a pointer, in which case it is assigned to the address of the
+        -:  303:/// element in `entries`.
+        -:  304:template <typename RangeT, typename T>
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+    #####:  313:    entry = entries[index];
+        -:  314:  else
+    #####:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+_Z12resolveEntryISt6vectorIN4mlir5ValueESaIS2_EEPS2_ENS1_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_N4llvm9StringRefE:
+function _Z12resolveEntryISt6vectorIN4mlir5ValueESaIS2_EEPS2_ENS1_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_N4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+        -:  313:    entry = entries[index];
+        -:  314:  else
+    #####:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+_Z12resolveEntryIN4llvm11SmallVectorIPN4mlir5BlockELj6EEES4_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_NS0_9StringRefE:
+function _Z12resolveEntryIN4llvm11SmallVectorIPN4mlir5BlockELj6EEES4_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+    #####:  313:    entry = entries[index];
+        -:  314:  else
+        -:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+_Z12resolveEntryIN4llvm11SmallVectorIN12_GLOBAL__N_121BytecodeOperationNameELj1EEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_mRT0_NS0_9StringRefE:
+function _Z12resolveEntryIN4llvm11SmallVectorIN12_GLOBAL__N_121BytecodeOperationNameELj1EEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_mRT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+        -:  313:    entry = entries[index];
+        -:  314:  else
+    #####:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+_Z12resolveEntryIN4llvm11SmallVectorIN4mlir24AsmDialectResourceHandleELj2EEES3_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_NS0_9StringRefE:
+function _Z12resolveEntryIN4llvm11SmallVectorIN4mlir24AsmDialectResourceHandleELj2EEES3_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_mRT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+    #####:  313:    entry = entries[index];
+        -:  314:  else
+        -:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+_Z12resolveEntryIN4llvm15MutableArrayRefIN12_GLOBAL__N_115BytecodeDialectEEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_mRT0_NS0_9StringRefE:
+function _Z12resolveEntryIN4llvm15MutableArrayRefIN12_GLOBAL__N_115BytecodeDialectEEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_mRT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  305:static LogicalResult resolveEntry(EncodingReader &reader, RangeT &entries,
+        -:  306:                                  uint64_t index, T &entry,
+        -:  307:                                  StringRef entryStr) {
+    #####:  308:  if (index >= entries.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return reader.emitError("invalid ", entryStr, " index: ", index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  310:
+        -:  311:  // If the provided entry is a pointer, resolve to the address of the entry.
+        -:  312:  if constexpr (std::is_convertible_v<llvm::detail::ValueOfRange<RangeT>, T>)
+        -:  313:    entry = entries[index];
+        -:  314:  else
+    #####:  315:    entry = &entries[index];
+    #####:  316:  return success();
+        -:  317:}
+------------------
+        -:  318:
+        -:  319:/// Parse and resolve an index into the given entry list.
+        -:  320:template <typename RangeT, typename T>
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+        -:  327:}
+------------------
+_Z10parseEntryISt6vectorIN4mlir5ValueESaIS2_EEPS2_ENS1_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_N4llvm9StringRefE:
+function _Z10parseEntryISt6vectorIN4mlir5ValueESaIS2_EEPS2_ENS1_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_N4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+_Z10parseEntryIN4llvm11SmallVectorIPN4mlir5BlockELj6EEES4_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_NS0_9StringRefE:
+function _Z10parseEntryIN4llvm11SmallVectorIPN4mlir5BlockELj6EEES4_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+_Z10parseEntryIN4llvm11SmallVectorIN12_GLOBAL__N_121BytecodeOperationNameELj1EEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_RT0_NS0_9StringRefE:
+function _Z10parseEntryIN4llvm11SmallVectorIN12_GLOBAL__N_121BytecodeOperationNameELj1EEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_RT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+_Z10parseEntryIN4llvm11SmallVectorIN4mlir24AsmDialectResourceHandleELj2EEES3_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_NS0_9StringRefE:
+function _Z10parseEntryIN4llvm11SmallVectorIN4mlir24AsmDialectResourceHandleELj2EEES3_ENS2_13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+_Z10parseEntryIN4llvm15MutableArrayRefIN12_GLOBAL__N_115BytecodeDialectEEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_RT0_NS0_9StringRefE:
+function _Z10parseEntryIN4llvm15MutableArrayRefIN12_GLOBAL__N_115BytecodeDialectEEEPS3_EN4mlir13LogicalResultERNS2_14EncodingReaderERT_RT0_NS0_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+_Z10parseEntryIN4llvm11SmallVectorINS0_9StringRefELj3EEES2_EN4mlir13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_S2_:
+function _Z10parseEntryIN4llvm11SmallVectorINS0_9StringRefELj3EEES2_EN4mlir13LogicalResultERN12_GLOBAL__N_114EncodingReaderERT_RT0_S2_ called 0 returned 0% blocks executed 0%
+    #####:  321:static LogicalResult parseEntry(EncodingReader &reader, RangeT &entries,
+        -:  322:                                T &entry, StringRef entryStr) {
+        -:  323:  uint64_t entryIdx;
+    #####:  324:  if (failed(reader.parseVarInt(entryIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:    return failure();
+    #####:  326:  return resolveEntry(reader, entries, entryIdx, entry, entryStr);
+call    0 never executed
+        -:  327:}
+------------------
+        -:  328:
+        -:  329://===----------------------------------------------------------------------===//
+        -:  330:// StringSectionReader
+        -:  331://===----------------------------------------------------------------------===//
+        -:  332:
+        -:  333:namespace {
+        -:  334:/// This class is used to read references to the string section from the
+        -:  335:/// bytecode.
+    #####:  336:class StringSectionReader {
+        -:  337:public:
+        -:  338:  /// Initialize the string section reader with the given section data.
+        -:  339:  LogicalResult initialize(Location fileLoc, ArrayRef<uint8_t> sectionData);
+        -:  340:
+        -:  341:  /// Parse a shared string from the string section. The shared string is
+        -:  342:  /// encoded using an index to a corresponding string in the string section.
+    #####:  343:  LogicalResult parseString(EncodingReader &reader, StringRef &result) {
+    #####:  344:    return parseEntry(reader, strings, result, "string");
+        -:  345:  }
+        -:  346:
+        -:  347:private:
+        -:  348:  /// The table of strings referenced within the bytecode file.
+        -:  349:  SmallVector<StringRef> strings;
+        -:  350:};
+        -:  351:} // namespace
+        -:  352:
+function _ZN12_GLOBAL__N_119StringSectionReader10initializeEN4mlir8LocationEN4llvm8ArrayRefIhEE called 0 returned 0% blocks executed 0%
+    #####:  353:LogicalResult StringSectionReader::initialize(Location fileLoc,
+        -:  354:                                              ArrayRef<uint8_t> sectionData) {
+    #####:  355:  EncodingReader stringReader(sectionData, fileLoc);
+call    0 never executed
+        -:  356:
+        -:  357:  // Parse the number of strings in the section.
+    #####:  358:  uint64_t numStrings;
+    #####:  359:  if (failed(stringReader.parseVarInt(numStrings)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  360:    return failure();
+    #####:  361:  strings.resize(numStrings);
+call    0 never executed
+        -:  362:
+        -:  363:  // Parse each of the strings. The sizes of the strings are encoded in reverse
+        -:  364:  // order, so that's the order we populate the table.
+    #####:  365:  size_t stringDataEndOffset = sectionData.size();
+    #####:  366:  for (StringRef &string : llvm::reverse(strings)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  367:    uint64_t stringSize;
+    #####:  368:    if (failed(stringReader.parseVarInt(stringSize)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  369:      return failure();
+    #####:  370:    if (stringDataEndOffset < stringSize) {
+branch  0 never executed
+branch  1 never executed
+    #####:  371:      return stringReader.emitError(
+call    0 never executed
+call    1 never executed
+    #####:  372:          "string size exceeds the available data size");
+call    0 never executed
+        -:  373:    }
+        -:  374:
+        -:  375:    // Extract the string from the data, dropping the null character.
+    #####:  376:    size_t stringOffset = stringDataEndOffset - stringSize;
+    #####:  377:    string = StringRef(
+    #####:  378:        reinterpret_cast<const char *>(sectionData.data() + stringOffset),
+        -:  379:        stringSize - 1);
+    #####:  380:    stringDataEndOffset = stringOffset;
+        -:  381:  }
+        -:  382:
+        -:  383:  // Check that the only remaining data was for the strings, i.e. the reader
+        -:  384:  // should be at the same offset as the first string.
+    #####:  385:  if ((sectionData.size() - stringReader.size()) != stringDataEndOffset) {
+branch  0 never executed
+branch  1 never executed
+    #####:  386:    return stringReader.emitError("unexpected trailing data between the "
+call    0 never executed
+call    1 never executed
+    #####:  387:                                  "offsets for strings and their data");
+call    0 never executed
+        -:  388:  }
+    #####:  389:  return success();
+        -:  390:}
+        -:  391:
+        -:  392://===----------------------------------------------------------------------===//
+        -:  393:// BytecodeDialect
+        -:  394://===----------------------------------------------------------------------===//
+        -:  395:
+        -:  396:namespace {
+        -:  397:/// This struct represents a dialect entry within the bytecode.
+    #####:  398:struct BytecodeDialect {
+        -:  399:  /// Load the dialect into the provided context if it hasn't been loaded yet.
+        -:  400:  /// Returns failure if the dialect couldn't be loaded *and* the provided
+        -:  401:  /// context does not allow unregistered dialects. The provided reader is used
+        -:  402:  /// for error emission if necessary.
+function _ZN12_GLOBAL__N_115BytecodeDialect4loadERNS_14EncodingReaderEPN4mlir11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  403:  LogicalResult load(EncodingReader &reader, MLIRContext *ctx) {
+    #####:  404:    if (dialect)
+branch  0 never executed
+branch  1 never executed
+    #####:  405:      return success();
+    #####:  406:    Dialect *loadedDialect = ctx->getOrLoadDialect(name);
+call    0 never executed
+    #####:  407:    if (!loadedDialect && !ctx->allowsUnregisteredDialects()) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  408:      return reader.emitError(
+call    0 never executed
+    #####:  409:          "dialect '", name,
+call    0 never executed
+        -:  410:          "' is unknown. If this is intended, please call "
+        -:  411:          "allowUnregisteredDialects() on the MLIRContext, or use "
+    #####:  412:          "-allow-unregistered-dialect with the MLIR tool used.");
+call    0 never executed
+        -:  413:    }
+    #####:  414:    dialect = loadedDialect;
+branch  0 never executed
+branch  1 never executed
+        -:  415:
+        -:  416:    // If the dialect was actually loaded, check to see if it has a bytecode
+        -:  417:    // interface.
+    #####:  418:    if (loadedDialect)
+branch  0 never executed
+branch  1 never executed
+    #####:  419:      interface = dyn_cast<BytecodeDialectInterface>(loadedDialect);
+call    0 never executed
+    #####:  420:    return success();
+        -:  421:  }
+        -:  422:
+        -:  423:  /// Return the loaded dialect, or nullptr if the dialect is unknown. This can
+        -:  424:  /// only be called after `load`.
+    #####:  425:  Dialect *getLoadedDialect() const {
+    #####:  426:    assert(dialect &&
+call    0 never executed
+        -:  427:           "expected `load` to be invoked before `getLoadedDialect`");
+    #####:  428:    return *dialect;
+branch  0 never executed
+branch  1 never executed
+        -:  429:  }
+        -:  430:
+        -:  431:  /// The loaded dialect entry. This field is None if we haven't attempted to
+        -:  432:  /// load, nullptr if we failed to load, otherwise the loaded dialect.
+        -:  433:  Optional<Dialect *> dialect;
+        -:  434:
+        -:  435:  /// The bytecode interface of the dialect, or nullptr if the dialect does not
+        -:  436:  /// implement the bytecode interface. This field should only be checked if the
+        -:  437:  /// `dialect` field is non-None.
+        -:  438:  const BytecodeDialectInterface *interface = nullptr;
+        -:  439:
+        -:  440:  /// The name of the dialect.
+        -:  441:  StringRef name;
+        -:  442:};
+        -:  443:
+        -:  444:/// This struct represents an operation name entry within the bytecode.
+        -:  445:struct BytecodeOperationName {
+        -:  446:  BytecodeOperationName(BytecodeDialect *dialect, StringRef name)
+        -:  447:      : dialect(dialect), name(name) {}
+        -:  448:
+        -:  449:  /// The loaded operation name, or None if it hasn't been processed yet.
+        -:  450:  Optional<OperationName> opName;
+        -:  451:
+        -:  452:  /// The dialect that owns this operation name.
+        -:  453:  BytecodeDialect *dialect;
+        -:  454:
+        -:  455:  /// The name of the operation, without the dialect prefix.
+        -:  456:  StringRef name;
+        -:  457:};
+        -:  458:} // namespace
+        -:  459:
+        -:  460:/// Parse a single dialect group encoded in the byte stream.
+function _ZL20parseDialectGroupingRN12_GLOBAL__N_114EncodingReaderEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS2_12function_refIFN4mlir13LogicalResultEPS4_EEE called 0 returned 0% blocks executed 0%
+    #####:  461:static LogicalResult parseDialectGrouping(
+        -:  462:    EncodingReader &reader, MutableArrayRef<BytecodeDialect> dialects,
+        -:  463:    function_ref<LogicalResult(BytecodeDialect *)> entryCallback) {
+        -:  464:  // Parse the dialect and the number of entries in the group.
+    #####:  465:  BytecodeDialect *dialect;
+    #####:  466:  if (failed(parseEntry(reader, dialects, dialect, "dialect")))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  467:    return failure();
+    #####:  468:  uint64_t numEntries;
+    #####:  469:  if (failed(reader.parseVarInt(numEntries)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  470:    return failure();
+        -:  471:
+    #####:  472:  for (uint64_t i = 0; i < numEntries; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  473:    if (failed(entryCallback(dialect)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  474:      return failure();
+    #####:  475:  return success();
+        -:  476:}
+        -:  477:
+        -:  478://===----------------------------------------------------------------------===//
+        -:  479:// ResourceSectionReader
+        -:  480://===----------------------------------------------------------------------===//
+        -:  481:
+        -:  482:namespace {
+        -:  483:/// This class is used to read the resource section from the bytecode.
+    #####:  484:class ResourceSectionReader {
+call    0 never executed
+        -:  485:public:
+        -:  486:  /// Initialize the resource section reader with the given section data.
+        -:  487:  LogicalResult initialize(Location fileLoc, const ParserConfig &config,
+        -:  488:                           MutableArrayRef<BytecodeDialect> dialects,
+        -:  489:                           StringSectionReader &stringReader,
+        -:  490:                           ArrayRef<uint8_t> sectionData,
+        -:  491:                           ArrayRef<uint8_t> offsetSectionData);
+        -:  492:
+        -:  493:  /// Parse a dialect resource handle from the resource section.
+    #####:  494:  LogicalResult parseResourceHandle(EncodingReader &reader,
+        -:  495:                                    AsmDialectResourceHandle &result) {
+    #####:  496:    return parseEntry(reader, dialectResources, result, "resource handle");
+        -:  497:  }
+        -:  498:
+        -:  499:private:
+        -:  500:  /// The table of dialect resources within the bytecode file.
+        -:  501:  SmallVector<AsmDialectResourceHandle> dialectResources;
+        -:  502:};
+        -:  503:
+        -:  504:class ParsedResourceEntry : public AsmParsedResourceEntry {
+        -:  505:public:
+    #####:  506:  ParsedResourceEntry(StringRef key, AsmResourceEntryKind kind,
+        -:  507:                      EncodingReader &reader, StringSectionReader &stringReader)
+    #####:  508:      : key(key), kind(kind), reader(reader), stringReader(stringReader) {}
+    #####:  509:  ~ParsedResourceEntry() override = default;
+call    0 never executed
+call    1 never executed
+------------------
+_ZN12_GLOBAL__N_119ParsedResourceEntryD0Ev:
+function _ZN12_GLOBAL__N_119ParsedResourceEntryD0Ev called 0 returned 0% blocks executed 0%
+    #####:  509:  ~ParsedResourceEntry() override = default;
+call    0 never executed
+call    1 never executed
+------------------
+_ZN12_GLOBAL__N_119ParsedResourceEntryD2Ev:
+function _ZN12_GLOBAL__N_119ParsedResourceEntryD2Ev called 0 returned 0% blocks executed 0%
+    #####:  509:  ~ParsedResourceEntry() override = default;
+call    0 never executed
+------------------
+        -:  510:
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry6getKeyEv called 0 returned 0% blocks executed 0%
+    #####:  511:  StringRef getKey() const final { return key; }
+        -:  512:
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry9emitErrorEv called 0 returned 0% blocks executed 0%
+    #####:  513:  InFlightDiagnostic emitError() const final { return reader.emitError(); }
+call    0 never executed
+        -:  514:
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry7getKindEv called 0 returned 0% blocks executed 0%
+    #####:  515:  AsmResourceEntryKind getKind() const final { return kind; }
+        -:  516:
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry11parseAsBoolEv called 0 returned 0% blocks executed 0%
+    #####:  517:  FailureOr<bool> parseAsBool() const final {
+    #####:  518:    if (kind != AsmResourceEntryKind::Bool)
+branch  0 never executed
+branch  1 never executed
+    #####:  519:      return emitError() << "expected a bool resource entry, but found a "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  520:                         << toString(kind) << " entry instead";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  521:
+    #####:  522:    bool value;
+    #####:  523:    if (failed(reader.parseByte(value)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  524:      return failure();
+    #####:  525:    return value;
+        -:  526:  }
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry13parseAsStringEv called 0 returned 0% blocks executed 0%
+    #####:  527:  FailureOr<std::string> parseAsString() const final {
+    #####:  528:    if (kind != AsmResourceEntryKind::String)
+branch  0 never executed
+branch  1 never executed
+    #####:  529:      return emitError() << "expected a string resource entry, but found a "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  530:                         << toString(kind) << " entry instead";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  531:
+    #####:  532:    StringRef string;
+    #####:  533:    if (failed(stringReader.parseString(reader, string)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  534:      return failure();
+    #####:  535:    return string.str();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  536:  }
+        -:  537:
+        -:  538:  FailureOr<AsmResourceBlob>
+function _ZNK12_GLOBAL__N_119ParsedResourceEntry11parseAsBlobEN4llvm12function_refIFN4mlir15AsmResourceBlobEmmEEE called 0 returned 0% blocks executed 0%
+    #####:  539:  parseAsBlob(BlobAllocatorFn allocator) const final {
+    #####:  540:    if (kind != AsmResourceEntryKind::Blob)
+branch  0 never executed
+branch  1 never executed
+    #####:  541:      return emitError() << "expected a blob resource entry, but found a "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  542:                         << toString(kind) << " entry instead";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  543:
+    #####:  544:    ArrayRef<uint8_t> data;
+    #####:  545:    uint64_t alignment;
+    #####:  546:    if (failed(reader.parseBlobAndAlignment(data, alignment)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  547:      return failure();
+        -:  548:
+        -:  549:    // Allocate memory for the blob using the provided allocator and copy the
+        -:  550:    // data into it.
+        -:  551:    // FIXME: If the current holder of the bytecode can ensure its lifetime
+        -:  552:    // (e.g. when mmap'd), we should not copy the data. We should use the data
+        -:  553:    // from the bytecode directly.
+    #####:  554:    AsmResourceBlob blob = allocator(data.size(), alignment);
+call    0 never executed
+    #####:  555:    assert(llvm::isAddrAligned(llvm::Align(alignment), blob.getData().data()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  556:           blob.isMutable() &&
+        -:  557:           "blob allocator did not return a properly aligned address");
+    #####:  558:    memcpy(blob.getMutableData().data(), data.data(), data.size());
+call    0 never executed
+call    1 never executed
+    #####:  559:    return blob;
+call    0 never executed
+call    1 never executed
+        -:  560:  }
+        -:  561:
+        -:  562:private:
+        -:  563:  StringRef key;
+        -:  564:  AsmResourceEntryKind kind;
+        -:  565:  EncodingReader &reader;
+        -:  566:  StringSectionReader &stringReader;
+        -:  567:};
+        -:  568:} // namespace
+        -:  569:
+        -:  570:template <typename T>
+        -:  571:static LogicalResult
+    #####:  572:parseResourceGroup(Location fileLoc, bool allowEmpty,
+        -:  573:                   EncodingReader &offsetReader, EncodingReader &resourceReader,
+        -:  574:                   StringSectionReader &stringReader, T *handler,
+        -:  575:                   function_ref<LogicalResult(StringRef)> processKeyFn = {}) {
+        -:  576:  uint64_t numResources;
+    #####:  577:  if (failed(offsetReader.parseVarInt(numResources)))
+    #####:  578:    return failure();
+        -:  579:
+    #####:  580:  for (uint64_t i = 0; i < numResources; ++i) {
+    #####:  581:    StringRef key;
+        -:  582:    AsmResourceEntryKind kind;
+        -:  583:    uint64_t resourceOffset;
+    #####:  584:    ArrayRef<uint8_t> data;
+    #####:  585:    if (failed(stringReader.parseString(offsetReader, key)) ||
+    #####:  586:        failed(offsetReader.parseVarInt(resourceOffset)) ||
+    #####:  587:        failed(offsetReader.parseByte(kind)) ||
+    #####:  588:        failed(resourceReader.parseBytes(resourceOffset, data)))
+    #####:  589:      return failure();
+        -:  590:
+        -:  591:    // Process the resource key.
+    #####:  592:    if ((processKeyFn && failed(processKeyFn(key))))
+    #####:  593:      return failure();
+        -:  594:
+        -:  595:    // If the resource data is empty and we allow it, don't error out when
+        -:  596:    // parsing below, just skip it.
+    #####:  597:    if (allowEmpty && data.empty())
+    #####:  598:      continue;
+        -:  599:
+        -:  600:    // Ignore the entry if we don't have a valid handler.
+    #####:  601:    if (!handler)
+    #####:  602:      continue;
+        -:  603:
+        -:  604:    // Otherwise, parse the resource value.
+    #####:  605:    EncodingReader entryReader(data, fileLoc);
+    #####:  606:    ParsedResourceEntry entry(key, kind, entryReader, stringReader);
+    #####:  607:    if (failed(handler->parseResource(entry)))
+    #####:  608:      return failure();
+    #####:  609:    if (!entryReader.empty()) {
+        -:  610:      return entryReader.emitError(
+    #####:  611:          "unexpected trailing bytes in resource entry '", key, "'");
+        -:  612:    }
+        -:  613:  }
+    #####:  614:  return success();
+        -:  615:}
+------------------
+_Z18parseResourceGroupIKN4mlir21OpAsmDialectInterfaceEENS0_13LogicalResultENS0_8LocationEbRN12_GLOBAL__N_114EncodingReaderES7_RNS5_19StringSectionReaderEPT_N4llvm12function_refIFS3_NSC_9StringRefEEEE:
+function _Z18parseResourceGroupIKN4mlir21OpAsmDialectInterfaceEENS0_13LogicalResultENS0_8LocationEbRN12_GLOBAL__N_114EncodingReaderES7_RNS5_19StringSectionReaderEPT_N4llvm12function_refIFS3_NSC_9StringRefEEEE called 0 returned 0% blocks executed 0%
+    #####:  572:parseResourceGroup(Location fileLoc, bool allowEmpty,
+        -:  573:                   EncodingReader &offsetReader, EncodingReader &resourceReader,
+        -:  574:                   StringSectionReader &stringReader, T *handler,
+        -:  575:                   function_ref<LogicalResult(StringRef)> processKeyFn = {}) {
+        -:  576:  uint64_t numResources;
+    #####:  577:  if (failed(offsetReader.parseVarInt(numResources)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  578:    return failure();
+        -:  579:
+    #####:  580:  for (uint64_t i = 0; i < numResources; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  581:    StringRef key;
+        -:  582:    AsmResourceEntryKind kind;
+        -:  583:    uint64_t resourceOffset;
+    #####:  584:    ArrayRef<uint8_t> data;
+call    0 never executed
+    #####:  585:    if (failed(stringReader.parseString(offsetReader, key)) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  586:        failed(offsetReader.parseVarInt(resourceOffset)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  587:        failed(offsetReader.parseByte(kind)) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  588:        failed(resourceReader.parseBytes(resourceOffset, data)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  589:      return failure();
+        -:  590:
+        -:  591:    // Process the resource key.
+    #####:  592:    if ((processKeyFn && failed(processKeyFn(key))))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  593:      return failure();
+        -:  594:
+        -:  595:    // If the resource data is empty and we allow it, don't error out when
+        -:  596:    // parsing below, just skip it.
+    #####:  597:    if (allowEmpty && data.empty())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  598:      continue;
+        -:  599:
+        -:  600:    // Ignore the entry if we don't have a valid handler.
+    #####:  601:    if (!handler)
+branch  0 never executed
+branch  1 never executed
+    #####:  602:      continue;
+        -:  603:
+        -:  604:    // Otherwise, parse the resource value.
+    #####:  605:    EncodingReader entryReader(data, fileLoc);
+    #####:  606:    ParsedResourceEntry entry(key, kind, entryReader, stringReader);
+call    0 never executed
+    #####:  607:    if (failed(handler->parseResource(entry)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  608:      return failure();
+call    0 never executed
+    #####:  609:    if (!entryReader.empty()) {
+branch  0 never executed
+branch  1 never executed
+        -:  610:      return entryReader.emitError(
+    #####:  611:          "unexpected trailing bytes in resource entry '", key, "'");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  612:    }
+        -:  613:  }
+    #####:  614:  return success();
+        -:  615:}
+------------------
+_Z18parseResourceGroupIN4mlir17AsmResourceParserEENS0_13LogicalResultENS0_8LocationEbRN12_GLOBAL__N_114EncodingReaderES6_RNS4_19StringSectionReaderEPT_N4llvm12function_refIFS2_NSB_9StringRefEEEE:
+function _Z18parseResourceGroupIN4mlir17AsmResourceParserEENS0_13LogicalResultENS0_8LocationEbRN12_GLOBAL__N_114EncodingReaderES6_RNS4_19StringSectionReaderEPT_N4llvm12function_refIFS2_NSB_9StringRefEEEE called 0 returned 0% blocks executed 0%
+    #####:  572:parseResourceGroup(Location fileLoc, bool allowEmpty,
+        -:  573:                   EncodingReader &offsetReader, EncodingReader &resourceReader,
+        -:  574:                   StringSectionReader &stringReader, T *handler,
+        -:  575:                   function_ref<LogicalResult(StringRef)> processKeyFn = {}) {
+        -:  576:  uint64_t numResources;
+    #####:  577:  if (failed(offsetReader.parseVarInt(numResources)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  578:    return failure();
+        -:  579:
+    #####:  580:  for (uint64_t i = 0; i < numResources; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  581:    StringRef key;
+        -:  582:    AsmResourceEntryKind kind;
+        -:  583:    uint64_t resourceOffset;
+    #####:  584:    ArrayRef<uint8_t> data;
+call    0 never executed
+    #####:  585:    if (failed(stringReader.parseString(offsetReader, key)) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  586:        failed(offsetReader.parseVarInt(resourceOffset)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  587:        failed(offsetReader.parseByte(kind)) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  588:        failed(resourceReader.parseBytes(resourceOffset, data)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  589:      return failure();
+        -:  590:
+        -:  591:    // Process the resource key.
+    #####:  592:    if ((processKeyFn && failed(processKeyFn(key))))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  593:      return failure();
+        -:  594:
+        -:  595:    // If the resource data is empty and we allow it, don't error out when
+        -:  596:    // parsing below, just skip it.
+    #####:  597:    if (allowEmpty && data.empty())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  598:      continue;
+        -:  599:
+        -:  600:    // Ignore the entry if we don't have a valid handler.
+    #####:  601:    if (!handler)
+branch  0 never executed
+branch  1 never executed
+    #####:  602:      continue;
+        -:  603:
+        -:  604:    // Otherwise, parse the resource value.
+    #####:  605:    EncodingReader entryReader(data, fileLoc);
+    #####:  606:    ParsedResourceEntry entry(key, kind, entryReader, stringReader);
+call    0 never executed
+    #####:  607:    if (failed(handler->parseResource(entry)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  608:      return failure();
+call    0 never executed
+    #####:  609:    if (!entryReader.empty()) {
+branch  0 never executed
+branch  1 never executed
+        -:  610:      return entryReader.emitError(
+    #####:  611:          "unexpected trailing bytes in resource entry '", key, "'");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  612:    }
+        -:  613:  }
+    #####:  614:  return success();
+        -:  615:}
+------------------
+        -:  616:
+        -:  617:LogicalResult
+function _ZN12_GLOBAL__N_121ResourceSectionReader10initializeEN4mlir8LocationERKNS1_12ParserConfigEN4llvm15MutableArrayRefINS_15BytecodeDialectEEERNS_19StringSectionReaderENS6_8ArrayRefIhEESD_ called 0 returned 0% blocks executed 0%
+    #####:  618:ResourceSectionReader::initialize(Location fileLoc, const ParserConfig &config,
+        -:  619:                                  MutableArrayRef<BytecodeDialect> dialects,
+        -:  620:                                  StringSectionReader &stringReader,
+        -:  621:                                  ArrayRef<uint8_t> sectionData,
+        -:  622:                                  ArrayRef<uint8_t> offsetSectionData) {
+    #####:  623:  EncodingReader resourceReader(sectionData, fileLoc);
+call    0 never executed
+    #####:  624:  EncodingReader offsetReader(offsetSectionData, fileLoc);
+        -:  625:
+        -:  626:  // Read the number of external resource providers.
+    #####:  627:  uint64_t numExternalResourceGroups;
+    #####:  628:  if (failed(offsetReader.parseVarInt(numExternalResourceGroups)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  629:    return failure();
+        -:  630:
+        -:  631:  // Utility functor that dispatches to `parseResourceGroup`, but implicitly
+        -:  632:  // provides most of the arguments.
+    #####:  633:  auto parseGroup = [&](auto *handler, bool allowEmpty = false,
+        -:  634:                        function_ref<LogicalResult(StringRef)> keyFn = {}) {
+    #####:  635:    return parseResourceGroup(fileLoc, allowEmpty, offsetReader, resourceReader,
+call    0 never executed
+call    1 never executed
+        -:  636:                              stringReader, handler, keyFn);
+    #####:  637:  };
+        -:  638:
+        -:  639:  // Read the external resources from the bytecode.
+    #####:  640:  for (uint64_t i = 0; i < numExternalResourceGroups; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  641:    StringRef key;
+    #####:  642:    if (failed(stringReader.parseString(offsetReader, key)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  643:      return failure();
+        -:  644:
+        -:  645:    // Get the handler for these resources.
+        -:  646:    // TODO: Should we require handling external resources in some scenarios?
+    #####:  647:    AsmResourceParser *handler = config.getResourceParser(key);
+call    0 never executed
+    #####:  648:    if (!handler) {
+branch  0 never executed
+branch  1 never executed
+    #####:  649:      emitWarning(fileLoc) << "ignoring unknown external resources for '" << key
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  650:                           << "'";
+call    0 never executed
+        -:  651:    }
+        -:  652:
+    #####:  653:    if (failed(parseGroup(handler)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  654:      return failure();
+        -:  655:  }
+        -:  656:
+        -:  657:  // Read the dialect resources from the bytecode.
+    #####:  658:  MLIRContext *ctx = fileLoc->getContext();
+call    0 never executed
+    #####:  659:  while (!offsetReader.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  660:    BytecodeDialect *dialect;
+    #####:  661:    if (failed(parseEntry(offsetReader, dialects, dialect, "dialect")) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  662:        failed(dialect->load(resourceReader, ctx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  663:      return failure();
+    #####:  664:    Dialect *loadedDialect = dialect->getLoadedDialect();
+branch  0 never executed
+branch  1 never executed
+    #####:  665:    if (!loadedDialect) {
+branch  0 never executed
+branch  1 never executed
+    #####:  666:      return resourceReader.emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  667:             << "dialect '" << dialect->name << "' is unknown";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  668:    }
+    #####:  669:    const auto *handler = dyn_cast<OpAsmDialectInterface>(loadedDialect);
+call    0 never executed
+    #####:  670:    if (!handler) {
+branch  0 never executed
+branch  1 never executed
+    #####:  671:      return resourceReader.emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  672:             << "unexpected resources for dialect '" << dialect->name << "'";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  673:    }
+        -:  674:
+        -:  675:    // Ensure that each resource is declared before being processed.
+function _ZZN12_GLOBAL__N_121ResourceSectionReader10initializeEN4mlir8LocationERKNS1_12ParserConfigEN4llvm15MutableArrayRefINS_15BytecodeDialectEEERNS_19StringSectionReaderENS6_8ArrayRefIhEESD_ENKUlNS6_9StringRefEE0_clESE_ called 0 returned 0% blocks executed 0%
+    #####:  676:    auto processResourceKeyFn = [&](StringRef key) -> LogicalResult {
+    #####:  677:      FailureOr<AsmDialectResourceHandle> handle =
+    #####:  678:          handler->declareResource(key);
+call    0 never executed
+    #####:  679:      if (failed(handle)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  680:        return resourceReader.emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  681:               << "unknown 'resource' key '" << key << "' for dialect '"
+call    0 never executed
+call    1 never executed
+    #####:  682:               << dialect->name << "'";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  683:      }
+    #####:  684:      dialectResources.push_back(*handle);
+call    0 never executed
+    #####:  685:      return success();
+    #####:  686:    };
+        -:  687:
+        -:  688:    // Parse the resources for this dialect. We allow empty resources because we
+        -:  689:    // just treat these as declarations.
+    #####:  690:    if (failed(parseGroup(handler, /*allowEmpty=*/true, processResourceKeyFn)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  691:      return failure();
+        -:  692:  }
+        -:  693:
+    #####:  694:  return success();
+        -:  695:}
+        -:  696:
+        -:  697://===----------------------------------------------------------------------===//
+        -:  698:// Attribute/Type Reader
+        -:  699://===----------------------------------------------------------------------===//
+        -:  700:
+        -:  701:namespace {
+        -:  702:/// This class provides support for reading attribute and type entries from the
+        -:  703:/// bytecode. Attribute and Type entries are read lazily on demand, so we use
+        -:  704:/// this reader to manage when to actually parse them from the bytecode.
+        -:  705:class AttrTypeReader {
+        -:  706:  /// This class represents a single attribute or type entry.
+        -:  707:  template <typename T>
+    #####:  708:  struct Entry {
+        -:  709:    /// The entry, or null if it hasn't been resolved yet.
+        -:  710:    T entry = {};
+        -:  711:    /// The parent dialect of this entry.
+        -:  712:    BytecodeDialect *dialect = nullptr;
+        -:  713:    /// A flag indicating if the entry was encoded using a custom encoding,
+        -:  714:    /// instead of using the textual assembly format.
+        -:  715:    bool hasCustomEncoding = false;
+        -:  716:    /// The raw data of this entry in the bytecode.
+        -:  717:    ArrayRef<uint8_t> data;
+        -:  718:  };
+        -:  719:  using AttrEntry = Entry<Attribute>;
+        -:  720:  using TypeEntry = Entry<Type>;
+        -:  721:
+        -:  722:public:
+    #####:  723:  AttrTypeReader(StringSectionReader &stringReader,
+        -:  724:                 ResourceSectionReader &resourceReader, Location fileLoc)
+    #####:  725:      : stringReader(stringReader), resourceReader(resourceReader),
+    #####:  726:        fileLoc(fileLoc) {}
+        -:  727:
+        -:  728:  /// Initialize the attribute and type information within the reader.
+        -:  729:  LogicalResult initialize(MutableArrayRef<BytecodeDialect> dialects,
+        -:  730:                           ArrayRef<uint8_t> sectionData,
+        -:  731:                           ArrayRef<uint8_t> offsetSectionData);
+        -:  732:
+        -:  733:  /// Resolve the attribute or type at the given index. Returns nullptr on
+        -:  734:  /// failure.
+    #####:  735:  Attribute resolveAttribute(size_t index) {
+    #####:  736:    return resolveEntry(attributes, index, "Attribute");
+        -:  737:  }
+    #####:  738:  Type resolveType(size_t index) { return resolveEntry(types, index, "Type"); }
+        -:  739:
+        -:  740:  /// Parse a reference to an attribute or type using the given reader.
+function _ZN12_GLOBAL__N_114AttrTypeReader14parseAttributeERNS_14EncodingReaderERN4mlir9AttributeE called 0 returned 0% blocks executed 0%
+    #####:  741:  LogicalResult parseAttribute(EncodingReader &reader, Attribute &result) {
+    #####:  742:    uint64_t attrIdx;
+    #####:  743:    if (failed(reader.parseVarInt(attrIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  744:      return failure();
+    #####:  745:    result = resolveAttribute(attrIdx);
+call    0 never executed
+    #####:  746:    return success(!!result);
+        -:  747:  }
+function _ZN12_GLOBAL__N_114AttrTypeReader9parseTypeERNS_14EncodingReaderERN4mlir4TypeE called 0 returned 0% blocks executed 0%
+    #####:  748:  LogicalResult parseType(EncodingReader &reader, Type &result) {
+    #####:  749:    uint64_t typeIdx;
+    #####:  750:    if (failed(reader.parseVarInt(typeIdx)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  751:      return failure();
+    #####:  752:    result = resolveType(typeIdx);
+call    0 never executed
+    #####:  753:    return success(!!result);
+        -:  754:  }
+        -:  755:
+        -:  756:  template <typename T>
+    #####:  757:  LogicalResult parseAttribute(EncodingReader &reader, T &result) {
+    #####:  758:    Attribute baseResult;
+    #####:  759:    if (failed(parseAttribute(reader, baseResult)))
+    #####:  760:      return failure();
+    #####:  761:    if ((result = baseResult.dyn_cast<T>()))
+    #####:  762:      return success();
+        -:  763:    return reader.emitError("expected attribute of type: ",
+    #####:  764:                            llvm::getTypeName<T>(), ", but got: ", baseResult);
+        -:  765:  }
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader14parseAttributeIN4mlir14DictionaryAttrEEENS2_13LogicalResultERNS_14EncodingReaderERT_:
+function _ZN12_GLOBAL__N_114AttrTypeReader14parseAttributeIN4mlir14DictionaryAttrEEENS2_13LogicalResultERNS_14EncodingReaderERT_ called 0 returned 0% blocks executed 0%
+    #####:  757:  LogicalResult parseAttribute(EncodingReader &reader, T &result) {
+    #####:  758:    Attribute baseResult;
+    #####:  759:    if (failed(parseAttribute(reader, baseResult)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  760:      return failure();
+    #####:  761:    if ((result = baseResult.dyn_cast<T>()))
+branch  0 never executed
+branch  1 never executed
+    #####:  762:      return success();
+        -:  763:    return reader.emitError("expected attribute of type: ",
+    #####:  764:                            llvm::getTypeName<T>(), ", but got: ", baseResult);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  765:  }
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader14parseAttributeIN4mlir12LocationAttrEEENS2_13LogicalResultERNS_14EncodingReaderERT_:
+function _ZN12_GLOBAL__N_114AttrTypeReader14parseAttributeIN4mlir12LocationAttrEEENS2_13LogicalResultERNS_14EncodingReaderERT_ called 0 returned 0% blocks executed 0%
+    #####:  757:  LogicalResult parseAttribute(EncodingReader &reader, T &result) {
+    #####:  758:    Attribute baseResult;
+    #####:  759:    if (failed(parseAttribute(reader, baseResult)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  760:      return failure();
+    #####:  761:    if ((result = baseResult.dyn_cast<T>()))
+branch  0 never executed
+branch  1 never executed
+    #####:  762:      return success();
+        -:  763:    return reader.emitError("expected attribute of type: ",
+    #####:  764:                            llvm::getTypeName<T>(), ", but got: ", baseResult);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  765:  }
+------------------
+        -:  766:
+        -:  767:private:
+        -:  768:  /// Resolve the given entry at `index`.
+        -:  769:  template <typename T>
+        -:  770:  T resolveEntry(SmallVectorImpl<Entry<T>> &entries, size_t index,
+        -:  771:                 StringRef entryType);
+        -:  772:
+        -:  773:  /// Parse an entry using the given reader that was encoded using the textual
+        -:  774:  /// assembly format.
+        -:  775:  template <typename T>
+        -:  776:  LogicalResult parseAsmEntry(T &result, EncodingReader &reader,
+        -:  777:                              StringRef entryType);
+        -:  778:
+        -:  779:  /// Parse an entry using the given reader that was encoded using a custom
+        -:  780:  /// bytecode format.
+        -:  781:  template <typename T>
+        -:  782:  LogicalResult parseCustomEntry(Entry<T> &entry, EncodingReader &reader,
+        -:  783:                                 StringRef entryType);
+        -:  784:
+        -:  785:  /// The string section reader used to resolve string references when parsing
+        -:  786:  /// custom encoded attribute/type entries.
+        -:  787:  StringSectionReader &stringReader;
+        -:  788:
+        -:  789:  /// The resource section reader used to resolve resource references when
+        -:  790:  /// parsing custom encoded attribute/type entries.
+        -:  791:  ResourceSectionReader &resourceReader;
+        -:  792:
+        -:  793:  /// The set of attribute and type entries.
+        -:  794:  SmallVector<AttrEntry> attributes;
+        -:  795:  SmallVector<TypeEntry> types;
+        -:  796:
+        -:  797:  /// A location used for error emission.
+        -:  798:  Location fileLoc;
+        -:  799:};
+        -:  800:
+        -:  801:class DialectReader : public DialectBytecodeReader {
+        -:  802:public:
+        -:  803:  DialectReader(AttrTypeReader &attrTypeReader,
+        -:  804:                StringSectionReader &stringReader,
+        -:  805:                ResourceSectionReader &resourceReader, EncodingReader &reader)
+        -:  806:      : attrTypeReader(attrTypeReader), stringReader(stringReader),
+        -:  807:        resourceReader(resourceReader), reader(reader) {}
+        -:  808:
+function _ZN12_GLOBAL__N_113DialectReader9emitErrorERKN4llvm5TwineE called 0 returned 0% blocks executed 0%
+    #####:  809:  InFlightDiagnostic emitError(const Twine &msg) override {
+    #####:  810:    return reader.emitError(msg);
+call    0 never executed
+        -:  811:  }
+        -:  812:
+        -:  813:  //===--------------------------------------------------------------------===//
+        -:  814:  // IR
+        -:  815:  //===--------------------------------------------------------------------===//
+        -:  816:
+function _ZN12_GLOBAL__N_113DialectReader13readAttributeERN4mlir9AttributeE called 0 returned 0% blocks executed 0%
+    #####:  817:  LogicalResult readAttribute(Attribute &result) override {
+    #####:  818:    return attrTypeReader.parseAttribute(reader, result);
+call    0 never executed
+        -:  819:  }
+        -:  820:
+function _ZN12_GLOBAL__N_113DialectReader8readTypeERN4mlir4TypeE called 0 returned 0% blocks executed 0%
+    #####:  821:  LogicalResult readType(Type &result) override {
+    #####:  822:    return attrTypeReader.parseType(reader, result);
+call    0 never executed
+        -:  823:  }
+        -:  824:
+function _ZN12_GLOBAL__N_113DialectReader18readResourceHandleEv called 0 returned 0% blocks executed 0%
+    #####:  825:  FailureOr<AsmDialectResourceHandle> readResourceHandle() override {
+    #####:  826:    AsmDialectResourceHandle handle;
+call    0 never executed
+    #####:  827:    if (failed(resourceReader.parseResourceHandle(reader, handle)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  828:      return failure();
+    #####:  829:    return handle;
+        -:  830:  }
+        -:  831:
+        -:  832:  //===--------------------------------------------------------------------===//
+        -:  833:  // Primitives
+        -:  834:  //===--------------------------------------------------------------------===//
+        -:  835:
+function _ZN12_GLOBAL__N_113DialectReader10readVarIntERm called 0 returned 0% blocks executed 0%
+    #####:  836:  LogicalResult readVarInt(uint64_t &result) override {
+    #####:  837:    return reader.parseVarInt(result);
+call    0 never executed
+        -:  838:  }
+        -:  839:
+function _ZN12_GLOBAL__N_113DialectReader16readSignedVarIntERl called 0 returned 0% blocks executed 0%
+    #####:  840:  LogicalResult readSignedVarInt(int64_t &result) override {
+    #####:  841:    uint64_t unsignedResult;
+    #####:  842:    if (failed(reader.parseSignedVarInt(unsignedResult)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  843:      return failure();
+    #####:  844:    result = static_cast<int64_t>(unsignedResult);
+    #####:  845:    return success();
+        -:  846:  }
+        -:  847:
+function _ZN12_GLOBAL__N_113DialectReader23readAPIntWithKnownWidthEj called 0 returned 0% blocks executed 0%
+    #####:  848:  FailureOr<APInt> readAPIntWithKnownWidth(unsigned bitWidth) override {
+        -:  849:    // Small values are encoded using a single byte.
+    #####:  850:    if (bitWidth <= 8) {
+branch  0 never executed
+branch  1 never executed
+    #####:  851:      uint8_t value;
+    #####:  852:      if (failed(reader.parseByte(value)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  853:        return failure();
+    #####:  854:      return APInt(bitWidth, value);
+call    0 never executed
+        -:  855:    }
+        -:  856:
+        -:  857:    // Large values up to 64 bits are encoded using a single varint.
+    #####:  858:    if (bitWidth <= 64) {
+branch  0 never executed
+branch  1 never executed
+    #####:  859:      uint64_t value;
+    #####:  860:      if (failed(reader.parseSignedVarInt(value)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  861:        return failure();
+    #####:  862:      return APInt(bitWidth, value);
+call    0 never executed
+        -:  863:    }
+        -:  864:
+        -:  865:    // Otherwise, for really big values we encode the array of active words in
+        -:  866:    // the value.
+    #####:  867:    uint64_t numActiveWords;
+    #####:  868:    if (failed(reader.parseVarInt(numActiveWords)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  869:      return failure();
+    #####:  870:    SmallVector<uint64_t, 4> words(numActiveWords);
+call    0 never executed
+    #####:  871:    for (uint64_t i = 0; i < numActiveWords; ++i)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  872:      if (failed(reader.parseSignedVarInt(words[i])))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  873:        return failure();
+    #####:  874:    return APInt(bitWidth, words);
+call    0 never executed
+        -:  875:  }
+        -:  876:
+        -:  877:  FailureOr<APFloat>
+function _ZN12_GLOBAL__N_113DialectReader29readAPFloatWithKnownSemanticsERKN4llvm12fltSemanticsE called 0 returned 0% blocks executed 0%
+    #####:  878:  readAPFloatWithKnownSemantics(const llvm::fltSemantics &semantics) override {
+    #####:  879:    FailureOr<APInt> intVal =
+    #####:  880:        readAPIntWithKnownWidth(APFloat::getSizeInBits(semantics));
+call    0 never executed
+call    1 never executed
+    #####:  881:    if (failed(intVal))
+branch  0 never executed
+branch  1 never executed
+    #####:  882:      return failure();
+    #####:  883:    return APFloat(semantics, *intVal);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  884:  }
+        -:  885:
+function _ZN12_GLOBAL__N_113DialectReader10readStringERN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  886:  LogicalResult readString(StringRef &result) override {
+    #####:  887:    return stringReader.parseString(reader, result);
+call    0 never executed
+        -:  888:  }
+        -:  889:
+function _ZN12_GLOBAL__N_113DialectReader8readBlobERN4llvm8ArrayRefIcEE called 0 returned 0% blocks executed 0%
+    #####:  890:  LogicalResult readBlob(ArrayRef<char> &result) override {
+    #####:  891:    uint64_t dataSize;
+    #####:  892:    ArrayRef<uint8_t> data;
+    #####:  893:    if (failed(reader.parseVarInt(dataSize)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  894:        failed(reader.parseBytes(dataSize, data)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  895:      return failure();
+    #####:  896:    result = llvm::makeArrayRef(reinterpret_cast<const char *>(data.data()),
+    #####:  897:                                data.size());
+    #####:  898:    return success();
+        -:  899:  }
+        -:  900:
+        -:  901:private:
+        -:  902:  AttrTypeReader &attrTypeReader;
+        -:  903:  StringSectionReader &stringReader;
+        -:  904:  ResourceSectionReader &resourceReader;
+        -:  905:  EncodingReader &reader;
+        -:  906:};
+        -:  907:} // namespace
+        -:  908:
+        -:  909:LogicalResult
+function _ZN12_GLOBAL__N_114AttrTypeReader10initializeEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS1_8ArrayRefIhEES6_ called 0 returned 0% blocks executed 0%
+    #####:  910:AttrTypeReader::initialize(MutableArrayRef<BytecodeDialect> dialects,
+        -:  911:                           ArrayRef<uint8_t> sectionData,
+        -:  912:                           ArrayRef<uint8_t> offsetSectionData) {
+    #####:  913:  EncodingReader offsetReader(offsetSectionData, fileLoc);
+call    0 never executed
+        -:  914:
+        -:  915:  // Parse the number of attribute and type entries.
+    #####:  916:  uint64_t numAttributes, numTypes;
+    #####:  917:  if (failed(offsetReader.parseVarInt(numAttributes)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  918:      failed(offsetReader.parseVarInt(numTypes)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  919:    return failure();
+    #####:  920:  attributes.resize(numAttributes);
+call    0 never executed
+    #####:  921:  types.resize(numTypes);
+call    0 never executed
+        -:  922:
+        -:  923:  // A functor used to accumulate the offsets for the entries in the given
+        -:  924:  // range.
+    #####:  925:  uint64_t currentOffset = 0;
+    #####:  926:  auto parseEntries = [&](auto &&range) {
+    #####:  927:    size_t currentIndex = 0, endIndex = range.size();
+        -:  928:
+        -:  929:    // Parse an individual entry.
+    #####:  930:    auto parseEntryFn = [&](BytecodeDialect *dialect) -> LogicalResult {
+    #####:  931:      auto &entry = range[currentIndex++];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  932:
+        -:  933:      uint64_t entrySize;
+    #####:  934:      if (failed(offsetReader.parseVarIntWithFlag(entrySize,
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  935:                                                  entry.hasCustomEncoding)))
+call    0 never executed
+call    1 never executed
+    #####:  936:        return failure();
+        -:  937:
+        -:  938:      // Verify that the offset is actually valid.
+    #####:  939:      if (currentOffset + entrySize > sectionData.size()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  940:        return offsetReader.emitError(
+    #####:  941:            "Attribute or Type entry offset points past the end of section");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  942:      }
+        -:  943:
+    #####:  944:      entry.data = sectionData.slice(currentOffset, entrySize);
+    #####:  945:      entry.dialect = dialect;
+    #####:  946:      currentOffset += entrySize;
+    #####:  947:      return success();
+        -:  948:    };
+    #####:  949:    while (currentIndex != endIndex)
+    #####:  950:      if (failed(parseDialectGrouping(offsetReader, dialects, parseEntryFn)))
+    #####:  951:        return failure();
+    #####:  952:    return success();
+    #####:  953:  };
+------------------
+_ZZN12_GLOBAL__N_114AttrTypeReader10initializeEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS1_8ArrayRefIhEES6_ENKUlOT_E_clIRNS1_11SmallVectorINS0_5EntryIN4mlir4TypeEEELj1EEEEEDaS8_:
+function _ZZN12_GLOBAL__N_114AttrTypeReader10initializeEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS1_8ArrayRefIhEES6_ENKUlOT_E_clIRNS1_11SmallVectorINS0_5EntryIN4mlir4TypeEEELj1EEEEEDaS8_ called 0 returned 0% blocks executed 0%
+    #####:  926:  auto parseEntries = [&](auto &&range) {
+    #####:  927:    size_t currentIndex = 0, endIndex = range.size();
+        -:  928:
+        -:  929:    // Parse an individual entry.
+    #####:  930:    auto parseEntryFn = [&](BytecodeDialect *dialect) -> LogicalResult {
+        -:  931:      auto &entry = range[currentIndex++];
+        -:  932:
+        -:  933:      uint64_t entrySize;
+    #####:  934:      if (failed(offsetReader.parseVarIntWithFlag(entrySize,
+call    0 never executed
+        -:  935:                                                  entry.hasCustomEncoding)))
+        -:  936:        return failure();
+        -:  937:
+        -:  938:      // Verify that the offset is actually valid.
+    #####:  939:      if (currentOffset + entrySize > sectionData.size()) {
+        -:  940:        return offsetReader.emitError(
+        -:  941:            "Attribute or Type entry offset points past the end of section");
+        -:  942:      }
+        -:  943:
+        -:  944:      entry.data = sectionData.slice(currentOffset, entrySize);
+        -:  945:      entry.dialect = dialect;
+        -:  946:      currentOffset += entrySize;
+        -:  947:      return success();
+        -:  948:    };
+    #####:  949:    while (currentIndex != endIndex)
+branch  0 never executed
+branch  1 never executed
+    #####:  950:      if (failed(parseDialectGrouping(offsetReader, dialects, parseEntryFn)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  951:        return failure();
+    #####:  952:    return success();
+        -:  953:  };
+------------------
+_ZZN12_GLOBAL__N_114AttrTypeReader10initializeEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS1_8ArrayRefIhEES6_ENKUlOT_E_clIRNS1_11SmallVectorINS0_5EntryIN4mlir9AttributeEEELj1EEEEEDaS8_:
+function _ZZN12_GLOBAL__N_114AttrTypeReader10initializeEN4llvm15MutableArrayRefINS_15BytecodeDialectEEENS1_8ArrayRefIhEES6_ENKUlOT_E_clIRNS1_11SmallVectorINS0_5EntryIN4mlir9AttributeEEELj1EEEEEDaS8_ called 0 returned 0% blocks executed 0%
+    #####:  926:  auto parseEntries = [&](auto &&range) {
+    #####:  927:    size_t currentIndex = 0, endIndex = range.size();
+        -:  928:
+        -:  929:    // Parse an individual entry.
+    #####:  930:    auto parseEntryFn = [&](BytecodeDialect *dialect) -> LogicalResult {
+        -:  931:      auto &entry = range[currentIndex++];
+        -:  932:
+        -:  933:      uint64_t entrySize;
+    #####:  934:      if (failed(offsetReader.parseVarIntWithFlag(entrySize,
+call    0 never executed
+        -:  935:                                                  entry.hasCustomEncoding)))
+        -:  936:        return failure();
+        -:  937:
+        -:  938:      // Verify that the offset is actually valid.
+    #####:  939:      if (currentOffset + entrySize > sectionData.size()) {
+        -:  940:        return offsetReader.emitError(
+        -:  941:            "Attribute or Type entry offset points past the end of section");
+        -:  942:      }
+        -:  943:
+        -:  944:      entry.data = sectionData.slice(currentOffset, entrySize);
+        -:  945:      entry.dialect = dialect;
+        -:  946:      currentOffset += entrySize;
+        -:  947:      return success();
+        -:  948:    };
+    #####:  949:    while (currentIndex != endIndex)
+branch  0 never executed
+branch  1 never executed
+    #####:  950:      if (failed(parseDialectGrouping(offsetReader, dialects, parseEntryFn)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  951:        return failure();
+    #####:  952:    return success();
+        -:  953:  };
+------------------
+        -:  954:
+        -:  955:  // Process each of the attributes, and then the types.
+    #####:  956:  if (failed(parseEntries(attributes)) || failed(parseEntries(types)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  957:    return failure();
+        -:  958:
+        -:  959:  // Ensure that we read everything from the section.
+    #####:  960:  if (!offsetReader.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  961:    return offsetReader.emitError(
+call    0 never executed
+call    1 never executed
+    #####:  962:        "unexpected trailing data in the Attribute/Type offset section");
+call    0 never executed
+        -:  963:  }
+    #####:  964:  return success();
+        -:  965:}
+        -:  966:
+        -:  967:template <typename T>
+    #####:  968:T AttrTypeReader::resolveEntry(SmallVectorImpl<Entry<T>> &entries, size_t index,
+        -:  969:                               StringRef entryType) {
+    #####:  970:  if (index >= entries.size()) {
+    #####:  971:    emitError(fileLoc) << "invalid " << entryType << " index: " << index;
+    #####:  972:    return {};
+        -:  973:  }
+        -:  974:
+        -:  975:  // If the entry has already been resolved, there is nothing left to do.
+    #####:  976:  Entry<T> &entry = entries[index];
+    #####:  977:  if (entry.entry)
+    #####:  978:    return entry.entry;
+        -:  979:
+        -:  980:  // Parse the entry.
+    #####:  981:  EncodingReader reader(entry.data, fileLoc);
+        -:  982:
+        -:  983:  // Parse based on how the entry was encoded.
+    #####:  984:  if (entry.hasCustomEncoding) {
+    #####:  985:    if (failed(parseCustomEntry(entry, reader, entryType)))
+    #####:  986:      return T();
+    #####:  987:  } else if (failed(parseAsmEntry(entry.entry, reader, entryType))) {
+    #####:  988:    return T();
+        -:  989:  }
+        -:  990:
+    #####:  991:  if (!reader.empty()) {
+    #####:  992:    reader.emitError("unexpected trailing bytes after " + entryType + " entry");
+    #####:  993:    return T();
+        -:  994:  }
+    #####:  995:  return entry.entry;
+        -:  996:}
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader12resolveEntryIN4mlir4TypeEEET_RN4llvm15SmallVectorImplINS0_5EntryIS4_EEEEmNS5_9StringRefE:
+function _ZN12_GLOBAL__N_114AttrTypeReader12resolveEntryIN4mlir4TypeEEET_RN4llvm15SmallVectorImplINS0_5EntryIS4_EEEEmNS5_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  968:T AttrTypeReader::resolveEntry(SmallVectorImpl<Entry<T>> &entries, size_t index,
+        -:  969:                               StringRef entryType) {
+    #####:  970:  if (index >= entries.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  971:    emitError(fileLoc) << "invalid " << entryType << " index: " << index;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  972:    return {};
+        -:  973:  }
+        -:  974:
+        -:  975:  // If the entry has already been resolved, there is nothing left to do.
+    #####:  976:  Entry<T> &entry = entries[index];
+branch  0 never executed
+branch  1 never executed
+    #####:  977:  if (entry.entry)
+branch  0 never executed
+branch  1 never executed
+    #####:  978:    return entry.entry;
+        -:  979:
+        -:  980:  // Parse the entry.
+    #####:  981:  EncodingReader reader(entry.data, fileLoc);
+        -:  982:
+        -:  983:  // Parse based on how the entry was encoded.
+    #####:  984:  if (entry.hasCustomEncoding) {
+branch  0 never executed
+branch  1 never executed
+    #####:  985:    if (failed(parseCustomEntry(entry, reader, entryType)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  986:      return T();
+    #####:  987:  } else if (failed(parseAsmEntry(entry.entry, reader, entryType))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  988:    return T();
+        -:  989:  }
+        -:  990:
+    #####:  991:  if (!reader.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  992:    reader.emitError("unexpected trailing bytes after " + entryType + " entry");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  993:    return T();
+        -:  994:  }
+    #####:  995:  return entry.entry;
+        -:  996:}
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader12resolveEntryIN4mlir9AttributeEEET_RN4llvm15SmallVectorImplINS0_5EntryIS4_EEEEmNS5_9StringRefE:
+function _ZN12_GLOBAL__N_114AttrTypeReader12resolveEntryIN4mlir9AttributeEEET_RN4llvm15SmallVectorImplINS0_5EntryIS4_EEEEmNS5_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  968:T AttrTypeReader::resolveEntry(SmallVectorImpl<Entry<T>> &entries, size_t index,
+        -:  969:                               StringRef entryType) {
+    #####:  970:  if (index >= entries.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  971:    emitError(fileLoc) << "invalid " << entryType << " index: " << index;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  972:    return {};
+        -:  973:  }
+        -:  974:
+        -:  975:  // If the entry has already been resolved, there is nothing left to do.
+    #####:  976:  Entry<T> &entry = entries[index];
+branch  0 never executed
+branch  1 never executed
+    #####:  977:  if (entry.entry)
+branch  0 never executed
+branch  1 never executed
+    #####:  978:    return entry.entry;
+        -:  979:
+        -:  980:  // Parse the entry.
+    #####:  981:  EncodingReader reader(entry.data, fileLoc);
+        -:  982:
+        -:  983:  // Parse based on how the entry was encoded.
+    #####:  984:  if (entry.hasCustomEncoding) {
+branch  0 never executed
+branch  1 never executed
+    #####:  985:    if (failed(parseCustomEntry(entry, reader, entryType)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  986:      return T();
+    #####:  987:  } else if (failed(parseAsmEntry(entry.entry, reader, entryType))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  988:    return T();
+        -:  989:  }
+        -:  990:
+    #####:  991:  if (!reader.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  992:    reader.emitError("unexpected trailing bytes after " + entryType + " entry");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  993:    return T();
+        -:  994:  }
+    #####:  995:  return entry.entry;
+        -:  996:}
+------------------
+        -:  997:
+        -:  998:template <typename T>
+    #####:  999:LogicalResult AttrTypeReader::parseAsmEntry(T &result, EncodingReader &reader,
+        -: 1000:                                            StringRef entryType) {
+    #####: 1001:  StringRef asmStr;
+    #####: 1002:  if (failed(reader.parseNullTerminatedString(asmStr)))
+    #####: 1003:    return failure();
+        -: 1004:
+        -: 1005:  // Invoke the MLIR assembly parser to parse the entry text.
+    #####: 1006:  size_t numRead = 0;
+    #####: 1007:  MLIRContext *context = fileLoc->getContext();
+        -: 1008:  if constexpr (std::is_same_v<T, Type>)
+    #####: 1009:    result = ::parseType(asmStr, context, numRead);
+        -: 1010:  else
+    #####: 1011:    result = ::parseAttribute(asmStr, context, numRead);
+    #####: 1012:  if (!result)
+    #####: 1013:    return failure();
+        -: 1014:
+        -: 1015:  // Ensure there weren't dangling characters after the entry.
+    #####: 1016:  if (numRead != asmStr.size()) {
+        -: 1017:    return reader.emitError("trailing characters found after ", entryType,
+    #####: 1018:                            " assembly format: ", asmStr.drop_front(numRead));
+        -: 1019:  }
+    #####: 1020:  return success();
+        -: 1021:}
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader13parseAsmEntryIN4mlir4TypeEEENS2_13LogicalResultERT_RNS_14EncodingReaderEN4llvm9StringRefE:
+function _ZN12_GLOBAL__N_114AttrTypeReader13parseAsmEntryIN4mlir4TypeEEENS2_13LogicalResultERT_RNS_14EncodingReaderEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  999:LogicalResult AttrTypeReader::parseAsmEntry(T &result, EncodingReader &reader,
+        -: 1000:                                            StringRef entryType) {
+    #####: 1001:  StringRef asmStr;
+    #####: 1002:  if (failed(reader.parseNullTerminatedString(asmStr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1003:    return failure();
+        -: 1004:
+        -: 1005:  // Invoke the MLIR assembly parser to parse the entry text.
+    #####: 1006:  size_t numRead = 0;
+    #####: 1007:  MLIRContext *context = fileLoc->getContext();
+call    0 never executed
+        -: 1008:  if constexpr (std::is_same_v<T, Type>)
+    #####: 1009:    result = ::parseType(asmStr, context, numRead);
+call    0 never executed
+        -: 1010:  else
+        -: 1011:    result = ::parseAttribute(asmStr, context, numRead);
+    #####: 1012:  if (!result)
+branch  0 never executed
+branch  1 never executed
+    #####: 1013:    return failure();
+        -: 1014:
+        -: 1015:  // Ensure there weren't dangling characters after the entry.
+    #####: 1016:  if (numRead != asmStr.size()) {
+branch  0 never executed
+branch  1 never executed
+        -: 1017:    return reader.emitError("trailing characters found after ", entryType,
+    #####: 1018:                            " assembly format: ", asmStr.drop_front(numRead));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1019:  }
+    #####: 1020:  return success();
+        -: 1021:}
+------------------
+_ZN12_GLOBAL__N_114AttrTypeReader13parseAsmEntryIN4mlir9AttributeEEENS2_13LogicalResultERT_RNS_14EncodingReaderEN4llvm9StringRefE:
+function _ZN12_GLOBAL__N_114AttrTypeReader13parseAsmEntryIN4mlir9AttributeEEENS2_13LogicalResultERT_RNS_14EncodingReaderEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  999:LogicalResult AttrTypeReader::parseAsmEntry(T &result, EncodingReader &reader,
+        -: 1000:                                            StringRef entryType) {
+    #####: 1001:  StringRef asmStr;
+    #####: 1002:  if (failed(reader.parseNullTerminatedString(asmStr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1003:    return failure();
+        -: 1004:
+        -: 1005:  // Invoke the MLIR assembly parser to parse the entry text.
+    #####: 1006:  size_t numRead = 0;
+    #####: 1007:  MLIRContext *context = fileLoc->getContext();
+call    0 never executed
+        -: 1008:  if constexpr (std::is_same_v<T, Type>)
+        -: 1009:    result = ::parseType(asmStr, context, numRead);
+        -: 1010:  else
+    #####: 1011:    result = ::parseAttribute(asmStr, context, numRead);
+call    0 never executed
+    #####: 1012:  if (!result)
+branch  0 never executed
+branch  1 never executed
+    #####: 1013:    return failure();
+        -: 1014:
+        -: 1015:  // Ensure there weren't dangling characters after the entry.
+    #####: 1016:  if (numRead != asmStr.size()) {
+branch  0 never executed
+branch  1 never executed
+        -: 1017:    return reader.emitError("trailing characters found after ", entryType,
+    #####: 1018:                            " assembly format: ", asmStr.drop_front(numRead));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1019:  }
+    #####: 1020:  return success();
+        -: 1021:}
+------------------
+        -: 1022:
+        -: 1023:template <typename T>
+        -: 1024:LogicalResult AttrTypeReader::parseCustomEntry(Entry<T> &entry,
+        -: 1025:                                               EncodingReader &reader,
+        -: 1026:                                               StringRef entryType) {
+        -: 1027:  if (failed(entry.dialect->load(reader, fileLoc.getContext())))
+        -: 1028:    return failure();
+        -: 1029:
+        -: 1030:  // Ensure that the dialect implements the bytecode interface.
+        -: 1031:  if (!entry.dialect->interface) {
+        -: 1032:    return reader.emitError("dialect '", entry.dialect->name,
+        -: 1033:                            "' does not implement the bytecode interface");
+        -: 1034:  }
+        -: 1035:
+        -: 1036:  // Ask the dialect to parse the entry.
+        -: 1037:  DialectReader dialectReader(*this, stringReader, resourceReader, reader);
+        -: 1038:  if constexpr (std::is_same_v<T, Type>)
+        -: 1039:    entry.entry = entry.dialect->interface->readType(dialectReader);
+        -: 1040:  else
+        -: 1041:    entry.entry = entry.dialect->interface->readAttribute(dialectReader);
+        -: 1042:  return success(!!entry.entry);
+        -: 1043:}
+        -: 1044:
+        -: 1045://===----------------------------------------------------------------------===//
+        -: 1046:// Bytecode Reader
+        -: 1047://===----------------------------------------------------------------------===//
+        -: 1048:
+        -: 1049:namespace {
+        -: 1050:/// This class is used to read a bytecode buffer and translate it into MLIR.
+        -: 1051:class BytecodeReader {
+        -: 1052:public:
+function _ZN12_GLOBAL__N_114BytecodeReaderC2EN4mlir8LocationERKNS1_12ParserConfigE called 0 returned 0% blocks executed 0%
+    #####: 1053:  BytecodeReader(Location fileLoc, const ParserConfig &config)
+    #####: 1054:      : config(config), fileLoc(fileLoc),
+    #####: 1055:        attrTypeReader(stringReader, resourceReader, fileLoc),
+        -: 1056:        // Use the builtin unrealized conversion cast operation to represent
+        -: 1057:        // forward references to values that aren't yet defined.
+    #####: 1058:        forwardRefOpState(UnknownLoc::get(config.getContext()),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1059:                          "builtin.unrealized_conversion_cast", ValueRange(),
+    #####: 1060:                          NoneType::get(config.getContext())) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1061:
+        -: 1062:  /// Read the bytecode defined within `buffer` into the given block.
+        -: 1063:  LogicalResult read(llvm::MemoryBufferRef buffer, Block *block);
+        -: 1064:
+        -: 1065:private:
+        -: 1066:  /// Return the context for this config.
+    #####: 1067:  MLIRContext *getContext() const { return config.getContext(); }
+        -: 1068:
+        -: 1069:  /// Parse the bytecode version.
+        -: 1070:  LogicalResult parseVersion(EncodingReader &reader);
+        -: 1071:
+        -: 1072:  //===--------------------------------------------------------------------===//
+        -: 1073:  // Dialect Section
+        -: 1074:
+        -: 1075:  LogicalResult parseDialectSection(ArrayRef<uint8_t> sectionData);
+        -: 1076:
+        -: 1077:  /// Parse an operation name reference using the given reader.
+        -: 1078:  FailureOr<OperationName> parseOpName(EncodingReader &reader);
+        -: 1079:
+        -: 1080:  //===--------------------------------------------------------------------===//
+        -: 1081:  // Attribute/Type Section
+        -: 1082:
+        -: 1083:  /// Parse an attribute or type using the given reader.
+        -: 1084:  template <typename T>
+    #####: 1085:  LogicalResult parseAttribute(EncodingReader &reader, T &result) {
+    #####: 1086:    return attrTypeReader.parseAttribute(reader, result);
+call    0 never executed
+        -: 1087:  }
+    #####: 1088:  LogicalResult parseType(EncodingReader &reader, Type &result) {
+    #####: 1089:    return attrTypeReader.parseType(reader, result);
+        -: 1090:  }
+        -: 1091:
+        -: 1092:  //===--------------------------------------------------------------------===//
+        -: 1093:  // Resource Section
+        -: 1094:
+        -: 1095:  LogicalResult
+        -: 1096:  parseResourceSection(Optional<ArrayRef<uint8_t>> resourceData,
+        -: 1097:                       Optional<ArrayRef<uint8_t>> resourceOffsetData);
+        -: 1098:
+        -: 1099:  //===--------------------------------------------------------------------===//
+        -: 1100:  // IR Section
+        -: 1101:
+        -: 1102:  /// This struct represents the current read state of a range of regions. This
+        -: 1103:  /// struct is used to enable iterative parsing of regions.
+    #####: 1104:  struct RegionReadState {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1105:    RegionReadState(Operation *op, bool isIsolatedFromAbove)
+    #####: 1106:        : RegionReadState(op->getRegions(), isIsolatedFromAbove) {}
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1107:    RegionReadState(MutableArrayRef<Region> regions, bool isIsolatedFromAbove)
+    #####: 1108:        : curRegion(regions.begin()), endRegion(regions.end()),
+    #####: 1109:          isIsolatedFromAbove(isIsolatedFromAbove) {}
+        -: 1110:
+        -: 1111:    /// The current regions being read.
+        -: 1112:    MutableArrayRef<Region>::iterator curRegion, endRegion;
+        -: 1113:
+        -: 1114:    /// The number of values defined immediately within this region.
+        -: 1115:    unsigned numValues = 0;
+        -: 1116:
+        -: 1117:    /// The current blocks of the region being read.
+        -: 1118:    SmallVector<Block *> curBlocks;
+        -: 1119:    Region::iterator curBlock = {};
+        -: 1120:
+        -: 1121:    /// The number of operations remaining to be read from the current block
+        -: 1122:    /// being read.
+        -: 1123:    uint64_t numOpsRemaining = 0;
+        -: 1124:
+        -: 1125:    /// A flag indicating if the regions being read are isolated from above.
+        -: 1126:    bool isIsolatedFromAbove = false;
+        -: 1127:  };
+        -: 1128:
+        -: 1129:  LogicalResult parseIRSection(ArrayRef<uint8_t> sectionData, Block *block);
+        -: 1130:  LogicalResult parseRegions(EncodingReader &reader,
+        -: 1131:                             std::vector<RegionReadState> &regionStack,
+        -: 1132:                             RegionReadState &readState);
+        -: 1133:  FailureOr<Operation *> parseOpWithoutRegions(EncodingReader &reader,
+        -: 1134:                                               RegionReadState &readState,
+        -: 1135:                                               bool &isIsolatedFromAbove);
+        -: 1136:
+        -: 1137:  LogicalResult parseRegion(EncodingReader &reader, RegionReadState &readState);
+        -: 1138:  LogicalResult parseBlock(EncodingReader &reader, RegionReadState &readState);
+        -: 1139:  LogicalResult parseBlockArguments(EncodingReader &reader, Block *block);
+        -: 1140:
+        -: 1141:  //===--------------------------------------------------------------------===//
+        -: 1142:  // Value Processing
+        -: 1143:
+        -: 1144:  /// Parse an operand reference using the given reader. Returns nullptr in the
+        -: 1145:  /// case of failure.
+        -: 1146:  Value parseOperand(EncodingReader &reader);
+        -: 1147:
+        -: 1148:  /// Sequentially define the given value range.
+        -: 1149:  LogicalResult defineValues(EncodingReader &reader, ValueRange values);
+        -: 1150:
+        -: 1151:  /// Create a value to use for a forward reference.
+        -: 1152:  Value createForwardRef();
+        -: 1153:
+        -: 1154:  //===--------------------------------------------------------------------===//
+        -: 1155:  // Fields
+        -: 1156:
+        -: 1157:  /// This class represents a single value scope, in which a value scope is
+        -: 1158:  /// delimited by isolated from above regions.
+    #####: 1159:  struct ValueScope {
+        -: 1160:    /// Push a new region state onto this scope, reserving enough values for
+        -: 1161:    /// those defined within the current region of the provided state.
+        -: 1162:    void push(RegionReadState &readState) {
+        -: 1163:      nextValueIDs.push_back(values.size());
+        -: 1164:      values.resize(values.size() + readState.numValues);
+        -: 1165:    }
+        -: 1166:
+        -: 1167:    /// Pop the values defined for the current region within the provided region
+        -: 1168:    /// state.
+        -: 1169:    void pop(RegionReadState &readState) {
+        -: 1170:      values.resize(values.size() - readState.numValues);
+        -: 1171:      nextValueIDs.pop_back();
+        -: 1172:    }
+        -: 1173:
+        -: 1174:    /// The set of values defined in this scope.
+        -: 1175:    std::vector<Value> values;
+        -: 1176:
+        -: 1177:    /// The ID for the next defined value for each region current being
+        -: 1178:    /// processed in this scope.
+        -: 1179:    SmallVector<unsigned, 4> nextValueIDs;
+        -: 1180:  };
+        -: 1181:
+        -: 1182:  /// The configuration of the parser.
+        -: 1183:  const ParserConfig &config;
+        -: 1184:
+        -: 1185:  /// A location to use when emitting errors.
+        -: 1186:  Location fileLoc;
+        -: 1187:
+        -: 1188:  /// The reader used to process attribute and types within the bytecode.
+        -: 1189:  AttrTypeReader attrTypeReader;
+        -: 1190:
+        -: 1191:  /// The version of the bytecode being read.
+        -: 1192:  uint64_t version = 0;
+        -: 1193:
+        -: 1194:  /// The producer of the bytecode being read.
+        -: 1195:  StringRef producer;
+        -: 1196:
+        -: 1197:  /// The table of IR units referenced within the bytecode file.
+        -: 1198:  SmallVector<BytecodeDialect> dialects;
+        -: 1199:  SmallVector<BytecodeOperationName> opNames;
+        -: 1200:
+        -: 1201:  /// The reader used to process resources within the bytecode.
+        -: 1202:  ResourceSectionReader resourceReader;
+        -: 1203:
+        -: 1204:  /// The table of strings referenced within the bytecode file.
+        -: 1205:  StringSectionReader stringReader;
+        -: 1206:
+        -: 1207:  /// The current set of available IR value scopes.
+        -: 1208:  std::vector<ValueScope> valueScopes;
+        -: 1209:  /// A block containing the set of operations defined to create forward
+        -: 1210:  /// references.
+        -: 1211:  Block forwardRefOps;
+        -: 1212:  /// A block containing previously created, and no longer used, forward
+        -: 1213:  /// reference operations.
+        -: 1214:  Block openForwardRefOps;
+        -: 1215:  /// An operation state used when instantiating forward references.
+        -: 1216:  OperationState forwardRefOpState;
+        -: 1217:};
+        -: 1218:} // namespace
+        -: 1219:
+        -: 1220:LogicalResult BytecodeReader::read(llvm::MemoryBufferRef buffer, Block *block) {
+        -: 1221:  EncodingReader reader(buffer.getBuffer(), fileLoc);
+        -: 1222:
+        -: 1223:  // Skip over the bytecode header, this should have already been checked.
+        -: 1224:  if (failed(reader.skipBytes(StringRef("ML\xefR").size())))
+        -: 1225:    return failure();
+        -: 1226:  // Parse the bytecode version and producer.
+        -: 1227:  if (failed(parseVersion(reader)) ||
+        -: 1228:      failed(reader.parseNullTerminatedString(producer)))
+        -: 1229:    return failure();
+        -: 1230:
+        -: 1231:  // Add a diagnostic handler that attaches a note that includes the original
+        -: 1232:  // producer of the bytecode.
+function _ZZN12_GLOBAL__N_114BytecodeReader4readEN4llvm15MemoryBufferRefEPN4mlir5BlockEENKUlRNS3_10DiagnosticEE_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1233:  ScopedDiagnosticHandler diagHandler(getContext(), [&](Diagnostic &diag) {
+    #####: 1234:    diag.attachNote() << "in bytecode version " << version
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1235:                      << " produced by: " << producer;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1236:    return failure();
+        -: 1237:  });
+        -: 1238:
+        -: 1239:  // Parse the raw data for each of the top-level sections of the bytecode.
+        -: 1240:  Optional<ArrayRef<uint8_t>> sectionDatas[bytecode::Section::kNumSections];
+        -: 1241:  while (!reader.empty()) {
+        -: 1242:    // Read the next section from the bytecode.
+        -: 1243:    bytecode::Section::ID sectionID;
+        -: 1244:    ArrayRef<uint8_t> sectionData;
+        -: 1245:    if (failed(reader.parseSection(sectionID, sectionData)))
+        -: 1246:      return failure();
+        -: 1247:
+        -: 1248:    // Check for duplicate sections, we only expect one instance of each.
+        -: 1249:    if (sectionDatas[sectionID]) {
+        -: 1250:      return reader.emitError("duplicate top-level section: ",
+        -: 1251:                              toString(sectionID));
+        -: 1252:    }
+        -: 1253:    sectionDatas[sectionID] = sectionData;
+        -: 1254:  }
+        -: 1255:  // Check that all of the required sections were found.
+        -: 1256:  for (int i = 0; i < bytecode::Section::kNumSections; ++i) {
+        -: 1257:    bytecode::Section::ID sectionID = static_cast<bytecode::Section::ID>(i);
+        -: 1258:    if (!sectionDatas[i] && !isSectionOptional(sectionID)) {
+        -: 1259:      return reader.emitError("missing data for top-level section: ",
+        -: 1260:                              toString(sectionID));
+        -: 1261:    }
+        -: 1262:  }
+        -: 1263:
+        -: 1264:  // Process the string section first.
+        -: 1265:  if (failed(stringReader.initialize(
+        -: 1266:          fileLoc, *sectionDatas[bytecode::Section::kString])))
+        -: 1267:    return failure();
+        -: 1268:
+        -: 1269:  // Process the dialect section.
+        -: 1270:  if (failed(parseDialectSection(*sectionDatas[bytecode::Section::kDialect])))
+        -: 1271:    return failure();
+        -: 1272:
+        -: 1273:  // Process the resource section if present.
+        -: 1274:  if (failed(parseResourceSection(
+        -: 1275:          sectionDatas[bytecode::Section::kResource],
+        -: 1276:          sectionDatas[bytecode::Section::kResourceOffset])))
+        -: 1277:    return failure();
+        -: 1278:
+        -: 1279:  // Process the attribute and type section.
+        -: 1280:  if (failed(attrTypeReader.initialize(
+        -: 1281:          dialects, *sectionDatas[bytecode::Section::kAttrType],
+        -: 1282:          *sectionDatas[bytecode::Section::kAttrTypeOffset])))
+        -: 1283:    return failure();
+        -: 1284:
+        -: 1285:  // Finally, process the IR section.
+        -: 1286:  return parseIRSection(*sectionDatas[bytecode::Section::kIR], block);
+        -: 1287:}
+        -: 1288:
+function _ZN12_GLOBAL__N_114BytecodeReader12parseVersionERNS_14EncodingReaderE called 0 returned 0% blocks executed 0%
+    #####: 1289:LogicalResult BytecodeReader::parseVersion(EncodingReader &reader) {
+    #####: 1290:  if (failed(reader.parseVarInt(version)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1291:    return failure();
+        -: 1292:
+        -: 1293:  // Validate the bytecode version.
+    #####: 1294:  uint64_t currentVersion = bytecode::kVersion;
+    #####: 1295:  if (version < currentVersion) {
+        -: 1296:    return reader.emitError("bytecode version ", version,
+        -: 1297:                            " is older than the current version of ",
+        -: 1298:                            currentVersion, ", and upgrade is not supported");
+        -: 1299:  }
+    #####: 1300:  if (version > currentVersion) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1301:    return reader.emitError("bytecode version ", version,
+call    0 never executed
+call    1 never executed
+        -: 1302:                            " is newer than the current version ",
+    #####: 1303:                            currentVersion);
+call    0 never executed
+        -: 1304:  }
+    #####: 1305:  return success();
+        -: 1306:}
+        -: 1307:
+        -: 1308://===----------------------------------------------------------------------===//
+        -: 1309:// Dialect Section
+        -: 1310:
+        -: 1311:LogicalResult
+function _ZN12_GLOBAL__N_114BytecodeReader19parseDialectSectionEN4llvm8ArrayRefIhEE called 0 returned 0% blocks executed 0%
+    #####: 1312:BytecodeReader::parseDialectSection(ArrayRef<uint8_t> sectionData) {
+    #####: 1313:  EncodingReader sectionReader(sectionData, fileLoc);
+call    0 never executed
+        -: 1314:
+        -: 1315:  // Parse the number of dialects in the section.
+    #####: 1316:  uint64_t numDialects;
+    #####: 1317:  if (failed(sectionReader.parseVarInt(numDialects)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1318:    return failure();
+    #####: 1319:  dialects.resize(numDialects);
+call    0 never executed
+        -: 1320:
+        -: 1321:  // Parse each of the dialects.
+    #####: 1322:  for (uint64_t i = 0; i < numDialects; ++i)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1323:    if (failed(stringReader.parseString(sectionReader, dialects[i].name)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1324:      return failure();
+        -: 1325:
+        -: 1326:  // Parse the operation names, which are grouped by dialect.
+function _ZZN12_GLOBAL__N_114BytecodeReader19parseDialectSectionEN4llvm8ArrayRefIhEEENKUlPNS_15BytecodeDialectEE_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1327:  auto parseOpName = [&](BytecodeDialect *dialect) {
+    #####: 1328:    StringRef opName;
+    #####: 1329:    if (failed(stringReader.parseString(sectionReader, opName)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1330:      return failure();
+    #####: 1331:    opNames.emplace_back(dialect, opName);
+call    0 never executed
+    #####: 1332:    return success();
+    #####: 1333:  };
+    #####: 1334:  while (!sectionReader.empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1335:    if (failed(parseDialectGrouping(sectionReader, dialects, parseOpName)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1336:      return failure();
+    #####: 1337:  return success();
+        -: 1338:}
+        -: 1339:
+function _ZN12_GLOBAL__N_114BytecodeReader11parseOpNameERNS_14EncodingReaderE called 0 returned 0% blocks executed 0%
+    #####: 1340:FailureOr<OperationName> BytecodeReader::parseOpName(EncodingReader &reader) {
+    #####: 1341:  BytecodeOperationName *opName = nullptr;
+    #####: 1342:  if (failed(parseEntry(reader, opNames, opName, "operation name")))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1343:    return failure();
+        -: 1344:
+        -: 1345:  // Check to see if this operation name has already been resolved. If we
+        -: 1346:  // haven't, load the dialect and build the operation name.
+    #####: 1347:  if (!opName->opName) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1348:    if (failed(opName->dialect->load(reader, getContext())))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1349:      return failure();
+    #####: 1350:    opName->opName.emplace((opName->dialect->name + "." + opName->name).str(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1351:                           getContext());
+call    0 never executed
+        -: 1352:  }
+    #####: 1353:  return *opName->opName;
+branch  0 never executed
+branch  1 never executed
+        -: 1354:}
+        -: 1355:
+        -: 1356://===----------------------------------------------------------------------===//
+        -: 1357:// Resource Section
+        -: 1358:
+        -: 1359:LogicalResult BytecodeReader::parseResourceSection(
+        -: 1360:    Optional<ArrayRef<uint8_t>> resourceData,
+        -: 1361:    Optional<ArrayRef<uint8_t>> resourceOffsetData) {
+        -: 1362:  // Ensure both sections are either present or not.
+        -: 1363:  if (resourceData.has_value() != resourceOffsetData.has_value()) {
+        -: 1364:    if (resourceOffsetData)
+        -: 1365:      return emitError(fileLoc, "unexpected resource offset section when "
+        -: 1366:                                "resource section is not present");
+        -: 1367:    return emitError(
+        -: 1368:        fileLoc,
+        -: 1369:        "expected resource offset section when resource section is present");
+        -: 1370:  }
+        -: 1371:
+        -: 1372:  // If the resource sections are absent, there is nothing to do.
+        -: 1373:  if (!resourceData)
+        -: 1374:    return success();
+        -: 1375:
+        -: 1376:  // Initialize the resource reader with the resource sections.
+        -: 1377:  return resourceReader.initialize(fileLoc, config, dialects, stringReader,
+        -: 1378:                                   *resourceData, *resourceOffsetData);
+        -: 1379:}
+        -: 1380:
+        -: 1381://===----------------------------------------------------------------------===//
+        -: 1382:// IR Section
+        -: 1383:
+function _ZN12_GLOBAL__N_114BytecodeReader14parseIRSectionEN4llvm8ArrayRefIhEEPN4mlir5BlockE called 0 returned 0% blocks executed 0%
+    #####: 1384:LogicalResult BytecodeReader::parseIRSection(ArrayRef<uint8_t> sectionData,
+        -: 1385:                                             Block *block) {
+    #####: 1386:  EncodingReader reader(sectionData, fileLoc);
+call    0 never executed
+        -: 1387:
+        -: 1388:  // A stack of operation regions currently being read from the bytecode.
+    #####: 1389:  std::vector<RegionReadState> regionStack;
+call    0 never executed
+        -: 1390:
+        -: 1391:  // Parse the top-level block using a temporary module operation.
+    #####: 1392:  OwningOpRef<ModuleOp> moduleOp = ModuleOp::create(fileLoc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1393:  regionStack.emplace_back(*moduleOp, /*isIsolatedFromAbove=*/true);
+call    0 never executed
+    #####: 1394:  regionStack.back().curBlocks.push_back(moduleOp->getBody());
+call    0 never executed
+call    1 never executed
+    #####: 1395:  regionStack.back().curBlock = regionStack.back().curRegion->begin();
+call    0 never executed
+    #####: 1396:  if (failed(parseBlock(reader, regionStack.back())))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1397:    return failure();
+    #####: 1398:  valueScopes.emplace_back();
+call    0 never executed
+    #####: 1399:  valueScopes.back().push(regionStack.back());
+call    0 never executed
+        -: 1400:
+        -: 1401:  // Iteratively parse regions until everything has been resolved.
+    #####: 1402:  while (!regionStack.empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1403:    if (failed(parseRegions(reader, regionStack, regionStack.back())))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1404:      return failure();
+    #####: 1405:  if (!forwardRefOps.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1406:    return reader.emitError(
+call    0 never executed
+call    1 never executed
+    #####: 1407:        "not all forward unresolved forward operand references");
+call    0 never executed
+        -: 1408:  }
+        -: 1409:
+        -: 1410:  // Verify that the parsed operations are valid.
+    #####: 1411:  if (config.shouldVerifyAfterParse() && failed(verify(*moduleOp)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1412:    return failure();
+        -: 1413:
+        -: 1414:  // Splice the parsed operations over to the provided top-level block.
+    #####: 1415:  auto &parsedOps = moduleOp->getBody()->getOperations();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1416:  auto &destOps = block->getOperations();
+    #####: 1417:  destOps.splice(destOps.end(), parsedOps, parsedOps.begin(), parsedOps.end());
+branch  0 never executed
+branch  1 never executed
+    #####: 1418:  return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1419:}
+        -: 1420:
+        -: 1421:LogicalResult
+function _ZN12_GLOBAL__N_114BytecodeReader12parseRegionsERNS_14EncodingReaderERSt6vectorINS0_15RegionReadStateESaIS4_EERS4_ called 0 returned 0% blocks executed 0%
+    #####: 1422:BytecodeReader::parseRegions(EncodingReader &reader,
+        -: 1423:                             std::vector<RegionReadState> &regionStack,
+        -: 1424:                             RegionReadState &readState) {
+        -: 1425:  // Read the regions of this operation.
+    #####: 1426:  for (; readState.curRegion != readState.endRegion; ++readState.curRegion) {
+branch  0 never executed
+branch  1 never executed
+        -: 1427:    // If the current block hasn't been setup yet, parse the header for this
+        -: 1428:    // region.
+    #####: 1429:    if (readState.curBlock == Region::iterator()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1430:      if (failed(parseRegion(reader, readState)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1431:        return failure();
+        -: 1432:
+        -: 1433:      // If the region is empty, there is nothing to more to do.
+    #####: 1434:      if (readState.curRegion->empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1435:        continue;
+        -: 1436:    }
+        -: 1437:
+        -: 1438:    // Parse the blocks within the region.
+    #####: 1439:    do {
+    #####: 1440:      while (readState.numOpsRemaining--) {
+branch  0 never executed
+branch  1 never executed
+        -: 1441:        // Read in the next operation. We don't read its regions directly, we
+        -: 1442:        // handle those afterwards as necessary.
+    #####: 1443:        bool isIsolatedFromAbove = false;
+    #####: 1444:        FailureOr<Operation *> op =
+    #####: 1445:            parseOpWithoutRegions(reader, readState, isIsolatedFromAbove);
+call    0 never executed
+    #####: 1446:        if (failed(op))
+branch  0 never executed
+branch  1 never executed
+    #####: 1447:          return failure();
+        -: 1448:
+        -: 1449:        // If the op has regions, add it to the stack for processing.
+    #####: 1450:        if ((*op)->getNumRegions()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1451:          regionStack.emplace_back(*op, isIsolatedFromAbove);
+call    0 never executed
+        -: 1452:
+        -: 1453:          // If the op is isolated from above, push a new value scope.
+    #####: 1454:          if (isIsolatedFromAbove)
+branch  0 never executed
+branch  1 never executed
+    #####: 1455:            valueScopes.emplace_back();
+call    0 never executed
+    #####: 1456:          return success();
+        -: 1457:        }
+        -: 1458:      }
+        -: 1459:
+        -: 1460:      // Move to the next block of the region.
+    #####: 1461:      if (++readState.curBlock == readState.curRegion->end())
+branch  0 never executed
+branch  1 never executed
+        -: 1462:        break;
+    #####: 1463:      if (failed(parseBlock(reader, readState)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1464:        return failure();
+        -: 1465:    } while (true);
+        -: 1466:
+        -: 1467:    // Reset the current block and any values reserved for this region.
+    #####: 1468:    readState.curBlock = {};
+call    0 never executed
+    #####: 1469:    valueScopes.back().pop(readState);
+call    0 never executed
+        -: 1470:  }
+        -: 1471:
+        -: 1472:  // When the regions have been fully parsed, pop them off of the read stack. If
+        -: 1473:  // the regions were isolated from above, we also pop the last value scope.
+    #####: 1474:  if (readState.isIsolatedFromAbove)
+branch  0 never executed
+branch  1 never executed
+    #####: 1475:    valueScopes.pop_back();
+call    0 never executed
+    #####: 1476:  regionStack.pop_back();
+branch  0 never executed
+branch  1 never executed
+    #####: 1477:  return success();
+        -: 1478:}
+        -: 1479:
+        -: 1480:FailureOr<Operation *>
+function _ZN12_GLOBAL__N_114BytecodeReader21parseOpWithoutRegionsERNS_14EncodingReaderERNS0_15RegionReadStateERb called 0 returned 0% blocks executed 0%
+    #####: 1481:BytecodeReader::parseOpWithoutRegions(EncodingReader &reader,
+        -: 1482:                                      RegionReadState &readState,
+        -: 1483:                                      bool &isIsolatedFromAbove) {
+        -: 1484:  // Parse the name of the operation.
+    #####: 1485:  FailureOr<OperationName> opName = parseOpName(reader);
+call    0 never executed
+    #####: 1486:  if (failed(opName))
+branch  0 never executed
+branch  1 never executed
+    #####: 1487:    return failure();
+        -: 1488:
+        -: 1489:  // Parse the operation mask, which indicates which components of the operation
+        -: 1490:  // are present.
+    #####: 1491:  uint8_t opMask;
+    #####: 1492:  if (failed(reader.parseByte(opMask)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1493:    return failure();
+        -: 1494:
+        -: 1495:  /// Parse the location.
+    #####: 1496:  LocationAttr opLoc;
+    #####: 1497:  if (failed(parseAttribute(reader, opLoc)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1498:    return failure();
+        -: 1499:
+        -: 1500:  // With the location and name resolved, we can start building the operation
+        -: 1501:  // state.
+    #####: 1502:  OperationState opState(opLoc, *opName);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1503:
+        -: 1504:  // Parse the attributes of the operation.
+    #####: 1505:  if (opMask & bytecode::OpEncodingMask::kHasAttrs) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1506:    DictionaryAttr dictAttr;
+    #####: 1507:    if (failed(parseAttribute(reader, dictAttr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1508:      return failure();
+    #####: 1509:    opState.attributes = dictAttr;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1510:  }
+        -: 1511:
+        -: 1512:  /// Parse the results of the operation.
+    #####: 1513:  if (opMask & bytecode::OpEncodingMask::kHasResults) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1514:    uint64_t numResults;
+    #####: 1515:    if (failed(reader.parseVarInt(numResults)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1516:      return failure();
+    #####: 1517:    opState.types.resize(numResults);
+call    0 never executed
+    #####: 1518:    for (int i = 0, e = numResults; i < e; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####: 1519:      if (failed(parseType(reader, opState.types[i])))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1520:        return failure();
+        -: 1521:  }
+        -: 1522:
+        -: 1523:  /// Parse the operands of the operation.
+    #####: 1524:  if (opMask & bytecode::OpEncodingMask::kHasOperands) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1525:    uint64_t numOperands;
+    #####: 1526:    if (failed(reader.parseVarInt(numOperands)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1527:      return failure();
+    #####: 1528:    opState.operands.resize(numOperands);
+call    0 never executed
+    #####: 1529:    for (int i = 0, e = numOperands; i < e; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####: 1530:      if (!(opState.operands[i] = parseOperand(reader)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1531:        return failure();
+        -: 1532:  }
+        -: 1533:
+        -: 1534:  /// Parse the successors of the operation.
+    #####: 1535:  if (opMask & bytecode::OpEncodingMask::kHasSuccessors) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1536:    uint64_t numSuccs;
+    #####: 1537:    if (failed(reader.parseVarInt(numSuccs)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1538:      return failure();
+    #####: 1539:    opState.successors.resize(numSuccs);
+call    0 never executed
+    #####: 1540:    for (int i = 0, e = numSuccs; i < e; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1541:      if (failed(parseEntry(reader, readState.curBlocks, opState.successors[i],
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1542:                            "successor")))
+    #####: 1543:        return failure();
+        -: 1544:    }
+        -: 1545:  }
+        -: 1546:
+        -: 1547:  /// Parse the regions of the operation.
+    #####: 1548:  if (opMask & bytecode::OpEncodingMask::kHasInlineRegions) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1549:    uint64_t numRegions;
+    #####: 1550:    if (failed(reader.parseVarIntWithFlag(numRegions, isIsolatedFromAbove)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1551:      return failure();
+        -: 1552:
+    #####: 1553:    opState.regions.reserve(numRegions);
+branch  0 never executed
+branch  1 never executed
+    #####: 1554:    for (int i = 0, e = numRegions; i < e; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####: 1555:      opState.regions.push_back(std::make_unique<Region>());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1556:  }
+        -: 1557:
+        -: 1558:  // Create the operation at the back of the current block.
+    #####: 1559:  Operation *op = Operation::create(opState);
+call    0 never executed
+    #####: 1560:  readState.curBlock->push_back(op);
+call    0 never executed
+call    1 never executed
+        -: 1561:
+        -: 1562:  // If the operation had results, update the value references.
+    #####: 1563:  if (op->getNumResults() && failed(defineValues(reader, op->getResults())))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1564:    return failure();
+        -: 1565:
+    #####: 1566:  return op;
+        -: 1567:}
+        -: 1568:
+function _ZN12_GLOBAL__N_114BytecodeReader11parseRegionERNS_14EncodingReaderERNS0_15RegionReadStateE called 0 returned 0% blocks executed 0%
+    #####: 1569:LogicalResult BytecodeReader::parseRegion(EncodingReader &reader,
+        -: 1570:                                          RegionReadState &readState) {
+        -: 1571:  // Parse the number of blocks in the region.
+    #####: 1572:  uint64_t numBlocks;
+    #####: 1573:  if (failed(reader.parseVarInt(numBlocks)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1574:    return failure();
+        -: 1575:
+        -: 1576:  // If the region is empty, there is nothing else to do.
+    #####: 1577:  if (numBlocks == 0)
+branch  0 never executed
+branch  1 never executed
+    #####: 1578:    return success();
+        -: 1579:
+        -: 1580:  // Parse the number of values defined in this region.
+    #####: 1581:  uint64_t numValues;
+    #####: 1582:  if (failed(reader.parseVarInt(numValues)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1583:    return failure();
+    #####: 1584:  readState.numValues = numValues;
+        -: 1585:
+        -: 1586:  // Create the blocks within this region. We do this before processing so that
+        -: 1587:  // we can rely on the blocks existing when creating operations.
+    #####: 1588:  readState.curBlocks.clear();
+branch  0 never executed
+branch  1 never executed
+    #####: 1589:  readState.curBlocks.reserve(numBlocks);
+branch  0 never executed
+branch  1 never executed
+    #####: 1590:  for (uint64_t i = 0; i < numBlocks; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1591:    readState.curBlocks.push_back(new Block());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1592:    readState.curRegion->push_back(readState.curBlocks.back());
+call    0 never executed
+call    1 never executed
+        -: 1593:  }
+        -: 1594:
+        -: 1595:  // Prepare the current value scope for this region.
+    #####: 1596:  valueScopes.back().push(readState);
+call    0 never executed
+        -: 1597:
+        -: 1598:  // Parse the entry block of the region.
+    #####: 1599:  readState.curBlock = readState.curRegion->begin();
+call    0 never executed
+    #####: 1600:  return parseBlock(reader, readState);
+call    0 never executed
+        -: 1601:}
+        -: 1602:
+function _ZN12_GLOBAL__N_114BytecodeReader10parseBlockERNS_14EncodingReaderERNS0_15RegionReadStateE called 0 returned 0% blocks executed 0%
+    #####: 1603:LogicalResult BytecodeReader::parseBlock(EncodingReader &reader,
+        -: 1604:                                         RegionReadState &readState) {
+    #####: 1605:  bool hasArgs;
+    #####: 1606:  if (failed(reader.parseVarIntWithFlag(readState.numOpsRemaining, hasArgs)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1607:    return failure();
+        -: 1608:
+        -: 1609:  // Parse the arguments of the block.
+    #####: 1610:  if (hasArgs && failed(parseBlockArguments(reader, &*readState.curBlock)))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1611:    return failure();
+        -: 1612:
+        -: 1613:  // We don't parse the operations of the block here, that's done elsewhere.
+    #####: 1614:  return success();
+        -: 1615:}
+        -: 1616:
+function _ZN12_GLOBAL__N_114BytecodeReader19parseBlockArgumentsERNS_14EncodingReaderEPN4mlir5BlockE called 0 returned 0% blocks executed 0%
+    #####: 1617:LogicalResult BytecodeReader::parseBlockArguments(EncodingReader &reader,
+        -: 1618:                                                  Block *block) {
+        -: 1619:  // Parse the value ID for the first argument, and the number of arguments.
+    #####: 1620:  uint64_t numArgs;
+    #####: 1621:  if (failed(reader.parseVarInt(numArgs)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1622:    return failure();
+        -: 1623:
+    #####: 1624:  SmallVector<Type> argTypes;
+branch  0 never executed
+branch  1 never executed
+    #####: 1625:  SmallVector<Location> argLocs;
+branch  0 never executed
+branch  1 never executed
+    #####: 1626:  argTypes.reserve(numArgs);
+branch  0 never executed
+branch  1 never executed
+    #####: 1627:  argLocs.reserve(numArgs);
+branch  0 never executed
+branch  1 never executed
+        -: 1628:
+    #####: 1629:  while (numArgs--) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1630:    Type argType;
+    #####: 1631:    LocationAttr argLoc;
+    #####: 1632:    if (failed(parseType(reader, argType)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1633:        failed(parseAttribute(reader, argLoc)))
+branch  0 never executed
+branch  1 never executed
+    #####: 1634:      return failure();
+        -: 1635:
+    #####: 1636:    argTypes.push_back(argType);
+call    0 never executed
+    #####: 1637:    argLocs.push_back(argLoc);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1638:  }
+    #####: 1639:  block->addArguments(argTypes, argLocs);
+call    0 never executed
+call    1 never executed
+    #####: 1640:  return defineValues(reader, block->getArguments());
+call    0 never executed
+call    1 never executed
+        -: 1641:}
+        -: 1642:
+        -: 1643://===----------------------------------------------------------------------===//
+        -: 1644:// Value Processing
+        -: 1645:
+function _ZN12_GLOBAL__N_114BytecodeReader12parseOperandERNS_14EncodingReaderE called 0 returned 0% blocks executed 0%
+    #####: 1646:Value BytecodeReader::parseOperand(EncodingReader &reader) {
+    #####: 1647:  std::vector<Value> &values = valueScopes.back().values;
+call    0 never executed
+    #####: 1648:  Value *value = nullptr;
+    #####: 1649:  if (failed(parseEntry(reader, values, value, "value")))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1650:    return Value();
+        -: 1651:
+        -: 1652:  // Create a new forward reference if necessary.
+    #####: 1653:  if (!*value)
+branch  0 never executed
+branch  1 never executed
+    #####: 1654:    *value = createForwardRef();
+call    0 never executed
+    #####: 1655:  return *value;
+        -: 1656:}
+        -: 1657:
+function _ZN12_GLOBAL__N_114BytecodeReader12defineValuesERNS_14EncodingReaderEN4mlir10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####: 1658:LogicalResult BytecodeReader::defineValues(EncodingReader &reader,
+        -: 1659:                                           ValueRange newValues) {
+    #####: 1660:  ValueScope &valueScope = valueScopes.back();
+call    0 never executed
+    #####: 1661:  std::vector<Value> &values = valueScope.values;
+        -: 1662:
+    #####: 1663:  unsigned &valueID = valueScope.nextValueIDs.back();
+call    0 never executed
+    #####: 1664:  unsigned valueIDEnd = valueID + newValues.size();
+branch  0 never executed
+branch  1 never executed
+    #####: 1665:  if (valueIDEnd > values.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1666:    return reader.emitError(
+call    0 never executed
+        -: 1667:        "value index range was outside of the expected range for "
+        -: 1668:        "the parent region, got [",
+        -: 1669:        valueID, ", ", valueIDEnd, "), but the maximum index was ",
+    #####: 1670:        values.size() - 1);
+call    0 never executed
+call    1 never executed
+        -: 1671:  }
+        -: 1672:
+        -: 1673:  // Assign the values and update any forward references.
+    #####: 1674:  for (unsigned i = 0, e = newValues.size(); i != e; ++i, ++valueID) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1675:    Value newValue = newValues[i];
+call    0 never executed
+        -: 1676:
+        -: 1677:    // Check to see if a definition for this value already exists.
+    #####: 1678:    if (Value oldValue = std::exchange(values[valueID], newValue)) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1679:      Operation *forwardRefOp = oldValue.getDefiningOp();
+call    0 never executed
+        -: 1680:
+        -: 1681:      // Assert that this is a forward reference operation. Given how we compute
+        -: 1682:      // definition ids (incrementally as we parse), it shouldn't be possible
+        -: 1683:      // for the value to be defined any other way.
+    #####: 1684:      assert(forwardRefOp && forwardRefOp->getBlock() == &forwardRefOps &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1685:             "value index was already defined?");
+        -: 1686:
+    #####: 1687:      oldValue.replaceAllUsesWith(newValue);
+call    0 never executed
+    #####: 1688:      forwardRefOp->moveBefore(&openForwardRefOps, openForwardRefOps.end());
+call    0 never executed
+        -: 1689:    }
+        -: 1690:  }
+    #####: 1691:  return success();
+        -: 1692:}
+        -: 1693:
+function _ZN12_GLOBAL__N_114BytecodeReader16createForwardRefEv called 0 returned 0% blocks executed 0%
+    #####: 1694:Value BytecodeReader::createForwardRef() {
+        -: 1695:  // Check for an avaliable existing operation to use. Otherwise, create a new
+        -: 1696:  // fake operation to use for the reference.
+    #####: 1697:  if (!openForwardRefOps.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1698:    Operation *op = &openForwardRefOps.back();
+call    0 never executed
+    #####: 1699:    op->moveBefore(&forwardRefOps, forwardRefOps.end());
+call    0 never executed
+        -: 1700:  } else {
+    #####: 1701:    forwardRefOps.push_back(Operation::create(forwardRefOpState));
+call    0 never executed
+call    1 never executed
+        -: 1702:  }
+    #####: 1703:  return forwardRefOps.back().getResult(0);
+call    0 never executed
+        -: 1704:}
+        -: 1705:
+        -: 1706://===----------------------------------------------------------------------===//
+        -: 1707:// Entry Points
+        -: 1708://===----------------------------------------------------------------------===//
+        -: 1709:
+function _ZN4mlir10isBytecodeEN4llvm15MemoryBufferRefE called 264004 returned 100% blocks executed 100%
+  264004*: 1710:bool mlir::isBytecode(llvm::MemoryBufferRef buffer) {
+  264004*: 1711:  return buffer.getBuffer().startswith("ML\xefR");
+        -: 1712:}
+        -: 1713:
+function _ZN4mlir16readBytecodeFileEN4llvm15MemoryBufferRefEPNS_5BlockERKNS_12ParserConfigE called 0 returned 0% blocks executed 0%
+    #####: 1714:LogicalResult mlir::readBytecodeFile(llvm::MemoryBufferRef buffer, Block *block,
+        -: 1715:                                     const ParserConfig &config) {
+    #####: 1716:  Location sourceFileLoc =
+    #####: 1717:      FileLineColLoc::get(config.getContext(), buffer.getBufferIdentifier(),
+    #####: 1718:                          /*line=*/0, /*column=*/0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1719:  if (!isBytecode(buffer)) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1720:    return emitError(sourceFileLoc,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1721:                     "input buffer is not an MLIR bytecode file");
+call    0 never executed
+        -: 1722:  }
+        -: 1723:
+    #####: 1724:  BytecodeReader reader(sourceFileLoc, config);
+call    0 never executed
+call    1 never executed
+    #####: 1725:  return reader.read(buffer, block);
+call    0 never executed
+        -: 1726:}

@@ -1,0 +1,185 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/Dialect/GPU/IR/GPUDialect.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/GPU/CMakeFiles/obj.MLIRGPUTransforms.dir/Transforms/AsyncRegionRewriter.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/GPU/CMakeFiles/obj.MLIRGPUTransforms.dir/Transforms/AsyncRegionRewriter.cpp.gcda
+        -:    0:Runs:325546
+        -:    1://===- GPUDialect.h - MLIR Dialect for GPU Kernels --------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines the GPU kernel-related operations and puts them in the
+        -:   10:// corresponding dialect.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_DIALECT_GPU_IR_GPUDIALECT_H
+        -:   15:#define MLIR_DIALECT_GPU_IR_GPUDIALECT_H
+        -:   16:
+        -:   17:#include "mlir/Dialect/DLTI/Traits.h"
+        -:   18:#include "mlir/IR/Builders.h"
+        -:   19:#include "mlir/IR/BuiltinTypes.h"
+        -:   20:#include "mlir/IR/Dialect.h"
+        -:   21:#include "mlir/IR/FunctionInterfaces.h"
+        -:   22:#include "mlir/IR/OpDefinition.h"
+        -:   23:#include "mlir/IR/OpImplementation.h"
+        -:   24:#include "mlir/IR/SymbolTable.h"
+        -:   25:#include "mlir/Interfaces/InferIntRangeInterface.h"
+        -:   26:#include "mlir/Interfaces/InferTypeOpInterface.h"
+        -:   27:#include "mlir/Interfaces/SideEffectInterfaces.h"
+        -:   28:#include "llvm/ADT/STLExtras.h"
+        -:   29:
+        -:   30:namespace mlir {
+        -:   31:namespace gpu {
+        -:   32:
+        -:   33:/// Utility class for the GPU dialect to represent triples of `Value`s
+        -:   34:/// accessible through `.x`, `.y`, and `.z` similarly to CUDA notation.
+        -:   35:struct KernelDim3 {
+        -:   36:  Value x;
+        -:   37:  Value y;
+        -:   38:  Value z;
+        -:   39:};
+        -:   40:
+        -:   41:class AsyncTokenType
+        -:   42:    : public Type::TypeBase<AsyncTokenType, Type, TypeStorage> {
+        -:   43:public:
+        -:   44:  // Used for generic hooks in TypeBase.
+    #####:   45:  using Base::Base;
+        -:   46:};
+        -:   47:
+        -:   48:/// MMAMatrixType storage and uniquing. Array is uniqued based on its shape
+        -:   49:/// and type.
+        -:   50:struct MMAMatrixStorageType : public TypeStorage {
+        -:   51:  MMAMatrixStorageType(unsigned numDims, const int64_t *dimShapes,
+        -:   52:                       Type elementType, StringRef operand)
+        -:   53:      : dimShapes(dimShapes), numDims(numDims), elementType(elementType),
+        -:   54:        operand(operand) {}
+        -:   55:
+        -:   56:  /// The hash key for uniquing.
+        -:   57:  using KeyTy = std::tuple<ArrayRef<int64_t>, Type, StringRef>;
+        -:   58:  bool operator==(const KeyTy &key) const {
+        -:   59:    return key == KeyTy(getShape(), elementType, operand);
+        -:   60:  }
+        -:   61:
+        -:   62:  /// Construction.
+        -:   63:  static MMAMatrixStorageType *construct(TypeStorageAllocator &allocator,
+        -:   64:                                         const KeyTy &key) {
+        -:   65:    ArrayRef<int64_t> shape = allocator.copyInto(std::get<0>(key));
+        -:   66:    StringRef operand = allocator.copyInto(std::get<2>(key));
+        -:   67:
+        -:   68:    return new (allocator.allocate<MMAMatrixStorageType>())
+        -:   69:        MMAMatrixStorageType(shape.size(), shape.data(), std::get<1>(key),
+        -:   70:                             operand);
+        -:   71:  }
+        -:   72:
+        -:   73:  ArrayRef<int64_t> getShape() const {
+        -:   74:    return ArrayRef<int64_t>(dimShapes, numDims);
+        -:   75:  }
+        -:   76:
+        -:   77:  StringRef getOperand() const { return operand; }
+        -:   78:
+        -:   79:  /// Reference to the shape of the MMA matrix.
+        -:   80:  const int64_t *dimShapes;
+        -:   81:
+        -:   82:  /// Number of dimensions in the MMA matrix.
+        -:   83:  unsigned numDims;
+        -:   84:
+        -:   85:  /// Element type of elements held in the MMA matrix.
+        -:   86:  Type elementType;
+        -:   87:
+        -:   88:  /// MMA operand that this MMAMatrix holds. The general form of operation this
+        -:   89:  /// type supports is given by the equation C += A*B. This field specifies
+        -:   90:  /// which operand in the given equation is held by this type. The valid values
+        -:   91:  /// are "AOp", "BOp" and "COp".
+        -:   92:  StringRef operand;
+        -:   93:};
+        -:   94:
+        -:   95:/// MMAMatrix represents a matrix held by a subgroup for matrix-matrix multiply
+        -:   96:/// accumulate operations. MMAMatrices are taken as direct operands by these
+        -:   97:/// operations and are also produced as results. These matrices are meant to
+        -:   98:/// reside in the registers. A limited number of pointwise operations can be
+        -:   99:/// performed on these matrices, i.e., operations which operate uniformly on
+        -:  100:/// all the elements in the matrix and do not change the order of matrix
+        -:  101:/// elements. The above conditions exist because the layout of matrix elements
+        -:  102:/// inside the matrix is opaque i.e., the elements may be present in the
+        -:  103:/// matrix in any order. The general usage of this type is shown as follows:-
+        -:  104:///
+        -:  105:///   %0 = gpu.subgroup_mma_load_matrix %arg0[%c0, %c0] {leadDimension = 16 :
+        -:  106:///           index} : memref<16x16xf16> -> !gpu.mma_matrix<16x16xf16, "AOp">
+        -:  107:///
+        -:  108:/// The MMAMatrixType describes the shape of the matrix being loaded and the
+        -:  109:/// operand being loaded too. The operand needs to be specified to aid the
+        -:  110:/// lowering of this type to dialects such as NVVM where each workitem may
+        -:  111:/// hold different amount of elements depending on the elementType of the
+        -:  112:/// matrix. For e.g., Each workitem holds 4 vector<2xf16>s for f16 data type
+        -:  113:/// and 8 f32s for f32 data type of MMAMatrix. Some other instances of usage
+        -:  114:/// are:-
+        -:  115:///
+        -:  116:///   %3 = gpu.subgroup_mma_compute %0, %1, %2 :
+        -:  117:///   !gpu.mma_matrix<16x16xf16, "AOp">, !gpu.mma_matrix<16x16xf16, "BOp">
+        -:  118:///    -> !gpu.mma_matrix<16x16xf32, "COp">
+        -:  119:///
+        -:  120:///
+        -:  121:///   gpu.subgroup_mma_store_matrix %3, %arg22[%c0, %c0] {leadDimension = 16
+        -:  122:///           : index}: !gpu.mma_matrix<16x16xf32, "COp">, memref<16x16xf32>
+        -:  123:// TODO: consider moving this to ODS.
+        -:  124:class MMAMatrixType
+        -:  125:    : public Type::TypeBase<MMAMatrixType, Type, MMAMatrixStorageType> {
+        -:  126:public:
+        -:  127:  using Base::Base;
+        -:  128:
+        -:  129:  /// Get MMAMatrixType and verify construction Invariants.
+        -:  130:  static MMAMatrixType get(ArrayRef<int64_t> shape, Type elementType,
+        -:  131:                           StringRef operand);
+        -:  132:
+        -:  133:  /// Get MMAMatrixType at a particular location and verify construction
+        -:  134:  /// Invariants.
+        -:  135:  static MMAMatrixType getChecked(function_ref<InFlightDiagnostic()> emitError,
+        -:  136:                                  ArrayRef<int64_t> shape, Type elementType,
+        -:  137:                                  StringRef operand);
+        -:  138:
+        -:  139:  /// Check if a type is valid a MMAMatrixType elementType.
+        -:  140:  static bool isValidElementType(Type elementType);
+        -:  141:
+        -:  142:  /// Verify that shape and elementType are actually allowed for the
+        -:  143:  /// MMAMatrixType.
+        -:  144:  static LogicalResult verify(function_ref<InFlightDiagnostic()> emitError,
+        -:  145:                              ArrayRef<int64_t> shape, Type elementType,
+        -:  146:                              StringRef operand);
+        -:  147:
+        -:  148:  /// Get number of dims.
+        -:  149:  unsigned getNumDims() const;
+        -:  150:
+        -:  151:  /// Get shape of the matrix.
+        -:  152:  ArrayRef<int64_t> getShape() const;
+        -:  153:
+        -:  154:  /// Get elementType of a single element.
+        -:  155:  Type getElementType() const;
+        -:  156:
+        -:  157:  /// The general form of operation this type supports is given by the equation
+        -:  158:  /// C += A*B. This function returns which operand in the given equation is
+        -:  159:  /// held by this type. String returned can be one of"AOp", "BOp" and "COp".
+        -:  160:  StringRef getOperand() const;
+        -:  161:};
+        -:  162:
+        -:  163:// Adds a `gpu.async.token` to the front of the argument list.
+        -:  164:void addAsyncDependency(Operation *op, Value token);
+        -:  165:
+        -:  166:} // namespace gpu
+        -:  167:} // namespace mlir
+        -:  168:
+        -:  169:#include "mlir/Dialect/GPU/IR/GPUOpsEnums.h.inc"
+        -:  170:
+        -:  171:#include "mlir/Dialect/GPU/IR/GPUOpsDialect.h.inc"
+        -:  172:
+        -:  173:#include "mlir/Dialect/GPU/IR/GPUOpInterfaces.h.inc"
+        -:  174:
+        -:  175:#define GET_ATTRDEF_CLASSES
+        -:  176:#include "mlir/Dialect/GPU/IR/GPUOpsAttributes.h.inc"
+        -:  177:
+        -:  178:#define GET_OP_CLASSES
+        -:  179:#include "mlir/Dialect/GPU/IR/GPUOps.h.inc"
+        -:  180:
+        -:  181:#endif // MLIR_DIALECT_GPU_IR_GPUDIALECT_H

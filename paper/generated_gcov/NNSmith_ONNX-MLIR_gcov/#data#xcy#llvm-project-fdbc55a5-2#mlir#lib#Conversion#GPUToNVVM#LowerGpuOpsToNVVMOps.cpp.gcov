@@ -1,0 +1,661 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Conversion/GPUToNVVM/LowerGpuOpsToNVVMOps.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/GPUToNVVM/CMakeFiles/obj.MLIRGPUToNVVMTransforms.dir/LowerGpuOpsToNVVMOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/GPUToNVVM/CMakeFiles/obj.MLIRGPUToNVVMTransforms.dir/LowerGpuOpsToNVVMOps.cpp.gcda
+        -:    0:Runs:128636
+        -:    1://===- LowerGpuOpsToNVVMOps.cpp - MLIR GPU to NVVM lowering passes --------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass to generate NVVMIR operations for higher-level
+        -:   10:// GPU operations.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+        -:   15:
+        -:   16:#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+        -:   17:#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+        -:   18:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+        -:   19:#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+        -:   20:#include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
+        -:   21:#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+        -:   22:#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+        -:   23:#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+        -:   24:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   25:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   26:#include "mlir/Dialect/GPU/Transforms/Passes.h"
+        -:   27:#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+        -:   28:#include "mlir/Dialect/Math/IR/Math.h"
+        -:   29:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   30:#include "mlir/Transforms/DialectConversion.h"
+        -:   31:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   32:
+        -:   33:#include "../GPUCommon/GPUOpsLowering.h"
+        -:   34:#include "../GPUCommon/IndexIntrinsicsOpLowering.h"
+        -:   35:#include "../GPUCommon/OpToFuncCallLowering.h"
+        -:   36:
+        -:   37:namespace mlir {
+        -:   38:#define GEN_PASS_DEF_CONVERTGPUOPSTONVVMOPS
+        -:   39:#include "mlir/Conversion/Passes.h.inc"
+        -:   40:} // namespace mlir
+        -:   41:
+        -:   42:using namespace mlir;
+        -:   43:
+        -:   44:namespace {
+        -:   45:
+        -:   46:/// Convert gpu dialect shfl mode enum to the equivalent nvvm one.
+    #####:   47:static NVVM::ShflKind convertShflKind(gpu::ShuffleMode mode) {
+    #####:   48:  switch (mode) {
+        -:   49:  case gpu::ShuffleMode::XOR:
+        -:   50:    return NVVM::ShflKind::bfly;
+        -:   51:  case gpu::ShuffleMode::UP:
+        -:   52:    return NVVM::ShflKind::up;
+        -:   53:  case gpu::ShuffleMode::DOWN:
+        -:   54:    return NVVM::ShflKind::down;
+        -:   55:  case gpu::ShuffleMode::IDX:
+        -:   56:    return NVVM::ShflKind::idx;
+        -:   57:  }
+    #####:   58:  llvm_unreachable("unknown shuffle mode");
+        -:   59:}
+        -:   60:
+        -:   61:struct GPUShuffleOpLowering : public ConvertOpToLLVMPattern<gpu::ShuffleOp> {
+    #####:   62:  using ConvertOpToLLVMPattern<gpu::ShuffleOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:   63:
+        -:   64:  /// Lowers a shuffle to the corresponding NVVM op.
+        -:   65:  ///
+        -:   66:  /// Convert the `width` argument into an activeMask (a bitmask which specifies
+        -:   67:  /// which threads participate in the shuffle) and a maskAndClamp (specifying
+        -:   68:  /// the highest lane which participates in the shuffle).
+        -:   69:  ///
+        -:   70:  ///     %one = llvm.constant(1 : i32) : i32
+        -:   71:  ///     %minus_one = llvm.constant(-1 : i32) : i32
+        -:   72:  ///     %thirty_two = llvm.constant(32 : i32) : i32
+        -:   73:  ///     %num_lanes = llvm.sub %thirty_two, %width : i32
+        -:   74:  ///     %active_mask = llvm.lshr %minus_one, %num_lanes : i32
+        -:   75:  ///     %mask_and_clamp = llvm.sub %width, %one : i32
+        -:   76:  ///     %shfl = nvvm.shfl.sync.bfly %active_mask, %value, %offset,
+        -:   77:  ///         %mask_and_clamp : !llvm<"{ float, i1 }">
+        -:   78:  ///     %shfl_value = llvm.extractvalue %shfl[0] :
+        -:   79:  ///         !llvm<"{ float, i1 }">
+        -:   80:  ///     %shfl_pred = llvm.extractvalue %shfl[1] :
+        -:   81:  ///         !llvm<"{ float, i1 }">
+        -:   82:  LogicalResult
+function _ZNK12_GLOBAL__N_120GPUShuffleOpLowering15matchAndRewriteEN4mlir3gpu9ShuffleOpENS2_16ShuffleOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   83:  matchAndRewrite(gpu::ShuffleOp op, OpAdaptor adaptor,
+        -:   84:                  ConversionPatternRewriter &rewriter) const override {
+    #####:   85:    Location loc = op->getLoc();
+call    0 never executed
+        -:   86:
+    #####:   87:    auto valueTy = adaptor.getValue().getType();
+call    0 never executed
+call    1 never executed
+    #####:   88:    auto int32Type = IntegerType::get(rewriter.getContext(), 32);
+call    0 never executed
+    #####:   89:    auto predTy = IntegerType::get(rewriter.getContext(), 1);
+call    0 never executed
+    #####:   90:    auto resultTy = LLVM::LLVMStructType::getLiteral(rewriter.getContext(),
+    #####:   91:                                                     {valueTy, predTy});
+call    0 never executed
+        -:   92:
+    #####:   93:    Value one = rewriter.create<LLVM::ConstantOp>(loc, int32Type, 1);
+call    0 never executed
+call    1 never executed
+    #####:   94:    Value minusOne = rewriter.create<LLVM::ConstantOp>(loc, int32Type, -1);
+call    0 never executed
+call    1 never executed
+    #####:   95:    Value thirtyTwo = rewriter.create<LLVM::ConstantOp>(loc, int32Type, 32);
+call    0 never executed
+call    1 never executed
+    #####:   96:    Value numLeadInactiveLane = rewriter.create<LLVM::SubOp>(
+    #####:   97:        loc, int32Type, thirtyTwo, adaptor.getWidth());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:   98:    // Bit mask of active lanes: `(-1) >> (32 - activeWidth)`.
+    #####:   99:    Value activeMask = rewriter.create<LLVM::LShrOp>(loc, int32Type, minusOne,
+    #####:  100:                                                     numLeadInactiveLane);
+call    0 never executed
+call    1 never executed
+    #####:  101:    Value maskAndClamp;
+    #####:  102:    if (op.getMode() == gpu::ShuffleMode::UP) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  103:      // Clamp lane: `32 - activeWidth`
+    #####:  104:      maskAndClamp = numLeadInactiveLane;
+        -:  105:    } else {
+        -:  106:      // Clamp lane: `activeWidth - 1`
+    #####:  107:      maskAndClamp =
+    #####:  108:          rewriter.create<LLVM::SubOp>(loc, int32Type, adaptor.getWidth(), one);
+call    0 never executed
+call    1 never executed
+        -:  109:    }
+        -:  110:
+    #####:  111:    auto returnValueAndIsValidAttr = rewriter.getUnitAttr();
+call    0 never executed
+    #####:  112:    Value shfl = rewriter.create<NVVM::ShflOp>(
+    #####:  113:        loc, resultTy, activeMask, adaptor.getValue(), adaptor.getOffset(),
+call    0 never executed
+    #####:  114:        maskAndClamp, convertShflKind(op.getMode()), returnValueAndIsValidAttr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  115:    Value shflValue = rewriter.create<LLVM::ExtractValueOp>(loc, shfl, 0);
+call    0 never executed
+call    1 never executed
+    #####:  116:    Value isActiveSrcLane = rewriter.create<LLVM::ExtractValueOp>(loc, shfl, 1);
+call    0 never executed
+call    1 never executed
+        -:  117:
+    #####:  118:    rewriter.replaceOp(op, {shflValue, isActiveSrcLane});
+call    0 never executed
+call    1 never executed
+    #####:  119:    return success();
+        -:  120:  }
+        -:  121:};
+        -:  122:
+        -:  123:struct GPULaneIdOpToNVVM : ConvertOpToLLVMPattern<gpu::LaneIdOp> {
+    #####:  124:  using ConvertOpToLLVMPattern<gpu::LaneIdOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:  125:
+        -:  126:  LogicalResult
+function _ZNK12_GLOBAL__N_117GPULaneIdOpToNVVM15matchAndRewriteEN4mlir3gpu8LaneIdOpENS2_15LaneIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  127:  matchAndRewrite(gpu::LaneIdOp op, gpu::LaneIdOp::Adaptor adaptor,
+        -:  128:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  129:    auto loc = op->getLoc();
+call    0 never executed
+    #####:  130:    MLIRContext *context = rewriter.getContext();
+call    0 never executed
+    #####:  131:    Value newOp = rewriter.create<NVVM::LaneIdOp>(loc, rewriter.getI32Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  132:    // Truncate or extend the result depending on the index bitwidth specified
+        -:  133:    // by the LLVMTypeConverter options.
+    #####:  134:    const unsigned indexBitwidth = getTypeConverter()->getIndexTypeBitwidth();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  135:    if (indexBitwidth > 32) {
+branch  0 never executed
+branch  1 never executed
+    #####:  136:      newOp = rewriter.create<LLVM::SExtOp>(
+    #####:  137:          loc, IntegerType::get(context, indexBitwidth), newOp);
+call    0 never executed
+call    1 never executed
+    #####:  138:    } else if (indexBitwidth < 32) {
+branch  0 never executed
+branch  1 never executed
+    #####:  139:      newOp = rewriter.create<LLVM::TruncOp>(
+    #####:  140:          loc, IntegerType::get(context, indexBitwidth), newOp);
+call    0 never executed
+call    1 never executed
+        -:  141:    }
+    #####:  142:    rewriter.replaceOp(op, {newOp});
+call    0 never executed
+call    1 never executed
+    #####:  143:    return success();
+        -:  144:  }
+        -:  145:};
+        -:  146:
+        -:  147:/// Import the GPU Ops to NVVM Patterns.
+        -:  148:#include "GPUToNVVM.cpp.inc"
+        -:  149:
+        -:  150:/// A pass that replaces all occurrences of GPU device operations with their
+        -:  151:/// corresponding NVVM equivalent.
+        -:  152:///
+        -:  153:/// This pass only handles device code and is not meant to be run on GPU host
+        -:  154:/// code.
+    40032:  155:struct LowerGpuOpsToNVVMOpsPass
+call    0 returned 100%
+        -:  156:    : public impl::ConvertGpuOpsToNVVMOpsBase<LowerGpuOpsToNVVMOpsPass> {
+        -:  157:  LowerGpuOpsToNVVMOpsPass() = default;
+function _ZN12_GLOBAL__N_124LowerGpuOpsToNVVMOpsPassC2Ej called 129298 returned 100% blocks executed 80%
+   129298:  158:  LowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth) {
+call    0 returned 100%
+   129298:  159:    this->indexBitwidth = indexBitwidth;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129298:  160:  }
+        -:  161:
+function _ZN12_GLOBAL__N_124LowerGpuOpsToNVVMOpsPass14runOnOperationEv called 0 returned 0% blocks executed 0%
+    #####:  162:  void runOnOperation() override {
+    #####:  163:    gpu::GPUModuleOp m = getOperation();
+call    0 never executed
+        -:  164:
+        -:  165:    // Request C wrapper emission.
+    #####:  166:    for (auto func : m.getOps<func::FuncOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  167:      func->setAttr(LLVM::LLVMDialect::getEmitCWrapperAttrName(),
+call    0 never executed
+call    1 never executed
+    #####:  168:                    UnitAttr::get(&getContext()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  169:    }
+        -:  170:
+        -:  171:    // Customize the bitwidth used for the device side index computations.
+    #####:  172:    LowerToLLVMOptions options(
+        -:  173:        m.getContext(),
+    #####:  174:        DataLayout(cast<DataLayoutOpInterface>(m.getOperation())));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  175:    if (indexBitwidth != kDeriveIndexBitwidthFromDataLayout)
+branch  0 never executed
+branch  1 never executed
+    #####:  176:      options.overrideIndexBitwidth(indexBitwidth);
+        -:  177:
+        -:  178:    // MemRef conversion for GPU to NVVM lowering. The GPU dialect uses memory
+        -:  179:    // space 5 for private memory attributions, but NVVM represents private
+        -:  180:    // memory allocations as local `alloca`s in the default address space. This
+        -:  181:    // converter drops the private memory space to support the use case above.
+    #####:  182:    LLVMTypeConverter converter(m.getContext(), options);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+function _ZZN12_GLOBAL__N_124LowerGpuOpsToNVVMOpsPass14runOnOperationEvENKUlN4mlir10MemRefTypeEE_clES2_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  183:    converter.addConversion([&](MemRefType type) -> Optional<Type> {
+call    0 never executed
+    #####:  184:      if (type.getMemorySpaceAsInt() !=
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  185:          gpu::GPUDialect::getPrivateAddressSpace())
+    #####:  186:        return llvm::None;
+    #####:  187:      return converter.convertType(MemRefType::Builder(type).setMemorySpace(
+    #####:  188:          IntegerAttr::get(IntegerType::get(m.getContext(), 64), 0)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  189:    });
+        -:  190:    // Lowering for MMAMatrixType.
+    #####:  191:    converter.addConversion([&](gpu::MMAMatrixType type) -> Type {
+call    0 never executed
+    #####:  192:      return convertMMAToLLVMType(type);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  193:    });
+    #####:  194:    RewritePatternSet patterns(m.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  195:    RewritePatternSet llvmPatterns(m.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  196:
+        -:  197:    // Apply in-dialect lowering first. In-dialect lowering will replace ops
+        -:  198:    // which need to be lowered further, which is not supported by a single
+        -:  199:    // conversion pass.
+    #####:  200:    populateGpuRewritePatterns(patterns);
+call    0 never executed
+    #####:  201:    (void)applyPatternsAndFoldGreedily(m, std::move(patterns));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  202:
+    #####:  203:    arith::populateArithToLLVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  204:    cf::populateControlFlowToLLVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  205:    populateFuncToLLVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  206:    populateMemRefToLLVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  207:    populateGpuToNVVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  208:    populateGpuWMMAToNVVMConversionPatterns(converter, llvmPatterns);
+call    0 never executed
+    #####:  209:    LLVMConversionTarget target(getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  210:    configureGpuToNVVMConversionLegality(target);
+call    0 never executed
+    #####:  211:    if (failed(applyPartialConversion(m, target, std::move(llvmPatterns))))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  212:      signalPassFailure();
+call    0 never executed
+    #####:  213:  }
+        -:  214:};
+        -:  215:
+        -:  216:} // namespace
+        -:  217:
+function _ZN4mlir36configureGpuToNVVMConversionLegalityERNS_16ConversionTargetE called 0 returned 0% blocks executed 0%
+    #####:  218:void mlir::configureGpuToNVVMConversionLegality(ConversionTarget &target) {
+    #####:  219:  target.addIllegalOp<func::FuncOp>();
+call    0 never executed
+    #####:  220:  target.addLegalDialect<::mlir::LLVM::LLVMDialect>();
+call    0 never executed
+    #####:  221:  target.addLegalDialect<::mlir::NVVM::NVVMDialect>();
+call    0 never executed
+    #####:  222:  target.addIllegalDialect<gpu::GPUDialect>();
+call    0 never executed
+    #####:  223:  target.addIllegalOp<LLVM::CosOp, LLVM::ExpOp, LLVM::Exp2Op, LLVM::FAbsOp,
+call    0 never executed
+        -:  224:                      LLVM::FCeilOp, LLVM::FFloorOp, LLVM::LogOp, LLVM::Log10Op,
+    #####:  225:                      LLVM::Log2Op, LLVM::PowOp, LLVM::SinOp, LLVM::SqrtOp>();
+        -:  226:
+        -:  227:  // TODO: Remove once we support replacing non-root ops.
+    #####:  228:  target.addLegalOp<gpu::YieldOp, gpu::GPUModuleOp, gpu::ModuleEndOp>();
+call    0 never executed
+    #####:  229:}
+        -:  230:
+        -:  231:template <typename OpTy>
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7FloorOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7FloorOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6AbsFOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6AbsFOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6AtanOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6AtanOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7Atan2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7Atan2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6CeilOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6CeilOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math5CosOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math5CosOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math5ExpOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math5ExpOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6Exp2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6Exp2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7ExpM1OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7ExpM1OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6TanhOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6TanhOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math5LogOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math5LogOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7Log1pOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7Log1pOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7Log10OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7Log10OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6Log2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6Log2OpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6PowFOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6PowFOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math7RsqrtOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math7RsqrtOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math5SinOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math5SinOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+_Z18populateOpPatternsIN4mlir4math6SqrtOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_:
+function _Z18populateOpPatternsIN4mlir4math6SqrtOpEEvRNS0_17LLVMTypeConverterERNS0_17RewritePatternSetEN4llvm9StringRefES8_ called 0 returned 0% blocks executed 0%
+    #####:  232:static void populateOpPatterns(LLVMTypeConverter &converter,
+call    0 never executed
+        -:  233:                               RewritePatternSet &patterns, StringRef f32Func,
+        -:  234:                               StringRef f64Func) {
+    #####:  235:  patterns.add<ScalarizeVectorOpLowering<OpTy>>(converter);
+    #####:  236:  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func);
+call    0 never executed
+    #####:  237:}
+------------------
+        -:  238:
+function _ZN4mlir35populateGpuToNVVMConversionPatternsERNS_17LLVMTypeConverterERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+    #####:  239:void mlir::populateGpuToNVVMConversionPatterns(LLVMTypeConverter &converter,
+        -:  240:                                               RewritePatternSet &patterns) {
+    #####:  241:  populateWithGenerated(patterns);
+call    0 never executed
+    #####:  242:  patterns
+        -:  243:      .add<GPUIndexIntrinsicOpLowering<gpu::ThreadIdOp, NVVM::ThreadIdXOp,
+        -:  244:                                       NVVM::ThreadIdYOp, NVVM::ThreadIdZOp>,
+        -:  245:           GPUIndexIntrinsicOpLowering<gpu::BlockDimOp, NVVM::BlockDimXOp,
+        -:  246:                                       NVVM::BlockDimYOp, NVVM::BlockDimZOp>,
+        -:  247:           GPUIndexIntrinsicOpLowering<gpu::BlockIdOp, NVVM::BlockIdXOp,
+        -:  248:                                       NVVM::BlockIdYOp, NVVM::BlockIdZOp>,
+        -:  249:           GPUIndexIntrinsicOpLowering<gpu::GridDimOp, NVVM::GridDimXOp,
+        -:  250:                                       NVVM::GridDimYOp, NVVM::GridDimZOp>,
+        -:  251:           GPULaneIdOpToNVVM, GPUShuffleOpLowering, GPUReturnOpLowering>(
+    #####:  252:          converter);
+call    0 never executed
+        -:  253:
+        -:  254:  // Explicitly drop memory space when lowering private memory
+        -:  255:  // attributions since NVVM models it as `alloca`s in the default
+        -:  256:  // memory space and does not support `alloca`s with addrspace(5).
+    #####:  257:  patterns.add<GPUFuncOpLowering>(
+call    0 never executed
+        -:  258:      converter, /*allocaAddrSpace=*/0,
+    #####:  259:      StringAttr::get(&converter.getContext(),
+call    0 never executed
+    #####:  260:                      NVVM::NVVMDialect::getKernelFuncAttrName()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  261:
+    #####:  262:  populateOpPatterns<math::AbsFOp>(converter, patterns, "__nv_fabsf",
+call    0 never executed
+        -:  263:                                   "__nv_fabs");
+    #####:  264:  populateOpPatterns<math::AtanOp>(converter, patterns, "__nv_atanf",
+call    0 never executed
+        -:  265:                                   "__nv_atan");
+    #####:  266:  populateOpPatterns<math::Atan2Op>(converter, patterns, "__nv_atan2f",
+call    0 never executed
+        -:  267:                                    "__nv_atan2");
+    #####:  268:  populateOpPatterns<math::CeilOp>(converter, patterns, "__nv_ceilf",
+call    0 never executed
+        -:  269:                                   "__nv_ceil");
+    #####:  270:  populateOpPatterns<math::CosOp>(converter, patterns, "__nv_cosf", "__nv_cos");
+call    0 never executed
+    #####:  271:  populateOpPatterns<math::ExpOp>(converter, patterns, "__nv_expf", "__nv_exp");
+call    0 never executed
+    #####:  272:  populateOpPatterns<math::Exp2Op>(converter, patterns, "__nv_exp2f",
+call    0 never executed
+        -:  273:                                   "__nv_exp2");
+    #####:  274:  populateOpPatterns<math::ExpM1Op>(converter, patterns, "__nv_expm1f",
+call    0 never executed
+        -:  275:                                    "__nv_expm1");
+    #####:  276:  populateOpPatterns<math::FloorOp>(converter, patterns, "__nv_floorf",
+call    0 never executed
+        -:  277:                                    "__nv_floor");
+    #####:  278:  populateOpPatterns<math::LogOp>(converter, patterns, "__nv_logf", "__nv_log");
+call    0 never executed
+    #####:  279:  populateOpPatterns<math::Log1pOp>(converter, patterns, "__nv_log1pf",
+call    0 never executed
+        -:  280:                                    "__nv_log1p");
+    #####:  281:  populateOpPatterns<math::Log10Op>(converter, patterns, "__nv_log10f",
+call    0 never executed
+        -:  282:                                    "__nv_log10");
+    #####:  283:  populateOpPatterns<math::Log2Op>(converter, patterns, "__nv_log2f",
+call    0 never executed
+        -:  284:                                   "__nv_log2");
+    #####:  285:  populateOpPatterns<math::PowFOp>(converter, patterns, "__nv_powf",
+call    0 never executed
+        -:  286:                                   "__nv_pow");
+    #####:  287:  populateOpPatterns<math::RsqrtOp>(converter, patterns, "__nv_rsqrtf",
+call    0 never executed
+        -:  288:                                    "__nv_rsqrt");
+    #####:  289:  populateOpPatterns<math::SinOp>(converter, patterns, "__nv_sinf", "__nv_sin");
+call    0 never executed
+    #####:  290:  populateOpPatterns<math::SqrtOp>(converter, patterns, "__nv_sqrtf",
+call    0 never executed
+        -:  291:                                   "__nv_sqrt");
+    #####:  292:  populateOpPatterns<math::TanhOp>(converter, patterns, "__nv_tanhf",
+call    0 never executed
+        -:  293:                                   "__nv_tanh");
+    #####:  294:}
+        -:  295:
+        -:  296:std::unique_ptr<OperationPass<gpu::GPUModuleOp>>
+function _ZN4mlir30createLowerGpuOpsToNVVMOpsPassEj called 129298 returned 100% blocks executed 100%
+   129298:  297:mlir::createLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth) {
+   129298:  298:  return std::make_unique<LowerGpuOpsToNVVMOpsPass>(indexBitwidth);
+call    0 returned 100%
+        -:  299:}

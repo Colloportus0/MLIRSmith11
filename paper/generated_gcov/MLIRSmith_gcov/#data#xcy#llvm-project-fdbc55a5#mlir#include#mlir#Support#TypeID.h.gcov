@@ -1,0 +1,524 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/include/mlir/Support/TypeID.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:116169
+        -:    1://===- TypeID.h - TypeID RTTI class -----------------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file contains a definition of the TypeID class. This provides a non
+        -:   10:// RTTI mechanism for producing unique type IDs in LLVM.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_SUPPORT_TYPEID_H
+        -:   15:#define MLIR_SUPPORT_TYPEID_H
+        -:   16:
+        -:   17:#include "mlir/Support/LLVM.h"
+        -:   18:#include "llvm/ADT/DenseMapInfo.h"
+        -:   19:#include "llvm/ADT/Hashing.h"
+        -:   20:#include "llvm/ADT/STLExtras.h"
+        -:   21:#include "llvm/Support/Allocator.h"
+        -:   22:#include "llvm/Support/PointerLikeTypeTraits.h"
+        -:   23:#include "llvm/Support/TypeName.h"
+        -:   24:
+        -:   25:namespace mlir {
+        -:   26://===----------------------------------------------------------------------===//
+        -:   27:// TypeID
+        -:   28://===----------------------------------------------------------------------===//
+        -:   29:
+        -:   30:/// This class provides an efficient unique identifier for a specific C++ type.
+        -:   31:/// This allows for a C++ type to be compared, hashed, and stored in an opaque
+        -:   32:/// context. This class is similar in some ways to std::type_index, but can be
+        -:   33:/// used for any type. For example, this class could be used to implement LLVM
+        -:   34:/// style isa/dyn_cast functionality for a type hierarchy:
+        -:   35:///
+        -:   36:///  struct Base {
+        -:   37:///    Base(TypeID typeID) : typeID(typeID) {}
+        -:   38:///    TypeID typeID;
+        -:   39:///  };
+        -:   40:///
+        -:   41:///  struct DerivedA : public Base {
+        -:   42:///    DerivedA() : Base(TypeID::get<DerivedA>()) {}
+        -:   43:///
+        -:   44:///    static bool classof(const Base *base) {
+        -:   45:///      return base->typeID == TypeID::get<DerivedA>();
+        -:   46:///    }
+        -:   47:///  };
+        -:   48:///
+        -:   49:///  void foo(Base *base) {
+        -:   50:///    if (DerivedA *a = llvm::dyn_cast<DerivedA>(base))
+        -:   51:///       ...
+        -:   52:///  }
+        -:   53:///
+        -:   54:/// C++ RTTI is a notoriously difficult topic; given the nature of shared
+        -:   55:/// libraries many different approaches fundamentally break down in either the
+        -:   56:/// area of support (i.e. only certain types of classes are supported), or in
+        -:   57:/// terms of performance (e.g. by using string comparison). This class intends
+        -:   58:/// to strike a balance between performance and the setup required to enable its
+        -:   59:/// use.
+        -:   60:///
+        -:   61:/// Assume we are adding support for some class Foo, below are the set of ways
+        -:   62:/// in which a given c++ type may be supported:
+        -:   63:///
+        -:   64:///  * Explicitly via `MLIR_DECLARE_EXPLICIT_TYPE_ID` and
+        -:   65:///    `MLIR_DEFINE_EXPLICIT_TYPE_ID`
+        -:   66:///
+        -:   67:///    - This method explicitly defines the type ID for a given type using the
+        -:   68:///      given macros. These should be placed at the top-level of the file (i.e.
+        -:   69:///      not within any namespace or class). This is the most effective and
+        -:   70:///      efficient method, but requires explicit annotations for each type.
+        -:   71:///
+        -:   72:///      Example:
+        -:   73:///
+        -:   74:///        // Foo.h
+        -:   75:///        MLIR_DECLARE_EXPLICIT_TYPE_ID(Foo);
+        -:   76:///
+        -:   77:///        // Foo.cpp
+        -:   78:///        MLIR_DEFINE_EXPLICIT_TYPE_ID(Foo);
+        -:   79:///
+        -:   80:///  * Explicitly via `MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID`
+        -:   81:///   - This method explicitly defines the type ID for a given type by
+        -:   82:///     annotating the class directly. This has similar effectiveness and
+        -:   83:///     efficiency to the above method, but should only be used on internal
+        -:   84:///     classes; i.e. those with definitions constrained to a specific library
+        -:   85:///     (generally classes in anonymous namespaces).
+        -:   86:///
+        -:   87:///     Example:
+        -:   88:///
+        -:   89:///       namespace {
+        -:   90:///       class Foo {
+        -:   91:///       public:
+        -:   92:///         MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(Foo)
+        -:   93:///       };
+        -:   94:///       } // namespace
+        -:   95:///
+        -:   96:///  * Implicitly via a fallback using the type name
+        -:   97:///   - This method implicitly defines a type ID for a given type by using the
+        -:   98:///     type name. This method requires nothing explicitly from the user, but
+        -:   99:///     pays additional access and initialization cost. Given that this method
+        -:  100:///     uses the name of the type, it may not be used for types defined in
+        -:  101:///     anonymous namespaces (which is asserted when it can be detected). String
+        -:  102:///     names do not provide any guarantees on uniqueness in these contexts.
+        -:  103:///
+        -:  104:class TypeID {
+        -:  105:  /// This class represents the storage of a type info object.
+        -:  106:  /// Note: We specify an explicit alignment here to allow use with
+        -:  107:  /// PointerIntPair and other utilities/data structures that require a known
+        -:  108:  /// pointer alignment.
+        -:  109:  struct alignas(8) Storage {};
+        -:  110:
+        -:  111:public:
+        -:  112:  TypeID() : TypeID(get<void>()) {}
+        -:  113:
+        -:  114:  /// Comparison operations.
+    #####:  115:  inline bool operator==(const TypeID &other) const {
+    #####:  116:    return storage == other.storage;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  117:  }
+        -:  118:  inline bool operator!=(const TypeID &other) const {
+        -:  119:    return !(*this == other);
+        -:  120:  }
+        -:  121:
+        -:  122:  /// Construct a type info object for the given type T.
+        -:  123:  template <typename T>
+        -:  124:  static TypeID get();
+        -:  125:  template <template <typename> class Trait>
+        -:  126:  static TypeID get();
+        -:  127:
+        -:  128:  /// Methods for supporting PointerLikeTypeTraits.
+    #####:  129:  const void *getAsOpaquePointer() const {
+    #####:  130:    return static_cast<const void *>(storage);
+branch  0 never executed
+branch  1 never executed
+        -:  131:  }
+    #####:  132:  static TypeID getFromOpaquePointer(const void *pointer) {
+    #####:  133:    return TypeID(reinterpret_cast<const Storage *>(pointer));
+        -:  134:  }
+        -:  135:
+        -:  136:  /// Enable hashing TypeID.
+        -:  137:  friend ::llvm::hash_code hash_value(TypeID id);
+        -:  138:
+        -:  139:private:
+    #####:  140:  TypeID(const Storage *storage) : storage(storage) {}
+        -:  141:
+        -:  142:  /// The storage of this type info object.
+        -:  143:  const Storage *storage;
+        -:  144:
+        -:  145:  friend class TypeIDAllocator;
+        -:  146:};
+        -:  147:
+        -:  148:/// Enable hashing TypeID.
+        -:  149:inline ::llvm::hash_code hash_value(TypeID id) {
+        -:  150:  return DenseMapInfo<const TypeID::Storage *>::getHashValue(id.storage);
+        -:  151:}
+        -:  152:
+        -:  153://===----------------------------------------------------------------------===//
+        -:  154:// TypeIDResolver
+        -:  155://===----------------------------------------------------------------------===//
+        -:  156:
+        -:  157:namespace detail {
+        -:  158:/// This class provides a fallback for resolving TypeIDs. It uses the string
+        -:  159:/// name of the type to perform the resolution, and as such does not allow the
+        -:  160:/// use of classes defined in "anonymous" contexts.
+        -:  161:class FallbackTypeIDResolver {
+        -:  162:protected:
+        -:  163:  /// Register an implicit type ID for the given type name.
+        -:  164:  static TypeID registerImplicitTypeID(StringRef name);
+        -:  165:};
+        -:  166:
+        -:  167:/// This class provides a resolver for getting the ID for a given class T. This
+        -:  168:/// allows for the derived type to specialize its resolution behavior. The
+        -:  169:/// default implementation uses the string name of the type to resolve the ID.
+        -:  170:/// This provides a strong definition, but at the cost of performance (we need
+        -:  171:/// to do an initial lookup) and is not usable by classes defined in anonymous
+        -:  172:/// contexts.
+        -:  173:///
+        -:  174:/// TODO: The use of the type name is only necessary when building in the
+        -:  175:/// presence of shared libraries. We could add a build flag that guarantees
+        -:  176:/// "static"-like environments and switch this to a more optimal implementation
+        -:  177:/// when that is enabled.
+        -:  178:template <typename T, typename Enable = void>
+        -:  179:class TypeIDResolver : public FallbackTypeIDResolver {
+        -:  180:public:
+        -:  181:  /// Trait to check if `U` is fully resolved. We use this to verify that `T` is
+        -:  182:  /// fully resolved when trying to resolve a TypeID. We don't technically need
+        -:  183:  /// to have the full definition of `T` for the fallback, but it does help
+        -:  184:  /// prevent situations where a forward declared type uses this fallback even
+        -:  185:  /// though there is a strong definition for the TypeID in the location where
+        -:  186:  /// `T` is defined.
+        -:  187:  template <typename U>
+        -:  188:  using is_fully_resolved_trait = decltype(sizeof(U));
+        -:  189:  template <typename U>
+        -:  190:  using is_fully_resolved = llvm::is_detected<is_fully_resolved_trait, U>;
+        -:  191:
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverINS_12ElementsAttrEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverINS_12ElementsAttrEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverINS_4LLVM22FastmathFlagsInterfaceEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverINS_4LLVM22FastmathFlagsInterfaceEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverINS_4LLVM14LLVMStructTypeEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverINS_4LLVM14LLVMStructTypeEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverIN4llvm5APIntEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverIN4llvm5APIntEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverINS_4LLVM12LLVMVoidTypeEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverINS_4LLVM12LLVMVoidTypeEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+_ZN4mlir6detail14TypeIDResolverINS_31LLVMTranslationDialectInterfaceEvE13resolveTypeIDEv:
+function _ZN4mlir6detail14TypeIDResolverINS_31LLVMTranslationDialectInterfaceEvE13resolveTypeIDEv called 0 returned 0% blocks executed 0%
+    #####:  192:  static TypeID resolveTypeID() {
+        -:  193:    static_assert(is_fully_resolved<T>::value,
+        -:  194:                  "TypeID::get<> requires the complete definition of `T`");
+    #####:  195:    static TypeID id = registerImplicitTypeID(llvm::getTypeName<T>());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  196:    return id;
+        -:  197:  }
+------------------
+        -:  198:};
+        -:  199:
+        -:  200:/// This class provides utilities for resolving the TypeID of a class that
+        -:  201:/// provides a `static TypeID resolveTypeID()` method. This allows for
+        -:  202:/// simplifying situations when the class can resolve the ID itself. This
+        -:  203:/// functionality is separated from the corresponding `TypeIDResolver`
+        -:  204:/// specialization below to enable referencing it more easily in different
+        -:  205:/// contexts.
+        -:  206:struct InlineTypeIDResolver {
+        -:  207:  /// Trait to check if `T` provides a static `resolveTypeID` method.
+        -:  208:  template <typename T>
+        -:  209:  using has_resolve_typeid_trait = decltype(T::resolveTypeID());
+        -:  210:  template <typename T>
+        -:  211:  using has_resolve_typeid = llvm::is_detected<has_resolve_typeid_trait, T>;
+        -:  212:
+        -:  213:  template <typename T>
+        -:  214:  static TypeID resolveTypeID() {
+        -:  215:    return T::resolveTypeID();
+        -:  216:  }
+        -:  217:};
+        -:  218:/// This class provides a resolver for getting the ID for a given class T, when
+        -:  219:/// the class provides a `static TypeID resolveTypeID()` method. This allows for
+        -:  220:/// simplifying situations when the class can resolve the ID itself.
+        -:  221:template <typename T>
+        -:  222:class TypeIDResolver<
+        -:  223:    T, std::enable_if_t<InlineTypeIDResolver::has_resolve_typeid<T>::value>> {
+        -:  224:public:
+        -:  225:  static TypeID resolveTypeID() {
+        -:  226:    return InlineTypeIDResolver::resolveTypeID<T>();
+        -:  227:  }
+        -:  228:};
+        -:  229:} // namespace detail
+        -:  230:
+        -:  231:template <typename T>
+    #####:  232:TypeID TypeID::get() {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+call   17 never executed
+    #####:  233:  return detail::TypeIDResolver<T>::resolveTypeID();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  234:}
+        -:  235:template <template <typename> class Trait>
+        -:  236:TypeID TypeID::get() {
+        -:  237:  // An empty class used to simplify the use of Trait types.
+        -:  238:  struct Empty {};
+        -:  239:  return TypeID::get<Trait<Empty>>();
+        -:  240:}
+        -:  241:
+        -:  242:// Declare/define an explicit specialization for TypeID: this forces the
+        -:  243:// compiler to emit a strong definition for a class and controls which
+        -:  244:// translation unit and shared object will actually have it.
+        -:  245:// This can be useful to turn to a link-time failure what would be in other
+        -:  246:// circumstances a hard-to-catch runtime bug when a TypeID is hidden in two
+        -:  247:// different shared libraries and instances of the same class only gets the same
+        -:  248:// TypeID inside a given DSO.
+        -:  249:#define MLIR_DECLARE_EXPLICIT_TYPE_ID(CLASS_NAME)                              \
+        -:  250:  namespace mlir {                                                             \
+        -:  251:  namespace detail {                                                           \
+        -:  252:  template <>                                                                  \
+        -:  253:  class TypeIDResolver<CLASS_NAME> {                                           \
+        -:  254:  public:                                                                      \
+        -:  255:    static TypeID resolveTypeID() { return id; }                               \
+        -:  256:                                                                               \
+        -:  257:  private:                                                                     \
+        -:  258:    static SelfOwningTypeID id;                                                \
+        -:  259:  };                                                                           \
+        -:  260:  } /* namespace detail */                                                     \
+        -:  261:  } /* namespace mlir */
+        -:  262:
+        -:  263:#define MLIR_DEFINE_EXPLICIT_TYPE_ID(CLASS_NAME)                               \
+        -:  264:  namespace mlir {                                                             \
+        -:  265:  namespace detail {                                                           \
+        -:  266:  SelfOwningTypeID TypeIDResolver<CLASS_NAME>::id = {};                        \
+        -:  267:  } /* namespace detail */                                                     \
+        -:  268:  } /* namespace mlir */
+        -:  269:
+        -:  270:// Declare/define an explicit, **internal**, specialization of TypeID for the
+        -:  271:// given class. This is useful for providing an explicit specialization of
+        -:  272:// TypeID for a class that is known to be internal to a specific library. It
+        -:  273:// should be placed within a public section of the declaration of the class.
+        -:  274:#define MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CLASS_NAME)               \
+        -:  275:  static ::mlir::TypeID resolveTypeID() {                                      \
+        -:  276:    static ::mlir::SelfOwningTypeID id;                                        \
+        -:  277:    return id;                                                                 \
+        -:  278:  }                                                                            \
+        -:  279:  static_assert(                                                               \
+        -:  280:      ::mlir::detail::InlineTypeIDResolver::has_resolve_typeid<                \
+        -:  281:          CLASS_NAME>::value,                                                  \
+        -:  282:      "`MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID` must be placed in a "    \
+        -:  283:      "public section of `" #CLASS_NAME "`");
+        -:  284:
+        -:  285://===----------------------------------------------------------------------===//
+        -:  286:// TypeIDAllocator
+        -:  287://===----------------------------------------------------------------------===//
+        -:  288:
+        -:  289:/// This class provides a way to define new TypeIDs at runtime.
+        -:  290:/// When the allocator is destructed, all allocated TypeIDs become invalid and
+        -:  291:/// therefore should not be used.
+        -:  292:class TypeIDAllocator {
+        -:  293:public:
+        -:  294:  /// Allocate a new TypeID, that is ensured to be unique for the lifetime
+        -:  295:  /// of the TypeIDAllocator.
+        -:  296:  TypeID allocate() { return TypeID(ids.Allocate()); }
+        -:  297:
+        -:  298:private:
+        -:  299:  /// The TypeIDs allocated are the addresses of the different storages.
+        -:  300:  /// Keeping those in memory ensure uniqueness of the TypeIDs.
+        -:  301:  llvm::SpecificBumpPtrAllocator<TypeID::Storage> ids;
+        -:  302:};
+        -:  303:
+        -:  304://===----------------------------------------------------------------------===//
+        -:  305:// SelfOwningTypeID
+        -:  306://===----------------------------------------------------------------------===//
+        -:  307:
+        -:  308:/// Defines a TypeID for each instance of this class by using a pointer to the
+        -:  309:/// instance. Thus, the copy and move constructor are deleted.
+        -:  310:/// Note: We align by 8 to match the alignment of TypeID::Storage, as we treat
+        -:  311:/// an instance of this class similarly to TypeID::Storage.
+        -:  312:class alignas(8) SelfOwningTypeID {
+        -:  313:public:
+        -:  314:  SelfOwningTypeID() = default;
+        -:  315:  SelfOwningTypeID(const SelfOwningTypeID &) = delete;
+        -:  316:  SelfOwningTypeID &operator=(const SelfOwningTypeID &) = delete;
+        -:  317:  SelfOwningTypeID(SelfOwningTypeID &&) = delete;
+        -:  318:  SelfOwningTypeID &operator=(SelfOwningTypeID &&) = delete;
+        -:  319:
+        -:  320:  /// Implicitly converts to the owned TypeID.
+    #####:  321:  operator TypeID() const { return getTypeID(); }
+        -:  322:
+        -:  323:  /// Return the TypeID owned by this object.
+    #####:  324:  TypeID getTypeID() const { return TypeID::getFromOpaquePointer(this); }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+call   17 never executed
+        -:  325:};
+        -:  326:
+        -:  327:} // namespace mlir
+        -:  328:
+        -:  329://===----------------------------------------------------------------------===//
+        -:  330:// Builtin TypeIDs
+        -:  331://===----------------------------------------------------------------------===//
+        -:  332:
+        -:  333:/// Explicitly register a set of "builtin" types.
+        -:  334:MLIR_DECLARE_EXPLICIT_TYPE_ID(void)
+        -:  335:
+        -:  336:namespace llvm {
+        -:  337:template <>
+        -:  338:struct DenseMapInfo<mlir::TypeID> {
+        -:  339:  static inline mlir::TypeID getEmptyKey() {
+        -:  340:    void *pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
+        -:  341:    return mlir::TypeID::getFromOpaquePointer(pointer);
+        -:  342:  }
+        -:  343:  static inline mlir::TypeID getTombstoneKey() {
+        -:  344:    void *pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
+        -:  345:    return mlir::TypeID::getFromOpaquePointer(pointer);
+        -:  346:  }
+        -:  347:  static unsigned getHashValue(mlir::TypeID val) {
+        -:  348:    return mlir::hash_value(val);
+        -:  349:  }
+        -:  350:  static bool isEqual(mlir::TypeID lhs, mlir::TypeID rhs) { return lhs == rhs; }
+        -:  351:};
+        -:  352:
+        -:  353:/// We align TypeID::Storage by 8, so allow LLVM to steal the low bits.
+        -:  354:template <>
+        -:  355:struct PointerLikeTypeTraits<mlir::TypeID> {
+        -:  356:  static inline void *getAsVoidPointer(mlir::TypeID info) {
+        -:  357:    return const_cast<void *>(info.getAsOpaquePointer());
+        -:  358:  }
+        -:  359:  static inline mlir::TypeID getFromVoidPointer(void *ptr) {
+        -:  360:    return mlir::TypeID::getFromOpaquePointer(ptr);
+        -:  361:  }
+        -:  362:  static constexpr int NumLowBitsAvailable = 3;
+        -:  363:};
+        -:  364:
+        -:  365:} // namespace llvm
+        -:  366:
+        -:  367:#endif // MLIR_SUPPORT_TYPEID_H

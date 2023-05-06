@@ -1,0 +1,2589 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Conversion/ArithToSPIRV/ArithToSPIRV.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/ArithToSPIRV/CMakeFiles/obj.MLIRArithToSPIRV.dir/ArithToSPIRV.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/ArithToSPIRV/CMakeFiles/obj.MLIRArithToSPIRV.dir/ArithToSPIRV.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- ArithToSPIRV.cpp - Arithmetic to SPIRV dialect conversion -----===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
+        -:   10:
+        -:   11:#include "../SPIRVCommon/Pattern.h"
+        -:   12:#include "mlir/Conversion/FuncToSPIRV/FuncToSPIRV.h"
+        -:   13:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   14:#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+        -:   15:#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+        -:   16:#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
+        -:   17:#include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
+        -:   18:#include "mlir/IR/BuiltinAttributes.h"
+        -:   19:#include "mlir/IR/BuiltinTypes.h"
+        -:   20:#include "llvm/ADT/ArrayRef.h"
+        -:   21:#include "llvm/Support/Debug.h"
+        -:   22:
+        -:   23:namespace mlir {
+        -:   24:#define GEN_PASS_DEF_CONVERTARITHTOSPIRV
+        -:   25:#include "mlir/Conversion/Passes.h.inc"
+        -:   26:} // namespace mlir
+        -:   27:
+        -:   28:#define DEBUG_TYPE "arith-to-spirv-pattern"
+        -:   29:
+        -:   30:using namespace mlir;
+        -:   31:
+        -:   32://===----------------------------------------------------------------------===//
+        -:   33:// Operation Conversion
+        -:   34://===----------------------------------------------------------------------===//
+        -:   35:
+        -:   36:namespace {
+        -:   37:
+        -:   38:/// Converts composite arith.constant operation to spirv.Constant.
+        -:   39:struct ConstantCompositeOpPattern final
+        -:   40:    : public OpConversionPattern<arith::ConstantOp> {
+        -:   41:  using OpConversionPattern<arith::ConstantOp>::OpConversionPattern;
+        -:   42:
+        -:   43:  LogicalResult
+        -:   44:  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+        -:   45:                  ConversionPatternRewriter &rewriter) const override;
+        -:   46:};
+        -:   47:
+        -:   48:/// Converts scalar arith.constant operation to spirv.Constant.
+        -:   49:struct ConstantScalarOpPattern final
+        -:   50:    : public OpConversionPattern<arith::ConstantOp> {
+        -:   51:  using OpConversionPattern<arith::ConstantOp>::OpConversionPattern;
+        -:   52:
+        -:   53:  LogicalResult
+        -:   54:  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+        -:   55:                  ConversionPatternRewriter &rewriter) const override;
+        -:   56:};
+        -:   57:
+        -:   58:/// Converts arith.remsi to GLSL SPIR-V ops.
+        -:   59:///
+        -:   60:/// This cannot be merged into the template unary/binary pattern due to Vulkan
+        -:   61:/// restrictions over spirv.SRem and spirv.SMod.
+        -:   62:struct RemSIOpGLPattern final : public OpConversionPattern<arith::RemSIOp> {
+        -:   63:  using OpConversionPattern<arith::RemSIOp>::OpConversionPattern;
+        -:   64:
+        -:   65:  LogicalResult
+        -:   66:  matchAndRewrite(arith::RemSIOp op, OpAdaptor adaptor,
+        -:   67:                  ConversionPatternRewriter &rewriter) const override;
+        -:   68:};
+        -:   69:
+        -:   70:/// Converts arith.remsi to OpenCL SPIR-V ops.
+        -:   71:struct RemSIOpCLPattern final : public OpConversionPattern<arith::RemSIOp> {
+        -:   72:  using OpConversionPattern<arith::RemSIOp>::OpConversionPattern;
+        -:   73:
+        -:   74:  LogicalResult
+        -:   75:  matchAndRewrite(arith::RemSIOp op, OpAdaptor adaptor,
+        -:   76:                  ConversionPatternRewriter &rewriter) const override;
+        -:   77:};
+        -:   78:
+        -:   79:/// Converts bitwise operations to SPIR-V operations. This is a special pattern
+        -:   80:/// other than the BinaryOpPatternPattern because if the operands are boolean
+        -:   81:/// values, SPIR-V uses different operations (`SPIRVLogicalOp`). For
+        -:   82:/// non-boolean operands, SPIR-V should use `SPIRVBitwiseOp`.
+        -:   83:template <typename Op, typename SPIRVLogicalOp, typename SPIRVBitwiseOp>
+        -:   84:struct BitwiseOpPattern final : public OpConversionPattern<Op> {
+        -:   85:  using OpConversionPattern<Op>::OpConversionPattern;
+        -:   86:
+        -:   87:  LogicalResult
+        -:   88:  matchAndRewrite(Op op, typename Op::Adaptor adaptor,
+        -:   89:                  ConversionPatternRewriter &rewriter) const override;
+        -:   90:};
+        -:   91:
+        -:   92:/// Converts arith.xori to SPIR-V operations.
+        -:   93:struct XOrIOpLogicalPattern final : public OpConversionPattern<arith::XOrIOp> {
+        -:   94:  using OpConversionPattern<arith::XOrIOp>::OpConversionPattern;
+        -:   95:
+        -:   96:  LogicalResult
+        -:   97:  matchAndRewrite(arith::XOrIOp op, OpAdaptor adaptor,
+        -:   98:                  ConversionPatternRewriter &rewriter) const override;
+        -:   99:};
+        -:  100:
+        -:  101:/// Converts arith.xori to SPIR-V operations if the type of source is i1 or
+        -:  102:/// vector of i1.
+        -:  103:struct XOrIOpBooleanPattern final : public OpConversionPattern<arith::XOrIOp> {
+        -:  104:  using OpConversionPattern<arith::XOrIOp>::OpConversionPattern;
+        -:  105:
+        -:  106:  LogicalResult
+        -:  107:  matchAndRewrite(arith::XOrIOp op, OpAdaptor adaptor,
+        -:  108:                  ConversionPatternRewriter &rewriter) const override;
+        -:  109:};
+        -:  110:
+        -:  111:/// Converts arith.uitofp to spirv.Select if the type of source is i1 or vector
+        -:  112:/// of i1.
+        -:  113:struct UIToFPI1Pattern final : public OpConversionPattern<arith::UIToFPOp> {
+        -:  114:  using OpConversionPattern<arith::UIToFPOp>::OpConversionPattern;
+        -:  115:
+        -:  116:  LogicalResult
+        -:  117:  matchAndRewrite(arith::UIToFPOp op, OpAdaptor adaptor,
+        -:  118:                  ConversionPatternRewriter &rewriter) const override;
+        -:  119:};
+        -:  120:
+        -:  121:/// Converts arith.extui to spirv.Select if the type of source is i1 or vector
+        -:  122:/// of i1.
+        -:  123:struct ExtUII1Pattern final : public OpConversionPattern<arith::ExtUIOp> {
+        -:  124:  using OpConversionPattern<arith::ExtUIOp>::OpConversionPattern;
+        -:  125:
+        -:  126:  LogicalResult
+        -:  127:  matchAndRewrite(arith::ExtUIOp op, OpAdaptor adaptor,
+        -:  128:                  ConversionPatternRewriter &rewriter) const override;
+        -:  129:};
+        -:  130:
+        -:  131:/// Converts arith.trunci to spirv.Select if the type of result is i1 or vector
+        -:  132:/// of i1.
+        -:  133:struct TruncII1Pattern final : public OpConversionPattern<arith::TruncIOp> {
+        -:  134:  using OpConversionPattern<arith::TruncIOp>::OpConversionPattern;
+        -:  135:
+        -:  136:  LogicalResult
+        -:  137:  matchAndRewrite(arith::TruncIOp op, OpAdaptor adaptor,
+        -:  138:                  ConversionPatternRewriter &rewriter) const override;
+        -:  139:};
+        -:  140:
+        -:  141:/// Converts type-casting standard operations to SPIR-V operations.
+        -:  142:template <typename Op, typename SPIRVOp>
+        -:  143:struct TypeCastingOpPattern final : public OpConversionPattern<Op> {
+        -:  144:  using OpConversionPattern<Op>::OpConversionPattern;
+        -:  145:
+        -:  146:  LogicalResult
+        -:  147:  matchAndRewrite(Op op, typename Op::Adaptor adaptor,
+        -:  148:                  ConversionPatternRewriter &rewriter) const override;
+        -:  149:};
+        -:  150:
+        -:  151:/// Converts integer compare operation on i1 type operands to SPIR-V ops.
+        -:  152:class CmpIOpBooleanPattern final : public OpConversionPattern<arith::CmpIOp> {
+        -:  153:public:
+        -:  154:  using OpConversionPattern<arith::CmpIOp>::OpConversionPattern;
+        -:  155:
+        -:  156:  LogicalResult
+        -:  157:  matchAndRewrite(arith::CmpIOp op, OpAdaptor adaptor,
+        -:  158:                  ConversionPatternRewriter &rewriter) const override;
+        -:  159:};
+        -:  160:
+        -:  161:/// Converts integer compare operation to SPIR-V ops.
+        -:  162:class CmpIOpPattern final : public OpConversionPattern<arith::CmpIOp> {
+        -:  163:public:
+        -:  164:  using OpConversionPattern<arith::CmpIOp>::OpConversionPattern;
+        -:  165:
+        -:  166:  LogicalResult
+        -:  167:  matchAndRewrite(arith::CmpIOp op, OpAdaptor adaptor,
+        -:  168:                  ConversionPatternRewriter &rewriter) const override;
+        -:  169:};
+        -:  170:
+        -:  171:/// Converts floating-point comparison operations to SPIR-V ops.
+        -:  172:class CmpFOpPattern final : public OpConversionPattern<arith::CmpFOp> {
+        -:  173:public:
+        -:  174:  using OpConversionPattern<arith::CmpFOp>::OpConversionPattern;
+        -:  175:
+        -:  176:  LogicalResult
+        -:  177:  matchAndRewrite(arith::CmpFOp op, OpAdaptor adaptor,
+        -:  178:                  ConversionPatternRewriter &rewriter) const override;
+        -:  179:};
+        -:  180:
+        -:  181:/// Converts floating point NaN check to SPIR-V ops. This pattern requires
+        -:  182:/// Kernel capability.
+        -:  183:class CmpFOpNanKernelPattern final : public OpConversionPattern<arith::CmpFOp> {
+        -:  184:public:
+        -:  185:  using OpConversionPattern<arith::CmpFOp>::OpConversionPattern;
+        -:  186:
+        -:  187:  LogicalResult
+        -:  188:  matchAndRewrite(arith::CmpFOp op, OpAdaptor adaptor,
+        -:  189:                  ConversionPatternRewriter &rewriter) const override;
+        -:  190:};
+        -:  191:
+        -:  192:/// Converts floating point NaN check to SPIR-V ops. This pattern does not
+        -:  193:/// require additional capability.
+        -:  194:class CmpFOpNanNonePattern final : public OpConversionPattern<arith::CmpFOp> {
+        -:  195:public:
+        -:  196:  using OpConversionPattern<arith::CmpFOp>::OpConversionPattern;
+        -:  197:
+        -:  198:  LogicalResult
+        -:  199:  matchAndRewrite(arith::CmpFOp op, OpAdaptor adaptor,
+        -:  200:                  ConversionPatternRewriter &rewriter) const override;
+        -:  201:};
+        -:  202:
+        -:  203:/// Converts arith.addui_carry to spirv.IAddCarry.
+        -:  204:class AddICarryOpPattern final
+        -:  205:    : public OpConversionPattern<arith::AddUICarryOp> {
+        -:  206:public:
+        -:  207:  using OpConversionPattern<arith::AddUICarryOp>::OpConversionPattern;
+        -:  208:  LogicalResult
+        -:  209:  matchAndRewrite(arith::AddUICarryOp op, OpAdaptor adaptor,
+        -:  210:                  ConversionPatternRewriter &rewriter) const override;
+        -:  211:};
+        -:  212:
+        -:  213:/// Converts arith.select to spirv.Select.
+        -:  214:class SelectOpPattern final : public OpConversionPattern<arith::SelectOp> {
+        -:  215:public:
+        -:  216:  using OpConversionPattern<arith::SelectOp>::OpConversionPattern;
+        -:  217:  LogicalResult
+        -:  218:  matchAndRewrite(arith::SelectOp op, OpAdaptor adaptor,
+        -:  219:                  ConversionPatternRewriter &rewriter) const override;
+        -:  220:};
+        -:  221:
+        -:  222:/// Converts arith.maxf to spirv.GL.FMax or spirv.CL.fmax.
+        -:  223:template <typename Op, typename SPIRVOp>
+        -:  224:class MinMaxFOpPattern final : public OpConversionPattern<Op> {
+        -:  225:public:
+        -:  226:  using OpConversionPattern<Op>::OpConversionPattern;
+        -:  227:  LogicalResult
+        -:  228:  matchAndRewrite(Op op, typename Op::Adaptor adaptor,
+        -:  229:                  ConversionPatternRewriter &rewriter) const override;
+        -:  230:};
+        -:  231:
+        -:  232:} // namespace
+        -:  233:
+        -:  234://===----------------------------------------------------------------------===//
+        -:  235:// Conversion Helpers
+        -:  236://===----------------------------------------------------------------------===//
+        -:  237:
+        -:  238:/// Converts the given `srcAttr` into a boolean attribute if it holds an
+        -:  239:/// integral value. Returns null attribute if conversion fails.
+function _ZL15convertBoolAttrN4mlir9AttributeENS_7BuilderE called 1779 returned 100% blocks executed 25%
+     1779:  240:static BoolAttr convertBoolAttr(Attribute srcAttr, Builder builder) {
+     1779:  241:  if (auto boolAttr = srcAttr.dyn_cast<BoolAttr>())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+     1779:  242:    return boolAttr;
+    #####:  243:  if (auto intAttr = srcAttr.dyn_cast<IntegerAttr>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  244:    return builder.getBoolAttr(intAttr.getValue().getBoolValue());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  245:  return BoolAttr();
+        -:  246:}
+        -:  247:
+        -:  248:/// Converts the given `srcAttr` to a new attribute of the given `dstType`.
+        -:  249:/// Returns null attribute if conversion fails.
+function _ZL18convertIntegerAttrN4mlir11IntegerAttrENS_11IntegerTypeENS_7BuilderE called 50073 returned 100% blocks executed 45%
+    50073:  250:static IntegerAttr convertIntegerAttr(IntegerAttr srcAttr, IntegerType dstType,
+        -:  251:                                      Builder builder) {
+        -:  252:  // If the source number uses less active bits than the target bitwidth, then
+        -:  253:  // it should be safe to convert.
+    50073:  254:  if (srcAttr.getValue().isIntN(dstType.getWidth()))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+branch  4 taken 100% (fallthrough)
+branch  5 taken 1%
+    49913:  255:    return builder.getIntegerAttr(dstType, srcAttr.getInt());
+call    0 returned 100%
+call    1 returned 100%
+        -:  256:
+        -:  257:  // XXX: Try again by interpreting the source number as a signed value.
+        -:  258:  // Although integers in the standard dialect are signless, they can represent
+        -:  259:  // a signed number. It's the operation decides how to interpret. This is
+        -:  260:  // dangerous, but it seems there is no good way of handling this if we still
+        -:  261:  // want to change the bitwidth. Emit a message at least.
+      160:  262:  if (srcAttr.getValue().isSignedIntN(dstType.getWidth())) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+branch  5 taken 84% (fallthrough)
+branch  6 taken 16%
+      135:  263:    auto dstAttr = builder.getIntegerAttr(dstType, srcAttr.getInt());
+call    0 returned 100%
+call    1 returned 100%
+     135*:  264:    LLVM_DEBUG(llvm::dbgs() << "attribute '" << srcAttr << "' converted to '"
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  265:                            << dstAttr << "' for type '" << dstType << "'\n");
+      135:  266:    return dstAttr;
+        -:  267:  }
+        -:  268:
+      25*:  269:  LLVM_DEBUG(llvm::dbgs() << "attribute '" << srcAttr
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  270:                          << "' illegal: cannot fit into target type '"
+        -:  271:                          << dstType << "'\n");
+       25:  272:  return IntegerAttr();
+        -:  273:}
+        -:  274:
+        -:  275:/// Converts the given `srcAttr` to a new attribute of the given `dstType`.
+        -:  276:/// Returns null attribute if `dstType` is not 32-bit or conversion fails.
+function _ZL16convertFloatAttrN4mlir9FloatAttrENS_9FloatTypeENS_7BuilderE called 7041 returned 100% blocks executed 50%
+     7041:  277:static FloatAttr convertFloatAttr(FloatAttr srcAttr, FloatType dstType,
+        -:  278:                                  Builder builder) {
+        -:  279:  // Only support converting to float for now.
+     7041:  280:  if (!dstType.isF32())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  281:    return FloatAttr();
+        -:  282:
+        -:  283:  // Try to convert the source floating-point number to single precision.
+     7041:  284:  APFloat dstVal = srcAttr.getValue();
+call    0 returned 100%
+     7041:  285:  bool losesInfo = false;
+     7041:  286:  APFloat::opStatus status =
+     7041:  287:      dstVal.convert(APFloat::IEEEsingle(), APFloat::rmTowardZero, &losesInfo);
+call    0 returned 100%
+     7041:  288:  if (status != APFloat::opOK || losesInfo) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  289:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+        -:  290:               << srcAttr << " illegal: cannot fit into converted type '"
+        -:  291:               << dstType << "'\n");
+    #####:  292:    return FloatAttr();
+        -:  293:  }
+        -:  294:
+     7041:  295:  return builder.getF32FloatAttr(dstVal.convertToFloat());
+call    0 returned 100%
+call    1 returned 100%
+        -:  296:}
+        -:  297:
+        -:  298:/// Returns true if the given `type` is a boolean scalar or vector type.
+function _ZL20isBoolScalarOrVectorN4mlir4TypeE called 290 returned 100% blocks executed 67%
+      290:  299:static bool isBoolScalarOrVector(Type type) {
+      290:  300:  if (type.isInteger(1))
+call    0 returned 100%
+branch  1 taken 53% (fallthrough)
+branch  2 taken 47%
+        -:  301:    return true;
+      155:  302:  if (auto vecType = type.dyn_cast<VectorType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  303:    return vecType.getElementType().isInteger(1);
+call    0 never executed
+call    1 never executed
+      155:  304:  return false;
+        -:  305:}
+        -:  306:
+        -:  307:/// Returns true if scalar/vector type `a` and `b` have the same number of
+        -:  308:/// bitwidth.
+function _ZL15hasSameBitwidthN4mlir4TypeES0_ called 31 returned 100% blocks executed 100%
+       31:  309:static bool hasSameBitwidth(Type a, Type b) {
+function _ZZL15hasSameBitwidthN4mlir4TypeES0_ENKUlS0_E_clES0_.isra.0 called 62 returned 100% blocks executed 42%
+       62:  310:  auto getNumBitwidth = [](Type type) {
+       62:  311:    unsigned bw = 0;
+       62:  312:    if (type.isIntOrFloat())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+       62:  313:      bw = type.getIntOrFloatBitWidth();
+call    0 returned 100%
+    #####:  314:    else if (auto vecType = type.dyn_cast<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  315:      bw = vecType.getElementTypeBitWidth() * vecType.getNumElements();
+call    0 never executed
+call    1 never executed
+       62:  316:    return bw;
+        -:  317:  };
+       31:  318:  unsigned aBW = getNumBitwidth(a);
+call    0 returned 100%
+       31:  319:  unsigned bBW = getNumBitwidth(b);
+call    0 returned 100%
+       31:  320:  return aBW != 0 && bBW != 0 && aBW == bBW;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+        -:  321:}
+        -:  322:
+        -:  323://===----------------------------------------------------------------------===//
+        -:  324:// ConstantOp with composite type
+        -:  325://===----------------------------------------------------------------------===//
+        -:  326:
+function _ZNK12_GLOBAL__N_126ConstantCompositeOpPattern15matchAndRewriteEN4mlir5arith10ConstantOpENS2_17ConstantOpAdaptorERNS1_25ConversionPatternRewriterE called 2615 returned 100% blocks executed 89%
+     2615:  327:LogicalResult ConstantCompositeOpPattern::matchAndRewrite(
+        -:  328:    arith::ConstantOp constOp, OpAdaptor adaptor,
+        -:  329:    ConversionPatternRewriter &rewriter) const {
+     2615:  330:  auto srcType = constOp.getType().dyn_cast<ShapedType>();
+call    0 returned 100%
+     2615:  331:  if (!srcType || srcType.getNumElements() == 1)
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+       25:  332:    return failure();
+        -:  333:
+        -:  334:  // arith.constant should only have vector or tenor types.
+    2590*:  335:  assert((srcType.isa<VectorType, RankedTensorType>()));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+        -:  336:
+     2590:  337:  auto dstType = getTypeConverter()->convertType(srcType);
+call    0 returned 100%
+     2590:  338:  if (!dstType)
+branch  0 taken 80% (fallthrough)
+branch  1 taken 20%
+     2081:  339:    return failure();
+        -:  340:
+      509:  341:  auto dstElementsAttr = constOp.getValue().dyn_cast<DenseElementsAttr>();
+call    0 returned 100%
+call    1 returned 100%
+      509:  342:  if (!dstElementsAttr)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  343:    return failure();
+        -:  344:
+      509:  345:  ShapedType dstAttrType = dstElementsAttr.getType();
+call    0 returned 100%
+        -:  346:
+        -:  347:  // If the composite type has more than one dimensions, perform linearization.
+      509:  348:  if (srcType.getRank() > 1) {
+call    0 returned 100%
+branch  1 taken 33% (fallthrough)
+branch  2 taken 67%
+      169:  349:    if (srcType.isa<RankedTensorType>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+      169:  350:      dstAttrType = RankedTensorType::get(srcType.getNumElements(),
+call    0 returned 100%
+call    1 returned 100%
+      338:  351:                                          srcType.getElementType());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      169:  352:      dstElementsAttr = dstElementsAttr.reshape(dstAttrType);
+call    0 returned 100%
+        -:  353:    } else {
+        -:  354:      // TODO: add support for large vectors.
+    #####:  355:      return failure();
+        -:  356:    }
+        -:  357:  }
+        -:  358:
+      509:  359:  Type srcElemType = srcType.getElementType();
+call    0 returned 100%
+      509:  360:  Type dstElemType;
+        -:  361:  // Tensor types are converted to SPIR-V array types; vector types are
+        -:  362:  // converted to SPIR-V vector/array types.
+      509:  363:  if (auto arrayType = dstType.dyn_cast<spirv::ArrayType>())
+call    0 returned 100%
+branch  1 taken 46% (fallthrough)
+branch  2 taken 54%
+      236:  364:    dstElemType = arrayType.getElementType();
+call    0 returned 100%
+        -:  365:  else
+      273:  366:    dstElemType = dstType.cast<VectorType>().getElementType();
+call    0 returned 100%
+call    1 returned 100%
+        -:  367:
+        -:  368:  // If the source and destination element types are different, perform
+        -:  369:  // attribute conversion.
+      509:  370:  if (srcElemType != dstElemType) {
+branch  0 taken 43% (fallthrough)
+branch  1 taken 57%
+      438:  371:    SmallVector<Attribute, 8> elements;
+call    0 returned 100%
+      219:  372:    if (srcElemType.isa<FloatType>()) {
+call    0 returned 100%
+branch  1 taken 34% (fallthrough)
+branch  2 taken 66%
+    11496:  373:      for (FloatAttr srcAttr : dstElementsAttr.getValues<FloatAttr>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+call    3 returned 100%
+     5673:  374:        FloatAttr dstAttr =
+call    0 returned 100%
+     5673:  375:            convertFloatAttr(srcAttr, dstElemType.cast<FloatType>(), rewriter);
+call    0 returned 100%
+     5673:  376:        if (!dstAttr)
+branch  0 taken 0%
+branch  1 taken 100%
+    #####:  377:          return failure();
+     5673:  378:        elements.push_back(dstAttr);
+call    0 returned 100%
+        -:  379:      }
+      144:  380:    } else if (srcElemType.isInteger(1)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  381:      return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  382:    } else {
+    83758:  383:      for (IntegerAttr srcAttr : dstElementsAttr.getValues<IntegerAttr>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+call    3 returned 100%
+    41735:  384:        IntegerAttr dstAttr = convertIntegerAttr(
+call    0 returned 100%
+    41735:  385:            srcAttr, dstElemType.cast<IntegerType>(), rewriter);
+call    0 returned 100%
+    41735:  386:        if (!dstAttr)
+branch  0 taken 0%
+branch  1 taken 100%
+    #####:  387:          return failure();
+    41735:  388:        elements.push_back(dstAttr);
+call    0 returned 100%
+        -:  389:      }
+        -:  390:    }
+        -:  391:
+        -:  392:    // Unfortunately, we cannot use dialect-specific types for element
+        -:  393:    // attributes; element attributes only works with builtin types. So we need
+        -:  394:    // to prepare another converted builtin types for the destination elements
+        -:  395:    // attribute.
+      219:  396:    if (dstAttrType.isa<RankedTensorType>())
+call    0 returned 100%
+branch  1 taken 60% (fallthrough)
+branch  2 taken 40%
+      132:  397:      dstAttrType = RankedTensorType::get(dstAttrType.getShape(), dstElemType);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  398:    else
+       87:  399:      dstAttrType = VectorType::get(dstAttrType.getShape(), dstElemType);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  400:
+      219:  401:    dstElementsAttr = DenseElementsAttr::get(dstAttrType, elements);
+call    0 returned 100%
+branch  1 taken 61% (fallthrough)
+branch  2 taken 39%
+        -:  402:  }
+        -:  403:
+      509:  404:  rewriter.replaceOpWithNewOp<spirv::ConstantOp>(constOp, dstType,
+      509:  405:                                                 dstElementsAttr);
+call    0 returned 100%
+      509:  406:  return success();
+        -:  407:}
+        -:  408:
+        -:  409://===----------------------------------------------------------------------===//
+        -:  410:// ConstantOp with scalar type
+        -:  411://===----------------------------------------------------------------------===//
+        -:  412:
+function _ZNK12_GLOBAL__N_123ConstantScalarOpPattern15matchAndRewriteEN4mlir5arith10ConstantOpENS2_17ConstantOpAdaptorERNS1_25ConversionPatternRewriterE called 15765 returned 100% blocks executed 91%
+    15765:  413:LogicalResult ConstantScalarOpPattern::matchAndRewrite(
+        -:  414:    arith::ConstantOp constOp, OpAdaptor adaptor,
+        -:  415:    ConversionPatternRewriter &rewriter) const {
+    15765:  416:  Type srcType = constOp.getType();
+call    0 returned 100%
+    15765:  417:  if (auto shapedType = srcType.dyn_cast<ShapedType>()) {
+call    0 returned 100%
+branch  1 taken 19% (fallthrough)
+branch  2 taken 81%
+     2960:  418:    if (shapedType.getNumElements() != 1)
+call    0 returned 100%
+branch  1 taken 88% (fallthrough)
+branch  2 taken 12%
+     2590:  419:      return failure();
+      370:  420:    srcType = shapedType.getElementType();
+call    0 returned 100%
+        -:  421:  }
+    13175:  422:  if (!srcType.isIntOrIndexOrFloat())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  423:    return failure();
+        -:  424:
+    13175:  425:  Attribute cstAttr = constOp.getValue();
+call    0 returned 100%
+    13175:  426:  if (auto elementsAttr = cstAttr.dyn_cast<DenseElementsAttr>())
+call    0 returned 100%
+branch  1 taken 3% (fallthrough)
+branch  2 taken 97%
+      370:  427:    cstAttr = elementsAttr.getSplatValue<Attribute>();
+call    0 returned 100%
+        -:  428:
+    13175:  429:  Type dstType = getTypeConverter()->convertType(srcType);
+call    0 returned 100%
+    13175:  430:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  431:    return failure();
+        -:  432:
+        -:  433:  // Floating-point types.
+    13175:  434:  if (srcType.isa<FloatType>()) {
+call    0 returned 100%
+branch  1 taken 23% (fallthrough)
+branch  2 taken 77%
+     3058:  435:    auto srcAttr = cstAttr.cast<FloatAttr>();
+call    0 returned 100%
+     3058:  436:    auto dstAttr = srcAttr;
+        -:  437:
+        -:  438:    // Floating-point types not supported in the target environment are all
+        -:  439:    // converted to float type.
+     3058:  440:    if (srcType != dstType) {
+branch  0 taken 45% (fallthrough)
+branch  1 taken 55%
+     1368:  441:      dstAttr = convertFloatAttr(srcAttr, dstType.cast<FloatType>(), rewriter);
+call    0 returned 100%
+call    1 returned 100%
+     1368:  442:      if (!dstAttr)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  443:        return failure();
+        -:  444:    }
+        -:  445:
+     3058:  446:    rewriter.replaceOpWithNewOp<spirv::ConstantOp>(constOp, dstType, dstAttr);
+call    0 returned 100%
+     3058:  447:    return success();
+        -:  448:  }
+        -:  449:
+        -:  450:  // Bool type.
+    10117:  451:  if (srcType.isInteger(1)) {
+call    0 returned 100%
+branch  1 taken 18% (fallthrough)
+branch  2 taken 82%
+        -:  452:    // arith.constant can use 0/1 instead of true/false for i1 values. We need
+        -:  453:    // to handle that here.
+     1779:  454:    auto dstAttr = convertBoolAttr(cstAttr, rewriter);
+call    0 returned 100%
+     1779:  455:    if (!dstAttr)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  456:      return failure();
+     1779:  457:    rewriter.replaceOpWithNewOp<spirv::ConstantOp>(constOp, dstType, dstAttr);
+call    0 returned 100%
+     1779:  458:    return success();
+        -:  459:  }
+        -:  460:
+        -:  461:  // IndexType or IntegerType. Index values are converted to 32-bit integer
+        -:  462:  // values when converting to SPIR-V.
+     8338:  463:  auto srcAttr = cstAttr.cast<IntegerAttr>();
+call    0 returned 100%
+     8338:  464:  auto dstAttr =
+call    0 returned 100%
+     8338:  465:      convertIntegerAttr(srcAttr, dstType.cast<IntegerType>(), rewriter);
+call    0 returned 100%
+     8338:  466:  if (!dstAttr)
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+       25:  467:    return failure();
+     8313:  468:  rewriter.replaceOpWithNewOp<spirv::ConstantOp>(constOp, dstType, dstAttr);
+call    0 returned 100%
+     8313:  469:  return success();
+        -:  470:}
+        -:  471:
+        -:  472://===----------------------------------------------------------------------===//
+        -:  473:// RemSIOpGLPattern
+        -:  474://===----------------------------------------------------------------------===//
+        -:  475:
+        -:  476:/// Returns signed remainder for `lhs` and `rhs` and lets the result follow
+        -:  477:/// the sign of `signOperand`.
+        -:  478:///
+        -:  479:/// Note that this is needed for Vulkan. Per the Vulkan's SPIR-V environment
+        -:  480:/// spec, "for the OpSRem and OpSMod instructions, if either operand is negative
+        -:  481:/// the result is undefined."  So we cannot directly use spirv.SRem/spirv.SMod
+        -:  482:/// if either operand can be negative. Emulate it via spirv.UMod.
+        -:  483:template <typename SignedAbsOp>
+      118:  484:static Value emulateSignedRemainder(Location loc, Value lhs, Value rhs,
+        -:  485:                                    Value signOperand, OpBuilder &builder) {
+     118*:  486:  assert(lhs.getType() == rhs.getType());
+     118*:  487:  assert(lhs == signOperand || rhs == signOperand);
+        -:  488:
+      118:  489:  Type type = lhs.getType();
+        -:  490:
+        -:  491:  // Calculate the remainder with spirv.UMod.
+      118:  492:  Value lhsAbs = builder.create<SignedAbsOp>(loc, type, lhs);
+      118:  493:  Value rhsAbs = builder.create<SignedAbsOp>(loc, type, rhs);
+      118:  494:  Value abs = builder.create<spirv::UModOp>(loc, lhsAbs, rhsAbs);
+        -:  495:
+        -:  496:  // Fix the sign.
+      118:  497:  Value isPositive;
+      118:  498:  if (lhs == signOperand)
+      118:  499:    isPositive = builder.create<spirv::IEqualOp>(loc, lhs, lhsAbs);
+        -:  500:  else
+    #####:  501:    isPositive = builder.create<spirv::IEqualOp>(loc, rhs, rhsAbs);
+      118:  502:  Value absNegate = builder.create<spirv::SNegateOp>(loc, type, abs);
+      118:  503:  return builder.create<spirv::SelectOp>(loc, type, isPositive, abs, absNegate);
+        -:  504:}
+------------------
+_Z22emulateSignedRemainderIN4mlir5spirv8CLSAbsOpEENS0_5ValueENS0_8LocationES3_S3_S3_RNS0_9OpBuilderE:
+function _Z22emulateSignedRemainderIN4mlir5spirv8CLSAbsOpEENS0_5ValueENS0_8LocationES3_S3_S3_RNS0_9OpBuilderE called 59 returned 100% blocks executed 69%
+       59:  484:static Value emulateSignedRemainder(Location loc, Value lhs, Value rhs,
+        -:  485:                                    Value signOperand, OpBuilder &builder) {
+      59*:  486:  assert(lhs.getType() == rhs.getType());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+      59*:  487:  assert(lhs == signOperand || rhs == signOperand);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  488:
+       59:  489:  Type type = lhs.getType();
+call    0 returned 100%
+        -:  490:
+        -:  491:  // Calculate the remainder with spirv.UMod.
+       59:  492:  Value lhsAbs = builder.create<SignedAbsOp>(loc, type, lhs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  493:  Value rhsAbs = builder.create<SignedAbsOp>(loc, type, rhs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  494:  Value abs = builder.create<spirv::UModOp>(loc, lhsAbs, rhsAbs);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  495:
+        -:  496:  // Fix the sign.
+       59:  497:  Value isPositive;
+       59:  498:  if (lhs == signOperand)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       59:  499:    isPositive = builder.create<spirv::IEqualOp>(loc, lhs, lhsAbs);
+call    0 returned 100%
+        -:  500:  else
+    #####:  501:    isPositive = builder.create<spirv::IEqualOp>(loc, rhs, rhsAbs);
+call    0 never executed
+       59:  502:  Value absNegate = builder.create<spirv::SNegateOp>(loc, type, abs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  503:  return builder.create<spirv::SelectOp>(loc, type, isPositive, abs, absNegate);
+call    0 returned 100%
+        -:  504:}
+------------------
+_Z22emulateSignedRemainderIN4mlir5spirv8GLSAbsOpEENS0_5ValueENS0_8LocationES3_S3_S3_RNS0_9OpBuilderE:
+function _Z22emulateSignedRemainderIN4mlir5spirv8GLSAbsOpEENS0_5ValueENS0_8LocationES3_S3_S3_RNS0_9OpBuilderE called 59 returned 100% blocks executed 69%
+       59:  484:static Value emulateSignedRemainder(Location loc, Value lhs, Value rhs,
+        -:  485:                                    Value signOperand, OpBuilder &builder) {
+      59*:  486:  assert(lhs.getType() == rhs.getType());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+      59*:  487:  assert(lhs == signOperand || rhs == signOperand);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  488:
+       59:  489:  Type type = lhs.getType();
+call    0 returned 100%
+        -:  490:
+        -:  491:  // Calculate the remainder with spirv.UMod.
+       59:  492:  Value lhsAbs = builder.create<SignedAbsOp>(loc, type, lhs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  493:  Value rhsAbs = builder.create<SignedAbsOp>(loc, type, rhs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  494:  Value abs = builder.create<spirv::UModOp>(loc, lhsAbs, rhsAbs);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  495:
+        -:  496:  // Fix the sign.
+       59:  497:  Value isPositive;
+       59:  498:  if (lhs == signOperand)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       59:  499:    isPositive = builder.create<spirv::IEqualOp>(loc, lhs, lhsAbs);
+call    0 returned 100%
+        -:  500:  else
+    #####:  501:    isPositive = builder.create<spirv::IEqualOp>(loc, rhs, rhsAbs);
+call    0 never executed
+       59:  502:  Value absNegate = builder.create<spirv::SNegateOp>(loc, type, abs);
+call    0 returned 100%
+call    1 returned 100%
+       59:  503:  return builder.create<spirv::SelectOp>(loc, type, isPositive, abs, absNegate);
+call    0 returned 100%
+        -:  504:}
+------------------
+        -:  505:
+        -:  506:LogicalResult
+function _ZNK12_GLOBAL__N_116RemSIOpGLPattern15matchAndRewriteEN4mlir5arith7RemSIOpENS2_14RemSIOpAdaptorERNS1_25ConversionPatternRewriterE called 59 returned 100% blocks executed 100%
+       59:  507:RemSIOpGLPattern::matchAndRewrite(arith::RemSIOp op, OpAdaptor adaptor,
+        -:  508:                                  ConversionPatternRewriter &rewriter) const {
+       59:  509:  Value result = emulateSignedRemainder<spirv::GLSAbsOp>(
+      118:  510:      op.getLoc(), adaptor.getOperands()[0], adaptor.getOperands()[1],
+call    0 returned 100%
+call    1 returned 100%
+      177:  511:      adaptor.getOperands()[0], rewriter);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+       59:  512:  rewriter.replaceOp(op, result);
+call    0 returned 100%
+call    1 returned 100%
+        -:  513:
+       59:  514:  return success();
+        -:  515:}
+        -:  516:
+        -:  517://===----------------------------------------------------------------------===//
+        -:  518:// RemSIOpCLPattern
+        -:  519://===----------------------------------------------------------------------===//
+        -:  520:
+        -:  521:LogicalResult
+function _ZNK12_GLOBAL__N_116RemSIOpCLPattern15matchAndRewriteEN4mlir5arith7RemSIOpENS2_14RemSIOpAdaptorERNS1_25ConversionPatternRewriterE called 59 returned 100% blocks executed 100%
+       59:  522:RemSIOpCLPattern::matchAndRewrite(arith::RemSIOp op, OpAdaptor adaptor,
+        -:  523:                                  ConversionPatternRewriter &rewriter) const {
+       59:  524:  Value result = emulateSignedRemainder<spirv::CLSAbsOp>(
+      118:  525:      op.getLoc(), adaptor.getOperands()[0], adaptor.getOperands()[1],
+call    0 returned 100%
+call    1 returned 100%
+      177:  526:      adaptor.getOperands()[0], rewriter);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+       59:  527:  rewriter.replaceOp(op, result);
+call    0 returned 100%
+call    1 returned 100%
+        -:  528:
+       59:  529:  return success();
+        -:  530:}
+        -:  531:
+        -:  532://===----------------------------------------------------------------------===//
+        -:  533:// BitwiseOpPattern
+        -:  534://===----------------------------------------------------------------------===//
+        -:  535:
+        -:  536:template <typename Op, typename SPIRVLogicalOp, typename SPIRVBitwiseOp>
+        -:  537:LogicalResult
+      164:  538:BitwiseOpPattern<Op, SPIRVLogicalOp, SPIRVBitwiseOp>::matchAndRewrite(
+        -:  539:    Op op, typename Op::Adaptor adaptor,
+        -:  540:    ConversionPatternRewriter &rewriter) const {
+     164*:  541:  assert(adaptor.getOperands().size() == 2);
+      164:  542:  auto dstType =
+      164:  543:      this->getTypeConverter()->convertType(op.getResult().getType());
+      164:  544:  if (!dstType)
+      164:  545:    return failure();
+      164:  546:  if (isBoolScalarOrVector(adaptor.getOperands().front().getType())) {
+      108:  547:    rewriter.template replaceOpWithNewOp<SPIRVLogicalOp>(op, dstType,
+        -:  548:                                                         adaptor.getOperands());
+        -:  549:  } else {
+       56:  550:    rewriter.template replaceOpWithNewOp<SPIRVBitwiseOp>(op, dstType,
+        -:  551:                                                         adaptor.getOperands());
+        -:  552:  }
+      164:  553:  return success();
+        -:  554:}
+------------------
+_ZNK12_GLOBAL__N_116BitwiseOpPatternIN4mlir5arith6AndIOpENS1_5spirv12LogicalAndOpENS4_12BitwiseAndOpEE15matchAndRewriteES3_NS2_13AndIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116BitwiseOpPatternIN4mlir5arith6AndIOpENS1_5spirv12LogicalAndOpENS4_12BitwiseAndOpEE15matchAndRewriteES3_NS2_13AndIOpAdaptorERNS1_25ConversionPatternRewriterE called 87 returned 100% blocks executed 89%
+       87:  538:BitwiseOpPattern<Op, SPIRVLogicalOp, SPIRVBitwiseOp>::matchAndRewrite(
+        -:  539:    Op op, typename Op::Adaptor adaptor,
+        -:  540:    ConversionPatternRewriter &rewriter) const {
+      87*:  541:  assert(adaptor.getOperands().size() == 2);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+       87:  542:  auto dstType =
+call    0 returned 100%
+call    1 returned 100%
+       87:  543:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 returned 100%
+       87:  544:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       87:  545:    return failure();
+       87:  546:  if (isBoolScalarOrVector(adaptor.getOperands().front().getType())) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 74% (fallthrough)
+branch  4 taken 26%
+       64:  547:    rewriter.template replaceOpWithNewOp<SPIRVLogicalOp>(op, dstType,
+call    0 returned 100%
+call    1 returned 100%
+        -:  548:                                                         adaptor.getOperands());
+        -:  549:  } else {
+       23:  550:    rewriter.template replaceOpWithNewOp<SPIRVBitwiseOp>(op, dstType,
+call    0 returned 100%
+call    1 returned 100%
+        -:  551:                                                         adaptor.getOperands());
+        -:  552:  }
+       87:  553:  return success();
+        -:  554:}
+------------------
+_ZNK12_GLOBAL__N_116BitwiseOpPatternIN4mlir5arith5OrIOpENS1_5spirv11LogicalOrOpENS4_11BitwiseOrOpEE15matchAndRewriteES3_NS2_12OrIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116BitwiseOpPatternIN4mlir5arith5OrIOpENS1_5spirv11LogicalOrOpENS4_11BitwiseOrOpEE15matchAndRewriteES3_NS2_12OrIOpAdaptorERNS1_25ConversionPatternRewriterE called 77 returned 100% blocks executed 89%
+       77:  538:BitwiseOpPattern<Op, SPIRVLogicalOp, SPIRVBitwiseOp>::matchAndRewrite(
+        -:  539:    Op op, typename Op::Adaptor adaptor,
+        -:  540:    ConversionPatternRewriter &rewriter) const {
+      77*:  541:  assert(adaptor.getOperands().size() == 2);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+       77:  542:  auto dstType =
+call    0 returned 100%
+call    1 returned 100%
+       77:  543:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 returned 100%
+       77:  544:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       77:  545:    return failure();
+       77:  546:  if (isBoolScalarOrVector(adaptor.getOperands().front().getType())) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 57% (fallthrough)
+branch  4 taken 43%
+       44:  547:    rewriter.template replaceOpWithNewOp<SPIRVLogicalOp>(op, dstType,
+call    0 returned 100%
+call    1 returned 100%
+        -:  548:                                                         adaptor.getOperands());
+        -:  549:  } else {
+       33:  550:    rewriter.template replaceOpWithNewOp<SPIRVBitwiseOp>(op, dstType,
+call    0 returned 100%
+call    1 returned 100%
+        -:  551:                                                         adaptor.getOperands());
+        -:  552:  }
+       77:  553:  return success();
+        -:  554:}
+------------------
+        -:  555:
+        -:  556://===----------------------------------------------------------------------===//
+        -:  557:// XOrIOpLogicalPattern
+        -:  558://===----------------------------------------------------------------------===//
+        -:  559:
+function _ZNK12_GLOBAL__N_120XOrIOpLogicalPattern15matchAndRewriteEN4mlir5arith6XOrIOpENS2_13XOrIOpAdaptorERNS1_25ConversionPatternRewriterE called 8 returned 100% blocks executed 80%
+        8:  560:LogicalResult XOrIOpLogicalPattern::matchAndRewrite(
+        -:  561:    arith::XOrIOp op, OpAdaptor adaptor,
+        -:  562:    ConversionPatternRewriter &rewriter) const {
+       8*:  563:  assert(adaptor.getOperands().size() == 2);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+        -:  564:
+        8:  565:  if (isBoolScalarOrVector(adaptor.getOperands().front().getType()))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  566:    return failure();
+        -:  567:
+        8:  568:  auto dstType = getTypeConverter()->convertType(op.getType());
+call    0 returned 100%
+        8:  569:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  570:    return failure();
+        8:  571:  rewriter.replaceOpWithNewOp<spirv::BitwiseXorOp>(op, dstType,
+        8:  572:                                                   adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+        -:  573:
+        8:  574:  return success();
+        -:  575:}
+        -:  576:
+        -:  577://===----------------------------------------------------------------------===//
+        -:  578:// XOrIOpBooleanPattern
+        -:  579://===----------------------------------------------------------------------===//
+        -:  580:
+function _ZNK12_GLOBAL__N_120XOrIOpBooleanPattern15matchAndRewriteEN4mlir5arith6XOrIOpENS2_13XOrIOpAdaptorERNS1_25ConversionPatternRewriterE called 23 returned 100% blocks executed 87%
+       23:  581:LogicalResult XOrIOpBooleanPattern::matchAndRewrite(
+        -:  582:    arith::XOrIOp op, OpAdaptor adaptor,
+        -:  583:    ConversionPatternRewriter &rewriter) const {
+      23*:  584:  assert(adaptor.getOperands().size() == 2);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+        -:  585:
+       23:  586:  if (!isBoolScalarOrVector(adaptor.getOperands().front().getType()))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 35% (fallthrough)
+branch  4 taken 65%
+        8:  587:    return failure();
+        -:  588:
+       15:  589:  auto dstType = getTypeConverter()->convertType(op.getType());
+call    0 returned 100%
+       15:  590:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  591:    return failure();
+       15:  592:  rewriter.replaceOpWithNewOp<spirv::LogicalNotEqualOp>(op, dstType,
+       15:  593:                                                        adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+       15:  594:  return success();
+        -:  595:}
+        -:  596:
+        -:  597://===----------------------------------------------------------------------===//
+        -:  598:// UIToFPI1Pattern
+        -:  599://===----------------------------------------------------------------------===//
+        -:  600:
+        -:  601:LogicalResult
+function _ZNK12_GLOBAL__N_115UIToFPI1Pattern15matchAndRewriteEN4mlir5arith8UIToFPOpENS2_15UIToFPOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  602:UIToFPI1Pattern::matchAndRewrite(arith::UIToFPOp op, OpAdaptor adaptor,
+        -:  603:                                 ConversionPatternRewriter &rewriter) const {
+    #####:  604:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  605:  if (!isBoolScalarOrVector(srcType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  606:    return failure();
+        -:  607:
+    #####:  608:  auto dstType =
+    #####:  609:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  610:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  611:  Value zero = spirv::ConstantOp::getZero(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  612:  Value one = spirv::ConstantOp::getOne(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  613:  rewriter.template replaceOpWithNewOp<spirv::SelectOp>(
+    #####:  614:      op, dstType, adaptor.getOperands().front(), one, zero);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  615:  return success();
+        -:  616:}
+        -:  617:
+        -:  618://===----------------------------------------------------------------------===//
+        -:  619:// ExtUII1Pattern
+        -:  620://===----------------------------------------------------------------------===//
+        -:  621:
+        -:  622:LogicalResult
+function _ZNK12_GLOBAL__N_114ExtUII1Pattern15matchAndRewriteEN4mlir5arith7ExtUIOpENS2_14ExtUIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  623:ExtUII1Pattern::matchAndRewrite(arith::ExtUIOp op, OpAdaptor adaptor,
+        -:  624:                                ConversionPatternRewriter &rewriter) const {
+    #####:  625:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  626:  if (!isBoolScalarOrVector(srcType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  627:    return failure();
+        -:  628:
+    #####:  629:  auto dstType =
+    #####:  630:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  631:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  632:  Value zero = spirv::ConstantOp::getZero(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  633:  Value one = spirv::ConstantOp::getOne(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  634:  rewriter.template replaceOpWithNewOp<spirv::SelectOp>(
+    #####:  635:      op, dstType, adaptor.getOperands().front(), one, zero);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  636:  return success();
+        -:  637:}
+        -:  638:
+        -:  639://===----------------------------------------------------------------------===//
+        -:  640:// TruncII1Pattern
+        -:  641://===----------------------------------------------------------------------===//
+        -:  642:
+        -:  643:LogicalResult
+function _ZNK12_GLOBAL__N_115TruncII1Pattern15matchAndRewriteEN4mlir5arith8TruncIOpENS2_15TruncIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  644:TruncII1Pattern::matchAndRewrite(arith::TruncIOp op, OpAdaptor adaptor,
+        -:  645:                                 ConversionPatternRewriter &rewriter) const {
+    #####:  646:  auto dstType =
+    #####:  647:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  648:  if (!isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  649:    return failure();
+        -:  650:
+    #####:  651:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  652:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  653:  // Check if (x & 1) == 1.
+    #####:  654:  Value mask = spirv::ConstantOp::getOne(srcType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  655:  Value maskedSrc = rewriter.create<spirv::BitwiseAndOp>(
+    #####:  656:      loc, srcType, adaptor.getOperands()[0], mask);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  657:  Value isOne = rewriter.create<spirv::IEqualOp>(loc, maskedSrc, mask);
+call    0 never executed
+call    1 never executed
+        -:  658:
+    #####:  659:  Value zero = spirv::ConstantOp::getZero(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  660:  Value one = spirv::ConstantOp::getOne(dstType, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  661:  rewriter.replaceOpWithNewOp<spirv::SelectOp>(op, dstType, isOne, one, zero);
+call    0 never executed
+    #####:  662:  return success();
+        -:  663:}
+        -:  664:
+        -:  665://===----------------------------------------------------------------------===//
+        -:  666:// TypeCastingOpPattern
+        -:  667://===----------------------------------------------------------------------===//
+        -:  668:
+        -:  669:template <typename Op, typename SPIRVOp>
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+    #####:  675:  auto dstType =
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith7ExtUIOpENS1_5spirv10UConvertOpEE15matchAndRewriteES3_NS2_14ExtUIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith7ExtUIOpENS1_5spirv10UConvertOpEE15matchAndRewriteES3_NS2_14ExtUIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith7ExtSIOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_14ExtSIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith7ExtSIOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_14ExtSIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith6ExtFOpENS1_5spirv10FConvertOpEE15matchAndRewriteES3_NS2_13ExtFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith6ExtFOpENS1_5spirv10FConvertOpEE15matchAndRewriteES3_NS2_13ExtFOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8TruncIOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_15TruncIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8TruncIOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_15TruncIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8TruncFOpENS1_5spirv10FConvertOpEE15matchAndRewriteES3_NS2_15TruncFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8TruncFOpENS1_5spirv10FConvertOpEE15matchAndRewriteES3_NS2_15TruncFOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8UIToFPOpENS1_5spirv13ConvertUToFOpEE15matchAndRewriteES3_NS2_15UIToFPOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8UIToFPOpENS1_5spirv13ConvertUToFOpEE15matchAndRewriteES3_NS2_15UIToFPOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8SIToFPOpENS1_5spirv13ConvertSToFOpEE15matchAndRewriteES3_NS2_15SIToFPOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8SIToFPOpENS1_5spirv13ConvertSToFOpEE15matchAndRewriteES3_NS2_15SIToFPOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8FPToSIOpENS1_5spirv13ConvertFToSOpEE15matchAndRewriteES3_NS2_15FPToSIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith8FPToSIOpENS1_5spirv13ConvertFToSOpEE15matchAndRewriteES3_NS2_15FPToSIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith11IndexCastOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_18IndexCastOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith11IndexCastOpENS1_5spirv10SConvertOpEE15matchAndRewriteES3_NS2_18IndexCastOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith13IndexCastUIOpENS1_5spirv10UConvertOpEE15matchAndRewriteES3_NS2_20IndexCastUIOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith13IndexCastUIOpENS1_5spirv10UConvertOpEE15matchAndRewriteES3_NS2_20IndexCastUIOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+_ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith9BitcastOpENS1_5spirv9BitcastOpEE15matchAndRewriteES3_NS2_16BitcastOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_120TypeCastingOpPatternIN4mlir5arith9BitcastOpENS1_5spirv9BitcastOpEE15matchAndRewriteES3_NS2_16BitcastOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  670:LogicalResult TypeCastingOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  671:    Op op, typename Op::Adaptor adaptor,
+        -:  672:    ConversionPatternRewriter &rewriter) const {
+    #####:  673:  assert(adaptor.getOperands().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  674:  auto srcType = adaptor.getOperands().front().getType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  675:  auto dstType =
+call    0 never executed
+    #####:  676:      this->getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  677:  if (isBoolScalarOrVector(srcType) || isBoolScalarOrVector(dstType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  678:    return failure();
+    #####:  679:  if (dstType == srcType) {
+branch  0 never executed
+branch  1 never executed
+        -:  680:    // Due to type conversion, we are seeing the same source and target type.
+        -:  681:    // Then we can just erase this operation by forwarding its operand.
+    #####:  682:    rewriter.replaceOp(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  683:  } else {
+    #####:  684:    rewriter.template replaceOpWithNewOp<SPIRVOp>(op, dstType,
+call    0 never executed
+call    1 never executed
+        -:  685:                                                  adaptor.getOperands());
+        -:  686:  }
+    #####:  687:  return success();
+        -:  688:}
+------------------
+        -:  689:
+        -:  690://===----------------------------------------------------------------------===//
+        -:  691:// CmpIOpBooleanPattern
+        -:  692://===----------------------------------------------------------------------===//
+        -:  693:
+function _ZNK12_GLOBAL__N_120CmpIOpBooleanPattern15matchAndRewriteEN4mlir5arith6CmpIOpENS2_13CmpIOpAdaptorERNS1_25ConversionPatternRewriterE called 37 returned 100% blocks executed 31%
+       37:  694:LogicalResult CmpIOpBooleanPattern::matchAndRewrite(
+        -:  695:    arith::CmpIOp op, OpAdaptor adaptor,
+        -:  696:    ConversionPatternRewriter &rewriter) const {
+       37:  697:  Type srcType = op.getLhs().getType();
+call    0 returned 100%
+call    1 returned 100%
+       37:  698:  if (!isBoolScalarOrVector(srcType))
+call    0 returned 100%
+branch  1 taken 84% (fallthrough)
+branch  2 taken 16%
+       31:  699:    return failure();
+        6:  700:  Type dstType = getTypeConverter()->convertType(srcType);
+call    0 returned 100%
+        6:  701:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  702:    return failure();
+        -:  703:
+        6:  704:  switch (op.getPredicate()) {
+call    0 returned 100%
+branch  1 taken 0%
+branch  2 taken 0%
+branch  3 taken 0%
+branch  4 taken 100%
+    #####:  705:  case arith::CmpIPredicate::eq: {
+    #####:  706:    rewriter.replaceOpWithNewOp<spirv::LogicalEqualOp>(op, adaptor.getLhs(),
+call    0 never executed
+    #####:  707:                                                       adaptor.getRhs());
+call    0 never executed
+call    1 never executed
+    #####:  708:    return success();
+        -:  709:  }
+    #####:  710:  case arith::CmpIPredicate::ne: {
+    #####:  711:    rewriter.replaceOpWithNewOp<spirv::LogicalNotEqualOp>(op, adaptor.getLhs(),
+call    0 never executed
+    #####:  712:                                                          adaptor.getRhs());
+call    0 never executed
+call    1 never executed
+    #####:  713:    return success();
+        -:  714:  }
+    #####:  715:  case arith::CmpIPredicate::uge:
+    #####:  716:  case arith::CmpIPredicate::ugt:
+    #####:  717:  case arith::CmpIPredicate::ule:
+    #####:  718:  case arith::CmpIPredicate::ult: {
+        -:  719:    // There are no direct corresponding instructions in SPIR-V for such cases.
+        -:  720:    // Extend them to 32-bit and do comparision then.
+    #####:  721:    Type type = rewriter.getI32Type();
+call    0 never executed
+    #####:  722:    if (auto vectorType = dstType.dyn_cast<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  723:      type = VectorType::get(vectorType.getShape(), type);
+call    0 never executed
+call    1 never executed
+    #####:  724:    auto extLhs =
+    #####:  725:        rewriter.create<arith::ExtUIOp>(op.getLoc(), type, adaptor.getLhs());
+call    0 never executed
+call    1 never executed
+    #####:  726:    auto extRhs =
+    #####:  727:        rewriter.create<arith::ExtUIOp>(op.getLoc(), type, adaptor.getRhs());
+call    0 never executed
+call    1 never executed
+        -:  728:
+    #####:  729:    rewriter.replaceOpWithNewOp<arith::CmpIOp>(op, op.getPredicate(), extLhs,
+    #####:  730:                                               extRhs);
+call    0 never executed
+call    1 never executed
+    #####:  731:    return success();
+        -:  732:  }
+        6:  733:  default:
+        6:  734:    break;
+        -:  735:  }
+        6:  736:  return failure();
+        -:  737:}
+        -:  738:
+        -:  739://===----------------------------------------------------------------------===//
+        -:  740:// CmpIOpPattern
+        -:  741://===----------------------------------------------------------------------===//
+        -:  742:
+        -:  743:LogicalResult
+function _ZNK12_GLOBAL__N_113CmpIOpPattern15matchAndRewriteEN4mlir5arith6CmpIOpENS2_13CmpIOpAdaptorERNS1_25ConversionPatternRewriterE called 58 returned 100% blocks executed 45%
+       58:  744:CmpIOpPattern::matchAndRewrite(arith::CmpIOp op, OpAdaptor adaptor,
+        -:  745:                               ConversionPatternRewriter &rewriter) const {
+       58:  746:  Type srcType = op.getLhs().getType();
+call    0 returned 100%
+call    1 returned 100%
+       58:  747:  if (isBoolScalarOrVector(srcType))
+call    0 returned 100%
+branch  1 taken 10% (fallthrough)
+branch  2 taken 90%
+        6:  748:    return failure();
+       52:  749:  Type dstType = getTypeConverter()->convertType(srcType);
+call    0 returned 100%
+       52:  750:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  751:    return failure();
+        -:  752:
+       52:  753:  switch (op.getPredicate()) {
+call    0 returned 100%
+branch  1 taken 0%
+branch  2 taken 0%
+branch  3 taken 21%
+branch  4 taken 10%
+branch  5 taken 10%
+branch  6 taken 0%
+branch  7 taken 0%
+branch  8 taken 8%
+branch  9 taken 52%
+branch 10 taken 0%
+branch 11 taken 0%
+        -:  754:#define DISPATCH(cmpPredicate, spirvOp)                                        \
+        -:  755:  case cmpPredicate:                                                           \
+        -:  756:    if (spirvOp::template hasTrait<OpTrait::spirv::UnsignedOp>() &&            \
+        -:  757:        srcType != dstType && !hasSameBitwidth(srcType, dstType)) {            \
+        -:  758:      return op.emitError(                                                     \
+        -:  759:          "bitwidth emulation is not implemented yet on unsigned op");         \
+        -:  760:    }                                                                          \
+        -:  761:    rewriter.replaceOpWithNewOp<spirvOp>(op, adaptor.getLhs(),                 \
+        -:  762:                                         adaptor.getRhs());                    \
+        -:  763:    return success();
+        -:  764:
+    #####:  765:    DISPATCH(arith::CmpIPredicate::eq, spirv::IEqualOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  766:    DISPATCH(arith::CmpIPredicate::ne, spirv::INotEqualOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+       11:  767:    DISPATCH(arith::CmpIPredicate::slt, spirv::SLessThanOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        5:  768:    DISPATCH(arith::CmpIPredicate::sle, spirv::SLessThanEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       5*:  769:    DISPATCH(arith::CmpIPredicate::sgt, spirv::SGreaterThanOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    #####:  770:    DISPATCH(arith::CmpIPredicate::sge, spirv::SGreaterThanEqualOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  771:    DISPATCH(arith::CmpIPredicate::ult, spirv::ULessThanOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+       4*:  772:    DISPATCH(arith::CmpIPredicate::ule, spirv::ULessThanEqualOp);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+      27*:  773:    DISPATCH(arith::CmpIPredicate::ugt, spirv::UGreaterThanOp);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+    #####:  774:    DISPATCH(arith::CmpIPredicate::uge, spirv::UGreaterThanEqualOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -:  775:
+        -:  776:#undef DISPATCH
+        -:  777:  }
+    #####:  778:  return failure();
+        -:  779:}
+        -:  780:
+        -:  781://===----------------------------------------------------------------------===//
+        -:  782:// CmpFOpPattern
+        -:  783://===----------------------------------------------------------------------===//
+        -:  784:
+        -:  785:LogicalResult
+function _ZNK12_GLOBAL__N_113CmpFOpPattern15matchAndRewriteEN4mlir5arith6CmpFOpENS2_13CmpFOpAdaptorERNS1_25ConversionPatternRewriterE called 128 returned 100% blocks executed 77%
+      128:  786:CmpFOpPattern::matchAndRewrite(arith::CmpFOp op, OpAdaptor adaptor,
+        -:  787:                               ConversionPatternRewriter &rewriter) const {
+      128:  788:  switch (op.getPredicate()) {
+call    0 returned 100%
+branch  1 taken 12%
+branch  2 taken 38%
+branch  3 taken 3%
+branch  4 taken 0%
+branch  5 taken 6%
+branch  6 taken 5%
+branch  7 taken 6%
+branch  8 taken 0%
+branch  9 taken 0%
+branch 10 taken 7%
+branch 11 taken 8%
+branch 12 taken 5%
+branch 13 taken 10%
+        -:  789:#define DISPATCH(cmpPredicate, spirvOp)                                        \
+        -:  790:  case cmpPredicate:                                                           \
+        -:  791:    rewriter.replaceOpWithNewOp<spirvOp>(op, adaptor.getLhs(),                 \
+        -:  792:                                         adaptor.getRhs());                    \
+        -:  793:    return success();
+        -:  794:
+        -:  795:    // Ordered.
+       15:  796:    DISPATCH(arith::CmpFPredicate::OEQ, spirv::FOrdEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       48:  797:    DISPATCH(arith::CmpFPredicate::OGT, spirv::FOrdGreaterThanOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       4*:  798:    DISPATCH(arith::CmpFPredicate::OGE, spirv::FOrdGreaterThanEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    #####:  799:    DISPATCH(arith::CmpFPredicate::OLT, spirv::FOrdLessThanOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        8:  800:    DISPATCH(arith::CmpFPredicate::OLE, spirv::FOrdLessThanEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        6:  801:    DISPATCH(arith::CmpFPredicate::ONE, spirv::FOrdNotEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  802:    // Unordered.
+       8*:  803:    DISPATCH(arith::CmpFPredicate::UEQ, spirv::FUnordEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    #####:  804:    DISPATCH(arith::CmpFPredicate::UGT, spirv::FUnordGreaterThanOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  805:    DISPATCH(arith::CmpFPredicate::UGE, spirv::FUnordGreaterThanEqualOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        9:  806:    DISPATCH(arith::CmpFPredicate::ULT, spirv::FUnordLessThanOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       10:  807:    DISPATCH(arith::CmpFPredicate::ULE, spirv::FUnordLessThanEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        7:  808:    DISPATCH(arith::CmpFPredicate::UNE, spirv::FUnordNotEqualOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  809:
+        -:  810:#undef DISPATCH
+        -:  811:
+       13:  812:  default:
+       13:  813:    break;
+        -:  814:  }
+       13:  815:  return failure();
+        -:  816:}
+        -:  817:
+        -:  818://===----------------------------------------------------------------------===//
+        -:  819:// CmpFOpNanKernelPattern
+        -:  820://===----------------------------------------------------------------------===//
+        -:  821:
+function _ZNK12_GLOBAL__N_122CmpFOpNanKernelPattern15matchAndRewriteEN4mlir5arith6CmpFOpENS2_13CmpFOpAdaptorERNS1_25ConversionPatternRewriterE called 128 returned 100% blocks executed 100%
+      128:  822:LogicalResult CmpFOpNanKernelPattern::matchAndRewrite(
+        -:  823:    arith::CmpFOp op, OpAdaptor adaptor,
+        -:  824:    ConversionPatternRewriter &rewriter) const {
+      128:  825:  if (op.getPredicate() == arith::CmpFPredicate::ORD) {
+call    0 returned 100%
+branch  1 taken 5% (fallthrough)
+branch  2 taken 95%
+        7:  826:    rewriter.replaceOpWithNewOp<spirv::OrderedOp>(op, adaptor.getLhs(),
+call    0 returned 100%
+       14:  827:                                                  adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+        7:  828:    return success();
+        -:  829:  }
+        -:  830:
+      121:  831:  if (op.getPredicate() == arith::CmpFPredicate::UNO) {
+call    0 returned 100%
+branch  1 taken 2% (fallthrough)
+branch  2 taken 98%
+        2:  832:    rewriter.replaceOpWithNewOp<spirv::UnorderedOp>(op, adaptor.getLhs(),
+call    0 returned 100%
+        4:  833:                                                    adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+        2:  834:    return success();
+        -:  835:  }
+        -:  836:
+      119:  837:  return failure();
+        -:  838:}
+        -:  839:
+        -:  840://===----------------------------------------------------------------------===//
+        -:  841:// CmpFOpNanNonePattern
+        -:  842://===----------------------------------------------------------------------===//
+        -:  843:
+function _ZNK12_GLOBAL__N_120CmpFOpNanNonePattern15matchAndRewriteEN4mlir5arith6CmpFOpENS2_13CmpFOpAdaptorERNS1_25ConversionPatternRewriterE called 13 returned 100% blocks executed 77%
+       13:  844:LogicalResult CmpFOpNanNonePattern::matchAndRewrite(
+        -:  845:    arith::CmpFOp op, OpAdaptor adaptor,
+        -:  846:    ConversionPatternRewriter &rewriter) const {
+       19:  847:  if (op.getPredicate() != arith::CmpFPredicate::ORD &&
+call    0 returned 100%
+branch  1 taken 46% (fallthrough)
+branch  2 taken 54%
+branch  3 taken 67% (fallthrough)
+branch  4 taken 33%
+        6:  848:      op.getPredicate() != arith::CmpFPredicate::UNO)
+call    0 returned 100%
+        4:  849:    return failure();
+        -:  850:
+        9:  851:  Location loc = op.getLoc();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        9:  852:  auto *converter = getTypeConverter<SPIRVTypeConverter>();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  853:
+        9:  854:  Value replace;
+        9:  855:  if (converter->getOptions().enableFastMathMode) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  856:    if (op.getPredicate() == arith::CmpFPredicate::ORD) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  857:      // Ordered comparsion checks if neither operand is NaN.
+    #####:  858:      replace = spirv::ConstantOp::getOne(op.getType(), loc, rewriter);
+call    0 never executed
+        -:  859:    } else {
+        -:  860:      // Unordered comparsion checks if either operand is NaN.
+    #####:  861:      replace = spirv::ConstantOp::getZero(op.getType(), loc, rewriter);
+call    0 never executed
+        -:  862:    }
+        -:  863:  } else {
+        9:  864:    Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        9:  865:    Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  866:
+        9:  867:    replace = rewriter.create<spirv::LogicalOrOp>(loc, lhsIsNan, rhsIsNan);
+call    0 returned 100%
+call    1 returned 100%
+        9:  868:    if (op.getPredicate() == arith::CmpFPredicate::ORD)
+call    0 returned 100%
+branch  1 taken 78% (fallthrough)
+branch  2 taken 22%
+        7:  869:      replace = rewriter.create<spirv::LogicalNotOp>(loc, replace);
+call    0 returned 100%
+        -:  870:  }
+        -:  871:
+        9:  872:  rewriter.replaceOp(op, replace);
+call    0 returned 100%
+call    1 returned 100%
+        9:  873:  return success();
+        -:  874:}
+        -:  875:
+        -:  876://===----------------------------------------------------------------------===//
+        -:  877:// AddICarryOpPattern
+        -:  878://===----------------------------------------------------------------------===//
+        -:  879:
+        -:  880:LogicalResult
+function _ZNK12_GLOBAL__N_118AddICarryOpPattern15matchAndRewriteEN4mlir5arith12AddUICarryOpENS2_19AddUICarryOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  881:AddICarryOpPattern::matchAndRewrite(arith::AddUICarryOp op, OpAdaptor adaptor,
+        -:  882:                                    ConversionPatternRewriter &rewriter) const {
+    #####:  883:  Type dstElemTy = adaptor.getLhs().getType();
+call    0 never executed
+call    1 never executed
+    #####:  884:  Location loc = op->getLoc();
+call    0 never executed
+    #####:  885:  Value result = rewriter.create<spirv::IAddCarryOp>(loc, adaptor.getLhs(),
+call    0 never executed
+    #####:  886:                                                     adaptor.getRhs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  887:
+    #####:  888:  Value sumResult = rewriter.create<spirv::CompositeExtractOp>(
+    #####:  889:      loc, result, llvm::makeArrayRef(0));
+call    0 never executed
+call    1 never executed
+    #####:  890:  Value carryValue = rewriter.create<spirv::CompositeExtractOp>(
+    #####:  891:      loc, result, llvm::makeArrayRef(1));
+call    0 never executed
+call    1 never executed
+        -:  892:
+        -:  893:  // Convert the carry value to boolean.
+    #####:  894:  Value one = spirv::ConstantOp::getOne(dstElemTy, loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  895:  Value carryResult = rewriter.create<spirv::IEqualOp>(loc, carryValue, one);
+call    0 never executed
+call    1 never executed
+        -:  896:
+    #####:  897:  rewriter.replaceOp(op, {sumResult, carryResult});
+call    0 never executed
+call    1 never executed
+    #####:  898:  return success();
+        -:  899:}
+        -:  900:
+        -:  901://===----------------------------------------------------------------------===//
+        -:  902:// SelectOpPattern
+        -:  903://===----------------------------------------------------------------------===//
+        -:  904:
+        -:  905:LogicalResult
+function _ZNK12_GLOBAL__N_115SelectOpPattern15matchAndRewriteEN4mlir5arith8SelectOpENS2_15SelectOpAdaptorERNS1_25ConversionPatternRewriterE called 33 returned 100% blocks executed 100%
+       33:  906:SelectOpPattern::matchAndRewrite(arith::SelectOp op, OpAdaptor adaptor,
+        -:  907:                                 ConversionPatternRewriter &rewriter) const {
+       33:  908:  rewriter.replaceOpWithNewOp<spirv::SelectOp>(op, adaptor.getCondition(),
+call    0 returned 100%
+       33:  909:                                               adaptor.getTrueValue(),
+call    0 returned 100%
+       66:  910:                                               adaptor.getFalseValue());
+call    0 returned 100%
+call    1 returned 100%
+       33:  911:  return success();
+        -:  912:}
+        -:  913:
+        -:  914://===----------------------------------------------------------------------===//
+        -:  915:// MaxFOpPattern
+        -:  916://===----------------------------------------------------------------------===//
+        -:  917:
+        -:  918:template <typename Op, typename SPIRVOp>
+       98:  919:LogicalResult MinMaxFOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  920:    Op op, typename Op::Adaptor adaptor,
+        -:  921:    ConversionPatternRewriter &rewriter) const {
+       98:  922:  auto *converter = this->template getTypeConverter<SPIRVTypeConverter>();
+       98:  923:  auto dstType = converter->convertType(op.getType());
+       98:  924:  if (!dstType)
+       98:  925:    return failure();
+        -:  926:
+        -:  927:  // arith.maxf/minf:
+        -:  928:  //   "if one of the arguments is NaN, then the result is also NaN."
+        -:  929:  // spirv.GL.FMax/FMin
+        -:  930:  //   "which operand is the result is undefined if one of the operands
+        -:  931:  //   is a NaN."
+        -:  932:  // spirv.CL.fmax/fmin:
+        -:  933:  //   "If one argument is a NaN, Fmin returns the other argument."
+        -:  934:
+       98:  935:  Location loc = op.getLoc();
+       98:  936:  Value spirvOp = rewriter.create<SPIRVOp>(loc, dstType, adaptor.getOperands());
+        -:  937:
+       98:  938:  if (converter->getOptions().enableFastMathMode) {
+    #####:  939:    rewriter.replaceOp(op, spirvOp);
+       98:  940:    return success();
+        -:  941:  }
+        -:  942:
+       98:  943:  Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+       98:  944:  Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+        -:  945:
+       98:  946:  Value select1 = rewriter.create<spirv::SelectOp>(loc, dstType, lhsIsNan,
+        -:  947:                                                   adaptor.getLhs(), spirvOp);
+       98:  948:  Value select2 = rewriter.create<spirv::SelectOp>(loc, dstType, rhsIsNan,
+        -:  949:                                                   adaptor.getRhs(), select1);
+        -:  950:
+       98:  951:  rewriter.replaceOp(op, select2);
+       98:  952:  return success();
+        -:  953:}
+------------------
+_ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MaxFOpENS1_5spirv8GLFMaxOpEE15matchAndRewriteES3_NS2_13MaxFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MaxFOpENS1_5spirv8GLFMaxOpEE15matchAndRewriteES3_NS2_13MaxFOpAdaptorERNS1_25ConversionPatternRewriterE called 28 returned 100% blocks executed 81%
+       28:  919:LogicalResult MinMaxFOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  920:    Op op, typename Op::Adaptor adaptor,
+        -:  921:    ConversionPatternRewriter &rewriter) const {
+       28:  922:  auto *converter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 returned 100%
+       28:  923:  auto dstType = converter->convertType(op.getType());
+call    0 returned 100%
+       28:  924:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       28:  925:    return failure();
+        -:  926:
+        -:  927:  // arith.maxf/minf:
+        -:  928:  //   "if one of the arguments is NaN, then the result is also NaN."
+        -:  929:  // spirv.GL.FMax/FMin
+        -:  930:  //   "which operand is the result is undefined if one of the operands
+        -:  931:  //   is a NaN."
+        -:  932:  // spirv.CL.fmax/fmin:
+        -:  933:  //   "If one argument is a NaN, Fmin returns the other argument."
+        -:  934:
+       28:  935:  Location loc = op.getLoc();
+call    0 returned 100%
+       28:  936:  Value spirvOp = rewriter.create<SPIRVOp>(loc, dstType, adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  937:
+       28:  938:  if (converter->getOptions().enableFastMathMode) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  939:    rewriter.replaceOp(op, spirvOp);
+call    0 never executed
+       28:  940:    return success();
+        -:  941:  }
+        -:  942:
+       28:  943:  Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       28:  944:  Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  945:
+       28:  946:  Value select1 = rewriter.create<spirv::SelectOp>(loc, dstType, lhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  947:                                                   adaptor.getLhs(), spirvOp);
+       28:  948:  Value select2 = rewriter.create<spirv::SelectOp>(loc, dstType, rhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  949:                                                   adaptor.getRhs(), select1);
+        -:  950:
+       28:  951:  rewriter.replaceOp(op, select2);
+call    0 returned 100%
+       28:  952:  return success();
+        -:  953:}
+------------------
+_ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MinFOpENS1_5spirv8GLFMinOpEE15matchAndRewriteES3_NS2_13MinFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MinFOpENS1_5spirv8GLFMinOpEE15matchAndRewriteES3_NS2_13MinFOpAdaptorERNS1_25ConversionPatternRewriterE called 21 returned 100% blocks executed 81%
+       21:  919:LogicalResult MinMaxFOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  920:    Op op, typename Op::Adaptor adaptor,
+        -:  921:    ConversionPatternRewriter &rewriter) const {
+       21:  922:  auto *converter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 returned 100%
+       21:  923:  auto dstType = converter->convertType(op.getType());
+call    0 returned 100%
+       21:  924:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       21:  925:    return failure();
+        -:  926:
+        -:  927:  // arith.maxf/minf:
+        -:  928:  //   "if one of the arguments is NaN, then the result is also NaN."
+        -:  929:  // spirv.GL.FMax/FMin
+        -:  930:  //   "which operand is the result is undefined if one of the operands
+        -:  931:  //   is a NaN."
+        -:  932:  // spirv.CL.fmax/fmin:
+        -:  933:  //   "If one argument is a NaN, Fmin returns the other argument."
+        -:  934:
+       21:  935:  Location loc = op.getLoc();
+call    0 returned 100%
+       21:  936:  Value spirvOp = rewriter.create<SPIRVOp>(loc, dstType, adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  937:
+       21:  938:  if (converter->getOptions().enableFastMathMode) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  939:    rewriter.replaceOp(op, spirvOp);
+call    0 never executed
+       21:  940:    return success();
+        -:  941:  }
+        -:  942:
+       21:  943:  Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       21:  944:  Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  945:
+       21:  946:  Value select1 = rewriter.create<spirv::SelectOp>(loc, dstType, lhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  947:                                                   adaptor.getLhs(), spirvOp);
+       21:  948:  Value select2 = rewriter.create<spirv::SelectOp>(loc, dstType, rhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  949:                                                   adaptor.getRhs(), select1);
+        -:  950:
+       21:  951:  rewriter.replaceOp(op, select2);
+call    0 returned 100%
+       21:  952:  return success();
+        -:  953:}
+------------------
+_ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MaxFOpENS1_5spirv8CLFMaxOpEE15matchAndRewriteES3_NS2_13MaxFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MaxFOpENS1_5spirv8CLFMaxOpEE15matchAndRewriteES3_NS2_13MaxFOpAdaptorERNS1_25ConversionPatternRewriterE called 28 returned 100% blocks executed 81%
+       28:  919:LogicalResult MinMaxFOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  920:    Op op, typename Op::Adaptor adaptor,
+        -:  921:    ConversionPatternRewriter &rewriter) const {
+       28:  922:  auto *converter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 returned 100%
+       28:  923:  auto dstType = converter->convertType(op.getType());
+call    0 returned 100%
+       28:  924:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       28:  925:    return failure();
+        -:  926:
+        -:  927:  // arith.maxf/minf:
+        -:  928:  //   "if one of the arguments is NaN, then the result is also NaN."
+        -:  929:  // spirv.GL.FMax/FMin
+        -:  930:  //   "which operand is the result is undefined if one of the operands
+        -:  931:  //   is a NaN."
+        -:  932:  // spirv.CL.fmax/fmin:
+        -:  933:  //   "If one argument is a NaN, Fmin returns the other argument."
+        -:  934:
+       28:  935:  Location loc = op.getLoc();
+call    0 returned 100%
+       28:  936:  Value spirvOp = rewriter.create<SPIRVOp>(loc, dstType, adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  937:
+       28:  938:  if (converter->getOptions().enableFastMathMode) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  939:    rewriter.replaceOp(op, spirvOp);
+call    0 never executed
+       28:  940:    return success();
+        -:  941:  }
+        -:  942:
+       28:  943:  Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       28:  944:  Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  945:
+       28:  946:  Value select1 = rewriter.create<spirv::SelectOp>(loc, dstType, lhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  947:                                                   adaptor.getLhs(), spirvOp);
+       28:  948:  Value select2 = rewriter.create<spirv::SelectOp>(loc, dstType, rhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  949:                                                   adaptor.getRhs(), select1);
+        -:  950:
+       28:  951:  rewriter.replaceOp(op, select2);
+call    0 returned 100%
+       28:  952:  return success();
+        -:  953:}
+------------------
+_ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MinFOpENS1_5spirv8CLFMinOpEE15matchAndRewriteES3_NS2_13MinFOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_116MinMaxFOpPatternIN4mlir5arith6MinFOpENS1_5spirv8CLFMinOpEE15matchAndRewriteES3_NS2_13MinFOpAdaptorERNS1_25ConversionPatternRewriterE called 21 returned 100% blocks executed 81%
+       21:  919:LogicalResult MinMaxFOpPattern<Op, SPIRVOp>::matchAndRewrite(
+        -:  920:    Op op, typename Op::Adaptor adaptor,
+        -:  921:    ConversionPatternRewriter &rewriter) const {
+       21:  922:  auto *converter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 returned 100%
+       21:  923:  auto dstType = converter->convertType(op.getType());
+call    0 returned 100%
+       21:  924:  if (!dstType)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       21:  925:    return failure();
+        -:  926:
+        -:  927:  // arith.maxf/minf:
+        -:  928:  //   "if one of the arguments is NaN, then the result is also NaN."
+        -:  929:  // spirv.GL.FMax/FMin
+        -:  930:  //   "which operand is the result is undefined if one of the operands
+        -:  931:  //   is a NaN."
+        -:  932:  // spirv.CL.fmax/fmin:
+        -:  933:  //   "If one argument is a NaN, Fmin returns the other argument."
+        -:  934:
+       21:  935:  Location loc = op.getLoc();
+call    0 returned 100%
+       21:  936:  Value spirvOp = rewriter.create<SPIRVOp>(loc, dstType, adaptor.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  937:
+       21:  938:  if (converter->getOptions().enableFastMathMode) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  939:    rewriter.replaceOp(op, spirvOp);
+call    0 never executed
+       21:  940:    return success();
+        -:  941:  }
+        -:  942:
+       21:  943:  Value lhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getLhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       21:  944:  Value rhsIsNan = rewriter.create<spirv::IsNanOp>(loc, adaptor.getRhs());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  945:
+       21:  946:  Value select1 = rewriter.create<spirv::SelectOp>(loc, dstType, lhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  947:                                                   adaptor.getLhs(), spirvOp);
+       21:  948:  Value select2 = rewriter.create<spirv::SelectOp>(loc, dstType, rhsIsNan,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  949:                                                   adaptor.getRhs(), select1);
+        -:  950:
+       21:  951:  rewriter.replaceOp(op, select2);
+call    0 returned 100%
+       21:  952:  return success();
+        -:  953:}
+------------------
+        -:  954:
+        -:  955://===----------------------------------------------------------------------===//
+        -:  956:// Pattern Population
+        -:  957://===----------------------------------------------------------------------===//
+        -:  958:
+function _ZN4mlir5arith28populateArithToSPIRVPatternsERNS_18SPIRVTypeConverterERNS_17RewritePatternSetE called 218 returned 100% blocks executed 100%
+      218:  959:void mlir::arith::populateArithToSPIRVPatterns(
+        -:  960:    SPIRVTypeConverter &typeConverter, RewritePatternSet &patterns) {
+        -:  961:  // clang-format off
+      218:  962:  patterns.add<
+        -:  963:    ConstantCompositeOpPattern,
+        -:  964:    ConstantScalarOpPattern,
+        -:  965:    spirv::ElementwiseOpPattern<arith::AddIOp, spirv::IAddOp>,
+        -:  966:    spirv::ElementwiseOpPattern<arith::SubIOp, spirv::ISubOp>,
+        -:  967:    spirv::ElementwiseOpPattern<arith::MulIOp, spirv::IMulOp>,
+        -:  968:    spirv::ElementwiseOpPattern<arith::DivUIOp, spirv::UDivOp>,
+        -:  969:    spirv::ElementwiseOpPattern<arith::DivSIOp, spirv::SDivOp>,
+        -:  970:    spirv::ElementwiseOpPattern<arith::RemUIOp, spirv::UModOp>,
+        -:  971:    RemSIOpGLPattern, RemSIOpCLPattern,
+        -:  972:    BitwiseOpPattern<arith::AndIOp, spirv::LogicalAndOp, spirv::BitwiseAndOp>,
+        -:  973:    BitwiseOpPattern<arith::OrIOp, spirv::LogicalOrOp, spirv::BitwiseOrOp>,
+        -:  974:    XOrIOpLogicalPattern, XOrIOpBooleanPattern,
+        -:  975:    spirv::ElementwiseOpPattern<arith::ShLIOp, spirv::ShiftLeftLogicalOp>,
+        -:  976:    spirv::ElementwiseOpPattern<arith::ShRUIOp, spirv::ShiftRightLogicalOp>,
+        -:  977:    spirv::ElementwiseOpPattern<arith::ShRSIOp, spirv::ShiftRightArithmeticOp>,
+        -:  978:    spirv::ElementwiseOpPattern<arith::NegFOp, spirv::FNegateOp>,
+        -:  979:    spirv::ElementwiseOpPattern<arith::AddFOp, spirv::FAddOp>,
+        -:  980:    spirv::ElementwiseOpPattern<arith::SubFOp, spirv::FSubOp>,
+        -:  981:    spirv::ElementwiseOpPattern<arith::MulFOp, spirv::FMulOp>,
+        -:  982:    spirv::ElementwiseOpPattern<arith::DivFOp, spirv::FDivOp>,
+        -:  983:    spirv::ElementwiseOpPattern<arith::RemFOp, spirv::FRemOp>,
+        -:  984:    TypeCastingOpPattern<arith::ExtUIOp, spirv::UConvertOp>, ExtUII1Pattern,
+        -:  985:    TypeCastingOpPattern<arith::ExtSIOp, spirv::SConvertOp>,
+        -:  986:    TypeCastingOpPattern<arith::ExtFOp, spirv::FConvertOp>,
+        -:  987:    TypeCastingOpPattern<arith::TruncIOp, spirv::SConvertOp>, TruncII1Pattern,
+        -:  988:    TypeCastingOpPattern<arith::TruncFOp, spirv::FConvertOp>,
+        -:  989:    TypeCastingOpPattern<arith::UIToFPOp, spirv::ConvertUToFOp>, UIToFPI1Pattern,
+        -:  990:    TypeCastingOpPattern<arith::SIToFPOp, spirv::ConvertSToFOp>,
+        -:  991:    TypeCastingOpPattern<arith::FPToSIOp, spirv::ConvertFToSOp>,
+        -:  992:    TypeCastingOpPattern<arith::IndexCastOp, spirv::SConvertOp>,
+        -:  993:    TypeCastingOpPattern<arith::IndexCastUIOp, spirv::UConvertOp>,
+        -:  994:    TypeCastingOpPattern<arith::BitcastOp, spirv::BitcastOp>,
+        -:  995:    CmpIOpBooleanPattern, CmpIOpPattern,
+        -:  996:    CmpFOpNanNonePattern, CmpFOpPattern,
+        -:  997:    AddICarryOpPattern, SelectOpPattern,
+        -:  998:
+        -:  999:    MinMaxFOpPattern<arith::MaxFOp, spirv::GLFMaxOp>,
+        -: 1000:    MinMaxFOpPattern<arith::MinFOp, spirv::GLFMinOp>,
+        -: 1001:    spirv::ElementwiseOpPattern<arith::MaxSIOp, spirv::GLSMaxOp>,
+        -: 1002:    spirv::ElementwiseOpPattern<arith::MaxUIOp, spirv::GLUMaxOp>,
+        -: 1003:    spirv::ElementwiseOpPattern<arith::MinSIOp, spirv::GLSMinOp>,
+        -: 1004:    spirv::ElementwiseOpPattern<arith::MinUIOp, spirv::GLUMinOp>,
+        -: 1005:
+        -: 1006:    MinMaxFOpPattern<arith::MaxFOp, spirv::CLFMaxOp>,
+        -: 1007:    MinMaxFOpPattern<arith::MinFOp, spirv::CLFMinOp>,
+        -: 1008:    spirv::ElementwiseOpPattern<arith::MaxSIOp, spirv::CLSMaxOp>,
+        -: 1009:    spirv::ElementwiseOpPattern<arith::MaxUIOp, spirv::CLUMaxOp>,
+        -: 1010:    spirv::ElementwiseOpPattern<arith::MinSIOp, spirv::CLSMinOp>,
+        -: 1011:    spirv::ElementwiseOpPattern<arith::MinUIOp, spirv::CLUMinOp>
+      218: 1012:  >(typeConverter, patterns.getContext());
+call    0 returned 100%
+        -: 1013:  // clang-format on
+        -: 1014:
+        -: 1015:  // Give CmpFOpNanKernelPattern a higher benefit so it can prevail when Kernel
+        -: 1016:  // capability is available.
+      218: 1017:  patterns.add<CmpFOpNanKernelPattern>(typeConverter, patterns.getContext(),
+call    0 returned 100%
+      218: 1018:                                       /*benefit=*/2);
+call    0 returned 100%
+      218: 1019:}
+        -: 1020:
+        -: 1021://===----------------------------------------------------------------------===//
+        -: 1022:// Pass Definition
+        -: 1023://===----------------------------------------------------------------------===//
+        -: 1024:
+        -: 1025:namespace {
+  116436*: 1026:struct ConvertArithToSPIRVPass
+call    0 never executed
+call    1 returned 100%
+        -: 1027:    : public impl::ConvertArithToSPIRVBase<ConvertArithToSPIRVPass> {
+function _ZN12_GLOBAL__N_123ConvertArithToSPIRVPass14runOnOperationEv called 203 returned 100% blocks executed 96%
+      203: 1028:  void runOnOperation() override {
+      203: 1029:    Operation *op = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      203: 1030:    auto targetAttr = spirv::lookupTargetEnvOrDefault(op);
+call    0 returned 100%
+      203: 1031:    auto target = SPIRVConversionTarget::get(targetAttr);
+call    0 returned 100%
+        -: 1032:
+      203: 1033:    SPIRVConversionOptions options;
+      203: 1034:    options.emulateNon32BitScalarTypes = this->emulateNon32BitScalarTypes;
+call    0 returned 100%
+      203: 1035:    options.enableFastMathMode = this->enableFastMath;
+      406: 1036:    SPIRVTypeConverter typeConverter(targetAttr, options);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -: 1037:
+        -: 1038:    // Use UnrealizedConversionCast as the bridge so that we don't need to pull
+        -: 1039:    // in patterns for other dialects.
+     203*: 1040:    auto addUnrealizedCast = [](OpBuilder &builder, Type type,
+        -: 1041:                                ValueRange inputs, Location loc) {
+    #####: 1042:      auto cast = builder.create<UnrealizedConversionCastOp>(loc, type, inputs);
+call    0 never executed
+    #####: 1043:      return Optional<Value>(cast.getResult(0));
+        -: 1044:    };
+      203: 1045:    typeConverter.addSourceMaterialization(addUnrealizedCast);
+call    0 returned 100%
+      203: 1046:    typeConverter.addTargetMaterialization(addUnrealizedCast);
+call    0 returned 100%
+      203: 1047:    target->addLegalOp<UnrealizedConversionCastOp>();
+call    0 returned 100%
+        -: 1048:
+        -: 1049:    // Fail hard when there are any remaining 'arith' ops.
+      203: 1050:    target->addIllegalDialect<arith::ArithDialect>();
+call    0 returned 100%
+        -: 1051:
+      406: 1052:    RewritePatternSet patterns(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      203: 1053:    arith::populateArithToSPIRVPatterns(typeConverter, patterns);
+call    0 returned 100%
+        -: 1054:
+      203: 1055:    if (failed(applyPartialConversion(op, *target, std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 98% (fallthrough)
+branch  4 taken 2%
+      199: 1056:      signalPassFailure();
+call    0 returned 100%
+      203: 1057:  }
+        -: 1058:};
+        -: 1059:} // namespace
+        -: 1060:
+function _ZN4mlir5arith29createConvertArithToSPIRVPassEv called 116436 returned 100% blocks executed 100%
+   116436: 1061:std::unique_ptr<OperationPass<>> mlir::arith::createConvertArithToSPIRVPass() {
+   116436: 1062:  return std::make_unique<ConvertArithToSPIRVPass>();
+call    0 returned 100%
+        -: 1063:}

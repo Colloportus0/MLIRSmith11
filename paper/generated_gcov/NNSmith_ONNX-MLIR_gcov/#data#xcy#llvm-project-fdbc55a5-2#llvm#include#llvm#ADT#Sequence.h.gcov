@@ -1,0 +1,396 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/ADT/Sequence.h
+        -:    0:Graph:../tools/mlir/lib/Target/SPIRV/Serialization/CMakeFiles/obj.MLIRSPIRVSerialization.dir/SerializeOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/SPIRV/Serialization/CMakeFiles/obj.MLIRSPIRVSerialization.dir/SerializeOps.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===- Sequence.h - Utility for producing sequences of values ---*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:/// \file
+        -:    9:/// Provides some synthesis utilities to produce sequences of values. The names
+        -:   10:/// are intentionally kept very short as they tend to occur in common and
+        -:   11:/// widely used contexts.
+        -:   12:///
+        -:   13:/// The `seq(A, B)` function produces a sequence of values from `A` to up to
+        -:   14:/// (but not including) `B`, i.e., [`A`, `B`), that can be safely iterated over.
+        -:   15:/// `seq` supports both integral (e.g., `int`, `char`, `uint32_t`) and enum
+        -:   16:/// types. `seq_inclusive(A, B)` produces a sequence of values from `A` to `B`,
+        -:   17:/// including `B`.
+        -:   18:///
+        -:   19:/// Examples with integral types:
+        -:   20:/// ```
+        -:   21:/// for (int x : seq(0, 3))
+        -:   22:///   outs() << x << " ";
+        -:   23:/// ```
+        -:   24:///
+        -:   25:/// Prints: `0 1 2 `.
+        -:   26:///
+        -:   27:/// ```
+        -:   28:/// for (int x : seq_inclusive(0, 3))
+        -:   29:///   outs() << x << " ";
+        -:   30:/// ```
+        -:   31:///
+        -:   32:/// Prints: `0 1 2 3 `.
+        -:   33:///
+        -:   34:/// Similar to `seq` and `seq_inclusive`, the `enum_seq` and
+        -:   35:/// `enum_seq_inclusive` functions produce sequences of enum values that can be
+        -:   36:/// iterated over.
+        -:   37:/// To enable iteration with enum types, you need to either mark enums as safe
+        -:   38:/// to iterate on by specializing `enum_iteration_traits`, or opt into
+        -:   39:/// potentially unsafe iteration at every callsite by passing
+        -:   40:/// `force_iteration_on_noniterable_enum`.
+        -:   41:///
+        -:   42:/// Examples with enum types:
+        -:   43:/// ```
+        -:   44:/// namespace X {
+        -:   45:///   enum class MyEnum : unsigned {A = 0, B, C};
+        -:   46:/// } // namespace X
+        -:   47:///
+        -:   48:/// template <> struct enum_iteration_traits<X::MyEnum> {
+        -:   49:///   static contexpr bool is_iterable = true;
+        -:   50:/// };
+        -:   51:///
+        -:   52:/// class MyClass {
+        -:   53:/// public:
+        -:   54:///   enum Safe { D = 3, E, F };
+        -:   55:///   enum MaybeUnsafe { G = 1, H = 2, I = 4 };
+        -:   56:/// };
+        -:   57:///
+        -:   58:/// template <> struct enum_iteration_traits<MyClass::Safe> {
+        -:   59:///   static contexpr bool is_iterable = true;
+        -:   60:/// };
+        -:   61:/// ```
+        -:   62:///
+        -:   63:/// ```
+        -:   64:///   for (auto v : enum_seq(MyClass::Safe::D, MyClass::Safe::F))
+        -:   65:///     outs() << int(v) << " ";
+        -:   66:/// ```
+        -:   67:///
+        -:   68:/// Prints: `3 4 `.
+        -:   69:///
+        -:   70:/// ```
+        -:   71:///   for (auto v : enum_seq(MyClass::MaybeUnsafe::H, MyClass::MaybeUnsafe::I,
+        -:   72:///                          force_iteration_on_noniterable_enum))
+        -:   73:///     outs() << int(v) << " ";
+        -:   74:/// ```
+        -:   75:///
+        -:   76:/// Prints: `2 3 `.
+        -:   77:///
+        -:   78://===----------------------------------------------------------------------===//
+        -:   79:
+        -:   80:#ifndef LLVM_ADT_SEQUENCE_H
+        -:   81:#define LLVM_ADT_SEQUENCE_H
+        -:   82:
+        -:   83:#include <cassert>     // assert
+        -:   84:#include <iterator>    // std::random_access_iterator_tag
+        -:   85:#include <limits>      // std::numeric_limits
+        -:   86:#include <type_traits> // std::is_integral, std::is_enum, std::underlying_type,
+        -:   87:                       // std::enable_if
+        -:   88:
+        -:   89:#include "llvm/Support/MathExtras.h" // AddOverflow / SubOverflow
+        -:   90:
+        -:   91:namespace llvm {
+        -:   92:
+        -:   93:// Enum traits that marks enums as safe or unsafe to iterate over.
+        -:   94:// By default, enum types are *not* considered safe for iteration.
+        -:   95:// To allow iteration for your enum type, provide a specialization with
+        -:   96:// `is_iterable` set to `true` in the `llvm` namespace.
+        -:   97:// Alternatively, you can pass the `force_iteration_on_noniterable_enum` tag
+        -:   98:// to `enum_seq` or `enum_seq_inclusive`.
+        -:   99:template <typename EnumT> struct enum_iteration_traits {
+        -:  100:  static constexpr bool is_iterable = false;
+        -:  101:};
+        -:  102:
+        -:  103:struct force_iteration_on_noniterable_enum_t {
+        -:  104:  explicit force_iteration_on_noniterable_enum_t() = default;
+        -:  105:};
+        -:  106:
+        -:  107:inline constexpr force_iteration_on_noniterable_enum_t
+        -:  108:    force_iteration_on_noniterable_enum;
+        -:  109:
+        -:  110:namespace detail {
+        -:  111:
+        -:  112:// Returns whether a value of type U can be represented with type T.
+    #####:  113:template <typename T, typename U> bool canTypeFitValue(const U Value) {
+    #####:  114:  const intmax_t BotT = intmax_t(std::numeric_limits<T>::min());
+    #####:  115:  const intmax_t BotU = intmax_t(std::numeric_limits<U>::min());
+    #####:  116:  const uintmax_t TopT = uintmax_t(std::numeric_limits<T>::max());
+    #####:  117:  const uintmax_t TopU = uintmax_t(std::numeric_limits<U>::max());
+    #####:  118:  return !((BotT > BotU && Value < static_cast<U>(BotT)) ||
+        -:  119:           (TopT < TopU && Value > static_cast<U>(TopT)));
+        -:  120:}
+        -:  121:
+        -:  122:// An integer type that asserts when:
+        -:  123:// - constructed from a value that doesn't fit into intmax_t,
+        -:  124:// - casted to a type that cannot hold the current value,
+        -:  125:// - its internal representation overflows.
+        -:  126:struct CheckedInt {
+        -:  127:  // Integral constructor, asserts if Value cannot be represented as intmax_t.
+        -:  128:  template <typename Integral, typename std::enable_if_t<
+        -:  129:                                   std::is_integral<Integral>::value, bool> = 0>
+    #####:  130:  static CheckedInt from(Integral FromValue) {
+    #####:  131:    if (!canTypeFitValue<intmax_t>(FromValue))
+        -:  132:      assertOutOfBounds();
+        -:  133:    CheckedInt Result;
+    #####:  134:    Result.Value = static_cast<intmax_t>(FromValue);
+        -:  135:    return Result;
+        -:  136:  }
+        -:  137:
+        -:  138:  // Enum constructor, asserts if Value cannot be represented as intmax_t.
+        -:  139:  template <typename Enum,
+        -:  140:            typename std::enable_if_t<std::is_enum<Enum>::value, bool> = 0>
+        -:  141:  static CheckedInt from(Enum FromValue) {
+        -:  142:    using type = std::underlying_type_t<Enum>;
+        -:  143:    return from<type>(static_cast<type>(FromValue));
+        -:  144:  }
+        -:  145:
+        -:  146:  // Equality
+        -:  147:  bool operator==(const CheckedInt &O) const { return Value == O.Value; }
+    #####:  148:  bool operator!=(const CheckedInt &O) const { return Value != O.Value; }
+        -:  149:
+        -:  150:  CheckedInt operator+(intmax_t Offset) const {
+        -:  151:    CheckedInt Result;
+        -:  152:    if (AddOverflow(Value, Offset, Result.Value))
+        -:  153:      assertOutOfBounds();
+        -:  154:    return Result;
+        -:  155:  }
+        -:  156:
+        -:  157:  intmax_t operator-(CheckedInt Other) const {
+        -:  158:    intmax_t Result;
+        -:  159:    if (SubOverflow(Value, Other.Value, Result))
+        -:  160:      assertOutOfBounds();
+        -:  161:    return Result;
+        -:  162:  }
+        -:  163:
+        -:  164:  // Convert to integral, asserts if Value cannot be represented as Integral.
+        -:  165:  template <typename Integral, typename std::enable_if_t<
+        -:  166:                                   std::is_integral<Integral>::value, bool> = 0>
+    #####:  167:  Integral to() const {
+    #####:  168:    if (!canTypeFitValue<Integral>(Value))
+    #####:  169:      assertOutOfBounds();
+call    0 never executed
+    #####:  170:    return static_cast<Integral>(Value);
+call    0 never executed
+        -:  171:  }
+        -:  172:
+        -:  173:  // Convert to enum, asserts if Value cannot be represented as Enum's
+        -:  174:  // underlying type.
+        -:  175:  template <typename Enum,
+        -:  176:            typename std::enable_if_t<std::is_enum<Enum>::value, bool> = 0>
+        -:  177:  Enum to() const {
+        -:  178:    using type = std::underlying_type_t<Enum>;
+        -:  179:    return Enum(to<type>());
+        -:  180:  }
+        -:  181:
+        -:  182:private:
+function _ZN4llvm6detail10CheckedInt17assertOutOfBoundsEv called 0 returned 0% blocks executed 0%
+    #####:  183:  static void assertOutOfBounds() { assert(false && "Out of bounds"); }
+        -:  184:
+        -:  185:  intmax_t Value;
+        -:  186:};
+        -:  187:
+        -:  188:template <typename T, bool IsReverse> struct SafeIntIterator {
+        -:  189:  using iterator_category = std::random_access_iterator_tag;
+        -:  190:  using value_type = T;
+        -:  191:  using difference_type = intmax_t;
+        -:  192:  using pointer = T *;
+        -:  193:  using reference = T &;
+        -:  194:
+        -:  195:  // Construct from T.
+    #####:  196:  explicit SafeIntIterator(T Value) : SI(CheckedInt::from<T>(Value)) {}
+        -:  197:  // Construct from other direction.
+        -:  198:  SafeIntIterator(const SafeIntIterator<T, !IsReverse> &O) : SI(O.SI) {}
+        -:  199:
+        -:  200:  // Dereference
+    #####:  201:  value_type operator*() const { return SI.to<T>(); }
+branch  0 never executed
+branch  1 never executed
+        -:  202:  // Indexing
+        -:  203:  value_type operator[](intmax_t Offset) const { return *(*this + Offset); }
+        -:  204:
+        -:  205:  // Can be compared for equivalence using the equality/inequality operators.
+        -:  206:  bool operator==(const SafeIntIterator &O) const { return SI == O.SI; }
+    #####:  207:  bool operator!=(const SafeIntIterator &O) const { return SI != O.SI; }
+branch  0 never executed
+branch  1 never executed
+        -:  208:  // Comparison
+        -:  209:  bool operator<(const SafeIntIterator &O) const { return (*this - O) < 0; }
+        -:  210:  bool operator>(const SafeIntIterator &O) const { return (*this - O) > 0; }
+        -:  211:  bool operator<=(const SafeIntIterator &O) const { return (*this - O) <= 0; }
+        -:  212:  bool operator>=(const SafeIntIterator &O) const { return (*this - O) >= 0; }
+        -:  213:
+        -:  214:  // Pre Increment/Decrement
+    #####:  215:  void operator++() { offset(1); }
+        -:  216:  void operator--() { offset(-1); }
+        -:  217:
+        -:  218:  // Post Increment/Decrement
+        -:  219:  SafeIntIterator operator++(int) {
+        -:  220:    const auto Copy = *this;
+        -:  221:    ++*this;
+        -:  222:    return Copy;
+        -:  223:  }
+        -:  224:  SafeIntIterator operator--(int) {
+        -:  225:    const auto Copy = *this;
+        -:  226:    --*this;
+        -:  227:    return Copy;
+        -:  228:  }
+        -:  229:
+        -:  230:  // Compound assignment operators
+        -:  231:  void operator+=(intmax_t Offset) { offset(Offset); }
+        -:  232:  void operator-=(intmax_t Offset) { offset(-Offset); }
+        -:  233:
+        -:  234:  // Arithmetic
+        -:  235:  SafeIntIterator operator+(intmax_t Offset) const { return add(Offset); }
+        -:  236:  SafeIntIterator operator-(intmax_t Offset) const { return add(-Offset); }
+        -:  237:
+        -:  238:  // Difference
+        -:  239:  intmax_t operator-(const SafeIntIterator &O) const {
+        -:  240:    return IsReverse ? O.SI - SI : SI - O.SI;
+        -:  241:  }
+        -:  242:
+        -:  243:private:
+        -:  244:  SafeIntIterator(const CheckedInt &SI) : SI(SI) {}
+        -:  245:
+    #####:  246:  static intmax_t getOffset(intmax_t Offset) {
+        -:  247:    return IsReverse ? -Offset : Offset;
+        -:  248:  }
+        -:  249:
+        -:  250:  CheckedInt add(intmax_t Offset) const { return SI + getOffset(Offset); }
+        -:  251:
+    #####:  252:  void offset(intmax_t Offset) { SI = SI + getOffset(Offset); }
+call    0 never executed
+        -:  253:
+        -:  254:  CheckedInt SI;
+        -:  255:
+        -:  256:  // To allow construction from the other direction.
+        -:  257:  template <typename, bool> friend struct SafeIntIterator;
+        -:  258:};
+        -:  259:
+        -:  260:} // namespace detail
+        -:  261:
+        -:  262:template <typename T> struct iota_range {
+        -:  263:  using value_type = T;
+        -:  264:  using reference = T &;
+        -:  265:  using const_reference = const T &;
+        -:  266:  using iterator = detail::SafeIntIterator<value_type, false>;
+        -:  267:  using const_iterator = iterator;
+        -:  268:  using reverse_iterator = detail::SafeIntIterator<value_type, true>;
+        -:  269:  using const_reverse_iterator = reverse_iterator;
+        -:  270:  using difference_type = intmax_t;
+        -:  271:  using size_type = std::size_t;
+        -:  272:
+function _ZN4llvm10iota_rangeIjEC2Ejjb called 0 returned 0% blocks executed 0%
+    #####:  273:  explicit iota_range(T Begin, T End, bool Inclusive)
+    #####:  274:      : BeginValue(Begin), PastEndValue(End) {
+    #####:  275:    assert(Begin <= End && "Begin must be less or equal to End.");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  276:    if (Inclusive)
+branch  0 never executed
+branch  1 never executed
+    #####:  277:      ++PastEndValue;
+call    0 never executed
+    #####:  278:  }
+        -:  279:
+        -:  280:  size_t size() const { return PastEndValue - BeginValue; }
+        -:  281:  bool empty() const { return BeginValue == PastEndValue; }
+        -:  282:
+    #####:  283:  auto begin() const { return const_iterator(BeginValue); }
+    #####:  284:  auto end() const { return const_iterator(PastEndValue); }
+        -:  285:
+        -:  286:  auto rbegin() const { return const_reverse_iterator(PastEndValue - 1); }
+        -:  287:  auto rend() const { return const_reverse_iterator(BeginValue - 1); }
+        -:  288:
+        -:  289:private:
+        -:  290:  static_assert(std::is_integral<T>::value || std::is_enum<T>::value,
+        -:  291:                "T must be an integral or enum type");
+        -:  292:  static_assert(std::is_same<T, std::remove_cv_t<T>>::value,
+        -:  293:                "T must not be const nor volatile");
+        -:  294:
+        -:  295:  iterator BeginValue;
+        -:  296:  iterator PastEndValue;
+        -:  297:};
+        -:  298:
+        -:  299:/// Iterate over an integral type from Begin up to - but not including - End.
+        -:  300:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX] for
+        -:  301:/// forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX] for reverse
+        -:  302:/// iteration).
+        -:  303:template <typename T, typename = std::enable_if_t<std::is_integral<T>::value &&
+        -:  304:                                                  !std::is_enum<T>::value>>
+    #####:  305:auto seq(T Begin, T End) {
+    #####:  306:  return iota_range<T>(Begin, End, false);
+call    0 never executed
+        -:  307:}
+        -:  308:
+        -:  309:/// Iterate over an integral type from Begin to End inclusive.
+        -:  310:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX - 1]
+        -:  311:/// for forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX - 1] for reverse
+        -:  312:/// iteration).
+        -:  313:template <typename T, typename = std::enable_if_t<std::is_integral<T>::value &&
+        -:  314:                                                  !std::is_enum<T>::value>>
+        -:  315:auto seq_inclusive(T Begin, T End) {
+        -:  316:  return iota_range<T>(Begin, End, true);
+        -:  317:}
+        -:  318:
+        -:  319:/// Iterate over an enum type from Begin up to - but not including - End.
+        -:  320:/// Note: `enum_seq` will generate each consecutive value, even if no
+        -:  321:/// enumerator with that value exists.
+        -:  322:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX] for
+        -:  323:/// forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX] for reverse
+        -:  324:/// iteration).
+        -:  325:template <typename EnumT,
+        -:  326:          typename = std::enable_if_t<std::is_enum<EnumT>::value>>
+        -:  327:auto enum_seq(EnumT Begin, EnumT End) {
+        -:  328:  static_assert(enum_iteration_traits<EnumT>::is_iterable,
+        -:  329:                "Enum type is not marked as iterable.");
+        -:  330:  return iota_range<EnumT>(Begin, End, false);
+        -:  331:}
+        -:  332:
+        -:  333:/// Iterate over an enum type from Begin up to - but not including - End, even
+        -:  334:/// when `EnumT` is not marked as safely iterable by `enum_iteration_traits`.
+        -:  335:/// Note: `enum_seq` will generate each consecutive value, even if no
+        -:  336:/// enumerator with that value exists.
+        -:  337:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX] for
+        -:  338:/// forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX] for reverse
+        -:  339:/// iteration).
+        -:  340:template <typename EnumT,
+        -:  341:          typename = std::enable_if_t<std::is_enum<EnumT>::value>>
+        -:  342:auto enum_seq(EnumT Begin, EnumT End, force_iteration_on_noniterable_enum_t) {
+        -:  343:  return iota_range<EnumT>(Begin, End, false);
+        -:  344:}
+        -:  345:
+        -:  346:/// Iterate over an enum type from Begin to End inclusive.
+        -:  347:/// Note: `enum_seq_inclusive` will generate each consecutive value, even if no
+        -:  348:/// enumerator with that value exists.
+        -:  349:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX - 1]
+        -:  350:/// for forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX - 1] for reverse
+        -:  351:/// iteration).
+        -:  352:template <typename EnumT,
+        -:  353:          typename = std::enable_if_t<std::is_enum<EnumT>::value>>
+        -:  354:auto enum_seq_inclusive(EnumT Begin, EnumT End) {
+        -:  355:  static_assert(enum_iteration_traits<EnumT>::is_iterable,
+        -:  356:                "Enum type is not marked as iterable.");
+        -:  357:  return iota_range<EnumT>(Begin, End, true);
+        -:  358:}
+        -:  359:
+        -:  360:/// Iterate over an enum type from Begin to End inclusive, even when `EnumT`
+        -:  361:/// is not marked as safely iterable by `enum_iteration_traits`.
+        -:  362:/// Note: `enum_seq_inclusive` will generate each consecutive value, even if no
+        -:  363:/// enumerator with that value exists.
+        -:  364:/// Note: Begin and End values have to be within [INTMAX_MIN, INTMAX_MAX - 1]
+        -:  365:/// for forward iteration (resp. [INTMAX_MIN + 1, INTMAX_MAX - 1] for reverse
+        -:  366:/// iteration).
+        -:  367:template <typename EnumT,
+        -:  368:          typename = std::enable_if_t<std::is_enum<EnumT>::value>>
+        -:  369:auto enum_seq_inclusive(EnumT Begin, EnumT End,
+        -:  370:                        force_iteration_on_noniterable_enum_t) {
+        -:  371:  return iota_range<EnumT>(Begin, End, true);
+        -:  372:}
+        -:  373:
+        -:  374:} // end namespace llvm
+        -:  375:
+        -:  376:#endif // LLVM_ADT_SEQUENCE_H

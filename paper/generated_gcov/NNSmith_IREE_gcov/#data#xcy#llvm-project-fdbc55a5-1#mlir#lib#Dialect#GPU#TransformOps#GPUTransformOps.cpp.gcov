@@ -1,0 +1,888 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/GPU/TransformOps/GPUTransformOps.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/GPU/TransformOps/CMakeFiles/obj.MLIRGPUTransformOps.dir/GPUTransformOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/GPU/TransformOps/CMakeFiles/obj.MLIRGPUTransformOps.dir/GPUTransformOps.cpp.gcda
+        -:    0:Runs:325546
+        -:    1://===- GPUTransformOps.cpp - Implementation of GPU transform ops ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
+        -:   10:
+        -:   11:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   12:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   13:#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
+        -:   14:#include "mlir/Dialect/PDL/IR/PDL.h"
+        -:   15:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   16:#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+        -:   17:#include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
+        -:   18:#include "mlir/IR/Diagnostics.h"
+        -:   19:#include "mlir/IR/Value.h"
+        -:   20:#include "llvm/ADT/None.h"
+        -:   21:#include "llvm/ADT/Optional.h"
+        -:   22:
+        -:   23:using namespace mlir;
+        -:   24:using namespace mlir::gpu;
+        -:   25:using namespace mlir::transform;
+        -:   26:
+        -:   27:namespace {
+        -:   28:/// A simple pattern rewriter that implements no special logic.
+    #####:   29:class SimpleRewriter : public PatternRewriter {
+        -:   30:public:
+    #####:   31:  SimpleRewriter(MLIRContext *context) : PatternRewriter(context) {}
+        -:   32:};
+        -:   33:} // namespace
+        -:   34:
+        -:   35:/// Determines if the size of the kernel configuration is supported by the GPU
+        -:   36:/// architecture being used. It presently makes use of CUDA limitations, however
+        -:   37:/// that aspect may be enhanced for other GPUs.
+        -:   38:static DiagnosedSilenceableFailure
+        -:   39:checkGpuLimits(TransformOpInterface transformOp, Optional<int64_t> gridDimX,
+        -:   40:               Optional<int64_t> gridDimY, Optional<int64_t> gridDimZ,
+        -:   41:               Optional<int64_t> blockDimX, Optional<int64_t> blockDimY,
+        -:   42:               Optional<int64_t> blockDimZ) {
+        -:   43:
+        -:   44:  static constexpr int maxTotalBlockdim = 1024;
+        -:   45:  static constexpr int maxBlockdimx = 1024;
+        -:   46:  static constexpr int maxBlockdimy = 1024;
+        -:   47:  static constexpr int maxBlockdimz = 64;
+        -:   48:  static constexpr int maxTotalGriddim = 2147483647;
+        -:   49:  static constexpr int maxGriddimx = 2147483647;
+        -:   50:  static constexpr int maxGriddimy = 65535;
+        -:   51:  static constexpr int maxGriddimz = 65535;
+        -:   52:
+        -:   53:  if ((blockDimX.value_or(1) * blockDimY.value_or(1) * blockDimZ.value_or(1)) >
+        -:   54:          maxTotalBlockdim ||
+        -:   55:      (gridDimX.value_or(1) * gridDimY.value_or(1) * gridDimZ.value_or(1)) >
+        -:   56:          maxTotalGriddim ||
+        -:   57:      blockDimX.value_or(1) > maxBlockdimx ||
+        -:   58:      blockDimY.value_or(1) > maxBlockdimy ||
+        -:   59:      blockDimZ.value_or(1) > maxBlockdimz ||
+        -:   60:      gridDimY.value_or(1) > maxGriddimy ||
+        -:   61:      gridDimZ.value_or(1) > maxGriddimz ||
+        -:   62:      gridDimX.value_or(1) > maxGriddimx) {
+        -:   63:    return transformOp.emitSilenceableError()
+        -:   64:           << "Trying to launch a GPU kernel with gridDim = ("
+        -:   65:           << gridDimX.value_or(1) << ", " << gridDimY.value_or(1) << ", "
+        -:   66:           << gridDimZ.value_or(1) << ") blockDim = (" << blockDimX.value_or(1)
+        -:   67:           << ", " << blockDimY.value_or(1) << ", " << blockDimZ.value_or(1)
+        -:   68:           << "). It is larger than the limits.";
+        -:   69:  }
+        -:   70:  return DiagnosedSilenceableFailure::success();
+        -:   71:}
+        -:   72:
+        -:   73:/// Creates an empty-body gpu::LaunchOp using the provided kernel settings and
+        -:   74:/// put a terminator within.
+        -:   75:static DiagnosedSilenceableFailure
+        -:   76:createGpuLaunch(RewriterBase &rewriter, Location loc,
+        -:   77:                TransformOpInterface transformOp, LaunchOp &launchOp,
+        -:   78:                Optional<int64_t> gridDimX = llvm::None,
+        -:   79:                Optional<int64_t> gridDimY = llvm::None,
+        -:   80:                Optional<int64_t> gridDimZ = llvm::None,
+        -:   81:                Optional<int64_t> blockDimX = llvm::None,
+        -:   82:                Optional<int64_t> blockDimY = llvm::None,
+        -:   83:                Optional<int64_t> blockDimZ = llvm::None) {
+        -:   84:  DiagnosedSilenceableFailure diag =
+        -:   85:      checkGpuLimits(transformOp, gridDimX, gridDimY, gridDimZ, blockDimX,
+        -:   86:                     blockDimY, blockDimZ);
+        -:   87:  if (!diag.succeeded())
+        -:   88:    return diag;
+        -:   89:
+        -:   90:  auto createConst = [&](int dim) {
+        -:   91:    return rewriter.create<arith::ConstantIndexOp>(loc, dim);
+        -:   92:  };
+        -:   93:  OpBuilder::InsertionGuard guard(rewriter);
+        -:   94:  Value one = createConst(1);
+        -:   95:  Value gridSizeX = gridDimX.has_value() ? createConst(gridDimX.value()) : one;
+        -:   96:  Value gridSizeY = gridDimY.has_value() ? createConst(gridDimY.value()) : one;
+        -:   97:  Value gridSizeZ = gridDimZ.has_value() ? createConst(gridDimZ.value()) : one;
+        -:   98:  Value blkSizeX = blockDimX.has_value() ? createConst(blockDimX.value()) : one;
+        -:   99:  Value blkSizeY = blockDimY.has_value() ? createConst(blockDimY.value()) : one;
+        -:  100:  Value blkSizeZ = blockDimZ.has_value() ? createConst(blockDimZ.value()) : one;
+        -:  101:  launchOp = rewriter.create<LaunchOp>(loc, gridSizeX, gridSizeY, gridSizeZ,
+        -:  102:                                       blkSizeX, blkSizeY, blkSizeZ);
+        -:  103:  rewriter.setInsertionPointToEnd(&launchOp.getBody().front());
+        -:  104:  rewriter.create<TerminatorOp>(loc);
+        -:  105:  return DiagnosedSilenceableFailure(success());
+        -:  106:}
+        -:  107:
+        -:  108:/// Alter kernel configuration of the given kernel.
+        -:  109:static DiagnosedSilenceableFailure
+        -:  110:alterGpuLaunch(SimpleRewriter &rewriter, LaunchOp gpuLaunch,
+        -:  111:               TransformOpInterface transformOp,
+        -:  112:               Optional<int64_t> gridDimX = llvm::None,
+        -:  113:               Optional<int64_t> gridDimY = llvm::None,
+        -:  114:               Optional<int64_t> gridDimZ = llvm::None,
+        -:  115:               Optional<int64_t> blockDimX = llvm::None,
+        -:  116:               Optional<int64_t> blockDimY = llvm::None,
+        -:  117:               Optional<int64_t> blockDimZ = llvm::None) {
+        -:  118:  DiagnosedSilenceableFailure diag =
+        -:  119:      checkGpuLimits(transformOp, gridDimX, gridDimY, gridDimZ, blockDimX,
+        -:  120:                     blockDimY, blockDimZ);
+        -:  121:  if (!diag.succeeded())
+        -:  122:    return diag;
+        -:  123:
+        -:  124:  KernelDim3 currentBlockdim = gpuLaunch.getBlockSizeOperandValues();
+        -:  125:  OpBuilder::InsertionGuard guard(rewriter);
+        -:  126:  rewriter.setInsertionPointAfterValue(currentBlockdim.x);
+        -:  127:  auto createConstValue = [&](int dim) {
+        -:  128:    return rewriter.create<arith::ConstantIndexOp>(currentBlockdim.x.getLoc(),
+        -:  129:                                                   dim);
+        -:  130:  };
+        -:  131:
+        -:  132:  if (gridDimX.has_value())
+        -:  133:    gpuLaunch.getGridSizeXMutable().assign(createConstValue(gridDimX.value()));
+        -:  134:  if (gridDimY.has_value())
+        -:  135:    gpuLaunch.getGridSizeYMutable().assign(createConstValue(gridDimY.value()));
+        -:  136:  if (gridDimZ.has_value())
+        -:  137:    gpuLaunch.getGridSizeZMutable().assign(createConstValue(gridDimZ.value()));
+        -:  138:  if (blockDimX.has_value())
+        -:  139:    gpuLaunch.getBlockSizeXMutable().assign(
+        -:  140:        createConstValue(blockDimX.value()));
+        -:  141:  if (blockDimY.has_value())
+        -:  142:    gpuLaunch.getBlockSizeYMutable().assign(
+        -:  143:        createConstValue(blockDimY.value()));
+        -:  144:  if (blockDimZ.has_value())
+        -:  145:    gpuLaunch.getBlockSizeZMutable().assign(
+        -:  146:        createConstValue(blockDimZ.value()));
+        -:  147:  return DiagnosedSilenceableFailure::success();
+        -:  148:}
+        -:  149:
+        -:  150://===----------------------------------------------------------------------===//
+        -:  151:// MapForeachToBlocks
+        -:  152://===----------------------------------------------------------------------===//
+        -:  153:
+function _ZN4mlir9transform3gpu22mapForeachToBlocksImplERNS_12RewriterBaseENS_3scf15ForeachThreadOpEN4llvm12function_refIFvS3_S5_RNS6_15SmallVectorImplINS_5ValueEEEEEERNS8_IlEENS0_20TransformOpInterfaceE called 0 returned 0% blocks executed 0%
+    #####:  154:DiagnosedSilenceableFailure mlir::transform::gpu::mapForeachToBlocksImpl(
+        -:  155:    RewriterBase &rewriter, scf::ForeachThreadOp foreachThreadOp,
+        -:  156:    function_ref<void(RewriterBase &, scf::ForeachThreadOp,
+        -:  157:                      SmallVectorImpl<Value> &)>
+        -:  158:        blockIdGenerator,
+        -:  159:    SmallVectorImpl<int64_t> &gridDims, TransformOpInterface transformOp) {
+    #####:  160:  if (foreachThreadOp.getNumResults() > 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  161:    return transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  162:           << "only bufferized scf.foreach_thread lowers to gpu.block_id";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  163:  if (foreachThreadOp.getNumThreads().size() > 3)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  164:    return transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  165:           << "scf.foreach_thread with rank > 3 does not lower to gpu.block_id";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  166:
+        -:  167:  // Step 0. Outline the compute workload region and set up the workload
+        -:  168:  // operands.
+    #####:  169:  FailureOr<SmallVector<OpFoldResult>> potentialGridDim =
+    #####:  170:      foreachThreadOp.getPermutedNumThreads(rewriter);
+call    0 never executed
+        -:  171:
+    #####:  172:  if (failed(potentialGridDim) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  173:      llvm::any_of(*potentialGridDim, [](OpFoldResult ofr) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  174:        return !getConstantIntValue(ofr).has_value();
+        -:  175:      })) {
+    #####:  176:    return transformOp.emitSilenceableError() << "unsupported dynamic gridDim";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  177:  }
+        -:  178:
+    #####:  179:  for (OpFoldResult ofr : *potentialGridDim)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  180:    gridDims.push_back(getConstantIntValue(ofr).value());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  181:
+    #####:  182:  SmallVector<Value> blockOps;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  183:  blockIdGenerator(rewriter, foreachThreadOp, blockOps);
+call    0 never executed
+        -:  184:
+        -:  185:  // Step 1. Move the body of foreachThreadOp.
+        -:  186:  // Erase the terminator first, it will not be used since we are on buffers.
+    #####:  187:  rewriter.eraseOp(foreachThreadOp.getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  188:  Block *targetBlock = foreachThreadOp->getBlock();
+call    0 never executed
+    #####:  189:  Block::iterator insertionPoint = Block::iterator(foreachThreadOp);
+call    0 never executed
+    #####:  190:  Block &sourceBlock = foreachThreadOp.getRegion().front();
+call    0 never executed
+call    1 never executed
+    #####:  191:  targetBlock->getOperations().splice(insertionPoint,
+call    0 never executed
+    #####:  192:                                      sourceBlock.getOperations());
+call    0 never executed
+        -:  193:
+        -:  194:  // Step 2. RAUW thread indices to thread ops.
+    #####:  195:  SmallVector<Value> threadIndices =
+    #####:  196:      *foreachThreadOp.getPermutedThreadIndices();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:  197:  assert(blockOps.size() == 3 && "3 block id ops are required");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  198:  for (auto [blockIdx, blockOp] : llvm::zip(threadIndices, blockOps)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  199:    Value val = blockIdx;
+    #####:  200:    Value blkOp = blockOp;
+    #####:  201:    if (!val)
+branch  0 never executed
+branch  1 never executed
+    #####:  202:      continue;
+    #####:  203:    for (Operation *user : llvm::make_early_inc_range(val.getUsers()))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  204:      user->replaceUsesOfWith(val, blkOp);
+call    0 never executed
+        -:  205:  }
+        -:  206:
+        -:  207:  // Step 3. Erase old op.
+    #####:  208:  rewriter.eraseOp(foreachThreadOp);
+call    0 never executed
+        -:  209:
+    #####:  210:  return DiagnosedSilenceableFailure::success();
+branch  0 never executed
+branch  1 never executed
+        -:  211:}
+        -:  212:
+function _ZN4mlir9transform3gpu27findTopLevelForeachThreadOpEPNS_9OperationERNS_3scf15ForeachThreadOpENS0_20TransformOpInterfaceE called 0 returned 0% blocks executed 0%
+    #####:  213:DiagnosedSilenceableFailure mlir::transform::gpu::findTopLevelForeachThreadOp(
+        -:  214:    Operation *target, scf::ForeachThreadOp &topLevelForeachThreadOp,
+        -:  215:    TransformOpInterface transformOp) {
+function _ZZN4mlir9transform3gpu27findTopLevelForeachThreadOpEPNS_9OperationERNS_3scf15ForeachThreadOpENS0_20TransformOpInterfaceEENKUlS5_E_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  216:  auto walkResult = target->walk([&](scf::ForeachThreadOp foreachThreadOp) {
+    #####:  217:    if (foreachThreadOp->getParentOfType<scf::ForeachThreadOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  218:      return WalkResult::advance();
+    #####:  219:    if (topLevelForeachThreadOp)
+branch  0 never executed
+branch  1 never executed
+        -:  220:      // TODO: Handle multiple foreach if there is no dependences between them
+    #####:  221:      return WalkResult::interrupt();
+    #####:  222:    topLevelForeachThreadOp = foreachThreadOp;
+    #####:  223:    return WalkResult::advance();
+    #####:  224:  });
+call    0 never executed
+        -:  225:
+    #####:  226:  if (walkResult.wasInterrupted())
+branch  0 never executed
+branch  1 never executed
+    #####:  227:    return transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  228:           << "could not find a unique topLevel scf.foreach_thread";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  229:  return DiagnosedSilenceableFailure::success();
+        -:  230:}
+        -:  231:
+        -:  232:/// This is a helper that is only used in
+        -:  233:/// rewriteTopLevelForeachThreadToGpuBlocks. It generates GPU dialects block_id.
+function _ZL19generateGpuBlockIdsRN4mlir12RewriterBaseENS_3scf15ForeachThreadOpERN4llvm15SmallVectorImplINS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  234:static void generateGpuBlockIds(RewriterBase &rewriter,
+        -:  235:                                scf::ForeachThreadOp foreachOp,
+        -:  236:                                SmallVectorImpl<Value> &blockOps) {
+    #####:  237:  Location loc = foreachOp->getLoc();
+call    0 never executed
+    #####:  238:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  239:  rewriter.setInsertionPoint(foreachOp);
+call    0 never executed
+    #####:  240:  IndexType indexType = rewriter.getIndexType();
+call    0 never executed
+    #####:  241:  SmallVector<Dimension> gpuDims{Dimension::x, Dimension::y, Dimension::z};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  242:  for (int64_t idx : llvm::seq<int64_t>(0, gpuDims.size())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  243:    blockOps.push_back(
+call    0 never executed
+    #####:  244:        rewriter.create<BlockIdOp>(loc, indexType, gpuDims[idx]));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  245:  }
+    #####:  246:}
+        -:  247:
+        -:  248:DiagnosedSilenceableFailure
+function _ZN4mlir9transform18MapForeachToBlocks10applyToOneEPNS_9OperationERN4llvm15SmallVectorImplIS3_EERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  249:transform::MapForeachToBlocks::applyToOne(Operation *target,
+        -:  250:                                          SmallVectorImpl<Operation *> &results,
+        -:  251:                                          transform::TransformState &state) {
+    #####:  252:  LaunchOp gpuLaunch = dyn_cast<LaunchOp>(target);
+call    0 never executed
+    #####:  253:  SimpleRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+        -:  254:  auto transformOp = cast<TransformOpInterface>(getOperation());
+        -:  255:
+    #####:  256:  if (!getGenerateGpuLaunch() && !gpuLaunch) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  257:    results.assign({target});
+call    0 never executed
+    #####:  258:    DiagnosedSilenceableFailure diag =
+    #####:  259:        emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  260:        << "Given target is not gpu.launch, set `generate_gpu_launch` "
+    #####:  261:           "attribute";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:    diag.attachNote(target->getLoc()) << "when applied to this payload op";
+call    0 never executed
+call    1 never executed
+    #####:  263:    return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  264:  }
+        -:  265:
+    #####:  266:  scf::ForeachThreadOp topLevelForeachThreadOp;
+call    0 never executed
+    #####:  267:  DiagnosedSilenceableFailure diag =
+        -:  268:      mlir::transform::gpu::findTopLevelForeachThreadOp(
+    #####:  269:          target, topLevelForeachThreadOp, transformOp);
+call    0 never executed
+call    1 never executed
+    #####:  270:  if (!diag.succeeded()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  271:    results.assign({target});
+call    0 never executed
+    #####:  272:    diag.attachNote(target->getLoc()) << "when applied to this payload op";
+call    0 never executed
+call    1 never executed
+    #####:  273:    return diag;
+branch  0 never executed
+branch  1 never executed
+        -:  274:  }
+        -:  275:
+    #####:  276:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  277:  rewriter.setInsertionPoint(topLevelForeachThreadOp);
+call    0 never executed
+        -:  278:
+        -:  279:  // Generate gpu launch here and move the foreach_thread inside
+    #####:  280:  if (getGenerateGpuLaunch()) {
+call    0 never executed
+    #####:  281:    DiagnosedSilenceableFailure diag =
+call    0 never executed
+    #####:  282:        createGpuLaunch(rewriter, target->getLoc(), transformOp, gpuLaunch);
+call    0 never executed
+    #####:  283:    if (!diag.succeeded()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  284:      results.assign({target});
+call    0 never executed
+    #####:  285:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  286:    }
+    #####:  287:    rewriter.setInsertionPointToStart(&gpuLaunch.getBody().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  288:    Operation *newForeachThreadOp = rewriter.clone(*topLevelForeachThreadOp);
+call    0 never executed
+    #####:  289:    rewriter.eraseOp(topLevelForeachThreadOp);
+call    0 never executed
+    #####:  290:    topLevelForeachThreadOp = cast<scf::ForeachThreadOp>(newForeachThreadOp);
+call    0 never executed
+call    1 never executed
+        -:  291:  }
+        -:  292:
+    #####:  293:  SmallVector<int64_t> gridDim = extractFromI64ArrayAttr(getGridDim());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  294:  diag = mlir::transform::gpu::mapForeachToBlocksImpl(
+call    0 never executed
+call    1 never executed
+        -:  295:      rewriter, topLevelForeachThreadOp, generateGpuBlockIds, gridDim,
+    #####:  296:      transformOp);
+call    0 never executed
+    #####:  297:  if (diag.succeeded()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  298:    diag = alterGpuLaunch(rewriter, gpuLaunch,
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  299:                          cast<TransformOpInterface>(getOperation()),
+    #####:  300:                          gridDim[0], gridDim[1], gridDim[2]);
+call    0 never executed
+call    1 never executed
+        -:  301:  }
+        -:  302:
+    #####:  303:  results.assign({gpuLaunch});
+call    0 never executed
+    #####:  304:  return diag;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  305:}
+        -:  306:
+        -:  307://===----------------------------------------------------------------------===//
+        -:  308:// MapNestedForeachToThreads
+        -:  309://===----------------------------------------------------------------------===//
+        -:  310:
+        -:  311:/// Searches `scf.foreach_thread` ops nested under `target` and maps each such
+        -:  312:/// op to GPU threads. Mapping is one-to-one and the induction variables of
+        -:  313:/// `scf.foreach_thread` are rewritten to gpu.thread_id according to the
+        -:  314:/// thread_dim_apping attribute. Sibling `scf.foreach_thread` are supported in
+        -:  315:/// which case, the union of the number of threads is computed and may result
+        -:  316:/// in predication. Dynamic, `scf.foreach_thread` trip counts are currently
+        -:  317:/// not supported. Dynamic block dim sizes are currently not supported.
+function _ZL35rewriteOneForeachThreadToGpuThreadsRN4mlir12RewriterBaseENS_3scf15ForeachThreadOpERKN4llvm15SmallVectorImplIlEEbNS4_8OptionalINS_9transform20TransformOpInterfaceEEE called 0 returned 0% blocks executed 0%
+    #####:  318:static DiagnosedSilenceableFailure rewriteOneForeachThreadToGpuThreads(
+        -:  319:    RewriterBase &rewriter, scf::ForeachThreadOp foreachThreadOp,
+        -:  320:    const SmallVectorImpl<int64_t> &globalBlockDims, bool syncAfterDistribute,
+        -:  321:    llvm::Optional<TransformOpInterface> transformOp) {
+    #####:  322:  auto failureHelper =
+function _ZZL35rewriteOneForeachThreadToGpuThreadsRN4mlir12RewriterBaseENS_3scf15ForeachThreadOpERKN4llvm15SmallVectorImplIlEEbNS4_8OptionalINS_9transform20TransformOpInterfaceEEEENKUlRKNS4_5TwineEE_clESF_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  323:      [&](const Twine &message) -> DiagnosedSilenceableFailure {
+    #####:  324:    if (transformOp.has_value()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  325:      return transformOp->emitSilenceableError() << message;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  326:    }
+    #####:  327:    return emitDefiniteFailure(foreachThreadOp, message);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  328:  };
+        -:  329:
+    #####:  330:  if (foreachThreadOp.getNumResults() > 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  331:    return failureHelper(
+    #####:  332:        "only bufferized scf.foreach_thread lowers to gpu.thread_id");
+call    0 never executed
+call    1 never executed
+        -:  333:
+    #####:  334:  if (foreachThreadOp.getNumThreads().size() > 3)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  335:    return failureHelper(
+    #####:  336:        "scf.foreach_thread with rank > 3 does not lower to gpu.thread_id");
+call    0 never executed
+call    1 never executed
+        -:  337:
+    #####:  338:  auto potentialBlockDim = foreachThreadOp.getPermutedNumThreads(rewriter);
+call    0 never executed
+    #####:  339:  if (failed(potentialBlockDim) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  340:      llvm::any_of(*potentialBlockDim, [](OpFoldResult ofr) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  341:        return !getConstantIntValue(ofr).has_value();
+        -:  342:      })) {
+    #####:  343:    return failureHelper("unsupported dynamic blockdim size");
+call    0 never executed
+call    1 never executed
+        -:  344:  }
+        -:  345:
+    #####:  346:  SmallVector<int64_t> blockDim =
+branch  0 never executed
+branch  1 never executed
+function _ZZL35rewriteOneForeachThreadToGpuThreadsRN4mlir12RewriterBaseENS_3scf15ForeachThreadOpERKN4llvm15SmallVectorImplIlEEbNS4_8OptionalINS_9transform20TransformOpInterfaceEEEENKUlNS_12OpFoldResultEE1_clESD_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  347:      llvm::to_vector(llvm::map_range(*potentialBlockDim, [](OpFoldResult ofr) {
+    #####:  348:        return getConstantIntValue(ofr).value();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  349:      }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  350:
+        -:  351:  // Step 1. Create the gpu.thread ops
+    #####:  352:  Location loc = foreachThreadOp.getLoc();
+call    0 never executed
+    #####:  353:  IndexType indexType = rewriter.getIndexType();
+call    0 never executed
+        -:  354:
+    #####:  355:  SmallVector<Dimension> gpuDims{Dimension::x, Dimension::y, Dimension::z};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  356:  SmallVector<Value> threadOps;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  357:  for (int64_t idx : llvm::seq<int64_t>(0, blockDim.size())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  358:    threadOps.push_back(
+call    0 never executed
+    #####:  359:        rewriter.create<ThreadIdOp>(loc, indexType, gpuDims[idx]));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  360:  }
+        -:  361:  // Step 2. Maybe create conditionals to predicate the region.
+    #####:  362:  Value predicate;
+    #####:  363:  for (auto [threadId, blockDim, globalBlockDim] :
+branch  0 never executed
+branch  1 never executed
+    #####:  364:       llvm::zip(threadOps, blockDim, globalBlockDims)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  365:    if (blockDim > globalBlockDim) {
+branch  0 never executed
+branch  1 never executed
+    #####:  366:      return failureHelper(
+        -:  367:          "The requested GPU threads are fewer than the number of loop trip "
+        -:  368:          "counts. Try to tile scf.foreach_thread before mapping or set small "
+    #####:  369:          "blockDim.");
+call    0 never executed
+call    1 never executed
+        -:  370:    }
+    #####:  371:    if (blockDim == globalBlockDim)
+branch  0 never executed
+branch  1 never executed
+    #####:  372:      continue;
+    #####:  373:    Value blockIdx = rewriter.create<arith::ConstantIndexOp>(loc, blockDim);
+call    0 never executed
+call    1 never executed
+    #####:  374:    Value tmpPredicate = rewriter.create<arith::CmpIOp>(
+    #####:  375:        loc, arith::CmpIPredicate::ult, threadId, blockIdx);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  376:    predicate =
+    #####:  377:        predicate ? rewriter.create<arith::AndIOp>(loc, predicate, tmpPredicate)
+call    0 never executed
+    #####:  378:                  : tmpPredicate;
+branch  0 never executed
+branch  1 never executed
+        -:  379:  }
+        -:  380:
+        -:  381:  // Step 3. Move the body of foreachThreadOp.
+        -:  382:  // Erase the terminator first, it will not be used.
+    #####:  383:  rewriter.eraseOp(foreachThreadOp.getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  384:  Block *targetBlock;
+    #####:  385:  Block::iterator insertionPoint;
+    #####:  386:  if (predicate) {
+branch  0 never executed
+branch  1 never executed
+        -:  387:    // Step 3.a. If predicated, move at the beginning.
+    #####:  388:    auto ifOp =
+    #####:  389:        rewriter.create<scf::IfOp>(loc, predicate, /*withElseRegion=*/false);
+call    0 never executed
+    #####:  390:    targetBlock = ifOp.thenBlock();
+call    0 never executed
+    #####:  391:    insertionPoint = ifOp.thenBlock()->begin();
+call    0 never executed
+        -:  392:  } else {
+        -:  393:    // Step 3.a. Otherwise, move inline just before foreachThreadOp.
+    #####:  394:    targetBlock = foreachThreadOp->getBlock();
+call    0 never executed
+    #####:  395:    insertionPoint = Block::iterator(foreachThreadOp);
+call    0 never executed
+        -:  396:  }
+    #####:  397:  Block &sourceBlock = foreachThreadOp.getRegion().front();
+call    0 never executed
+call    1 never executed
+    #####:  398:  targetBlock->getOperations().splice(insertionPoint,
+call    0 never executed
+    #####:  399:                                      sourceBlock.getOperations());
+call    0 never executed
+        -:  400:
+        -:  401:  // Step 4. RAUW thread indices to thread ops.
+    #####:  402:  SmallVector<Value> threadIndices =
+    #####:  403:      *foreachThreadOp.getPermutedThreadIndices();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:  404:  for (auto [threadIdx, threadOp] : llvm::zip(threadIndices, threadOps)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  405:    Value val = threadIdx;
+    #####:  406:    Value op = threadOp;
+    #####:  407:    if (!val)
+branch  0 never executed
+branch  1 never executed
+    #####:  408:      continue;
+    #####:  409:    for (Operation *user : llvm::make_early_inc_range(val.getUsers())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  410:      user->replaceUsesOfWith(val, op);
+call    0 never executed
+        -:  411:    }
+        -:  412:  }
+        -:  413:
+        -:  414:  // Step 5. syncthreads.
+        -:  415:  // TODO: Need warpsync
+    #####:  416:  if (syncAfterDistribute)
+branch  0 never executed
+branch  1 never executed
+    #####:  417:    rewriter.create<BarrierOp>(loc);
+call    0 never executed
+        -:  418:
+        -:  419:  // Step 6. Erase old op.
+    #####:  420:  rewriter.eraseOp(foreachThreadOp);
+call    0 never executed
+        -:  421:
+    #####:  422:  return DiagnosedSilenceableFailure::success();
+branch  0 never executed
+branch  1 never executed
+        -:  423:}
+        -:  424:
+function _ZN4mlir9transform3gpu29mapNestedForeachToThreadsImplERNS_12RewriterBaseEPNS_9OperationERKN4llvm15SmallVectorImplIlEEbNS6_8OptionalINS0_20TransformOpInterfaceEEE called 0 returned 0% blocks executed 0%
+    #####:  425:DiagnosedSilenceableFailure mlir::transform::gpu::mapNestedForeachToThreadsImpl(
+        -:  426:    RewriterBase &rewriter, Operation *target,
+        -:  427:    const SmallVectorImpl<int64_t> &blockDim, bool syncAfterDistribute,
+        -:  428:    llvm::Optional<TransformOpInterface> transformOp) {
+    #####:  429:  DiagnosedSilenceableFailure diag = DiagnosedSilenceableFailure::success();
+call    0 never executed
+function _ZZN4mlir9transform3gpu29mapNestedForeachToThreadsImplERNS_12RewriterBaseEPNS_9OperationERKN4llvm15SmallVectorImplIlEEbNS6_8OptionalINS0_20TransformOpInterfaceEEEENKUlNS_3scf15ForeachThreadOpEE_clESF_ called 0 returned 0% blocks executed 0%
+    #####:  430:  target->walk([&](scf::ForeachThreadOp foreachThreadOp) {
+    #####:  431:    rewriter.setInsertionPoint(foreachThreadOp);
+call    0 never executed
+    #####:  432:    diag = rewriteOneForeachThreadToGpuThreads(
+call    0 never executed
+    #####:  433:        rewriter, foreachThreadOp, blockDim, syncAfterDistribute, transformOp);
+call    0 never executed
+call    1 never executed
+    #####:  434:    return diag.succeeded() ? WalkResult::advance() : WalkResult::interrupt();
+branch  0 never executed
+branch  1 never executed
+    #####:  435:  });
+call    0 never executed
+call    1 never executed
+    #####:  436:  return diag;
+        -:  437:}
+        -:  438:
+function _ZN4mlir9transform25MapNestedForeachToThreads10applyToOneEPNS_9OperationERN4llvm15SmallVectorImplIS3_EERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  439:DiagnosedSilenceableFailure transform::MapNestedForeachToThreads::applyToOne(
+        -:  440:    ::mlir::Operation *target,
+        -:  441:    ::llvm::SmallVectorImpl<::mlir::Operation *> &results,
+        -:  442:    ::mlir::transform::TransformState &state) {
+    #####:  443:  LaunchOp gpuLaunch = dyn_cast<LaunchOp>(target);
+call    0 never executed
+    #####:  444:  auto transformOp = cast<TransformOpInterface>(getOperation());
+call    0 never executed
+        -:  445:
+    #####:  446:  if (!gpuLaunch) {
+branch  0 never executed
+branch  1 never executed
+    #####:  447:    results.assign({target});
+call    0 never executed
+    #####:  448:    return emitSilenceableError() << "Given target is not gpu.launch";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  449:  }
+        -:  450:
+    #####:  451:  SmallVector<int64_t> blockDim = extractFromI64ArrayAttr(getBlockDim());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  452:  blockDim.resize(/*size=*/3, /*value=*/1);
+call    0 never executed
+        -:  453:
+    #####:  454:  DiagnosedSilenceableFailure diag =
+branch  0 never executed
+branch  1 never executed
+        -:  455:      checkGpuLimits(transformOp, llvm::None, llvm::None, llvm::None,
+    #####:  456:                     blockDim[0], blockDim[1], blockDim[2]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  457:  if (diag.isSilenceableFailure()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  458:    results.assign({target});
+call    0 never executed
+    #####:  459:    diag.attachNote(getLoc()) << getBlockDimAttrName() << " is very large";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  460:    return diag;
+branch  0 never executed
+branch  1 never executed
+        -:  461:  }
+        -:  462:
+    #####:  463:  SimpleRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  464:  rewriter.setInsertionPoint(target);
+call    0 never executed
+        -:  465:
+    #####:  466:  diag = mlir::transform::gpu::mapNestedForeachToThreadsImpl(
+call    0 never executed
+call    1 never executed
+    #####:  467:      rewriter, target, blockDim, getSyncAfterDistribute(), transformOp);
+call    0 never executed
+call    1 never executed
+    #####:  468:  if (diag.succeeded()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  469:    diag =
+branch  0 never executed
+branch  1 never executed
+    #####:  470:        alterGpuLaunch(rewriter, gpuLaunch, transformOp, llvm::None, llvm::None,
+call    0 never executed
+call    1 never executed
+    #####:  471:                       llvm::None, blockDim[0], blockDim[1], blockDim[2]);
+call    0 never executed
+call    1 never executed
+        -:  472:  }
+        -:  473:
+    #####:  474:  results.assign({gpuLaunch});
+call    0 never executed
+    #####:  475:  return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  476:}
+        -:  477:
+        -:  478://===----------------------------------------------------------------------===//
+        -:  479:// Transform op registration
+        -:  480://===----------------------------------------------------------------------===//
+        -:  481:
+        -:  482:namespace {
+        -:  483:/// Registers new ops and declares PDL as dependent dialect since the
+        -:  484:/// additional ops are using PDL types for operands and results.
+   262096:  485:class GPUTransformDialectExtension
+call    0 returned 100%
+        -:  486:    : public transform::TransformDialectExtension<
+        -:  487:          GPUTransformDialectExtension> {
+        -:  488:public:
+function _ZN12_GLOBAL__N_128GPUTransformDialectExtensionC2Ev called 325546 returned 100% blocks executed 100%
+   325546:  489:  GPUTransformDialectExtension() {
+call    0 returned 100%
+   325546:  490:    declareDependentDialect<pdl::PDLDialect>();
+call    0 returned 100%
+   325546:  491:    declareGeneratedDialect<scf::SCFDialect>();
+call    0 returned 100%
+   325546:  492:    declareGeneratedDialect<arith::ArithDialect>();
+call    0 returned 100%
+   325546:  493:    declareGeneratedDialect<GPUDialect>();
+call    0 returned 100%
+   325546:  494:    registerTransformOps<
+        -:  495:#define GET_OP_LIST
+        -:  496:#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.cpp.inc"
+   325546:  497:        >();
+call    0 returned 100%
+   325546:  498:  }
+        -:  499:};
+        -:  500:} // namespace
+        -:  501:
+        -:  502:#define GET_OP_CLASSES
+        -:  503:#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.cpp.inc"
+        -:  504:
+function _ZN4mlir3gpu33registerTransformDialectExtensionERNS_15DialectRegistryE called 325546 returned 100% blocks executed 100%
+   325546:  505:void mlir::gpu::registerTransformDialectExtension(DialectRegistry &registry) {
+   325546:  506:  registry.addExtensions<GPUTransformDialectExtension>();
+call    0 returned 100%
+   325546:  507:}

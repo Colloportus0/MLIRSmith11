@@ -1,0 +1,603 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/IR/AsmState.h
+        -:    0:Graph:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcda
+        -:    0:Runs:325564
+        -:    1://===- AsmState.h - Assembly State Utilities --------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines various classes and utilites for interacting with the MLIR
+        -:   10:// assembly formats.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_IR_ASMSTATE_H_
+        -:   15:#define MLIR_IR_ASMSTATE_H_
+        -:   16:
+        -:   17:#include "mlir/IR/OperationSupport.h"
+        -:   18:#include "mlir/Support/LLVM.h"
+        -:   19:#include "llvm/ADT/MapVector.h"
+        -:   20:#include "llvm/ADT/StringMap.h"
+        -:   21:
+        -:   22:#include <memory>
+        -:   23:
+        -:   24:namespace mlir {
+        -:   25:class AsmResourcePrinter;
+        -:   26:class AsmDialectResourceHandle;
+        -:   27:class Operation;
+        -:   28:
+        -:   29:namespace detail {
+        -:   30:class AsmStateImpl;
+        -:   31:} // namespace detail
+        -:   32:
+        -:   33://===----------------------------------------------------------------------===//
+        -:   34:// Resources
+        -:   35://===----------------------------------------------------------------------===//
+        -:   36:
+        -:   37:/// The following classes enable support for parsing and printing resources
+        -:   38:/// within MLIR assembly formats. Resources are a mechanism by which dialects,
+        -:   39:/// and external clients, may attach additional information when parsing or
+        -:   40:/// printing IR without that information being encoded in the IR itself.
+        -:   41:/// Resources are not uniqued within the MLIR context, are not attached directly
+        -:   42:/// to any operation, and are solely intended to live and be processed outside
+        -:   43:/// of the immediate IR.
+        -:   44:///
+        -:   45:/// Resources are encoded using a key-value pair nested within dictionaries
+        -:   46:/// anchored either on a dialect, or an externally registered entity.
+        -:   47:/// Dictionaries anchored on dialects use the dialect namespace directly, and
+        -:   48:/// dictionaries anchored on external entities use a provided unique identifier.
+        -:   49:/// The resource key is an identifier used to disambiguate the data. The
+        -:   50:/// resource value may be stored in various limited forms, but general encodings
+        -:   51:/// use a string (human readable) or blob format (binary). Within the textual
+        -:   52:/// format, an example may be of the form:
+        -:   53:///
+        -:   54:/// {-#
+        -:   55:///   // The `dialect_resources` section within the file-level metadata
+        -:   56:///   // dictionary is used to contain any dialect resource entries.
+        -:   57:///   dialect_resources: {
+        -:   58:///     // Here is a dictionary anchored on "foo_dialect", which is a dialect
+        -:   59:///     // namespace.
+        -:   60:///     foo_dialect: {
+        -:   61:///       // `some_dialect_resource` is a key to be interpreted by the dialect,
+        -:   62:///       // and used to initialize/configure/etc.
+        -:   63:///       some_dialect_resource: "Some important resource value"
+        -:   64:///     }
+        -:   65:///   },
+        -:   66:///   // The `external_resources` section within the file-level metadata
+        -:   67:///   // dictionary is used to contain any non-dialect resource entries.
+        -:   68:///   external_resources: {
+        -:   69:///     // Here is a dictionary anchored on "mlir_reproducer", which is an
+        -:   70:///     // external entity representing MLIR's crash reproducer functionality.
+        -:   71:///     mlir_reproducer: {
+        -:   72:///       // `pipeline` is an entry that holds a crash reproducer pipeline
+        -:   73:///       // resource.
+        -:   74:///       pipeline: "func.func(canonicalize,cse)"
+        -:   75:///     }
+        -:   76:///   }
+        -:   77:/// #-}
+        -:   78:///
+        -:   79:
+        -:   80://===----------------------------------------------------------------------===//
+        -:   81:// Resource Entry
+        -:   82:
+        -:   83:/// This class represents a processed binary blob of data. A resource blob is
+        -:   84:/// essentially a collection of data, potentially mutable, with an associated
+        -:   85:/// deleter function (used if the data needs to be destroyed).
+        -:   86:class AsmResourceBlob {
+        -:   87:public:
+        -:   88:  /// A deleter function that frees a blob given the data, allocation size, and
+        -:   89:  /// allocation aligment.
+        -:   90:  using DeleterFn =
+        -:   91:      llvm::unique_function<void(void *data, size_t size, size_t align)>;
+        -:   92:
+        -:   93:  //===--------------------------------------------------------------------===//
+        -:   94:  // Construction
+        -:   95:  //===--------------------------------------------------------------------===//
+        -:   96:
+        -:   97:  AsmResourceBlob() = default;
+        -:   98:  AsmResourceBlob(ArrayRef<char> data, size_t dataAlignment, DeleterFn deleter,
+        -:   99:                  bool dataIsMutable)
+        -:  100:      : data(data), dataAlignment(dataAlignment), deleter(std::move(deleter)),
+        -:  101:        dataIsMutable(dataIsMutable) {}
+        -:  102:  /// Utility constructor that initializes a blob with a non-char type T.
+        -:  103:  template <typename T, typename DelT>
+        -:  104:  AsmResourceBlob(ArrayRef<T> data, DelT &&deleteFn, bool dataIsMutable)
+        -:  105:      : data((const char *)data.data(), data.size() * sizeof(T)),
+        -:  106:        dataAlignment(alignof(T)),
+        -:  107:        deleter([deleteFn = std::forward<DelT>(deleteFn)](
+        -:  108:                    void *data, size_t size, size_t align) {
+        -:  109:          return deleteFn((T *)data, size, align);
+        -:  110:        }),
+        -:  111:        dataIsMutable(dataIsMutable) {}
+        -:  112:  AsmResourceBlob(AsmResourceBlob &&) = default;
+        -:  113:  AsmResourceBlob &operator=(AsmResourceBlob &&rhs) {
+        -:  114:    // Delete the current blob if necessary.
+        -:  115:    if (deleter)
+        -:  116:      deleter(const_cast<char *>(data.data()), data.size(), dataAlignment);
+        -:  117:
+        -:  118:    // Take the data entries from rhs.
+        -:  119:    data = rhs.data;
+        -:  120:    dataAlignment = rhs.dataAlignment;
+        -:  121:    deleter = std::move(rhs.deleter);
+        -:  122:    dataIsMutable = rhs.dataIsMutable;
+        -:  123:    return *this;
+        -:  124:  }
+        -:  125:  AsmResourceBlob(const AsmResourceBlob &) = delete;
+        -:  126:  AsmResourceBlob &operator=(const AsmResourceBlob &) = delete;
+        -:  127:  ~AsmResourceBlob() {
+        -:  128:    if (deleter)
+        -:  129:      deleter(const_cast<char *>(data.data()), data.size(), dataAlignment);
+        -:  130:  }
+        -:  131:
+        -:  132:  //===--------------------------------------------------------------------===//
+        -:  133:  // Data Access
+        -:  134:  //===--------------------------------------------------------------------===//
+        -:  135:
+        -:  136:  /// Return the alignment of the underlying data.
+        -:  137:  size_t getDataAlignment() const { return dataAlignment; }
+        -:  138:
+        -:  139:  /// Return the raw underlying data of this blob.
+        -:  140:  ArrayRef<char> getData() const { return data; }
+        -:  141:
+        -:  142:  /// Return the underlying data as an array of the given type. This is an
+        -:  143:  /// inherrently unsafe operation, and should only be used when the data is
+        -:  144:  /// known to be of the correct type.
+        -:  145:  template <typename T>
+        -:  146:  ArrayRef<T> getDataAs() const {
+        -:  147:    return llvm::makeArrayRef<T>((const T *)data.data(),
+        -:  148:                                 data.size() / sizeof(T));
+        -:  149:  }
+        -:  150:
+        -:  151:  /// Return a mutable reference to the raw underlying data of this blob.
+        -:  152:  /// Asserts that the blob `isMutable`.
+        -:  153:  MutableArrayRef<char> getMutableData() {
+        -:  154:    assert(isMutable() &&
+        -:  155:           "cannot access mutable reference to non-mutable data");
+        -:  156:    return MutableArrayRef<char>(const_cast<char *>(data.data()), data.size());
+        -:  157:  }
+        -:  158:
+        -:  159:  /// Return if the data of this blob is mutable.
+        -:  160:  bool isMutable() const { return dataIsMutable; }
+        -:  161:
+        -:  162:  /// Return the deleter function of this blob.
+        -:  163:  DeleterFn &getDeleter() { return deleter; }
+        -:  164:  const DeleterFn &getDeleter() const { return deleter; }
+        -:  165:
+        -:  166:private:
+        -:  167:  /// The raw, properly aligned, blob data.
+        -:  168:  ArrayRef<char> data;
+        -:  169:
+        -:  170:  /// The alignment of the data.
+        -:  171:  size_t dataAlignment = 0;
+        -:  172:
+        -:  173:  /// An optional deleter function used to deallocate the underlying data when
+        -:  174:  /// necessary.
+        -:  175:  DeleterFn deleter;
+        -:  176:
+        -:  177:  /// Whether the data is mutable.
+        -:  178:  bool dataIsMutable;
+        -:  179:};
+        -:  180:
+        -:  181:/// This class provides a simple utility wrapper for creating heap allocated
+        -:  182:/// AsmResourceBlobs.
+        -:  183:class HeapAsmResourceBlob {
+        -:  184:public:
+        -:  185:  /// Create a new heap allocated blob with the given size and alignment.
+        -:  186:  /// `dataIsMutable` indicates if the allocated data can be mutated. By
+        -:  187:  /// default, we treat heap allocated blobs as mutable.
+        -:  188:  static AsmResourceBlob allocate(size_t size, size_t align,
+        -:  189:                                  bool dataIsMutable = true) {
+        -:  190:    return AsmResourceBlob(
+        -:  191:        ArrayRef<char>((char *)llvm::allocate_buffer(size, align), size), align,
+        -:  192:        llvm::deallocate_buffer, dataIsMutable);
+        -:  193:  }
+        -:  194:  /// Create a new heap allocated blob and copy the provided data into it.
+        -:  195:  static AsmResourceBlob allocateAndCopy(ArrayRef<char> data, size_t align,
+        -:  196:                                         bool dataIsMutable = true) {
+        -:  197:    AsmResourceBlob blob = allocate(data.size(), align, dataIsMutable);
+        -:  198:    std::memcpy(blob.getMutableData().data(), data.data(), data.size());
+        -:  199:    return blob;
+        -:  200:  }
+        -:  201:  template <typename T>
+        -:  202:  static std::enable_if_t<!std::is_same<T, char>::value, AsmResourceBlob>
+        -:  203:  allocateAndCopy(ArrayRef<T> data, bool dataIsMutable = true) {
+        -:  204:    return allocateAndCopy(
+        -:  205:        ArrayRef<char>((const char *)data.data(), data.size() * sizeof(T)),
+        -:  206:        alignof(T));
+        -:  207:  }
+        -:  208:};
+        -:  209:/// This class provides a simple utility wrapper for creating "unmanaged"
+        -:  210:/// AsmResourceBlobs. The lifetime of the data provided to these blobs is
+        -:  211:/// guaranteed to persist beyond the lifetime of this reference.
+        -:  212:class UnmanagedAsmResourceBlob {
+        -:  213:public:
+        -:  214:  /// Create a new unmanaged resource directly referencing the provided data.
+        -:  215:  /// `dataIsMutable` indicates if the allocated data can be mutated. By
+        -:  216:  /// default, we treat unmanaged blobs as immutable.
+        -:  217:  static AsmResourceBlob allocateWithAlign(ArrayRef<char> data, size_t align,
+        -:  218:                                           bool dataIsMutable = false) {
+        -:  219:    return AsmResourceBlob(data, align, /*deleter=*/{},
+        -:  220:                           /*dataIsMutable=*/false);
+        -:  221:  }
+        -:  222:  template <typename T>
+        -:  223:  static AsmResourceBlob allocateInferAlign(ArrayRef<T> data,
+        -:  224:                                            bool dataIsMutable = false) {
+        -:  225:    return allocateWithAlign(
+        -:  226:        ArrayRef<char>((const char *)data.data(), data.size() * sizeof(T)),
+        -:  227:        alignof(T));
+        -:  228:  }
+        -:  229:};
+        -:  230:
+        -:  231:/// This class is used to build resource entries for use by the printer. Each
+        -:  232:/// resource entry is represented using a key/value pair. The provided key must
+        -:  233:/// be unique within the current context, which allows for a client to provide
+        -:  234:/// resource entries without worrying about overlap with other clients.
+        -:  235:class AsmResourceBuilder {
+        -:  236:public:
+        -:  237:  virtual ~AsmResourceBuilder();
+        -:  238:
+        -:  239:  /// Build a resource entry represented by the given bool.
+        -:  240:  virtual void buildBool(StringRef key, bool data) = 0;
+        -:  241:
+        -:  242:  /// Build a resource entry represented by the given human-readable string
+        -:  243:  /// value.
+        -:  244:  virtual void buildString(StringRef key, StringRef data) = 0;
+        -:  245:
+        -:  246:  /// Build an resource entry represented by the given binary blob data.
+        -:  247:  virtual void buildBlob(StringRef key, ArrayRef<char> data,
+        -:  248:                         uint32_t dataAlignment) = 0;
+        -:  249:  /// Build an resource entry represented by the given binary blob data. This is
+        -:  250:  /// a useful overload if the data type is known. Note that this does not
+        -:  251:  /// support `char` element types to avoid accidentally not providing the
+        -:  252:  /// expected alignment of data in situations that treat blobs generically.
+        -:  253:  template <typename T>
+        -:  254:  std::enable_if_t<!std::is_same<T, char>::value> buildBlob(StringRef key,
+        -:  255:                                                            ArrayRef<T> data) {
+        -:  256:    buildBlob(
+        -:  257:        key, ArrayRef<char>((const char *)data.data(), data.size() * sizeof(T)),
+        -:  258:        alignof(T));
+        -:  259:  }
+        -:  260:  /// Build an resource entry represented by the given resource blob. This is
+        -:  261:  /// a useful overload if a blob already exists in-memory.
+        -:  262:  void buildBlob(StringRef key, const AsmResourceBlob &blob) {
+        -:  263:    buildBlob(key, blob.getData(), blob.getDataAlignment());
+        -:  264:  }
+        -:  265:};
+        -:  266:
+        -:  267:/// This enum represents the different kinds of resource values.
+        -:  268:enum class AsmResourceEntryKind {
+        -:  269:  /// A blob of data with an accompanying alignment.
+        -:  270:  Blob,
+        -:  271:  /// A boolean value.
+        -:  272:  Bool,
+        -:  273:  /// A string value.
+        -:  274:  String,
+        -:  275:};
+        -:  276:StringRef toString(AsmResourceEntryKind kind);
+        -:  277:
+        -:  278:/// This class represents a single parsed resource entry.
+        -:  279:class AsmParsedResourceEntry {
+        -:  280:public:
+        -:  281:  virtual ~AsmParsedResourceEntry();
+        -:  282:
+        -:  283:  /// Return the key of the resource entry.
+        -:  284:  virtual StringRef getKey() const = 0;
+        -:  285:
+        -:  286:  /// Emit an error at the location of this entry.
+        -:  287:  virtual InFlightDiagnostic emitError() const = 0;
+        -:  288:
+        -:  289:  /// Return the kind of this value.
+        -:  290:  virtual AsmResourceEntryKind getKind() const = 0;
+        -:  291:
+        -:  292:  /// Parse the resource entry represented by a boolean. Returns failure if the
+        -:  293:  /// entry does not correspond to a bool.
+        -:  294:  virtual FailureOr<bool> parseAsBool() const = 0;
+        -:  295:
+        -:  296:  /// Parse the resource entry represented by a human-readable string. Returns
+        -:  297:  /// failure if the entry does not correspond to a string.
+        -:  298:  virtual FailureOr<std::string> parseAsString() const = 0;
+        -:  299:
+        -:  300:  /// An allocator function used to allocate memory for a blob when required.
+        -:  301:  /// The function is provided a size and alignment, and should return an
+        -:  302:  /// aligned allocation buffer.
+        -:  303:  using BlobAllocatorFn =
+        -:  304:      function_ref<AsmResourceBlob(size_t size, size_t align)>;
+        -:  305:
+        -:  306:  /// Parse the resource entry represented by a binary blob. Returns failure if
+        -:  307:  /// the entry does not correspond to a blob. If the blob needed to be
+        -:  308:  /// allocated, the given allocator function is invoked.
+        -:  309:  virtual FailureOr<AsmResourceBlob>
+        -:  310:  parseAsBlob(BlobAllocatorFn allocator) const = 0;
+        -:  311:  /// Parse the resource entry represented by a binary blob using heap
+        -:  312:  /// allocation.
+        -:  313:  FailureOr<AsmResourceBlob> parseAsBlob() const {
+        -:  314:    return parseAsBlob([](size_t size, size_t align) {
+        -:  315:      return HeapAsmResourceBlob::allocate(size, align);
+        -:  316:    });
+        -:  317:  }
+        -:  318:};
+        -:  319:
+        -:  320://===----------------------------------------------------------------------===//
+        -:  321:// Resource Parser/Printer
+        -:  322:
+        -:  323:/// This class represents an instance of a resource parser. This class should be
+        -:  324:/// implemented by non-dialect clients that want to inject additional resources
+        -:  325:/// into MLIR assembly formats.
+        -:  326:class AsmResourceParser {
+        -:  327:public:
+        -:  328:  /// Create a new parser with the given identifying name. This name uniquely
+        -:  329:  /// identifies the entries of this parser, and differentiates them from other
+        -:  330:  /// contexts.
+        -:  331:  AsmResourceParser(StringRef name) : name(name.str()) {}
+        -:  332:  virtual ~AsmResourceParser();
+        -:  333:
+        -:  334:  /// Return the name of this parser.
+        -:  335:  StringRef getName() const { return name; }
+        -:  336:
+        -:  337:  /// Parse the given resource entry. Returns failure if the key/data were not
+        -:  338:  /// valid, or could otherwise not be processed correctly. Any necessary errors
+        -:  339:  /// should be emitted with the provided entry.
+        -:  340:  virtual LogicalResult parseResource(AsmParsedResourceEntry &entry) = 0;
+        -:  341:
+        -:  342:  /// Return a resource parser implemented via the given callable, whose form
+        -:  343:  /// should match that of `parseResource` above.
+        -:  344:  template <typename CallableT>
+        -:  345:  static std::unique_ptr<AsmResourceParser> fromCallable(StringRef name,
+        -:  346:                                                         CallableT &&parseFn) {
+        -:  347:    struct Processor : public AsmResourceParser {
+        -:  348:      Processor(StringRef name, CallableT &&parseFn)
+        -:  349:          : AsmResourceParser(name), parseFn(std::move(parseFn)) {}
+        -:  350:      LogicalResult parseResource(AsmParsedResourceEntry &entry) override {
+        -:  351:        return parseFn(entry);
+        -:  352:      }
+        -:  353:
+        -:  354:      std::decay_t<CallableT> parseFn;
+        -:  355:    };
+        -:  356:    return std::make_unique<Processor>(name, std::forward<CallableT>(parseFn));
+        -:  357:  }
+        -:  358:
+        -:  359:private:
+        -:  360:  std::string name;
+        -:  361:};
+        -:  362:
+        -:  363:/// This class represents an instance of a resource printer. This class should
+        -:  364:/// be implemented by non-dialect clients that want to inject additional
+        -:  365:/// resources into MLIR assembly formats.
+        -:  366:class AsmResourcePrinter {
+        -:  367:public:
+        -:  368:  /// Create a new printer with the given identifying name. This name uniquely
+        -:  369:  /// identifies the entries of this printer, and differentiates them from
+        -:  370:  /// other contexts.
+        -:  371:  AsmResourcePrinter(StringRef name) : name(name.str()) {}
+        -:  372:  virtual ~AsmResourcePrinter();
+        -:  373:
+        -:  374:  /// Return the name of this printer.
+        -:  375:  StringRef getName() const { return name; }
+        -:  376:
+        -:  377:  /// Build any resources to include during printing, utilizing the given
+        -:  378:  /// top-level root operation to help determine what information to include.
+        -:  379:  /// Provided data should be registered in the form of a key/data pair, to the
+        -:  380:  /// given builder.
+        -:  381:  virtual void buildResources(Operation *op,
+        -:  382:                              AsmResourceBuilder &builder) const = 0;
+        -:  383:
+        -:  384:  /// Return a resource printer implemented via the given callable, whose form
+        -:  385:  /// should match that of `buildResources` above.
+        -:  386:  template <typename CallableT>
+        -:  387:  static std::unique_ptr<AsmResourcePrinter> fromCallable(StringRef name,
+        -:  388:                                                          CallableT &&printFn) {
+        -:  389:    struct Printer : public AsmResourcePrinter {
+        -:  390:      Printer(StringRef name, CallableT &&printFn)
+        -:  391:          : AsmResourcePrinter(name), printFn(std::move(printFn)) {}
+        -:  392:      void buildResources(Operation *op,
+        -:  393:                          AsmResourceBuilder &builder) const override {
+        -:  394:        printFn(op, builder);
+        -:  395:      }
+        -:  396:
+        -:  397:      std::decay_t<CallableT> printFn;
+        -:  398:    };
+        -:  399:    return std::make_unique<Printer>(name, std::forward<CallableT>(printFn));
+        -:  400:  }
+        -:  401:
+        -:  402:private:
+        -:  403:  std::string name;
+        -:  404:};
+        -:  405:
+        -:  406:/// A fallback map containing external resources not explicitly handled by
+        -:  407:/// another parser/printer.
+        -:  408:class FallbackAsmResourceMap {
+        -:  409:public:
+        -:  410:  /// This class represents an opaque resource.
+        -:  411:  struct OpaqueAsmResource {
+        -:  412:    OpaqueAsmResource(StringRef key,
+        -:  413:                      std::variant<AsmResourceBlob, bool, std::string> value)
+        -:  414:        : key(key.str()), value(std::move(value)) {}
+        -:  415:
+        -:  416:    /// The key identifying the resource.
+        -:  417:    std::string key;
+        -:  418:    /// An opaque value for the resource, whose variant values align 1-1 with
+        -:  419:    /// the kinds defined in AsmResourceEntryKind.
+        -:  420:    std::variant<AsmResourceBlob, bool, std::string> value;
+        -:  421:  };
+        -:  422:
+        -:  423:  /// Return a parser than can be used for parsing entries for the given
+        -:  424:  /// identifier key.
+        -:  425:  AsmResourceParser &getParserFor(StringRef key);
+        -:  426:
+        -:  427:  /// Build a set of resource printers to print the resources within this map.
+        -:  428:  std::vector<std::unique_ptr<AsmResourcePrinter>> getPrinters();
+        -:  429:
+        -:  430:private:
+        -:  431:  struct ResourceCollection : public AsmResourceParser {
+        -:  432:    ResourceCollection(StringRef name) : AsmResourceParser(name) {}
+        -:  433:
+        -:  434:    /// Parse a resource into this collection.
+        -:  435:    LogicalResult parseResource(AsmParsedResourceEntry &entry) final;
+        -:  436:
+        -:  437:    /// Build the resources held by this collection.
+        -:  438:    void buildResources(Operation *op, AsmResourceBuilder &builder) const;
+        -:  439:
+        -:  440:    /// The set of resources parsed into this collection.
+        -:  441:    SmallVector<OpaqueAsmResource> resources;
+        -:  442:  };
+        -:  443:
+        -:  444:  /// The set of opaque resources.
+        -:  445:  llvm::MapVector<std::string, std::unique_ptr<ResourceCollection>,
+        -:  446:                  llvm::StringMap<unsigned>>
+        -:  447:      keyToResources;
+        -:  448:};
+        -:  449:
+        -:  450://===----------------------------------------------------------------------===//
+        -:  451:// ParserConfig
+        -:  452://===----------------------------------------------------------------------===//
+        -:  453:
+        -:  454:/// This class represents a configuration for the MLIR assembly parser. It
+        -:  455:/// contains all of the necessary state to parse a MLIR source file.
+        -:  456:class ParserConfig {
+        -:  457:public:
+        -:  458:  /// Construct a parser configuration with the given context.
+        -:  459:  /// `verifyAfterParse` indicates if the IR should be verified after parsing.
+        -:  460:  /// `fallbackResourceMap` is an optional fallback handler that can be used to
+        -:  461:  /// parse external resources not explicitly handled by another parser.
+        -:  462:  ParserConfig(MLIRContext *context, bool verifyAfterParse = true,
+        -:  463:               FallbackAsmResourceMap *fallbackResourceMap = nullptr)
+        -:  464:      : context(context), verifyAfterParse(verifyAfterParse),
+        -:  465:        fallbackResourceMap(fallbackResourceMap) {
+        -:  466:    assert(context && "expected valid MLIR context");
+        -:  467:  }
+        -:  468:
+        -:  469:  /// Return the MLIRContext to be used when parsing.
+  263986*:  470:  MLIRContext *getContext() const { return context; }
+call    0 never executed
+call    1 never executed
+call    2 returned 100%
+        -:  471:
+        -:  472:  /// Returns if the parser should verify the IR after parsing.
+        -:  473:  bool shouldVerifyAfterParse() const { return verifyAfterParse; }
+        -:  474:
+        -:  475:  /// Return the resource parser registered to the given name, or nullptr if no
+        -:  476:  /// parser with `name` is registered.
+        -:  477:  AsmResourceParser *getResourceParser(StringRef name) const {
+        -:  478:    auto it = resourceParsers.find(name);
+        -:  479:    if (it != resourceParsers.end())
+        -:  480:      return it->second.get();
+        -:  481:    if (fallbackResourceMap)
+        -:  482:      return &fallbackResourceMap->getParserFor(name);
+        -:  483:    return nullptr;
+        -:  484:  }
+        -:  485:
+        -:  486:  /// Attach the given resource parser.
+        -:  487:  void attachResourceParser(std::unique_ptr<AsmResourceParser> parser) {
+        -:  488:    StringRef name = parser->getName();
+        -:  489:    auto it = resourceParsers.try_emplace(name, std::move(parser));
+        -:  490:    (void)it;
+        -:  491:    assert(it.second &&
+        -:  492:           "resource parser already registered with the given name");
+        -:  493:  }
+        -:  494:
+        -:  495:  /// Attach the given callable resource parser with the given name.
+        -:  496:  template <typename CallableT>
+        -:  497:  std::enable_if_t<std::is_convertible<
+        -:  498:      CallableT, function_ref<LogicalResult(AsmParsedResourceEntry &)>>::value>
+        -:  499:  attachResourceParser(StringRef name, CallableT &&parserFn) {
+        -:  500:    attachResourceParser(AsmResourceParser::fromCallable(
+        -:  501:        name, std::forward<CallableT>(parserFn)));
+        -:  502:  }
+        -:  503:
+        -:  504:private:
+        -:  505:  MLIRContext *context;
+        -:  506:  bool verifyAfterParse;
+        -:  507:  DenseMap<StringRef, std::unique_ptr<AsmResourceParser>> resourceParsers;
+        -:  508:  FallbackAsmResourceMap *fallbackResourceMap;
+        -:  509:};
+        -:  510:
+        -:  511://===----------------------------------------------------------------------===//
+        -:  512:// AsmState
+        -:  513://===----------------------------------------------------------------------===//
+        -:  514:
+        -:  515:/// This class provides management for the lifetime of the state used when
+        -:  516:/// printing the IR. It allows for alleviating the cost of recomputing the
+        -:  517:/// internal state of the asm printer.
+        -:  518:///
+        -:  519:/// The IR should not be mutated in-between invocations using this state, and
+        -:  520:/// the IR being printed must not be an parent of the IR originally used to
+        -:  521:/// initialize this state. This means that if a child operation is provided, a
+        -:  522:/// parent operation cannot reuse this state.
+        -:  523:class AsmState {
+        -:  524:public:
+        -:  525:  /// This map represents the raw locations of operations within the output
+        -:  526:  /// stream. This maps the original pointer to the operation, to a pair of line
+        -:  527:  /// and column in the output stream.
+        -:  528:  using LocationMap = DenseMap<Operation *, std::pair<unsigned, unsigned>>;
+        -:  529:
+        -:  530:  /// Initialize the asm state at the level of the given operation. A location
+        -:  531:  /// map may optionally be provided to be populated when printing. `map` is an
+        -:  532:  /// optional fallback resource map, which when provided will attach resource
+        -:  533:  /// printers for the fallback resources within the map.
+        -:  534:  AsmState(Operation *op,
+        -:  535:           const OpPrintingFlags &printerFlags = OpPrintingFlags(),
+        -:  536:           LocationMap *locationMap = nullptr,
+        -:  537:           FallbackAsmResourceMap *map = nullptr);
+        -:  538:  AsmState(MLIRContext *ctx,
+        -:  539:           const OpPrintingFlags &printerFlags = OpPrintingFlags(),
+        -:  540:           LocationMap *locationMap = nullptr,
+        -:  541:           FallbackAsmResourceMap *map = nullptr);
+        -:  542:  ~AsmState();
+        -:  543:
+        -:  544:  /// Get the printer flags.
+        -:  545:  const OpPrintingFlags &getPrinterFlags() const;
+        -:  546:
+        -:  547:  /// Return an instance of the internal implementation. Returns nullptr if the
+        -:  548:  /// state has not been initialized.
+        -:  549:  detail::AsmStateImpl &getImpl() { return *impl; }
+        -:  550:
+        -:  551:  //===--------------------------------------------------------------------===//
+        -:  552:  // Resources
+        -:  553:  //===--------------------------------------------------------------------===//
+        -:  554:
+        -:  555:  /// Attach the given resource printer to the AsmState.
+        -:  556:  void attachResourcePrinter(std::unique_ptr<AsmResourcePrinter> printer);
+        -:  557:
+        -:  558:  /// Attach an resource printer, in the form of a callable, to the AsmState.
+        -:  559:  template <typename CallableT>
+        -:  560:  std::enable_if_t<std::is_convertible<
+        -:  561:      CallableT, function_ref<void(Operation *, AsmResourceBuilder &)>>::value>
+        -:  562:  attachResourcePrinter(StringRef name, CallableT &&printFn) {
+        -:  563:    attachResourcePrinter(AsmResourcePrinter::fromCallable(
+        -:  564:        name, std::forward<CallableT>(printFn)));
+        -:  565:  }
+        -:  566:
+        -:  567:  /// Attach resource printers to the AsmState for the fallback resources
+        -:  568:  /// in the given map.
+        -:  569:  void attachFallbackResourcePrinter(FallbackAsmResourceMap &map) {
+        -:  570:    for (auto &printer : map.getPrinters())
+        -:  571:      attachResourcePrinter(std::move(printer));
+        -:  572:  }
+        -:  573:
+        -:  574:  /// Returns a map of dialect resources that were referenced when using this
+        -:  575:  /// state to print IR.
+        -:  576:  DenseMap<Dialect *, SetVector<AsmDialectResourceHandle>> &
+        -:  577:  getDialectResources() const;
+        -:  578:
+        -:  579:private:
+        -:  580:  AsmState() = delete;
+        -:  581:
+        -:  582:  /// A pointer to allocated storage for the impl state.
+        -:  583:  std::unique_ptr<detail::AsmStateImpl> impl;
+        -:  584:};
+        -:  585:
+        -:  586://===----------------------------------------------------------------------===//
+        -:  587:// AsmPrinter CommandLine Options
+        -:  588://===----------------------------------------------------------------------===//
+        -:  589:
+        -:  590:/// Register a set of useful command-line options that can be used to configure
+        -:  591:/// various flags within the AsmPrinter.
+        -:  592:void registerAsmPrinterCLOptions();
+        -:  593:
+        -:  594:} // namespace mlir
+        -:  595:
+        -:  596:#endif // MLIR_IR_ASMSTATE_H_

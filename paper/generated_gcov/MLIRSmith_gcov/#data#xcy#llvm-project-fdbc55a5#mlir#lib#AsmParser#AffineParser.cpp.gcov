@@ -1,0 +1,1244 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/AsmParser/AffineParser.cpp
+        -:    0:Graph:../tools/mlir/lib/AsmParser/CMakeFiles/obj.MLIRAsmParser.dir/AffineParser.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/AsmParser/CMakeFiles/obj.MLIRAsmParser.dir/AffineParser.cpp.gcda
+        -:    0:Runs:116177
+        -:    1://===- AffineParser.cpp - MLIR Affine Parser ------------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a parser for Affine structures.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "Parser.h"
+        -:   14:#include "mlir/IR/AffineMap.h"
+        -:   15:#include "mlir/IR/IntegerSet.h"
+        -:   16:#include "llvm/Support/SourceMgr.h"
+        -:   17:
+        -:   18:using namespace mlir;
+        -:   19:using namespace mlir::detail;
+        -:   20:
+        -:   21:namespace {
+        -:   22:
+        -:   23:/// Lower precedence ops (all at the same precedence level). LNoOp is false in
+        -:   24:/// the boolean sense.
+        -:   25:enum AffineLowPrecOp {
+        -:   26:  /// Null value.
+        -:   27:  LNoOp,
+        -:   28:  Add,
+        -:   29:  Sub
+        -:   30:};
+        -:   31:
+        -:   32:/// Higher precedence ops - all at the same precedence level. HNoOp is false
+        -:   33:/// in the boolean sense.
+        -:   34:enum AffineHighPrecOp {
+        -:   35:  /// Null value.
+        -:   36:  HNoOp,
+        -:   37:  Mul,
+        -:   38:  FloorDiv,
+        -:   39:  CeilDiv,
+        -:   40:  Mod
+        -:   41:};
+        -:   42:
+        -:   43:/// This is a specialized parser for affine structures (affine maps, affine
+        -:   44:/// expressions, and integer sets), maintaining the state transient to their
+        -:   45:/// bodies.
+35297756*:   46:class AffineParser : public Parser {
+        -:   47:public:
+17648878*:   48:  AffineParser(ParserState &state, bool allowParsingSSAIds = false,
+        -:   49:               function_ref<ParseResult(bool)> parseElement = nullptr)
+17648878*:   50:      : Parser(state), allowParsingSSAIds(allowParsingSSAIds),
+15413076*:   51:        parseElement(parseElement) {}
+call    0 returned 100%
+        -:   52:
+        -:   53:  ParseResult parseAffineMapRange(unsigned numDims, unsigned numSymbols,
+        -:   54:                                  AffineMap &result);
+        -:   55:  ParseResult parseAffineMapOrIntegerSetInline(AffineMap &map, IntegerSet &set);
+        -:   56:  ParseResult parseIntegerSetConstraints(unsigned numDims, unsigned numSymbols,
+        -:   57:                                         IntegerSet &result);
+        -:   58:  ParseResult parseAffineMapOfSSAIds(AffineMap &map,
+        -:   59:                                     OpAsmParser::Delimiter delimiter);
+        -:   60:  ParseResult parseAffineExprOfSSAIds(AffineExpr &expr);
+        -:   61:  void getDimsAndSymbolSSAIds(SmallVectorImpl<StringRef> &dimAndSymbolSSAIds,
+        -:   62:                              unsigned &numDims);
+        -:   63:
+        -:   64:private:
+        -:   65:  // Binary affine op parsing.
+        -:   66:  AffineLowPrecOp consumeIfLowPrecOp();
+        -:   67:  AffineHighPrecOp consumeIfHighPrecOp();
+        -:   68:
+        -:   69:  // Identifier lists for polyhedral structures.
+        -:   70:  ParseResult parseDimIdList(unsigned &numDims);
+        -:   71:  ParseResult parseSymbolIdList(unsigned &numSymbols);
+        -:   72:  ParseResult parseDimAndOptionalSymbolIdList(unsigned &numDims,
+        -:   73:                                              unsigned &numSymbols);
+        -:   74:  ParseResult parseIdentifierDefinition(AffineExpr idExpr);
+        -:   75:
+        -:   76:  AffineExpr parseAffineExpr();
+        -:   77:  AffineExpr parseParentheticalExpr();
+        -:   78:  AffineExpr parseNegateExpression(AffineExpr lhs);
+        -:   79:  AffineExpr parseIntegerExpr();
+        -:   80:  AffineExpr parseBareIdExpr();
+        -:   81:  AffineExpr parseSSAIdExpr(bool isSymbol);
+        -:   82:  AffineExpr parseSymbolSSAIdExpr();
+        -:   83:
+        -:   84:  AffineExpr getAffineBinaryOpExpr(AffineHighPrecOp op, AffineExpr lhs,
+        -:   85:                                   AffineExpr rhs, SMLoc opLoc);
+        -:   86:  AffineExpr getAffineBinaryOpExpr(AffineLowPrecOp op, AffineExpr lhs,
+        -:   87:                                   AffineExpr rhs);
+        -:   88:  AffineExpr parseAffineOperandExpr(AffineExpr lhs);
+        -:   89:  AffineExpr parseAffineLowPrecOpExpr(AffineExpr llhs, AffineLowPrecOp llhsOp);
+        -:   90:  AffineExpr parseAffineHighPrecOpExpr(AffineExpr llhs, AffineHighPrecOp llhsOp,
+        -:   91:                                       SMLoc llhsOpLoc);
+        -:   92:  AffineExpr parseAffineConstraint(bool *isEq);
+        -:   93:
+        -:   94:private:
+        -:   95:  bool allowParsingSSAIds;
+        -:   96:  function_ref<ParseResult(bool)> parseElement;
+        -:   97:  unsigned numDimOperands = 0;
+        -:   98:  unsigned numSymbolOperands = 0;
+        -:   99:  SmallVector<std::pair<StringRef, AffineExpr>, 4> dimsAndSymbols;
+        -:  100:};
+        -:  101:} // namespace
+        -:  102:
+        -:  103:/// Create an affine binary high precedence op expression (mul's, div's, mod).
+        -:  104:/// opLoc is the location of the op token to be used to report errors
+        -:  105:/// for non-conforming expressions.
+function _ZN12_GLOBAL__N_112AffineParser21getAffineBinaryOpExprENS_16AffineHighPrecOpEN4mlir10AffineExprES3_N4llvm5SMLocE called 6753113 returned 100% blocks executed 47%
+  6753113:  106:AffineExpr AffineParser::getAffineBinaryOpExpr(AffineHighPrecOp op,
+        -:  107:                                               AffineExpr lhs, AffineExpr rhs,
+        -:  108:                                               SMLoc opLoc) {
+        -:  109:  // TODO: make the error location info accurate.
+  6753113:  110:  switch (op) {
+branch  0 taken 28%
+branch  1 taken 23%
+branch  2 taken 25%
+branch  3 taken 25%
+branch  4 taken 0%
+branch  5 taken 0%
+  1862573:  111:  case Mul:
+  1862573:  112:    if (!lhs.isSymbolicOrConstant() && !rhs.isSymbolicOrConstant()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+    #####:  113:      emitError(opLoc, "non-affine expression: at least one of the multiply "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  114:                       "operands has to be either a constant or symbolic");
+    #####:  115:      return nullptr;
+        -:  116:    }
+  1862573:  117:    return lhs * rhs;
+call    0 returned 100%
+  1548425:  118:  case FloorDiv:
+  1548425:  119:    if (!rhs.isSymbolicOrConstant()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  120:      emitError(opLoc, "non-affine expression: right operand of floordiv "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  121:                       "has to be either a constant or symbolic");
+    #####:  122:      return nullptr;
+        -:  123:    }
+  1548425:  124:    return lhs.floorDiv(rhs);
+call    0 returned 100%
+  1685736:  125:  case CeilDiv:
+  1685736:  126:    if (!rhs.isSymbolicOrConstant()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  127:      emitError(opLoc, "non-affine expression: right operand of ceildiv "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  128:                       "has to be either a constant or symbolic");
+    #####:  129:      return nullptr;
+        -:  130:    }
+  1685736:  131:    return lhs.ceilDiv(rhs);
+call    0 returned 100%
+  1656379:  132:  case Mod:
+  1656379:  133:    if (!rhs.isSymbolicOrConstant()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  134:      emitError(opLoc, "non-affine expression: right operand of mod "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  135:                       "has to be either a constant or symbolic");
+    #####:  136:      return nullptr;
+        -:  137:    }
+  1656379:  138:    return lhs % rhs;
+call    0 returned 100%
+    #####:  139:  case HNoOp:
+    #####:  140:    llvm_unreachable("can't create affine expression for null high prec op");
+call    0 never executed
+        -:  141:    return nullptr;
+        -:  142:  }
+    #####:  143:  llvm_unreachable("Unknown AffineHighPrecOp");
+call    0 never executed
+        -:  144:}
+        -:  145:
+        -:  146:/// Create an affine binary low precedence op expression (add, sub).
+        -:  147:AffineExpr AffineParser::getAffineBinaryOpExpr(AffineLowPrecOp op,
+        -:  148:                                               AffineExpr lhs, AffineExpr rhs) {
+        -:  149:  switch (op) {
+        -:  150:  case AffineLowPrecOp::Add:
+        -:  151:    return lhs + rhs;
+        -:  152:  case AffineLowPrecOp::Sub:
+        -:  153:    return lhs - rhs;
+        -:  154:  case AffineLowPrecOp::LNoOp:
+        -:  155:    llvm_unreachable("can't create affine expression for null low prec op");
+        -:  156:    return nullptr;
+        -:  157:  }
+        -:  158:  llvm_unreachable("Unknown AffineLowPrecOp");
+        -:  159:}
+        -:  160:
+        -:  161:/// Consume this token if it is a lower precedence affine op (there are only
+        -:  162:/// two precedence levels).
+function _ZN12_GLOBAL__N_112AffineParser18consumeIfLowPrecOpEv called 51108133 returned 100% blocks executed 100%
+ 51108133:  163:AffineLowPrecOp AffineParser::consumeIfLowPrecOp() {
+ 51108133:  164:  switch (getToken().getKind()) {
+branch  0 taken 5%
+branch  1 taken 6%
+branch  2 taken 89%
+  2707437:  165:  case Token::plus:
+  2707437:  166:    consumeToken(Token::plus);
+  2707437:  167:    return AffineLowPrecOp::Add;
+call    0 returned 100%
+  3051794:  168:  case Token::minus:
+  3051794:  169:    consumeToken(Token::minus);
+  3051794:  170:    return AffineLowPrecOp::Sub;
+call    0 returned 100%
+        -:  171:  default:
+        -:  172:    return AffineLowPrecOp::LNoOp;
+        -:  173:  }
+        -:  174:}
+        -:  175:
+        -:  176:/// Consume this token if it is a higher precedence affine op (there are only
+        -:  177:/// two precedence levels)
+function _ZN12_GLOBAL__N_112AffineParser19consumeIfHighPrecOpEv called 47181401 returned 100% blocks executed 100%
+ 47181401:  178:AffineHighPrecOp AffineParser::consumeIfHighPrecOp() {
+ 47181401:  179:  switch (getToken().getKind()) {
+branch  0 taken 4%
+branch  1 taken 3%
+branch  2 taken 4%
+branch  3 taken 4%
+branch  4 taken 86%
+  1862573:  180:  case Token::star:
+  1862573:  181:    consumeToken(Token::star);
+  1862573:  182:    return Mul;
+call    0 returned 100%
+  1548425:  183:  case Token::kw_floordiv:
+  1548425:  184:    consumeToken(Token::kw_floordiv);
+  1548425:  185:    return FloorDiv;
+call    0 returned 100%
+  1685736:  186:  case Token::kw_ceildiv:
+  1685736:  187:    consumeToken(Token::kw_ceildiv);
+  1685736:  188:    return CeilDiv;
+call    0 returned 100%
+  1656379:  189:  case Token::kw_mod:
+  1656379:  190:    consumeToken(Token::kw_mod);
+  1656379:  191:    return Mod;
+call    0 returned 100%
+        -:  192:  default:
+        -:  193:    return HNoOp;
+        -:  194:  }
+        -:  195:}
+        -:  196:
+        -:  197:/// Parse a high precedence op expression list: mul, div, and mod are high
+        -:  198:/// precedence binary ops, i.e., parse a
+        -:  199:///   expr_1 op_1 expr_2 op_2 ... expr_n
+        -:  200:/// where op_1, op_2 are all a AffineHighPrecOp (mul, div, mod).
+        -:  201:/// All affine binary ops are left associative.
+        -:  202:/// Given llhs, returns (llhs llhsOp lhs) op rhs, or (lhs op rhs) if llhs is
+        -:  203:/// null. If no rhs can be found, returns (llhs llhsOp lhs) or lhs if llhs is
+        -:  204:/// null. llhsOpLoc is the location of the llhsOp token that will be used to
+        -:  205:/// report an error for non-conforming expressions.
+function _ZN12_GLOBAL__N_112AffineParser25parseAffineHighPrecOpExprEN4mlir10AffineExprENS_16AffineHighPrecOpEN4llvm5SMLocE called 6753113 returned 100% blocks executed 47%
+  6753113:  206:AffineExpr AffineParser::parseAffineHighPrecOpExpr(AffineExpr llhs,
+        -:  207:                                                   AffineHighPrecOp llhsOp,
+        -:  208:                                                   SMLoc llhsOpLoc) {
+  6753113:  209:  AffineExpr lhs = parseAffineOperandExpr(llhs);
+call    0 returned 100%
+  6753113:  210:  if (!lhs)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  211:    return nullptr;
+        -:  212:
+        -:  213:  // Found an LHS. Parse the remaining expression.
+  6753113:  214:  auto opLoc = getToken().getLoc();
+call    0 returned 100%
+  6753113:  215:  if (AffineHighPrecOp op = consumeIfHighPrecOp()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  216:    if (llhs) {
+branch  0 never executed
+branch  1 never executed
+    #####:  217:      AffineExpr expr = getAffineBinaryOpExpr(llhsOp, llhs, lhs, opLoc);
+call    0 never executed
+    #####:  218:      if (!expr)
+branch  0 never executed
+branch  1 never executed
+    #####:  219:        return nullptr;
+    #####:  220:      return parseAffineHighPrecOpExpr(expr, op, opLoc);
+call    0 never executed
+        -:  221:    }
+        -:  222:    // No LLHS, get RHS
+    #####:  223:    return parseAffineHighPrecOpExpr(lhs, op, opLoc);
+call    0 never executed
+        -:  224:  }
+        -:  225:
+        -:  226:  // This is the last operand in this expression.
+  6753113:  227:  if (llhs)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+  6753113:  228:    return getAffineBinaryOpExpr(llhsOp, llhs, lhs, llhsOpLoc);
+call    0 returned 100%
+        -:  229:
+        -:  230:  // No llhs, 'lhs' itself is the expression.
+    #####:  231:  return lhs;
+        -:  232:}
+        -:  233:
+        -:  234:/// Parse an affine expression inside parentheses.
+        -:  235:///
+        -:  236:///   affine-expr ::= `(` affine-expr `)`
+function _ZN12_GLOBAL__N_112AffineParser22parseParentheticalExprEv called 3725315 returned 100% blocks executed 65%
+  3725315:  237:AffineExpr AffineParser::parseParentheticalExpr() {
+  3725315:  238:  if (parseToken(Token::l_paren, "expected '('"))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  239:    return nullptr;
+  3725315:  240:  if (getToken().is(Token::r_paren))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  241:    return emitError("no expression inside parentheses"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  242:
+  7450630:  243:  auto expr = parseAffineExpr();
+ 3725315*:  244:  if (!expr || parseToken(Token::r_paren, "expected ')'"))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  245:    return nullptr;
+        -:  246:
+  3725315:  247:  return expr;
+        -:  248:}
+        -:  249:
+        -:  250:/// Parse the negation expression.
+        -:  251:///
+        -:  252:///   affine-expr ::= `-` affine-expr
+function _ZN12_GLOBAL__N_112AffineParser21parseNegateExpressionEN4mlir10AffineExprE called 1675295 returned 100% blocks executed 62%
+  1675295:  253:AffineExpr AffineParser::parseNegateExpression(AffineExpr lhs) {
+  1675295:  254:  if (parseToken(Token::minus, "expected '-'"))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  255:    return nullptr;
+        -:  256:
+  1675295:  257:  AffineExpr operand = parseAffineOperandExpr(lhs);
+call    0 returned 100%
+        -:  258:  // Since negation has the highest precedence of all ops (including high
+        -:  259:  // precedence ops) but lower than parentheses, we are only going to use
+        -:  260:  // parseAffineOperandExpr instead of parseAffineExpr here.
+  1675295:  261:  if (!operand)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  262:    // Extra error message although parseAffineOperandExpr would have
+        -:  263:    // complained. Leads to a better diagnostic.
+    #####:  264:    return emitError("missing operand of negation"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+  1675295:  265:  return (-1) * operand;
+call    0 returned 100%
+        -:  266:}
+        -:  267:
+        -:  268:/// Returns true if the given token can be represented as an identifier.
+115307871:  269:static bool isIdentifier(const Token &token) {
+        -:  270:  // We include only `inttype` and `bare_identifier` here since they are the
+        -:  271:  // only non-keyword tokens that can be used to represent an identifier.
+115307871*:  272:  return token.isAny(Token::bare_identifier, Token::inttype) ||
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+branch  6 never executed
+branch  7 never executed
+branch  8 taken 0% (fallthrough)
+branch  9 taken 100%
+branch 10 never executed
+branch 11 never executed
+    #####:  273:         token.isKeyword();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  274:}
+        -:  275:
+        -:  276:/// Parse a bare id that may appear in an affine expression.
+        -:  277:///
+        -:  278:///   affine-expr ::= bare-id
+function _ZN12_GLOBAL__N_112AffineParser15parseBareIdExprEv called 30791452 returned 100% blocks executed 48%
+ 30791452:  279:AffineExpr AffineParser::parseBareIdExpr() {
+30791452*:  280:  if (!isIdentifier(getToken()))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  281:    return emitWrongTokenError("expected bare identifier"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  282:
+ 30791452:  283:  StringRef sRef = getTokenSpelling();
+ 59612649:  284:  for (auto entry : dimsAndSymbols) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 88433846:  285:    if (entry.first == sRef) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 30791452:  286:      consumeToken();
+call    0 returned 100%
+ 30791452:  287:      return entry.second;
+        -:  288:    }
+        -:  289:  }
+        -:  290:
+    #####:  291:  return emitWrongTokenError("use of undeclared identifier"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  292:}
+        -:  293:
+        -:  294:/// Parse an SSA id which may appear in an affine expression.
+function _ZN12_GLOBAL__N_112AffineParser14parseSSAIdExprEb called 4358352 returned 100% blocks executed 63%
+  4358352:  295:AffineExpr AffineParser::parseSSAIdExpr(bool isSymbol) {
+  4358352:  296:  if (!allowParsingSSAIds)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  297:    return emitWrongTokenError("unexpected ssa identifier"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+  4358352:  298:  if (getToken().isNot(Token::percent_identifier))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  299:    return emitWrongTokenError("expected ssa identifier"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+  4358352:  300:  auto name = getTokenSpelling();
+        -:  301:  // Check if we already parsed this SSA id.
+  6904305:  302:  for (auto entry : dimsAndSymbols) {
+branch  0 taken 39% (fallthrough)
+branch  1 taken 61%
+  3949531:  303:    if (entry.first == name) {
+branch  0 taken 52% (fallthrough)
+branch  1 taken 48%
+   143922:  304:      consumeToken(Token::percent_identifier);
+call    0 returned 100%
+   143922:  305:      return entry.second;
+        -:  306:    }
+        -:  307:  }
+        -:  308:  // Parse the SSA id and add an AffineDim/SymbolExpr to represent it.
+  4214430:  309:  if (parseElement(isSymbol))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  310:    return nullptr;
+  4214430:  311:  auto idExpr = isSymbol
+    #####:  312:                    ? getAffineSymbolExpr(numSymbolOperands++, getContext())
+call    0 never executed
+  4214430:  313:                    : getAffineDimExpr(numDimOperands++, getContext());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+  4214430:  314:  dimsAndSymbols.push_back({name, idExpr});
+call    0 returned 100%
+  4214430:  315:  return idExpr;
+        -:  316:}
+        -:  317:
+function _ZN12_GLOBAL__N_112AffineParser20parseSymbolSSAIdExprEv called 0 returned 0% blocks executed 0%
+    #####:  318:AffineExpr AffineParser::parseSymbolSSAIdExpr() {
+    #####:  319:  if (parseToken(Token::kw_symbol, "expected symbol keyword") ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  320:      parseToken(Token::l_paren, "expected '(' at start of SSA symbol"))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  321:    return nullptr;
+    #####:  322:  AffineExpr symbolExpr = parseSSAIdExpr(/*isSymbol=*/true);
+call    0 never executed
+    #####:  323:  if (!symbolExpr)
+branch  0 never executed
+branch  1 never executed
+    #####:  324:    return nullptr;
+    #####:  325:  if (parseToken(Token::r_paren, "expected ')' at end of SSA symbol"))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  326:    return nullptr;
+    #####:  327:  return symbolExpr;
+        -:  328:}
+        -:  329:
+        -:  330:/// Parse a positive integral constant appearing in an affine expression.
+        -:  331:///
+        -:  332:///   affine-expr ::= integer-literal
+function _ZN12_GLOBAL__N_112AffineParser16parseIntegerExprEv called 12233014 returned 100% blocks executed 60%
+ 12233014:  333:AffineExpr AffineParser::parseIntegerExpr() {
+ 12233014:  334:  auto val = getToken().getUInt64IntegerValue();
+call    0 returned 100%
+ 12233014:  335:  if (!val.has_value() || (int64_t)val.value() < 0)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  336:    return emitError("constant too large for index"), nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  337:
+ 12233014:  338:  consumeToken(Token::integer);
+call    0 returned 100%
+ 12233014:  339:  return builder.getAffineConstantExpr((int64_t)val.value());
+call    0 returned 100%
+        -:  340:}
+        -:  341:
+        -:  342:/// Parses an expression that can be a valid operand of an affine expression.
+        -:  343:/// lhs: if non-null, lhs is an affine expression that is the lhs of a binary
+        -:  344:/// operator, the rhs of which is being parsed. This is used to determine
+        -:  345:/// whether an error should be emitted for a missing right operand.
+        -:  346://  Eg: for an expression without parentheses (like i + j + k + l), each
+        -:  347://  of the four identifiers is an operand. For i + j*k + l, j*k is not an
+        -:  348://  operand expression, it's an op expression and will be parsed via
+        -:  349://  parseAffineHighPrecOpExpression(). However, for i + (j*k) + -l, (j*k) and
+        -:  350://  -l are valid operands that will be parsed by this function.
+function _ZN12_GLOBAL__N_112AffineParser22parseAffineOperandExprEN4mlir10AffineExprE called 52783428 returned 100% blocks executed 24%
+ 52783428:  351:AffineExpr AffineParser::parseAffineOperandExpr(AffineExpr lhs) {
+ 52783428:  352:  switch (getToken().getKind()) {
+branch  0 taken 0%
+branch  1 taken 8%
+branch  2 taken 23%
+branch  3 taken 7%
+branch  4 taken 3%
+branch  5 taken 0%
+branch  6 taken 0%
+branch  7 taken 58%
+    #####:  353:  case Token::kw_symbol:
+    #####:  354:    return parseSymbolSSAIdExpr();
+call    0 never executed
+  4358352:  355:  case Token::percent_identifier:
+  4358352:  356:    return parseSSAIdExpr(/*isSymbol=*/false);
+call    0 returned 100%
+ 12233014:  357:  case Token::integer:
+ 12233014:  358:    return parseIntegerExpr();
+call    0 returned 100%
+  3725315:  359:  case Token::l_paren:
+  3725315:  360:    return parseParentheticalExpr();
+call    0 returned 100%
+  1675295:  361:  case Token::minus:
+  1675295:  362:    return parseNegateExpression(lhs);
+call    0 returned 100%
+    #####:  363:  case Token::kw_ceildiv:
+    #####:  364:  case Token::kw_floordiv:
+    #####:  365:  case Token::kw_mod:
+        -:  366:    // Try to treat these tokens as identifiers.
+    #####:  367:    return parseBareIdExpr();
+call    0 never executed
+    #####:  368:  case Token::plus:
+    #####:  369:  case Token::star:
+    #####:  370:    if (lhs)
+branch  0 never executed
+branch  1 never executed
+    #####:  371:      emitError("missing right operand of binary operator");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  372:    else
+    #####:  373:      emitError("missing left operand of binary operator");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  374:    return nullptr;
+ 30791452:  375:  default:
+        -:  376:    // If nothing matches, we try to treat this token as an identifier.
+30791452*:  377:    if (isIdentifier(getToken()))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 30791452:  378:      return parseBareIdExpr();
+call    0 returned 100%
+        -:  379:
+    #####:  380:    if (lhs)
+branch  0 never executed
+branch  1 never executed
+    #####:  381:      emitError("missing right operand of binary operator");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  382:    else
+    #####:  383:      emitError("expected affine expression");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  384:    return nullptr;
+        -:  385:  }
+        -:  386:}
+        -:  387:
+        -:  388:/// Parse affine expressions that are bare-id's, integer constants,
+        -:  389:/// parenthetical affine expressions, and affine op expressions that are a
+        -:  390:/// composition of those.
+        -:  391:///
+        -:  392:/// All binary op's associate from left to right.
+        -:  393:///
+        -:  394:/// {add, sub} have lower precedence than {mul, div, and mod}.
+        -:  395:///
+        -:  396:/// Add, sub'are themselves at the same precedence level. Mul, floordiv,
+        -:  397:/// ceildiv, and mod are at the same higher precedence level. Negation has
+        -:  398:/// higher precedence than any binary op.
+        -:  399:///
+        -:  400:/// llhs: the affine expression appearing on the left of the one being parsed.
+        -:  401:/// This function will return ((llhs llhsOp lhs) op rhs) if llhs is non null,
+        -:  402:/// and lhs op rhs otherwise; if there is no rhs, llhs llhsOp lhs is returned
+        -:  403:/// if llhs is non-null; otherwise lhs is returned. This is to deal with left
+        -:  404:/// associativity.
+        -:  405:///
+        -:  406:/// Eg: when the expression is e1 + e2*e3 + e4, with e1 as llhs, this function
+        -:  407:/// will return the affine expr equivalent of (e1 + (e2*e3)) + e4, where
+        -:  408:/// (e2*e3) will be parsed using parseAffineHighPrecOpExpr().
+function _ZN12_GLOBAL__N_112AffineParser24parseAffineLowPrecOpExprEN4mlir10AffineExprENS_15AffineLowPrecOpE called 44355020 returned 100% blocks executed 93%
+ 44355020:  409:AffineExpr AffineParser::parseAffineLowPrecOpExpr(AffineExpr llhs,
+        -:  410:                                                  AffineLowPrecOp llhsOp) {
+ 44355020:  411:  AffineExpr lhs;
+ 44355020:  412:  if (!(lhs = parseAffineOperandExpr(llhs)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  413:    return nullptr;
+        -:  414:
+        -:  415:  // Found an LHS. Deal with the ops.
+ 44355020:  416:  if (AffineLowPrecOp lOp = consumeIfLowPrecOp()) {
+call    0 returned 100%
+branch  1 taken 9% (fallthrough)
+branch  2 taken 91%
+  3926732:  417:    if (llhs) {
+branch  0 taken 20% (fallthrough)
+branch  1 taken 80%
+   774920:  418:      AffineExpr sum = getAffineBinaryOpExpr(llhsOp, llhs, lhs);
+call    0 returned 100%
+   774920:  419:      return parseAffineLowPrecOpExpr(sum, lOp);
+call    0 returned 100%
+        -:  420:    }
+        -:  421:    // No LLHS, get RHS and form the expression.
+  3151812:  422:    return parseAffineLowPrecOpExpr(lhs, lOp);
+call    0 returned 100%
+        -:  423:  }
+ 40428288:  424:  auto opLoc = getToken().getLoc();
+call    0 returned 100%
+ 40428288:  425:  if (AffineHighPrecOp hOp = consumeIfHighPrecOp()) {
+call    0 returned 100%
+branch  1 taken 17% (fallthrough)
+branch  2 taken 83%
+        -:  426:    // We have a higher precedence op here. Get the rhs operand for the llhs
+        -:  427:    // through parseAffineHighPrecOpExpr.
+  6753113:  428:    AffineExpr highRes = parseAffineHighPrecOpExpr(lhs, hOp, opLoc);
+call    0 returned 100%
+  6753113:  429:    if (!highRes)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  430:      return nullptr;
+        -:  431:
+        -:  432:    // If llhs is null, the product forms the first operand of the yet to be
+        -:  433:    // found expression. If non-null, the op to associate with llhs is llhsOp.
+  6753113:  434:    AffineExpr expr =
+  6753113:  435:        llhs ? getAffineBinaryOpExpr(llhsOp, llhs, highRes) : highRes;
+branch  0 taken 11% (fallthrough)
+branch  1 taken 89%
+call    2 returned 100%
+        -:  436:
+        -:  437:    // Recurse for subsequent low prec op's after the affine high prec op
+        -:  438:    // expression.
+  6753113:  439:    if (AffineLowPrecOp nextOp = consumeIfLowPrecOp())
+call    0 returned 100%
+branch  1 taken 27% (fallthrough)
+branch  2 taken 73%
+  1832499:  440:      return parseAffineLowPrecOpExpr(expr, nextOp);
+call    0 returned 100%
+  4920614:  441:    return expr;
+        -:  442:  }
+        -:  443:  // Last operand in the expression list.
+ 33675175:  444:  if (llhs)
+branch  0 taken 13% (fallthrough)
+branch  1 taken 87%
+  4268874:  445:    return getAffineBinaryOpExpr(llhsOp, llhs, lhs);
+call    0 returned 100%
+        -:  446:  // No llhs, 'lhs' itself is the expression.
+ 29406301:  447:  return lhs;
+        -:  448:}
+        -:  449:
+        -:  450:/// Parse an affine expression.
+        -:  451:///  affine-expr ::= `(` affine-expr `)`
+        -:  452:///                | `-` affine-expr
+        -:  453:///                | affine-expr `+` affine-expr
+        -:  454:///                | affine-expr `-` affine-expr
+        -:  455:///                | affine-expr `*` affine-expr
+        -:  456:///                | affine-expr `floordiv` affine-expr
+        -:  457:///                | affine-expr `ceildiv` affine-expr
+        -:  458:///                | affine-expr `mod` affine-expr
+        -:  459:///                | bare-id
+        -:  460:///                | integer-literal
+        -:  461:///
+        -:  462:/// Additional conditions are checked depending on the production. For eg.,
+        -:  463:/// one of the operands for `*` has to be either constant/symbolic; the second
+        -:  464:/// operand for floordiv, ceildiv, and mod has to be a positive integer.
+38595789*:  465:AffineExpr AffineParser::parseAffineExpr() {
+ 3725315*:  466:  return parseAffineLowPrecOpExpr(nullptr, AffineLowPrecOp::LNoOp);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  467:}
+        -:  468:
+        -:  469:/// Parse a dim or symbol from the lists appearing before the actual
+        -:  470:/// expressions of the affine map. Update our state to store the
+        -:  471:/// dimensional/symbolic identifier.
+function _ZN12_GLOBAL__N_112AffineParser25parseIdentifierDefinitionEN4mlir10AffineExprE called 53724967 returned 100% blocks executed 42%
+ 53724967:  472:ParseResult AffineParser::parseIdentifierDefinition(AffineExpr idExpr) {
+53724967*:  473:  if (!isIdentifier(getToken()))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  474:    return emitWrongTokenError("expected bare identifier");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  475:
+ 53724967:  476:  auto name = getTokenSpelling();
+146013444:  477:  for (auto entry : dimsAndSymbols) {
+branch  0 taken 63% (fallthrough)
+branch  1 taken 37%
+184576954*:  478:    if (entry.first == name)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    #####:  479:      return emitError("redefinition of identifier '" + name + "'");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  480:  }
+ 53724967:  481:  consumeToken();
+call    0 returned 100%
+        -:  482:
+ 53724967:  483:  dimsAndSymbols.push_back({name, idExpr});
+call    0 returned 100%
+ 53724967:  484:  return success();
+        -:  485:}
+        -:  486:
+        -:  487:/// Parse the list of dimensional identifiers to an affine map.
+function _ZN12_GLOBAL__N_112AffineParser14parseDimIdListERj called 15413076 returned 100% blocks executed 100%
+ 15413076:  488:ParseResult AffineParser::parseDimIdList(unsigned &numDims) {
+function _ZZN12_GLOBAL__N_112AffineParser14parseDimIdListERjENKUlvE_clEv.isra.0 called 40889098 returned 100% blocks executed 100%
+ 40889098:  489:  auto parseElt = [&]() -> ParseResult {
+ 40889098:  490:    auto dimension = getAffineDimExpr(numDims++, getContext());
+call    0 returned 100%
+ 40889098:  491:    return parseIdentifierDefinition(dimension);
+call    0 returned 100%
+ 15413076:  492:  };
+ 15413076:  493:  return parseCommaSeparatedList(Delimiter::Paren, parseElt,
+ 15413076:  494:                                 " in dimensional identifier list");
+call    0 returned 100%
+        -:  495:}
+        -:  496:
+        -:  497:/// Parse the list of symbolic identifiers to an affine map.
+function _ZN12_GLOBAL__N_112AffineParser17parseSymbolIdListERj called 4461837 returned 100% blocks executed 100%
+  4461837:  498:ParseResult AffineParser::parseSymbolIdList(unsigned &numSymbols) {
+function _ZZN12_GLOBAL__N_112AffineParser17parseSymbolIdListERjENKUlvE_clEv.isra.0 called 12835869 returned 100% blocks executed 100%
+ 12835869:  499:  auto parseElt = [&]() -> ParseResult {
+ 12835869:  500:    auto symbol = getAffineSymbolExpr(numSymbols++, getContext());
+call    0 returned 100%
+ 12835869:  501:    return parseIdentifierDefinition(symbol);
+call    0 returned 100%
+  4461837:  502:  };
+  4461837:  503:  return parseCommaSeparatedList(Delimiter::Square, parseElt,
+  4461837:  504:                                 " in symbol list");
+call    0 returned 100%
+        -:  505:}
+        -:  506:
+        -:  507:/// Parse the list of symbolic identifiers to an affine map.
+        -:  508:ParseResult
+function _ZN12_GLOBAL__N_112AffineParser31parseDimAndOptionalSymbolIdListERjS1_ called 15413076 returned 100% blocks executed 86%
+ 15413076:  509:AffineParser::parseDimAndOptionalSymbolIdList(unsigned &numDims,
+        -:  510:                                              unsigned &numSymbols) {
+ 15413076:  511:  if (parseDimIdList(numDims)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  512:    return failure();
+        -:  513:  }
+ 15413076:  514:  if (!getToken().is(Token::l_square)) {
+branch  0 taken 71% (fallthrough)
+branch  1 taken 29%
+ 10951239:  515:    numSymbols = 0;
+ 10951239:  516:    return success();
+        -:  517:  }
+  4461837:  518:  return parseSymbolIdList(numSymbols);
+call    0 returned 100%
+        -:  519:}
+        -:  520:
+        -:  521:/// Parses an ambiguous affine map or integer set definition inline.
+function _ZN12_GLOBAL__N_112AffineParser32parseAffineMapOrIntegerSetInlineERN4mlir9AffineMapERNS1_10IntegerSetE called 15413076 returned 100% blocks executed 83%
+ 15413076:  522:ParseResult AffineParser::parseAffineMapOrIntegerSetInline(AffineMap &map,
+        -:  523:                                                           IntegerSet &set) {
+ 15413076:  524:  unsigned numDims = 0, numSymbols = 0;
+        -:  525:
+        -:  526:  // List of dimensional and optional symbol identifiers.
+ 15413076:  527:  if (parseDimAndOptionalSymbolIdList(numDims, numSymbols))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  528:    return failure();
+        -:  529:
+ 15413076:  530:  if (consumeIf(Token::arrow))
+branch  0 taken 3% (fallthrough)
+branch  1 taken 97%
+ 14912545:  531:    return parseAffineMapRange(numDims, numSymbols, map);
+call    0 returned 100%
+        -:  532:
+   500531:  533:  if (parseToken(Token::colon, "expected '->' or ':'"))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0%
+branch  3 taken 100%
+    #####:  534:    return failure();
+   500531:  535:  return parseIntegerSetConstraints(numDims, numSymbols, set);
+call    0 returned 100%
+        -:  536:}
+        -:  537:
+        -:  538:/// Parse an AffineMap where the dim and symbol identifiers are SSA ids.
+        -:  539:ParseResult
+function _ZN12_GLOBAL__N_112AffineParser22parseAffineMapOfSSAIdsERN4mlir9AffineMapENS1_9AsmParser9DelimiterE called 2235802 returned 100% blocks executed 88%
+  2235802:  540:AffineParser::parseAffineMapOfSSAIds(AffineMap &map,
+        -:  541:                                     OpAsmParser::Delimiter delimiter) {
+        -:  542:
+  2235802:  543:  SmallVector<AffineExpr, 4> exprs;
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_112AffineParser22parseAffineMapOfSSAIdsERN4mlir9AffineMapENS1_9AsmParser9DelimiterEENKUlvE_clEv.isra.0 called 4358352 returned 100% blocks executed 83%
+  4358352:  544:  auto parseElt = [&]() -> ParseResult {
+  4358352:  545:    auto elt = parseAffineExpr();
+call    0 returned 100%
+  4358352:  546:    exprs.push_back(elt);
+call    0 returned 100%
+  4358352:  547:    return elt ? success() : failure();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+  2235802:  548:  };
+        -:  549:
+        -:  550:  // Parse a multi-dimensional affine expression (a comma-separated list of
+        -:  551:  // 1-d affine expressions); the list can be empty. Grammar:
+        -:  552:  // multi-dim-affine-expr ::= `(` `)`
+        -:  553:  //                         | `(` affine-expr (`,` affine-expr)* `)`
+  2235802:  554:  if (parseCommaSeparatedList(delimiter, parseElt, " in affine map"))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  555:    return failure();
+        -:  556:
+        -:  557:  // Parsed a valid affine map.
+  2235802:  558:  map = AffineMap::get(numDimOperands, dimsAndSymbols.size() - numDimOperands,
+  2235802:  559:                       exprs, getContext());
+call    0 returned 100%
+  2235802:  560:  return success();
+        -:  561:}
+        -:  562:
+        -:  563:/// Parse an AffineExpr where the dim and symbol identifiers are SSA ids.
+    #####:  564:ParseResult AffineParser::parseAffineExprOfSSAIds(AffineExpr &expr) {
+    #####:  565:  expr = parseAffineExpr();
+call    0 never executed
+    #####:  566:  return success(expr != nullptr);
+branch  0 never executed
+branch  1 never executed
+        -:  567:}
+        -:  568:
+        -:  569:/// Parse the range and sizes affine map definition inline.
+        -:  570:///
+        -:  571:///  affine-map ::= dim-and-symbol-id-lists `->` multi-dim-affine-expr
+        -:  572:///
+        -:  573:///  multi-dim-affine-expr ::= `(` `)`
+        -:  574:///  multi-dim-affine-expr ::= `(` affine-expr (`,` affine-expr)* `)`
+function _ZN12_GLOBAL__N_112AffineParser19parseAffineMapRangeEjjRN4mlir9AffineMapE called 14912545 returned 100% blocks executed 75%
+ 14912545:  575:ParseResult AffineParser::parseAffineMapRange(unsigned numDims,
+        -:  576:                                              unsigned numSymbols,
+        -:  577:                                              AffineMap &result) {
+ 14912545:  578:  SmallVector<AffineExpr, 4> exprs;
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_112AffineParser19parseAffineMapRangeEjjRN4mlir9AffineMapEENKUlvE_clEv.isra.0 called 27921292 returned 100% blocks executed 83%
+ 27921292:  579:  auto parseElt = [&]() -> ParseResult {
+ 27921292:  580:    auto elt = parseAffineExpr();
+call    0 returned 100%
+ 27921292:  581:    ParseResult res = elt ? success() : failure();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+ 27921292:  582:    exprs.push_back(elt);
+call    0 returned 100%
+ 27921292:  583:    return res;
+ 14912545:  584:  };
+        -:  585:
+        -:  586:  // Parse a multi-dimensional affine expression (a comma-separated list of
+        -:  587:  // 1-d affine expressions). Grammar:
+        -:  588:  // multi-dim-affine-expr ::= `(` `)`
+        -:  589:  //                         | `(` affine-expr (`,` affine-expr)* `)`
+ 14912545:  590:  if (parseCommaSeparatedList(Delimiter::Paren, parseElt,
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 14912545:  591:                              " in affine map range"))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  592:    return failure();
+        -:  593:
+        -:  594:  // Parsed a valid affine map.
+ 14912545:  595:  result = AffineMap::get(numDims, numSymbols, exprs, getContext());
+call    0 returned 100%
+ 14912545:  596:  return success();
+        -:  597:}
+        -:  598:
+        -:  599:/// Parse an affine constraint.
+        -:  600:///  affine-constraint ::= affine-expr `>=` `affine-expr`
+        -:  601:///                      | affine-expr `<=` `affine-expr`
+        -:  602:///                      | affine-expr `==` `affine-expr`
+        -:  603:///
+        -:  604:/// The constraint is normalized to
+        -:  605:///  affine-constraint ::= affine-expr `>=` `0`
+        -:  606:///                      | affine-expr `==` `0`
+        -:  607:/// before returning.
+        -:  608:///
+        -:  609:/// isEq is set to true if the parsed constraint is an equality, false if it
+        -:  610:/// is an inequality (greater than or equal).
+        -:  611:///
+function _ZN12_GLOBAL__N_112AffineParser21parseAffineConstraintEPb called 1295415 returned 100% blocks executed 55%
+  1295415:  612:AffineExpr AffineParser::parseAffineConstraint(bool *isEq) {
+  1295415:  613:  AffineExpr lhsExpr = parseAffineExpr();
+call    0 returned 100%
+  1295415:  614:  if (!lhsExpr)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  615:    return nullptr;
+        -:  616:
+        -:  617:  // affine-constraint ::= `affine-expr` `>=` `affine-expr`
+  1976508:  618:  if (consumeIf(Token::greater) && consumeIf(Token::equal)) {
+branch  0 taken 53% (fallthrough)
+branch  1 taken 47%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+   681093:  619:    AffineExpr rhsExpr = parseAffineExpr();
+call    0 returned 100%
+   681093:  620:    if (!rhsExpr)
+branch  0 taken 0%
+branch  1 taken 100%
+    #####:  621:      return nullptr;
+   681093:  622:    *isEq = false;
+   681093:  623:    return lhsExpr - rhsExpr;
+call    0 returned 100%
+        -:  624:  }
+        -:  625:
+        -:  626:  // affine-constraint ::= `affine-expr` `<=` `affine-expr`
+  614322*:  627:  if (consumeIf(Token::less) && consumeIf(Token::equal)) {
+branch  0 taken 0%
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+    #####:  628:    AffineExpr rhsExpr = parseAffineExpr();
+call    0 never executed
+    #####:  629:    if (!rhsExpr)
+branch  0 never executed
+branch  1 never executed
+    #####:  630:      return nullptr;
+    #####:  631:    *isEq = false;
+    #####:  632:    return rhsExpr - lhsExpr;
+call    0 never executed
+        -:  633:  }
+        -:  634:
+        -:  635:  // affine-constraint ::= `affine-expr` `==` `affine-expr`
+ 1228644*:  636:  if (consumeIf(Token::equal) && consumeIf(Token::equal)) {
+branch  0 taken 100%
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+   614322:  637:    AffineExpr rhsExpr = parseAffineExpr();
+call    0 returned 100%
+   614322:  638:    if (!rhsExpr)
+branch  0 taken 0%
+branch  1 taken 100%
+    #####:  639:      return nullptr;
+   614322:  640:    *isEq = true;
+   614322:  641:    return lhsExpr - rhsExpr;
+call    0 returned 100%
+        -:  642:  }
+        -:  643:
+    #####:  644:  return emitError("expected '== affine-expr' or '>= affine-expr' at end of "
+        -:  645:                   "affine constraint"),
+    #####:  646:         nullptr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  647:}
+        -:  648:
+        -:  649:/// Parse the constraints that are part of an integer set definition.
+        -:  650:///  integer-set-inline
+        -:  651:///                ::= dim-and-symbol-id-lists `:`
+        -:  652:///                '(' affine-constraint-conjunction? ')'
+        -:  653:///  affine-constraint-conjunction ::= affine-constraint (`,`
+        -:  654:///                                       affine-constraint)*
+        -:  655:///
+function _ZN12_GLOBAL__N_112AffineParser26parseIntegerSetConstraintsEjjRN4mlir10IntegerSetE called 500531 returned 100% blocks executed 57%
+   500531:  656:ParseResult AffineParser::parseIntegerSetConstraints(unsigned numDims,
+        -:  657:                                                     unsigned numSymbols,
+        -:  658:                                                     IntegerSet &result) {
+   500531:  659:  SmallVector<AffineExpr, 4> constraints;
+call    0 returned 100%
+   500531:  660:  SmallVector<bool, 4> isEqs;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+function _ZZN12_GLOBAL__N_112AffineParser26parseIntegerSetConstraintsEjjRN4mlir10IntegerSetEENKUlvE_clEv called 1295415 returned 100% blocks executed 86%
+  1795946:  661:  auto parseElt = [&]() -> ParseResult {
+  1295415:  662:    bool isEq;
+  1295415:  663:    auto elt = parseAffineConstraint(&isEq);
+call    0 returned 100%
+  1295415:  664:    ParseResult res = elt ? success() : failure();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+  1295415:  665:    if (elt) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+  1295415:  666:      constraints.push_back(elt);
+call    0 returned 100%
+  1295415:  667:      isEqs.push_back(isEq);
+call    0 returned 100%
+        -:  668:    }
+  1295415:  669:    return res;
+   500531:  670:  };
+        -:  671:
+        -:  672:  // Parse a list of affine constraints (comma-separated).
+   500531:  673:  if (parseCommaSeparatedList(Delimiter::Paren, parseElt,
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   500531:  674:                              " in integer set constraint list"))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  675:    return failure();
+        -:  676:
+        -:  677:  // If no constraints were parsed, then treat this as a degenerate 'true' case.
+   500531:  678:  if (constraints.empty()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  679:    /* 0 == 0 */
+    #####:  680:    auto zero = getAffineConstantExpr(0, getContext());
+call    0 never executed
+    #####:  681:    result = IntegerSet::get(numDims, numSymbols, zero, true);
+call    0 never executed
+    #####:  682:    return success();
+        -:  683:  }
+        -:  684:
+        -:  685:  // Parsed a valid integer set.
+   500531:  686:  result = IntegerSet::get(numDims, numSymbols, constraints, isEqs);
+call    0 returned 100%
+   500531:  687:  return success();
+        -:  688:}
+        -:  689:
+        -:  690://===----------------------------------------------------------------------===//
+        -:  691:// Parser
+        -:  692://===----------------------------------------------------------------------===//
+        -:  693:
+        -:  694:/// Parse an ambiguous reference to either and affine map or an integer set.
+function _ZN4mlir6detail6Parser35parseAffineMapOrIntegerSetReferenceERNS_9AffineMapERNS_10IntegerSetE called 15413076 returned 100% blocks executed 100%
+ 15413076:  695:ParseResult Parser::parseAffineMapOrIntegerSetReference(AffineMap &map,
+        -:  696:                                                        IntegerSet &set) {
+ 15413076:  697:  return AffineParser(state).parseAffineMapOrIntegerSetInline(map, set);
+call    0 returned 100%
+branch  1 taken 31% (fallthrough)
+branch  2 taken 69%
+        -:  698:}
+function _ZN4mlir6detail6Parser23parseAffineMapReferenceERNS_9AffineMapE called 14912545 returned 100% blocks executed 50%
+ 14912545:  699:ParseResult Parser::parseAffineMapReference(AffineMap &map) {
+ 14912545:  700:  SMLoc curLoc = getToken().getLoc();
+call    0 returned 100%
+ 14912545:  701:  IntegerSet set;
+ 14912545:  702:  if (parseAffineMapOrIntegerSetReference(map, set))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  703:    return failure();
+ 14912545:  704:  if (set)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  705:    return emitError(curLoc, "expected AffineMap, but got IntegerSet");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+ 14912545:  706:  return success();
+        -:  707:}
+function _ZN4mlir6detail6Parser24parseIntegerSetReferenceERNS_10IntegerSetE called 500531 returned 100% blocks executed 50%
+   500531:  708:ParseResult Parser::parseIntegerSetReference(IntegerSet &set) {
+   500531:  709:  SMLoc curLoc = getToken().getLoc();
+call    0 returned 100%
+   500531:  710:  AffineMap map;
+   500531:  711:  if (parseAffineMapOrIntegerSetReference(map, set))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  712:    return failure();
+   500531:  713:  if (map)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  714:    return emitError(curLoc, "expected IntegerSet, but got AffineMap");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+   500531:  715:  return success();
+        -:  716:}
+        -:  717:
+        -:  718:/// Parse an AffineMap of SSA ids. The callback 'parseElement' is used to
+        -:  719:/// parse SSA value uses encountered while parsing affine expressions.
+        -:  720:ParseResult
+function _ZN4mlir6detail6Parser22parseAffineMapOfSSAIdsERNS_9AffineMapEN4llvm12function_refIFNS_11ParseResultEbEEENS_9AsmParser9DelimiterE called 2235802 returned 100% blocks executed 75%
+  2235802:  721:Parser::parseAffineMapOfSSAIds(AffineMap &map,
+        -:  722:                               function_ref<ParseResult(bool)> parseElement,
+        -:  723:                               OpAsmParser::Delimiter delimiter) {
+  2235802:  724:  return AffineParser(state, /*allowParsingSSAIds=*/true, parseElement)
+call    0 returned 100%
+  2235802:  725:      .parseAffineMapOfSSAIds(map, delimiter);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  726:}
+        -:  727:
+        -:  728:/// Parse an AffineExpr of SSA ids. The callback `parseElement` is used to parse
+        -:  729:/// SSA value uses encountered while parsing.
+        -:  730:ParseResult
+function _ZN4mlir6detail6Parser23parseAffineExprOfSSAIdsERNS_10AffineExprEN4llvm12function_refIFNS_11ParseResultEbEEE called 0 returned 0% blocks executed 0%
+    #####:  731:Parser::parseAffineExprOfSSAIds(AffineExpr &expr,
+        -:  732:                                function_ref<ParseResult(bool)> parseElement) {
+    #####:  733:  return AffineParser(state, /*allowParsingSSAIds=*/true, parseElement)
+call    0 never executed
+    #####:  734:      .parseAffineExprOfSSAIds(expr);
+branch  0 never executed
+branch  1 never executed
+        -:  735:}
+        -:  736:
+function _ZL26parseAffineMapOrIntegerSetN4llvm9StringRefEPN4mlir11MLIRContextERNS1_9AffineMapERNS1_10IntegerSetE called 0 returned 0% blocks executed 0%
+    #####:  737:static void parseAffineMapOrIntegerSet(StringRef inputStr, MLIRContext *context,
+        -:  738:                                       AffineMap &map, IntegerSet &set) {
+    #####:  739:  llvm::SourceMgr sourceMgr;
+call    0 never executed
+    #####:  740:  auto memBuffer = llvm::MemoryBuffer::getMemBuffer(
+call    0 never executed
+        -:  741:      inputStr, /*BufferName=*/"<mlir_parser_buffer>",
+    #####:  742:      /*RequiresNullTerminator=*/false);
+call    0 never executed
+call    1 never executed
+    #####:  743:  sourceMgr.AddNewSourceBuffer(std::move(memBuffer), SMLoc());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  744:  SymbolState symbolState;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  745:  ParserConfig config(context);
+call    0 never executed
+call    1 never executed
+    #####:  746:  ParserState state(sourceMgr, config, symbolState, /*asmState=*/nullptr,
+    #####:  747:                    /*codeCompleteContext=*/nullptr);
+call    0 never executed
+call    1 never executed
+    #####:  748:  Parser parser(state);
+call    0 never executed
+        -:  749:
+    #####:  750:  SourceMgrDiagnosticHandler handler(sourceMgr, context, llvm::errs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  751:  if (parser.parseAffineMapOrIntegerSetReference(map, set))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  752:    return;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  753:
+    #####:  754:  Token endTok = parser.getToken();
+branch  0 never executed
+branch  1 never executed
+    #####:  755:  if (endTok.isNot(Token::eof)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  756:    parser.emitError(endTok.getLoc(), "encountered unexpected token");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  757:    return;
+        -:  758:  }
+        -:  759:}
+        -:  760:
+function _ZN4mlir14parseAffineMapEN4llvm9StringRefEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  761:AffineMap mlir::parseAffineMap(StringRef inputStr, MLIRContext *context) {
+    #####:  762:  AffineMap map;
+    #####:  763:  IntegerSet set;
+    #####:  764:  parseAffineMapOrIntegerSet(inputStr, context, map, set);
+call    0 never executed
+    #####:  765:  assert(!set &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  766:         "expected string to represent AffineMap, but got IntegerSet instead");
+    #####:  767:  return map;
+        -:  768:}
+        -:  769:
+function _ZN4mlir15parseIntegerSetEN4llvm9StringRefEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  770:IntegerSet mlir::parseIntegerSet(StringRef inputStr, MLIRContext *context) {
+    #####:  771:  AffineMap map;
+    #####:  772:  IntegerSet set;
+    #####:  773:  parseAffineMapOrIntegerSet(inputStr, context, map, set);
+call    0 never executed
+    #####:  774:  assert(!map &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  775:         "expected string to represent IntegerSet, but got AffineMap instead");
+    #####:  776:  return set;
+        -:  777:}

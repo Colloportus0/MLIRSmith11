@@ -1,0 +1,1078 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Linalg/Transforms/HoistPadding.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/HoistPadding.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/HoistPadding.cpp.gcda
+        -:    0:Runs:128628
+        -:    1://===- HoistPadding.cpp - Hoisting for tensor::PadOp ----------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements functions concerned with hoisting padding operations.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Linalg/Transforms/HoistPadding.h"
+        -:   14:#include "mlir/Analysis/SliceAnalysis.h"
+        -:   15:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   16:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   17:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   18:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   19:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   20:#include "mlir/Dialect/SCF/Utils/Utils.h"
+        -:   21:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   22:#include "mlir/Dialect/Utils/IndexingUtils.h"
+        -:   23:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   24:#include "mlir/Dialect/Vector/Utils/VectorUtils.h"
+        -:   25:#include "mlir/IR/AsmState.h"
+        -:   26:#include "mlir/IR/BuiltinOps.h"
+        -:   27:#include "mlir/IR/Dominance.h"
+        -:   28:#include "mlir/IR/Matchers.h"
+        -:   29:#include "llvm/ADT/StringRef.h"
+        -:   30:#include "llvm/Support/Debug.h"
+        -:   31:
+        -:   32:using llvm::dbgs;
+        -:   33:
+        -:   34:#define DEBUG_TYPE "hoist-padding"
+        -:   35:
+        -:   36:#define DBGS() (dbgs() << '[' << DEBUG_TYPE << "] ")
+        -:   37:
+        -:   38:using namespace mlir;
+        -:   39:using namespace mlir::linalg;
+        -:   40:
+        -:   41:/// Analysis class to support tensor::PadOp hoisting across multiple enclosing
+        -:   42:/// loops. The failure conditions are:
+        -:   43:///   1. Pad op has a use that is not an input of a LinalgOp.
+        -:   44:///   2. Pad op does not have a constant padding value.
+        -:   45:///   3. There is no immediately enclosing scf::ForOp.
+        -:   46:///   4. The backward slice from the pad op to the scf::ForOp to hoist above
+        -:   47:///      contains an unknown op with non index type operands, a region, or a
+        -:   48:///      memory effect.
+        -:   49:///   5. The backward slice from the pad op to the scf::ForOp to hoist above is
+        -:   50:///      empty.
+        -:   51:///   6. The source tensor of pad op is not defined by an extract slice op.
+        -:   52:///   7. The source tensor of the extract slice op is not defined outside of
+        -:   53:///      the outermost enclosing scf::ForOp.
+        -:   54:///   8. There is no enclosing scf::ForOp that indexes the padded data.
+        -:   55:/// Other cases succeed and will trigger hoisting of the pad op.
+        -:   56:struct HoistingAnalysis {
+        -:   57:  HoistingAnalysis(tensor::PadOp padOp, int numLoops);
+        -:   58:
+    #####:   59:  bool isValid() { return valid; }
+        -:   60:
+        -:   61:  /// Footprint of the packedTensor, computed from the packingLoops.
+        -:   62:  SmallVector<Value> getPackedTensorSizes(ImplicitLocOpBuilder &b);
+        -:   63:
+        -:   64:  /// The outermost loop, determined by `nLevels` above which `padOp` will
+        -:   65:  /// be hoisted.
+        -:   66:  scf::ForOp outermostEnclosingForOp;
+        -:   67:
+        -:   68:  /// Backward slice rooted at `padOp` and nested under
+        -:   69:  /// `outermostEnclosingForOp`.
+        -:   70:  SetVector<Operation *> backwardSlice;
+        -:   71:
+        -:   72:  /// The scf::ForOp immediately enclosing `padOp` such that:
+        -:   73:  ///  1. they are nested under `outermostEnclosingForOp` (inclusive)
+        -:   74:  ///  2. whose induction variable is used, directly or indirectly, in the
+        -:   75:  ///     computation of `padOp`.
+        -:   76:  /// The span of these loops determines the footprint of the packed tensor.
+        -:   77:  SmallVector<scf::ForOp> packingLoops;
+        -:   78:
+        -:   79:private:
+        -:   80:  /// Drop any non-index dependencies of `padOp` and `sliceOp` from
+        -:   81:  /// `backwardSlice`. The method follows the use-def chains of the index
+        -:   82:  /// operands consumed by `padOp` and `sliceOp` and drops the operations
+        -:   83:  /// not part of this index computation. Afterwards, the filtered
+        -:   84:  /// `backwardSlice` contains only the loops whose induction variable is used,
+        -:   85:  /// directly or indirectly, to index the padded tensor. The method returns
+        -:   86:  /// failure if the filtered backward slice contains an unexpected operation.
+        -:   87:  ///
+        -:   88:  /// Example:
+        -:   89:  /// ```
+        -:   90:  /// %source = linalg.fill(%cst, %arg0)
+        -:   91:  /// scf.for %i
+        -:   92:  ///   %unrelated = linalg.fill(%cst, %arg1)    // not used to index %source!
+        -:   93:  ///   scf.for %j (%arg2 = %unrelated)
+        -:   94:  ///     scf.for %k                             // not used to index %source!
+        -:   95:  ///       %ubi = affine.min #map(%i)
+        -:   96:  ///       %ubj = affine.min #map(%j)
+        -:   97:  ///       %slice = tensor.extract_slice %source [%i, %j] [%ubi, %ubj]
+        -:   98:  ///       %padded_slice = tensor.pad %slice
+        -:   99:  /// ```
+        -:  100:  /// dropNonIndexDependencies(%padded_slice, %slice)
+        -:  101:  /// removes [scf.for %k, linalg.fill(%cst, %arg1)] from backwardSlice.
+        -:  102:  LogicalResult dropNonIndexDependencies(tensor::PadOp padOp,
+        -:  103:                                         tensor::ExtractSliceOp sliceOp);
+        -:  104:
+        -:  105:  /// Encodes whether the analysis is valid and hoisting can proceed.
+        -:  106:  bool valid;
+        -:  107:};
+        -:  108:
+        -:  109:/// Return true if all uses of `padOp` are an input tensor of some
+        -:  110:/// LinalgOp.
+function _ZL27isOnlyUsedAsInputOfLinalgOpN4mlir6tensor5PadOpE called 0 returned 0% blocks executed 0%
+    #####:  111:static bool isOnlyUsedAsInputOfLinalgOp(tensor::PadOp padOp) {
+    #####:  112:  for (OpOperand &use : padOp.getResult().getUses()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  113:    auto linalgUser = dyn_cast<linalg::LinalgOp>(use.getOwner());
+call    0 never executed
+    #####:  114:    if (!linalgUser || !linalgUser.isDpsInput(&use)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  115:      LLVM_DEBUG(DBGS() << "Found a use of " << *(padOp)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+        -:  116:                        << "\nthat is not an input tensor of a LinalgOp, "
+        -:  117:                        << "cannot hoist\n"
+        -:  118:                        << *(use.getOwner()) << "\n");
+    #####:  119:      return false;
+        -:  120:    }
+        -:  121:  }
+    #####:  122:  return true;
+        -:  123:}
+        -:  124:
+        -:  125:/// Return at most nLevels of immediately enclosing scf::ForOp loops.
+        -:  126:/// Stops at the first parent that is not an scf::ForOp.
+        -:  127:/// Multi-loops such as scf.parallel or linalg.tiled_loop are not modeled atm.
+        -:  128:/// Control-flow and other containing ops with regions are not modeled atm.
+        -:  129:static void
+function _ZL24getAtMostNEnclosingLoopsN4mlir6tensor5PadOpEiRN4llvm11SmallVectorINS_3scf5ForOpELj6EEE called 0 returned 0% blocks executed 0%
+    #####:  130:getAtMostNEnclosingLoops(tensor::PadOp padOp, int nLevels,
+        -:  131:                         SmallVector<scf::ForOp> &reverseEnclosingLoops) {
+    #####:  132:  AsmState state(padOp->getParentOfType<func::FuncOp>());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  133:  (void)state;
+    #####:  134:  scf::ForOp outermostEnclosingForOp = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  135:  Operation *nextEnclosingOp = padOp->getParentOp();
+branch  0 never executed
+branch  1 never executed
+    #####:  136:  while (nLevels-- > 0 &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  137:         (outermostEnclosingForOp = dyn_cast<scf::ForOp>(nextEnclosingOp))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  138:    LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+        -:  139:        DBGS() << "loops: ";
+        -:  140:        outermostEnclosingForOp.getInductionVar().printAsOperand(dbgs(), state);
+        -:  141:        dbgs() << "\n");
+    #####:  142:    reverseEnclosingLoops.push_back(outermostEnclosingForOp);
+call    0 never executed
+    #####:  143:    nextEnclosingOp = outermostEnclosingForOp->getParentOp();
+branch  0 never executed
+branch  1 never executed
+        -:  144:  }
+    #####:  145:}
+        -:  146:
+        -:  147:/// Returns the transposed `rankedTensorType` if `transposeVector` is non-empty.
+        -:  148:/// Fail if `transposeVector` is no permutation matching the tensor rank.
+        -:  149:static FailureOr<RankedTensorType>
+function _ZL21computeTransposedTypeN4mlir16RankedTensorTypeEN4llvm8ArrayRefIlEE called 0 returned 0% blocks executed 0%
+    #####:  150:computeTransposedType(RankedTensorType rankedTensorType,
+        -:  151:                      ArrayRef<int64_t> transposeVector) {
+    #####:  152:  if (transposeVector.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  153:    return rankedTensorType;
+    #####:  154:  if (!isPermutation(transposeVector) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  155:      transposeVector.size() != static_cast<size_t>(rankedTensorType.getRank()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  156:    return failure();
+        -:  157:
+    #####:  158:  SmallVector<int64_t> transposedShape(rankedTensorType.getShape().begin(),
+call    0 never executed
+    #####:  159:                                       rankedTensorType.getShape().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  160:  applyPermutationToVector(transposedShape, transposeVector);
+call    0 never executed
+        -:  161:
+    #####:  162:  using RTTBuilder = RankedTensorType::Builder;
+    #####:  163:  RankedTensorType transposedTensorType =
+    #####:  164:      RTTBuilder(rankedTensorType).setShape(transposedShape);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  165:  return transposedTensorType;
+branch  0 never executed
+branch  1 never executed
+        -:  166:}
+        -:  167:
+function _ZN16HoistingAnalysisC2EN4mlir6tensor5PadOpEi called 0 returned 0% blocks executed 0%
+    #####:  168:HoistingAnalysis::HoistingAnalysis(tensor::PadOp padOp, int numLoops) {
+call    0 never executed
+call    1 never executed
+    #####:  169:  valid = false;
+        -:  170:
+        -:  171:  // Bail on any use that isn't an input of a LinalgOp.
+        -:  172:  // Hoisting of inplace updates happens after vectorization.
+    #####:  173:  if (!isOnlyUsedAsInputOfLinalgOp(padOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  174:    return;
+        -:  175:
+        -:  176:  // Get at most `numLoops` of immediately enclosing loops.
+    #####:  177:  SmallVector<scf::ForOp> reverseEnclosingLoops;
+call    0 never executed
+    #####:  178:  getAtMostNEnclosingLoops(padOp, numLoops, reverseEnclosingLoops);
+call    0 never executed
+    #####:  179:  if (reverseEnclosingLoops.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  180:    LLVM_DEBUG(DBGS() << "No immediately enclosing loop -> skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  181:    return;
+        -:  182:  }
+        -:  183:
+    #####:  184:  outermostEnclosingForOp = reverseEnclosingLoops.back();
+call    0 never executed
+        -:  185:
+        -:  186:  // Get the `sliceOp` that defines the source tensor of `padOp` and
+        -:  187:  // check its source is defined outside of the outermost loop. This check
+        -:  188:  // ensures the padded data is available for packing before entering the
+        -:  189:  // outermost enclosing loop.
+        -:  190:  //
+        -:  191:  // Example:
+        -:  192:  // ```
+        -:  193:  // %source = linalg.fill(%cst, %arg0)
+        -:  194:  // // %source is available for packing here!
+        -:  195:  // scf.for %i
+        -:  196:  //   scf.for %j
+        -:  197:  //     scf.for %k
+        -:  198:  //       %slice = tensor.extract_slice %source [%i, %j]
+        -:  199:  //       %padded_slice = tensor.pad %slice
+        -:  200:  // ```
+    #####:  201:  auto sliceOp = padOp.getSource().getDefiningOp<tensor::ExtractSliceOp>();
+call    0 never executed
+call    1 never executed
+    #####:  202:  if (!sliceOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  203:    LLVM_DEBUG(DBGS() << "Cannot find the extract slice op -> skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  204:    return;
+        -:  205:  }
+    #####:  206:  if (!outermostEnclosingForOp.isDefinedOutsideOfLoop(sliceOp.getSource())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  207:    LLVM_DEBUG(DBGS() << "Source not defined outside of loops -> skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  208:    return;
+        -:  209:  }
+        -:  210:
+        -:  211:  // Check the region of `padOp` depends on a constant only. Adding
+        -:  212:  // hoisting support for arbitrary padding regions would require cloning all
+        -:  213:  // dependencies captured by the padding region.
+    #####:  214:  Value paddingValue = padOp.getConstantPaddingValue();
+call    0 never executed
+    #####:  215:  if (!paddingValue ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  216:      !isa_and_nonnull<arith::ConstantOp>(paddingValue.getDefiningOp())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  217:    LLVM_DEBUG(DBGS() << "Cannot find constant padding value -> skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  218:    return;
+        -:  219:  }
+        -:  220:
+        -:  221:  // Get all the ops in the backwards slice starting from `padOp` and that
+        -:  222:  // are dominated by the outermost enclosing loop.
+    #####:  223:  DominanceInfo domInfo(outermostEnclosingForOp);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  224:  getBackwardSlice(padOp.getOperation(), &backwardSlice, [&](Operation *op) {
+call    0 never executed
+    #####:  225:    return domInfo.dominates(outermostEnclosingForOp, op);
+branch  0 never executed
+branch  1 never executed
+        -:  226:  });
+    #####:  227:  if (backwardSlice.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  228:    return;
+branch  0 never executed
+branch  1 never executed
+        -:  229:  // Add `padOp` itself to the backward slice.
+    #####:  230:  backwardSlice.insert(padOp.getOperation());
+call    0 never executed
+        -:  231:
+        -:  232:  // Remove all ops in the backward slice that are not used to index the padded
+        -:  233:  // tensor. In particular, keep `padOp`, `sliceOp`, and the loop and
+        -:  234:  // affine operations used for the index computation.
+    #####:  235:  if (failed(dropNonIndexDependencies(padOp, sliceOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  236:    return;
+        -:  237:
+        -:  238:  // Add only the loops part of the filtered `backwardSlice` to the packing
+        -:  239:  // loops. All other loops are not used to index the padded data and
+        -:  240:  // consequently access the same data in every loop iteration. Adding them to
+        -:  241:  // the packing loops would increase the cache footprint of the packed data
+        -:  242:  // by storing the same data multiple times.
+    #####:  243:  for (scf::ForOp forOp : llvm::reverse(reverseEnclosingLoops))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  244:    if (backwardSlice.contains(forOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  245:      packingLoops.push_back(forOp);
+call    0 never executed
+    #####:  246:  if (packingLoops.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  247:    LLVM_DEBUG(DBGS() << "Cannot find a packing loop -> skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  248:    return;
+        -:  249:  }
+        -:  250:
+        -:  251:  // The analysis is valid and hoisting can occur.
+    #####:  252:  valid = true;
+call    0 never executed
+        -:  253:}
+        -:  254:
+        -:  255:LogicalResult
+function _ZN16HoistingAnalysis24dropNonIndexDependenciesEN4mlir6tensor5PadOpENS1_14ExtractSliceOpE called 0 returned 0% blocks executed 0%
+    #####:  256:HoistingAnalysis::dropNonIndexDependencies(tensor::PadOp padOp,
+        -:  257:                                           tensor::ExtractSliceOp sliceOp) {
+        -:  258:  // Set of all values used for index computation.
+    #####:  259:  SetVector<Value> indexEdges;
+call    0 never executed
+call    1 never executed
+        -:  260:
+        -:  261:  // Add all index operands of `operation` to `indexEdges`. An index operand is
+        -:  262:  // an operand of type index.
+function _ZZN16HoistingAnalysis24dropNonIndexDependenciesEN4mlir6tensor5PadOpENS1_14ExtractSliceOpEENKUlPNS0_9OperationEE_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  263:  auto addIndexOperandsToIndexEdges = [&](Operation *operation) {
+    #####:  264:    for (Value operand : operation->getOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  265:      if (operand.getType().isIndex())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  266:        indexEdges.insert(operand);
+call    0 never executed
+    #####:  267:  };
+        -:  268:
+        -:  269:  // Check if any operation result is contained in `indexEdges`.
+    #####:  270:  auto hasIndexResult = [&](Operation *operation) {
+    #####:  271:    return llvm::any_of(operation->getResults(), [&](Value result) {
+call    0 never executed
+call    1 never executed
+    #####:  272:      return indexEdges.contains(result);
+call    0 never executed
+        -:  273:    });
+    #####:  274:  };
+        -:  275:
+        -:  276:  // Starting from `padOp` and `sliceOp` walk the use-def edges of index
+        -:  277:  // type in `backwardSlice`. Add the index operands of an operation to
+        -:  278:  // `indexEdges` and remove all operations from `backwardSlice` that are not
+        -:  279:  // part of the index computation.
+        -:  280:  //
+        -:  281:  // Example:
+        -:  282:  // ```
+        -:  283:  // %source = linalg.fill(%cst, %arg0)
+        -:  284:  // scf.for %i
+        -:  285:  //   %unrelated = linalg.fill(%cst, %arg1)    // not used to index %source!
+        -:  286:  //   scf.for %j (%arg2 = %unrelated)
+        -:  287:  //     scf.for %k                             // not used to index %source!
+        -:  288:  //       %ubi = affine.min #map(%i)
+        -:  289:  //       %ubj = affine.min #map(%j)
+        -:  290:  //       %slice = tensor.extract_slice %source [%i, %j] [%ubi, %ubj]
+        -:  291:  //       %padded_slice = tensor.pad %slice
+        -:  292:  // ```
+        -:  293:  // After iterating `backwardSlice` we obtain:
+        -:  294:  // indexEdges = [%i, %j, %ubi, %ubj]
+        -:  295:  // backwardSlice = backwardSlice / [linalg.fill(%cst, %arg1), scf.for %k]
+    #####:  296:  SetVector<Operation *> operationsToRemove;
+call    0 never executed
+    #####:  297:  for (Operation *op : llvm::reverse(backwardSlice)) {
+branch  0 never executed
+branch  1 never executed
+        -:  298:    // Add the index operands of `padOp` and `sliceOp` to start the
+        -:  299:    // exploration of the index computation.
+    #####:  300:    if (op == padOp || op == sliceOp) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  301:      addIndexOperandsToIndexEdges(op);
+call    0 never executed
+    #####:  302:      continue;
+        -:  303:    }
+        -:  304:    // Add the index operands of the loop if its induction variable is
+        -:  305:    // used for index computation.
+    #####:  306:    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  307:      if (!hasIndexResult(op) && indexEdges.contains(forOp.getInductionVar())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  308:        addIndexOperandsToIndexEdges(op);
+call    0 never executed
+    #####:  309:        continue;
+        -:  310:      }
+        -:  311:    }
+        -:  312:    // Add the index operands of all other operations if at least one result is
+        -:  313:    // used for index computation.
+    #####:  314:    if (hasIndexResult(op)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  315:      addIndexOperandsToIndexEdges(op);
+call    0 never executed
+        -:  316:      // Check the operands of the remaining operations all have index type.
+    #####:  317:      if (llvm::any_of(op->getOperandTypes(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  318:                       [](Type type) { return !type.isIndex(); })) {
+    #####:  319:        LLVM_DEBUG(DBGS() << "Unsupported op with non index type operands: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  320:                          << op << " -> skip\n");
+    #####:  321:        return failure();
+        -:  322:      }
+        -:  323:      // Check the remaining operations do not have regions or memory effects.
+    #####:  324:      auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op);
+call    0 never executed
+    #####:  325:      bool hasMemoryEffect = effectInterface && !effectInterface.hasNoEffect();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  326:      if (hasMemoryEffect || op->getNumRegions() != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  327:        LLVM_DEBUG(DBGS() << "Unsupported op with region or memory effect: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  328:                          << op << " -> skip\n");
+    #####:  329:        return failure();
+        -:  330:      }
+    #####:  331:      continue;
+        -:  332:    }
+        -:  333:    // Remove all other operations not used by the index computation. An
+        -:  334:    // exception are constant operations that may be used by `padOp`.
+    #####:  335:    if (!isa<arith::ConstantOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  336:      operationsToRemove.insert(op);
+call    0 never executed
+        -:  337:  }
+    #####:  338:  backwardSlice.set_subtract(operationsToRemove);
+    #####:  339:  return success();
+call    0 never executed
+        -:  340:}
+        -:  341:
+        -:  342:SmallVector<Value>
+function _ZN16HoistingAnalysis20getPackedTensorSizesERN4mlir20ImplicitLocOpBuilderE called 0 returned 0% blocks executed 0%
+    #####:  343:HoistingAnalysis::getPackedTensorSizes(ImplicitLocOpBuilder &b) {
+    #####:  344:  SmallVector<Value> dynamicTensorSizes;
+        -:  345:
+        -:  346:  // Upper bound the packing loop lengths to size the packed tensor. Taking
+        -:  347:  // upper bounds can make the sizes of the packed tensor independent of the
+        -:  348:  // enclosing loops. This independence is a prerequisite for reusing the same
+        -:  349:  // buffer for all enclosing loop iterations and hoisting its allocation out of
+        -:  350:  // the enclosing loops.
+    #####:  351:  for (auto forOp : packingLoops) {
+branch  0 never executed
+branch  1 never executed
+        -:  352:    // Compute an upper bound `ubVal` for the upper bound of `forOp`.
+    #####:  353:    AffineMap boundMap;
+    #####:  354:    SmallVector<Value> boundOperands;
+call    0 never executed
+    #####:  355:    getUpperBoundForIndex(forOp.getUpperBound(), boundMap, boundOperands);
+call    0 never executed
+call    1 never executed
+    #####:  356:    Value ubVal = b.createOrFold<AffineMinOp>(boundMap, boundOperands);
+call    0 never executed
+        -:  357:    // Compute the maximal packing loop length as (ub - lb).ceilDiv(step) and
+        -:  358:    // store the result to `dynamicTensorSizes`.
+        -:  359:    // TODO: instead of using the lower bound of `forOp` directly, implement a
+        -:  360:    // lower bound computation similar to the upper bound computation.
+    #####:  361:    AffineExpr lb, ub, step;
+    #####:  362:    bindDims(b.getContext(), lb, ub);
+call    0 never executed
+    #####:  363:    bindSymbols(b.getContext(), step);
+call    0 never executed
+    #####:  364:    Value res = b.createOrFold<AffineApplyOp>(
+    #####:  365:        (ub - lb).ceilDiv(step), ValueRange{forOp.getLowerBound(), ubVal,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  366:                                            cast<scf::ForOp>(forOp).getStep()});
+call    0 never executed
+    #####:  367:    dynamicTensorSizes.push_back(res);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  368:  }
+        -:  369:
+    #####:  370:  return dynamicTensorSizes;
+        -:  371:}
+        -:  372:
+function _ZL26isDefinedOutsideOrConstantN4mlir3scf5ForOpENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  373:static bool isDefinedOutsideOrConstant(scf::ForOp outer, Value v) {
+    #####:  374:  return outer.isDefinedOutsideOfLoop(v) || matchPattern(v, m_Constant());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  375:}
+        -:  376:
+        -:  377:/// Return the current iteration number in the loop (iv - lb).ceilDiv(step).
+        -:  378:/// The returned Value is guaranteed not to depend on any loop comprised in
+        -:  379:/// [`outer`, `forOp`].
+        -:  380:/// Return null if such a loop-independent quantity cannot be computed.
+function _ZL23buildLoopIterationCountRN4mlir9OpBuilderENS_3scf5ForOpES3_ called 0 returned 0% blocks executed 0%
+    #####:  381:static Value buildLoopIterationCount(OpBuilder &b, scf::ForOp outer,
+        -:  382:                                     scf::ForOp forOp) {
+    #####:  383:  MLIRContext *ctx = forOp->getContext();
+call    0 never executed
+    #####:  384:  AffineExpr iv, lb, step;
+    #####:  385:  bindDims(ctx, iv, lb);
+call    0 never executed
+    #####:  386:  bindSymbols(ctx, step);
+call    0 never executed
+    #####:  387:  if (!isDefinedOutsideOrConstant(outer, forOp.getLowerBound()) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  388:      !isDefinedOutsideOrConstant(outer, forOp.getStep()))
+call    0 never executed
+call    1 never executed
+    #####:  389:    return Value();
+    #####:  390:  Value ivVal = forOp.getInductionVar(), lbVal = forOp.getLowerBound(),
+call    0 never executed
+call    1 never executed
+    #####:  391:        stepVal = forOp.getStep();
+call    0 never executed
+    #####:  392:  auto loc = forOp->getLoc();
+call    0 never executed
+    #####:  393:  return b.createOrFold<AffineApplyOp>(loc, (iv - lb).ceilDiv(step),
+call    0 never executed
+    #####:  394:                                       ValueRange{ivVal, lbVal, stepVal});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  395:}
+        -:  396:
+function _ZN4mlir6linalg21hoistPaddingOnTensorsENS_6tensor5PadOpEiN4llvm8ArrayRefIlEERS2_RNS3_15SmallVectorImplINS0_9GenericOpEEE called 0 returned 0% blocks executed 0%
+    #####:  397:FailureOr<Value> mlir::linalg::hoistPaddingOnTensors(
+        -:  398:    tensor::PadOp opToHoist, int numLoops, ArrayRef<int64_t> transposeVector,
+        -:  399:    tensor::PadOp &hoistedOp, SmallVectorImpl<GenericOp> &transposeOps) {
+    #####:  400:  LLVM_DEBUG(DBGS() << "Try to hoist " << *(opToHoist) << " by " << numLoops
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+        -:  401:                    << " loops\n");
+    #####:  402:  HoistingAnalysis analysis(opToHoist, numLoops);
+call    0 never executed
+    #####:  403:  if (!analysis.isValid()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  404:    LLVM_DEBUG(DBGS() << "Analysis failed -> Skip\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  405:    return failure();
+        -:  406:  }
+        -:  407:
+    #####:  408:  scf::ForOp outer = analysis.outermostEnclosingForOp;
+    #####:  409:  ImplicitLocOpBuilder b(outer->getLoc(), outer);
+call    0 never executed
+        -:  410:
+    #####:  411:  SmallVector<Value> dynamicTensorSizes = analysis.getPackedTensorSizes(b);
+call    0 never executed
+call    1 never executed
+        -:  412:
+        -:  413:  // Update actual number of loops, which may be smaller.
+    #####:  414:  int nPackedLoops = analysis.packingLoops.size();
+call    0 never executed
+        -:  415:
+    #####:  416:  Location loc = opToHoist->getLoc();
+call    0 never executed
+    #####:  417:  RankedTensorType paddedTensorType = opToHoist.getResultType();
+call    0 never executed
+    #####:  418:  int paddedRank = paddedTensorType.getRank();
+call    0 never executed
+        -:  419:
+        -:  420:  // Compute the type of the transposed padded tensor.
+    #####:  421:  FailureOr<RankedTensorType> transposedTensorType =
+    #####:  422:      computeTransposedType(paddedTensorType, transposeVector);
+call    0 never executed
+    #####:  423:  if (failed(transposedTensorType))
+branch  0 never executed
+branch  1 never executed
+    #####:  424:    return failure();
+        -:  425:
+        -:  426:  // Create the packed tensor<?x?x..?xtransposedShape> into which we amortize
+        -:  427:  // padding.
+    #####:  428:  SmallVector<int64_t> packedShape(nPackedLoops, ShapedType::kDynamicSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  429:  // TODO: go grab dims when necessary, for now tensor::PadOp returns a static
+        -:  430:  // tensor.
+    #####:  431:  llvm::append_range(packedShape, transposedTensorType->getShape());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  432:  auto packedTensorType = RankedTensorType::get(
+    #####:  433:      packedShape, transposedTensorType->getElementType());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  434:  Value packedTensor = b.create<tensor::EmptyOp>(
+    #####:  435:      loc, packedTensorType.getShape(), packedTensorType.getElementType(),
+call    0 never executed
+call    1 never executed
+    #####:  436:      dynamicTensorSizes);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  437:
+        -:  438:  // Clone the operations involved in the backward slice, iteratively stepping
+        -:  439:  // into the loops that we encounter.
+        -:  440:  // The implementation proceeds in a stack-like fashion:
+        -:  441:  //   1. Iteratively clone and step into the loops, pushing the `packedTensor`
+        -:  442:  //      deeper in the stack.
+        -:  443:  //   2. Create a GenericOp if `transposeVector` is non-empty.
+        -:  444:  //   3. Create a InsertSliceOp at the top of the stack.
+        -:  445:  //   4. Iteratively pop and yield the result of the InsertSliceOp across
+        -:  446:  //      the cloned loops.
+    #####:  447:  SmallVector<Value> clonedLoopIvs, leadingPackedTensorIndexings;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  448:  clonedLoopIvs.reserve(nPackedLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  449:  leadingPackedTensorIndexings.reserve(nPackedLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  450:  BlockAndValueMapping bvm;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  451:  // Stack step 1. iteratively clone loops and push `packedTensor`.
+    #####:  452:  for (Operation *op : analysis.backwardSlice) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  453:    // Specifically sit out in the extract_slice(packedTensor) case: this is the
+        -:  454:    // piece we seek to replace.
+    #####:  455:    if (auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  456:      if (bvm.lookupOrDefault(sliceOp.getSource()) == packedTensor)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  457:        continue;
+        -:  458:    // Clone all operations except it is a loop.
+    #####:  459:    auto forOp = dyn_cast<scf::ForOp>(op);
+call    0 never executed
+    #####:  460:    if (!forOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  461:      b.clone(*op, bvm);
+call    0 never executed
+    #####:  462:      continue;
+        -:  463:    }
+        -:  464:    // Create a packing loop that takes `packedTensor` as iteration argument.
+    #####:  465:    auto clonedForOp = b.create<scf::ForOp>(
+    #####:  466:        loc, bvm.lookupOrDefault(forOp.getLowerBound()),
+call    0 never executed
+    #####:  467:        bvm.lookupOrDefault(forOp.getUpperBound()),
+call    0 never executed
+call    1 never executed
+    #####:  468:        bvm.lookupOrDefault(forOp.getStep()), packedTensor);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  469:    // Map the induction var, region args and results to the `clonedForOp`.
+    #####:  470:    bvm.map(forOp.getInductionVar(), clonedForOp.getInductionVar());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  471:    bvm.map(forOp.getRegionIterArgs(), clonedForOp.getRegionIterArgs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  472:    bvm.map(forOp.getResults(), clonedForOp.getResults());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  473:    assert(clonedForOp->getNumRegions() == 1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  474:    clonedLoopIvs.push_back(clonedForOp.getInductionVar());
+call    0 never executed
+call    1 never executed
+        -:  475:
+    #####:  476:    b.setInsertionPointToStart(&clonedForOp->getRegion(0).front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  477:    Value loopIndependentIterationCount =
+    #####:  478:        buildLoopIterationCount(b, outer, clonedForOp);
+call    0 never executed
+        -:  479:    // Assert the loop-independent iteration count can be computed.
+    #####:  480:    if (!loopIndependentIterationCount)
+branch  0 never executed
+branch  1 never executed
+    #####:  481:      llvm_unreachable("loop independence prerequisite not met");
+call    0 never executed
+    #####:  482:    leadingPackedTensorIndexings.push_back(loopIndependentIterationCount);
+call    0 never executed
+    #####:  483:    packedTensor = clonedForOp.getRegionIterArgs().front();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  484:  }
+        -:  485:
+        -:  486:  // offsets = [clonedLoopIvs, 0 .. 0].
+    #####:  487:  SmallVector<OpFoldResult> offsets(leadingPackedTensorIndexings.begin(),
+call    0 never executed
+    #####:  488:                                    leadingPackedTensorIndexings.end());
+call    0 never executed
+call    1 never executed
+    #####:  489:  offsets.append(paddedRank, b.getIndexAttr(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  490:  // sizes = [1 .. 1, transposedShape].
+    #####:  491:  SmallVector<OpFoldResult> sizes(nPackedLoops, b.getIndexAttr(1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  492:  for (int64_t sz : transposedTensorType->getShape()) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  493:    // TODO: go grab dims when necessary, for now tensor::PadOp returns a static
+    #####:  494:    assert(!ShapedType::isDynamic(sz) && "padded tensor needs static sizes");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  495:    sizes.push_back(b.getIndexAttr(sz));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  496:  }
+        -:  497:  // strides = [1 .. 1].
+    #####:  498:  SmallVector<OpFoldResult> strides(nPackedLoops + paddedRank,
+    #####:  499:                                    b.getIndexAttr(1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  500:
+        -:  501:  // Stack step 2. create GenericOp if `transposeVector` is non-empty.
+    #####:  502:  Value paddedTensor = bvm.lookup(opToHoist.getResult());
+call    0 never executed
+call    1 never executed
+    #####:  503:  if (!transposeVector.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  504:    Value outputTensor = b.create<tensor::ExtractSliceOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  505:        loc, *transposedTensorType, packedTensor, offsets, sizes, strides);
+call    0 never executed
+call    1 never executed
+    #####:  506:    transposeOps.push_back(
+call    0 never executed
+call    1 never executed
+        -:  507:        makeTransposeOp(b, loc, paddedTensor, outputTensor, transposeVector));
+    #####:  508:    paddedTensor = transposeOps.back()->getResult(0);
+call    0 never executed
+        -:  509:  }
+        -:  510:
+        -:  511:  // Stack step 3. create InsertSliceOp at the top of the stack.
+    #####:  512:  Value inserted = b.create<tensor::InsertSliceOp>(
+    #####:  513:      loc, paddedTensor, packedTensor, offsets, sizes, strides);
+call    0 never executed
+        -:  514:
+        -:  515:  // Stack step 4. iteratively pop the stack and propagate the yield.
+    #####:  516:  Value valueToYield = inserted;
+    #####:  517:  for (Value iv : llvm::reverse(clonedLoopIvs)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  518:    auto forOp = scf::getForInductionVarOwner(iv);
+call    0 never executed
+    #####:  519:    b.setInsertionPointToEnd(&forOp.getRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  520:    b.create<scf::YieldOp>(loc, valueToYield);
+call    0 never executed
+    #####:  521:    valueToYield = forOp.getResult(0);
+        -:  522:  }
+        -:  523:
+        -:  524:  // Now the packed tensor is ready, replace the original padding op by a
+        -:  525:  // 1x..x1 slice [originalLoopIvs, 0 .. 0][1 .. 1, paddedShape][1 .. 1].
+    #####:  526:  b.setInsertionPoint(opToHoist);
+call    0 never executed
+    #####:  527:  SmallVector<Value> loopIterationCounts = llvm::to_vector<4>(
+branch  0 never executed
+branch  1 never executed
+    #####:  528:      llvm::map_range(analysis.packingLoops, [&](Operation *loop) {
+    #####:  529:        return buildLoopIterationCount(b, outer, cast<scf::ForOp>(loop));
+call    0 never executed
+call    1 never executed
+    #####:  530:      }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  531:  // Assert all loop iteration counts can be computed.
+    #####:  532:  if (llvm::any_of(loopIterationCounts, [](Value v) { return !v; }))
+branch  0 never executed
+branch  1 never executed
+    #####:  533:    llvm_unreachable("loop independence prerequisite not met");
+call    0 never executed
+        -:  534:  // offsets = [originalLoopIvs, 0 .. 0].
+    #####:  535:  offsets.assign(loopIterationCounts.begin(), loopIterationCounts.end());
+call    0 never executed
+    #####:  536:  offsets.append(paddedRank, b.getIndexAttr(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  537:  // sizes = [1 .. 1, transposedShape] (definedabove).
+        -:  538:  // strides = [1 .. 1] (defined above)
+    #####:  539:  packedTensor =
+branch  0 never executed
+branch  1 never executed
+    #####:  540:      scf::getForInductionVarOwner(clonedLoopIvs.front())->getResult(0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  541:  Value newResult = b.create<tensor::ExtractSliceOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  542:      loc, *transposedTensorType, packedTensor, offsets, sizes, strides);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  543:
+        -:  544:  // Transpose the packed tensor back to the original storage order.
+    #####:  545:  if (!transposeVector.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  546:    Value emptyTensor = b.create<tensor::EmptyOp>(
+    #####:  547:        loc, paddedTensorType.getShape(), paddedTensorType.getElementType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  548:    transposeOps.push_back(
+call    0 never executed
+call    1 never executed
+        -:  549:        makeTransposeOp(b, loc, newResult, emptyTensor, transposeVector));
+    #####:  550:    newResult = transposeOps.back()->getResult(0);
+call    0 never executed
+        -:  551:  }
+        -:  552:
+        -:  553:  // Make the newly cloned `opToHoist` available to the caller.
+    #####:  554:  hoistedOp =
+    #####:  555:      cast<tensor::PadOp>(bvm.lookup(opToHoist.getResult()).getDefiningOp());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  556:  return newResult;
+branch  0 never executed
+branch  1 never executed
+        -:  557:}

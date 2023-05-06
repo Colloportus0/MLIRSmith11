@@ -1,0 +1,1498 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/SparseTensor/Transforms/SparseTensorCodegen.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/SparseTensorCodegen.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/SparseTensorCodegen.cpp.gcda
+        -:    0:Runs:128629
+        -:    1://===- SparseTensorCodegen.cpp - Sparse tensor primitives conversion ------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// A pass that converts sparse tensor types and primitives to actual compiler
+        -:   10:// visible buffers and actual compiler IR that implements these primitives on
+        -:   11:// the selected sparse tensor storage schemes. This pass provides an alternative
+        -:   12:// to the SparseTensorConversion pass, eliminating the dependence on a runtime
+        -:   13:// support library, and providing much more opportunities for subsequent
+        -:   14:// compiler optimization of the generated code.
+        -:   15://
+        -:   16://===----------------------------------------------------------------------===//
+        -:   17:
+        -:   18:#include "CodegenUtils.h"
+        -:   19:
+        -:   20:#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+        -:   21:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   22:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   23:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   24:#include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
+        -:   25:#include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
+        -:   26:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   27:#include "mlir/Transforms/DialectConversion.h"
+        -:   28:
+        -:   29:using namespace mlir;
+        -:   30:using namespace mlir::sparse_tensor;
+        -:   31:
+        -:   32:namespace {
+        -:   33:
+        -:   34:static constexpr uint64_t DimSizesIdx = 0;
+        -:   35:static constexpr uint64_t MemSizesIdx = 2;
+        -:   36:static constexpr uint64_t FieldsIdx = 3;
+        -:   37:
+        -:   38://===----------------------------------------------------------------------===//
+        -:   39:// Helper methods.
+        -:   40://===----------------------------------------------------------------------===//
+        -:   41:
+        -:   42:/// Returns the "tuple" value of the adapted tensor.
+    #####:   43:static UnrealizedConversionCastOp getTuple(Value tensor) {
+    #####:   44:  return llvm::cast<UnrealizedConversionCastOp>(tensor.getDefiningOp());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+        -:   45:}
+        -:   46:
+        -:   47:/// Packs the given values as a "tuple" value.
+function _ZN12_GLOBAL__N_1L8genTupleERN4mlir9OpBuilderENS0_8LocationENS0_4TypeENS0_10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####:   48:static Value genTuple(OpBuilder &rewriter, Location loc, Type tp,
+        -:   49:                      ValueRange values) {
+    #####:   50:  return rewriter.create<UnrealizedConversionCastOp>(loc, TypeRange(tp), values)
+call    0 never executed
+call    1 never executed
+    #####:   51:      .getResult(0);
+        -:   52:}
+        -:   53:
+        -:   54:/// Flatten a list of operands that may contain sparse tensors.
+function _ZN12_GLOBAL__N_1L15flattenOperandsEN4mlir10ValueRangeERN4llvm15SmallVectorImplINS0_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:   55:static void flattenOperands(ValueRange operands,
+        -:   56:                            SmallVectorImpl<Value> &flattened) {
+        -:   57:  // In case of
+        -:   58:  // sparse_tensor, c, sparse_tensor
+        -:   59:  // ==>
+        -:   60:  // memref ..., c, memref ...
+    #####:   61:  for (auto operand : operands) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   62:    if (auto tuple = getTuple(operand);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   63:        tuple && getSparseTensorEncoding(tuple->getResultTypes()[0]))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+        -:   64:      // An unrealized_conversion_cast will be inserted by type converter to
+        -:   65:      // inter-mix the gap between 1:N conversion between sparse tensors and
+        -:   66:      // fields. In this case, take the operands in the cast and replace the
+        -:   67:      // sparse tensor output with the flattened type array.
+    #####:   68:      flattened.append(tuple.getOperands().begin(), tuple.getOperands().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:   69:    else
+    #####:   70:      flattened.push_back(operand);
+call    0 never executed
+        -:   71:  }
+    #####:   72:}
+        -:   73:
+        -:   74:/// Gets the dimension size for the given sparse tensor at the given dim.
+        -:   75:/// Returns None if no sparse encoding is attached to the tensor type.
+function _ZN12_GLOBAL__N_1L19sizeFromTensorAtDimERN4mlir9OpBuilderENS0_8LocationENS0_16RankedTensorTypeENS0_5ValueEj called 0 returned 0% blocks executed 0%
+    #####:   76:static Optional<Value> sizeFromTensorAtDim(OpBuilder &rewriter, Location loc,
+        -:   77:                                           RankedTensorType tensorTp,
+        -:   78:                                           Value adaptedValue, unsigned dim) {
+    #####:   79:  auto enc = getSparseTensorEncoding(tensorTp);
+call    0 never executed
+    #####:   80:  if (!enc)
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return llvm::None;
+        -:   82:
+        -:   83:  // Access into static dimension can query original type directly.
+        -:   84:  // Note that this is typically already done by DimOp's folding.
+    #####:   85:  auto shape = tensorTp.getShape();
+call    0 never executed
+    #####:   86:  if (!ShapedType::isDynamic(shape[dim]))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   87:    return constantIndex(rewriter, loc, shape[dim]);
+call    0 never executed
+        -:   88:
+        -:   89:  // Any other query can consult the dimSizes array at field DimSizesIdx,
+        -:   90:  // accounting for the reordering applied to the sparse storage.
+    #####:   91:  auto tuple = getTuple(adaptedValue);
+call    0 never executed
+    #####:   92:  Value idx = constantIndex(rewriter, loc, toStoredDim(tensorTp, dim));
+call    0 never executed
+call    1 never executed
+    #####:   93:  return rewriter
+    #####:   94:      .create<memref::LoadOp>(loc, tuple.getInputs()[DimSizesIdx], idx)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   95:      .getResult();
+call    0 never executed
+        -:   96:}
+        -:   97:
+        -:   98:/// Translates field index to memSizes index.
+    #####:   99:static unsigned getMemSizesIndex(unsigned field) {
+    #####:  100:  assert(FieldsIdx <= field);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  101:  return field - FieldsIdx;
+        -:  102:}
+        -:  103:
+        -:  104:/// Returns field index of sparse tensor type for pointers/indices, when set.
+function _ZN12_GLOBAL__N_1L13getFieldIndexEN4mlir4TypeEjj called 0 returned 0% blocks executed 0%
+    #####:  105:static unsigned getFieldIndex(Type type, unsigned ptrDim, unsigned idxDim) {
+    #####:  106:  assert(getSparseTensorEncoding(type));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  107:  RankedTensorType rType = type.cast<RankedTensorType>();
+call    0 never executed
+    #####:  108:  unsigned field = FieldsIdx; // start past header
+    #####:  109:  unsigned ptr = 0;
+    #####:  110:  unsigned idx = 0;
+    #####:  111:  for (unsigned r = 0, rank = rType.getShape().size(); r < rank; r++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  112:    if (isCompressedDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  113:      if (ptr++ == ptrDim)
+branch  0 never executed
+branch  1 never executed
+    #####:  114:        return field;
+    #####:  115:      field++;
+    #####:  116:      if (idx++ == idxDim)
+branch  0 never executed
+branch  1 never executed
+    #####:  117:        return field;
+    #####:  118:      field++;
+    #####:  119:    } else if (isSingletonDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  120:      if (idx++ == idxDim)
+branch  0 never executed
+branch  1 never executed
+    #####:  121:        return field;
+    #####:  122:      field++;
+        -:  123:    } else {
+    #####:  124:      assert(isDenseDim(rType, r)); // no fields
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  125:    }
+        -:  126:  }
+    #####:  127:  assert(ptrDim == -1u && idxDim == -1u);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  128:  return field + 1; // return values field index
+        -:  129:}
+        -:  130:
+        -:  131:/// Maps a sparse tensor type to the appropriate compounded buffers.
+        -:  132:static Optional<LogicalResult>
+function _ZN12_GLOBAL__N_1L23convertSparseTensorTypeEN4mlir4TypeERN4llvm15SmallVectorImplIS1_EE called 0 returned 0% blocks executed 0%
+    #####:  133:convertSparseTensorType(Type type, SmallVectorImpl<Type> &fields) {
+    #####:  134:  auto enc = getSparseTensorEncoding(type);
+call    0 never executed
+    #####:  135:  if (!enc)
+branch  0 never executed
+branch  1 never executed
+    #####:  136:    return llvm::None;
+        -:  137:  // Construct the basic types.
+    #####:  138:  auto *context = type.getContext();
+call    0 never executed
+    #####:  139:  unsigned idxWidth = enc.getIndexBitWidth();
+call    0 never executed
+    #####:  140:  unsigned ptrWidth = enc.getPointerBitWidth();
+call    0 never executed
+    #####:  141:  RankedTensorType rType = type.cast<RankedTensorType>();
+call    0 never executed
+    #####:  142:  Type indexType = IndexType::get(context);
+call    0 never executed
+    #####:  143:  Type idxType = idxWidth ? IntegerType::get(context, idxWidth) : indexType;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  144:  Type ptrType = ptrWidth ? IntegerType::get(context, ptrWidth) : indexType;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  145:  Type eltType = rType.getElementType();
+call    0 never executed
+        -:  146:  //
+        -:  147:  // Sparse tensor storage for rank-dimensional tensor is organized as a
+        -:  148:  // single compound type with the following fields. Note that every
+        -:  149:  // memref with ? size actually behaves as a "vector", i.e. the stored
+        -:  150:  // size is the capacity and the used size resides in the memSizes array.
+        -:  151:  //
+        -:  152:  // struct {
+        -:  153:  //   memref<rank x index> dimSizes     ; size in each dimension
+        -:  154:  //   memref<rank x index> dimCursor    ; cursor in each dimension
+        -:  155:  //   memref<n x index> memSizes        ; sizes of ptrs/inds/values
+        -:  156:  //   ; per-dimension d:
+        -:  157:  //   ;  if dense:
+        -:  158:  //        <nothing>
+        -:  159:  //   ;  if compresed:
+        -:  160:  //        memref<? x ptr>  pointers-d  ; pointers for sparse dim d
+        -:  161:  //        memref<? x idx>  indices-d   ; indices for sparse dim d
+        -:  162:  //   ;  if singleton:
+        -:  163:  //        memref<? x idx>  indices-d   ; indices for singleton dim d
+        -:  164:  //   memref<? x eltType> values        ; values
+        -:  165:  // };
+        -:  166:  //
+    #####:  167:  unsigned rank = rType.getShape().size();
+call    0 never executed
+call    1 never executed
+    #####:  168:  unsigned lastField = getFieldIndex(type, -1u, -1u);
+call    0 never executed
+        -:  169:  // The dimSizes array, dimCursor array, and memSizes array.
+    #####:  170:  fields.push_back(MemRefType::get({rank}, indexType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  171:  fields.push_back(MemRefType::get({rank}, indexType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  172:  fields.push_back(MemRefType::get({getMemSizesIndex(lastField)}, indexType));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+        -:  173:  // Per-dimension storage.
+    #####:  174:  for (unsigned r = 0; r < rank; r++) {
+branch  0 never executed
+branch  1 never executed
+        -:  175:    // Dimension level types apply in order to the reordered dimension.
+        -:  176:    // As a result, the compound type can be constructed directly in the given
+        -:  177:    // order. Clients of this type know what field is what from the sparse
+        -:  178:    // tensor type.
+    #####:  179:    if (isCompressedDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  180:      fields.push_back(MemRefType::get({ShapedType::kDynamicSize}, ptrType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  181:      fields.push_back(MemRefType::get({ShapedType::kDynamicSize}, idxType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  182:    } else if (isSingletonDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  183:      fields.push_back(MemRefType::get({ShapedType::kDynamicSize}, idxType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  184:    } else {
+    #####:  185:      assert(isDenseDim(rType, r)); // no fields
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  186:    }
+        -:  187:  }
+        -:  188:  // The values array.
+    #####:  189:  fields.push_back(MemRefType::get({ShapedType::kDynamicSize}, eltType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  190:  assert(fields.size() == lastField);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  191:  return success();
+        -:  192:}
+        -:  193:
+        -:  194:/// Creates allocation operation.
+function _ZN12_GLOBAL__N_1L16createAllocationERN4mlir9OpBuilderENS0_8LocationENS0_4TypeENS0_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  195:static Value createAllocation(OpBuilder &builder, Location loc, Type type,
+        -:  196:                              Value sz) {
+    #####:  197:  auto memType = MemRefType::get({ShapedType::kDynamicSize}, type);
+call    0 never executed
+call    1 never executed
+    #####:  198:  return builder.create<memref::AllocOp>(loc, memType, sz);
+call    0 never executed
+        -:  199:}
+        -:  200:
+        -:  201:/// Creates allocation for each field in sparse tensor type. Note that
+        -:  202:/// for all dynamic memrefs, the memory size is really the capacity of
+        -:  203:/// the "vector", while the actual size resides in the sizes array.
+        -:  204:///
+        -:  205:/// TODO: for efficiency, we will need heuristis to make educated guesses
+        -:  206:///       on the required capacities
+        -:  207:///
+function _ZN12_GLOBAL__N_1L17createAllocFieldsERN4mlir9OpBuilderENS0_8LocationENS0_4TypeENS0_10ValueRangeERN4llvm15SmallVectorImplINS0_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  208:static void createAllocFields(OpBuilder &builder, Location loc, Type type,
+        -:  209:                              ValueRange dynSizes,
+        -:  210:                              SmallVectorImpl<Value> &fields) {
+    #####:  211:  auto enc = getSparseTensorEncoding(type);
+call    0 never executed
+    #####:  212:  assert(enc);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  213:  // Construct the basic types.
+    #####:  214:  unsigned idxWidth = enc.getIndexBitWidth();
+call    0 never executed
+    #####:  215:  unsigned ptrWidth = enc.getPointerBitWidth();
+call    0 never executed
+    #####:  216:  RankedTensorType rType = type.cast<RankedTensorType>();
+call    0 never executed
+    #####:  217:  Type indexType = builder.getIndexType();
+call    0 never executed
+    #####:  218:  Type idxType = idxWidth ? builder.getIntegerType(idxWidth) : indexType;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  219:  Type ptrType = ptrWidth ? builder.getIntegerType(ptrWidth) : indexType;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  220:  Type eltType = rType.getElementType();
+call    0 never executed
+    #####:  221:  auto shape = rType.getShape();
+call    0 never executed
+    #####:  222:  unsigned rank = shape.size();
+call    0 never executed
+    #####:  223:  bool allDense = true;
+    #####:  224:  Value one = constantIndex(builder, loc, 1);
+call    0 never executed
+    #####:  225:  Value linear = one;
+    #####:  226:  Value heuristic = one; // FIX, see TODO above
+        -:  227:  // Build original sizes.
+    #####:  228:  SmallVector<Value, 8> sizes;
+    #####:  229:  for (unsigned r = 0, o = 0; r < rank; r++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  230:    if (ShapedType::isDynamic(shape[r]))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  231:      sizes.push_back(dynSizes[o++]);
+call    0 never executed
+call    1 never executed
+        -:  232:    else
+    #####:  233:      sizes.push_back(constantIndex(builder, loc, shape[r]));
+call    0 never executed
+call    1 never executed
+        -:  234:  }
+        -:  235:  // The dimSizes array, dimCursor array, and memSizes array.
+    #####:  236:  unsigned lastField = getFieldIndex(type, -1u, -1u);
+call    0 never executed
+    #####:  237:  Value dimSizes =
+    #####:  238:      builder.create<memref::AllocOp>(loc, MemRefType::get({rank}, indexType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  239:  Value dimCursor =
+    #####:  240:      builder.create<memref::AllocOp>(loc, MemRefType::get({rank}, indexType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  241:  Value memSizes = builder.create<memref::AllocOp>(
+    #####:  242:      loc, MemRefType::get({getMemSizesIndex(lastField)}, indexType));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  243:  fields.push_back(dimSizes);
+call    0 never executed
+    #####:  244:  fields.push_back(dimCursor);
+call    0 never executed
+    #####:  245:  fields.push_back(memSizes);
+        -:  246:  // Per-dimension storage.
+    #####:  247:  for (unsigned r = 0; r < rank; r++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  248:    // Get the original dimension (ro) for the current stored dimension.
+    #####:  249:    unsigned ro = toOrigDim(rType, r);
+call    0 never executed
+    #####:  250:    builder.create<memref::StoreOp>(loc, sizes[ro], dimSizes,
+    #####:  251:                                    constantIndex(builder, loc, r));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  252:    linear = builder.create<arith::MulIOp>(loc, linear, sizes[ro]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  253:    // Allocate fields.
+    #####:  254:    if (isCompressedDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  255:      fields.push_back(createAllocation(builder, loc, ptrType, heuristic));
+call    0 never executed
+call    1 never executed
+    #####:  256:      fields.push_back(createAllocation(builder, loc, idxType, heuristic));
+call    0 never executed
+    #####:  257:      allDense = false;
+call    0 never executed
+    #####:  258:    } else if (isSingletonDim(rType, r)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  259:      fields.push_back(createAllocation(builder, loc, idxType, heuristic));
+call    0 never executed
+    #####:  260:      allDense = false;
+call    0 never executed
+        -:  261:    } else {
+    #####:  262:      assert(isDenseDim(rType, r)); // no fields
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  263:    }
+        -:  264:  }
+        -:  265:  // The values array. For all-dense, the full length is required.
+        -:  266:  // In all other case, we resort to the heuristical initial value.
+    #####:  267:  Value valuesSz = allDense ? linear : heuristic;
+branch  0 never executed
+branch  1 never executed
+    #####:  268:  fields.push_back(createAllocation(builder, loc, eltType, valuesSz));
+call    0 never executed
+call    1 never executed
+        -:  269:  // Set memSizes.
+    #####:  270:  if (allDense)
+branch  0 never executed
+branch  1 never executed
+    #####:  271:    builder.create<memref::StoreOp>(
+call    0 never executed
+        -:  272:        loc, valuesSz, memSizes,
+    #####:  273:        constantIndex(builder, loc, 0)); // TODO: avoid memSizes in this case?
+call    0 never executed
+        -:  274:  else
+    #####:  275:    builder.create<linalg::FillOp>(
+    #####:  276:        loc, ValueRange{constantZero(builder, loc, indexType)},
+call    0 never executed
+    #####:  277:        ValueRange{memSizes});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  278:  assert(fields.size() == lastField);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  279:}
+        -:  280:
+        -:  281:/// Creates a straightforward counting for-loop.
+function _ZN12_GLOBAL__N_1L9createForERN4mlir9OpBuilderENS0_8LocationENS0_5ValueERN4llvm15SmallVectorImplIS4_EE called 0 returned 0% blocks executed 0%
+    #####:  282:static scf::ForOp createFor(OpBuilder &builder, Location loc, Value count,
+        -:  283:                            SmallVectorImpl<Value> &fields) {
+    #####:  284:  Type indexType = builder.getIndexType();
+call    0 never executed
+    #####:  285:  Value zero = constantZero(builder, loc, indexType);
+call    0 never executed
+    #####:  286:  Value one = constantOne(builder, loc, indexType);
+call    0 never executed
+    #####:  287:  scf::ForOp forOp = builder.create<scf::ForOp>(loc, zero, count, one, fields);
+call    0 never executed
+    #####:  288:  for (unsigned i = 0, e = fields.size(); i < e; i++)
+branch  0 never executed
+branch  1 never executed
+    #####:  289:    fields[i] = forOp.getRegionIterArg(i);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  290:  builder.setInsertionPointToStart(forOp.getBody());
+call    0 never executed
+    #####:  291:  return forOp;
+        -:  292:}
+        -:  293:
+        -:  294:/// Creates a pushback op for given field and updates the fields array
+        -:  295:/// accordingly.
+function _ZN12_GLOBAL__N_1L14createPushbackERN4mlir9OpBuilderENS0_8LocationERN4llvm15SmallVectorImplINS0_5ValueEEEjS6_ called 0 returned 0% blocks executed 0%
+    #####:  296:static void createPushback(OpBuilder &builder, Location loc,
+        -:  297:                           SmallVectorImpl<Value> &fields, unsigned field,
+        -:  298:                           Value value) {
+    #####:  299:  assert(FieldsIdx <= field && field < fields.size());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  300:  Type etp = fields[field].getType().cast<ShapedType>().getElementType();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  301:  if (value.getType() != etp)
+branch  0 never executed
+branch  1 never executed
+    #####:  302:    value = builder.create<arith::IndexCastOp>(loc, etp, value);
+call    0 never executed
+    #####:  303:  fields[field] = builder.create<PushBackOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  304:      loc, fields[field].getType(), fields[MemSizesIdx], fields[field], value,
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  305:      APInt(64, getMemSizesIndex(field)));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  306:}
+        -:  307:
+        -:  308:/// Generates insertion code.
+        -:  309://
+        -:  310:// TODO: generalize this for any rank and format currently it is just sparse
+        -:  311://       vectors as a proof of concept that we have everything in place!
+        -:  312://
+function _ZN12_GLOBAL__N_1L9genInsertERN4mlir9OpBuilderENS0_8LocationENS0_16RankedTensorTypeERN4llvm15SmallVectorImplINS0_5ValueEEES9_S7_ called 0 returned 0% blocks executed 0%
+    #####:  313:static void genInsert(OpBuilder &builder, Location loc, RankedTensorType rtp,
+        -:  314:                      SmallVectorImpl<Value> &fields,
+        -:  315:                      SmallVectorImpl<Value> &indices, Value value) {
+    #####:  316:  unsigned rank = indices.size();
+call    0 never executed
+    #####:  317:  assert(rtp.getShape().size() == rank);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  318:  if (rank != 1 || !isCompressedDim(rtp, 0) || !isUniqueDim(rtp, 0) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+    #####:  319:      !isOrderedDim(rtp, 0))
+call    0 never executed
+    #####:  320:    return; // TODO: add codegen
+        -:  321:  // push_back memSizes indices-0 index
+        -:  322:  // push_back memSizes values    value
+    #####:  323:  createPushback(builder, loc, fields, FieldsIdx + 1, indices[0]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  324:  createPushback(builder, loc, fields, FieldsIdx + 2, value);
+call    0 never executed
+        -:  325:}
+        -:  326:
+        -:  327:/// Generations insertion finalization code.
+        -:  328://
+        -:  329:// TODO: this too only works for the very simple case
+        -:  330://
+function _ZN12_GLOBAL__N_1L12genEndInsertERN4mlir9OpBuilderENS0_8LocationENS0_16RankedTensorTypeERN4llvm15SmallVectorImplINS0_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  331:static void genEndInsert(OpBuilder &builder, Location loc, RankedTensorType rtp,
+        -:  332:                         SmallVectorImpl<Value> &fields) {
+    #####:  333:  if (rtp.getShape().size() != 1 || !isCompressedDim(rtp, 0) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  334:      !isUniqueDim(rtp, 0) || !isOrderedDim(rtp, 0))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  335:    return; // TODO: add codegen
+        -:  336:  // push_back memSizes pointers-0 0
+        -:  337:  // push_back memSizes pointers-0 memSizes[2]
+    #####:  338:  Value zero = constantIndex(builder, loc, 0);
+call    0 never executed
+    #####:  339:  Value two = constantIndex(builder, loc, 2);
+call    0 never executed
+    #####:  340:  Value size = builder.create<memref::LoadOp>(loc, fields[MemSizesIdx], two);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  341:  createPushback(builder, loc, fields, FieldsIdx, zero);
+call    0 never executed
+    #####:  342:  createPushback(builder, loc, fields, FieldsIdx, size);
+call    0 never executed
+        -:  343:}
+        -:  344:
+        -:  345://===----------------------------------------------------------------------===//
+        -:  346:// Codegen rules.
+        -:  347://===----------------------------------------------------------------------===//
+        -:  348:
+        -:  349:/// Sparse tensor storage conversion rule for returns.
+        -:  350:class SparseReturnConverter : public OpConversionPattern<func::ReturnOp> {
+        -:  351:public:
+        -:  352:  using OpConversionPattern::OpConversionPattern;
+        -:  353:  LogicalResult
+function _ZNK12_GLOBAL__N_121SparseReturnConverter15matchAndRewriteEN4mlir4func8ReturnOpENS2_15ReturnOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  354:  matchAndRewrite(func::ReturnOp op, OpAdaptor adaptor,
+        -:  355:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  356:    SmallVector<Value, 8> flattened;
+call    0 never executed
+    #####:  357:    flattenOperands(adaptor.getOperands(), flattened);
+call    0 never executed
+call    1 never executed
+        -:  358:    // Create a return with the flattened value extracted from sparse tensors.
+    #####:  359:    rewriter.replaceOpWithNewOp<func::ReturnOp>(op, flattened);
+call    0 never executed
+    #####:  360:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  361:  }
+        -:  362:};
+        -:  363:
+        -:  364:/// Sparse tensor storage conversion rule for calls.
+        -:  365:class SparseCallConverter : public OpConversionPattern<func::CallOp> {
+        -:  366:public:
+        -:  367:  // The default CallOp converter can not handle 1:N type conversion.
+        -:  368:  using OpConversionPattern::OpConversionPattern;
+        -:  369:  LogicalResult
+function _ZNK12_GLOBAL__N_119SparseCallConverter15matchAndRewriteEN4mlir4func6CallOpENS2_13CallOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  370:  matchAndRewrite(func::CallOp op, OpAdaptor adaptor,
+        -:  371:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  372:    Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+        -:  373:    // In case of:
+        -:  374:    //  sparse_tensor, f, sparse_tensor = call @foo(...)
+        -:  375:    // ==>
+        -:  376:    //  memref..., f, memref = call @foo(...) replace with
+        -:  377:    //  cast(memref...)->sparse_tensor, f, cast(memref...)->sparse_tensor
+    #####:  378:    SmallVector<Type, 8> finalRetTy;
+branch  0 never executed
+branch  1 never executed
+    #####:  379:    if (failed(typeConverter->convertTypes(op.getResultTypes(), finalRetTy)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  380:      return failure();
+        -:  381:
+        -:  382:    // (1) Genereates new call with flattened return value.
+    #####:  383:    SmallVector<Value, 8> flattened;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  384:    flattenOperands(adaptor.getOperands(), flattened);
+call    0 never executed
+call    1 never executed
+    #####:  385:    auto newCall = rewriter.create<func::CallOp>(loc, op.getCallee(),
+    #####:  386:                                                 finalRetTy, flattened);
+call    0 never executed
+call    1 never executed
+        -:  387:    // (2) Create cast operation for sparse tensor returns.
+    #####:  388:    SmallVector<Value, 4> castedRet;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  389:    // Tracks the offset of current return value (of the orignal call)
+        -:  390:    // relative to the new call (after sparse tensor flattening);
+    #####:  391:    unsigned retOffset = 0;
+        -:  392:    // Temporal buffer to hold the flattened list of type for
+        -:  393:    // a sparse tensor.
+    #####:  394:    SmallVector<Type, 8> sparseFlat;
+branch  0 never executed
+branch  1 never executed
+    #####:  395:    for (auto ret : op.getResults()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  396:      assert(retOffset < newCall.getNumResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  397:      auto retType = ret.getType();
+call    0 never executed
+    #####:  398:      if (failed(typeConverter->convertType(retType, sparseFlat)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  399:        // This should never happen.
+    #####:  400:        llvm_unreachable("Failed to convert type in sparse tensor codegen");
+call    0 never executed
+        -:  401:
+        -:  402:      // Converted types can not be empty when the type conversion succeed.
+    #####:  403:      assert(!sparseFlat.empty());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  404:      if (sparseFlat.size() > 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  405:        auto flatSize = sparseFlat.size();
+branch  0 never executed
+branch  1 never executed
+    #####:  406:        ValueRange fields(iterator_range<ResultRange::iterator>(
+    #####:  407:            newCall.result_begin() + retOffset,
+call    0 never executed
+    #####:  408:            newCall.result_begin() + retOffset + flatSize));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  409:        castedRet.push_back(genTuple(rewriter, loc, retType, fields));
+call    0 never executed
+call    1 never executed
+    #####:  410:        retOffset += flatSize;
+        -:  411:      } else {
+        -:  412:        // If this is an 1:1 conversion, no need for casting.
+    #####:  413:        castedRet.push_back(newCall.getResult(retOffset));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  414:        retOffset++;
+        -:  415:      }
+    #####:  416:      sparseFlat.clear();
+        -:  417:    }
+        -:  418:
+    #####:  419:    assert(castedRet.size() == op.getNumResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  420:    rewriter.replaceOp(op, castedRet);
+call    0 never executed
+call    1 never executed
+    #####:  421:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  422:  }
+        -:  423:};
+        -:  424:
+        -:  425:/// Sparse codegen rule for dimension accesses.
+        -:  426:class SparseDimOpConverter : public OpConversionPattern<tensor::DimOp> {
+        -:  427:public:
+        -:  428:  using OpConversionPattern::OpConversionPattern;
+        -:  429:  LogicalResult
+function _ZNK12_GLOBAL__N_120SparseDimOpConverter15matchAndRewriteEN4mlir6tensor5DimOpENS2_12DimOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  430:  matchAndRewrite(tensor::DimOp op, OpAdaptor adaptor,
+        -:  431:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  432:    Optional<int64_t> index = op.getConstantIndex();
+call    0 never executed
+    #####:  433:    if (!index)
+branch  0 never executed
+branch  1 never executed
+    #####:  434:      return failure();
+    #####:  435:    auto sz =
+call    0 never executed
+        -:  436:        sizeFromTensorAtDim(rewriter, op.getLoc(),
+    #####:  437:                            op.getSource().getType().cast<RankedTensorType>(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  438:                            adaptor.getSource(), *index);
+call    0 never executed
+call    1 never executed
+    #####:  439:    if (!sz)
+branch  0 never executed
+branch  1 never executed
+    #####:  440:      return failure();
+        -:  441:
+    #####:  442:    rewriter.replaceOp(op, *sz);
+call    0 never executed
+call    1 never executed
+    #####:  443:    return success();
+        -:  444:  }
+        -:  445:};
+        -:  446:
+        -:  447:/// Sparse codegen rule for trivial tensor casts.
+        -:  448:class SparseCastConverter : public OpConversionPattern<tensor::CastOp> {
+        -:  449:public:
+        -:  450:  using OpConversionPattern::OpConversionPattern;
+        -:  451:  LogicalResult
+function _ZNK12_GLOBAL__N_119SparseCastConverter15matchAndRewriteEN4mlir6tensor6CastOpENS2_13CastOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  452:  matchAndRewrite(tensor::CastOp op, OpAdaptor adaptor,
+        -:  453:                  ConversionPatternRewriter &rewriter) const override {
+        -:  454:    // Only rewrite identically annotated source/dest.
+    #####:  455:    auto encDst = getSparseTensorEncoding(op.getType());
+call    0 never executed
+call    1 never executed
+    #####:  456:    auto encSrc = getSparseTensorEncoding(op.getSource().getType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  457:    if (!encDst || encDst != encSrc)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  458:      return failure();
+    #####:  459:    rewriter.replaceOp(op, adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####:  460:    return success();
+        -:  461:  }
+        -:  462:};
+        -:  463:
+        -:  464:/// Sparse codgen rule for the alloc operator.
+        -:  465:class SparseTensorAllocConverter
+        -:  466:    : public OpConversionPattern<bufferization::AllocTensorOp> {
+        -:  467:public:
+        -:  468:  using OpConversionPattern::OpConversionPattern;
+        -:  469:  LogicalResult
+function _ZNK12_GLOBAL__N_126SparseTensorAllocConverter15matchAndRewriteEN4mlir13bufferization13AllocTensorOpENS2_20AllocTensorOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  470:  matchAndRewrite(bufferization::AllocTensorOp op, OpAdaptor adaptor,
+        -:  471:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  472:    RankedTensorType resType = op.getType();
+call    0 never executed
+    #####:  473:    auto enc = getSparseTensorEncoding(resType);
+call    0 never executed
+    #####:  474:    if (!enc)
+branch  0 never executed
+branch  1 never executed
+    #####:  475:      return failure();
+    #####:  476:    if (op.getCopy())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  477:      return rewriter.notifyMatchFailure(op, "tensor copy not implemented");
+call    0 never executed
+        -:  478:
+        -:  479:    // Construct allocation for each field.
+    #####:  480:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  481:    SmallVector<Value, 8> fields;
+call    0 never executed
+    #####:  482:    createAllocFields(rewriter, loc, resType, adaptor.getOperands(), fields);
+call    0 never executed
+call    1 never executed
+        -:  483:    // Replace operation with resulting memrefs.
+    #####:  484:    rewriter.replaceOp(op, genTuple(rewriter, loc, resType, fields));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  485:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  486:  }
+        -:  487:};
+        -:  488:
+        -:  489:/// Sparse codegen rule for the dealloc operator.
+        -:  490:class SparseTensorDeallocConverter
+        -:  491:    : public OpConversionPattern<bufferization::DeallocTensorOp> {
+        -:  492:public:
+        -:  493:  using OpConversionPattern::OpConversionPattern;
+        -:  494:  LogicalResult
+function _ZNK12_GLOBAL__N_128SparseTensorDeallocConverter15matchAndRewriteEN4mlir13bufferization15DeallocTensorOpENS2_22DeallocTensorOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  495:  matchAndRewrite(bufferization::DeallocTensorOp op, OpAdaptor adaptor,
+        -:  496:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  497:    auto enc = getSparseTensorEncoding(op.getTensor().getType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  498:    if (!enc)
+branch  0 never executed
+branch  1 never executed
+    #####:  499:      return failure();
+        -:  500:
+        -:  501:    // Replace the sparse tensor deallocation with field deallocations.
+    #####:  502:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  503:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  504:    for (auto input : tuple.getInputs())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  505:      // Deallocate every buffer used to store the sparse tensor handler.
+    #####:  506:      rewriter.create<memref::DeallocOp>(loc, input);
+call    0 never executed
+        -:  507:
+    #####:  508:    rewriter.eraseOp(op);
+call    0 never executed
+    #####:  509:    return success();
+        -:  510:  }
+        -:  511:};
+        -:  512:
+        -:  513:/// Sparse codegen rule for tensor rematerialization.
+        -:  514:class SparseTensorLoadConverter : public OpConversionPattern<LoadOp> {
+        -:  515:public:
+        -:  516:  using OpConversionPattern::OpConversionPattern;
+        -:  517:  LogicalResult
+function _ZNK12_GLOBAL__N_125SparseTensorLoadConverter15matchAndRewriteEN4mlir13sparse_tensor6LoadOpENS2_13LoadOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  518:  matchAndRewrite(LoadOp op, OpAdaptor adaptor,
+        -:  519:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  520:    RankedTensorType srcType =
+    #####:  521:        op.getTensor().getType().cast<RankedTensorType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  522:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+        -:  523:    // Prepare fields.
+    #####:  524:    SmallVector<Value, 8> fields(tuple.getInputs());
+call    0 never executed
+call    1 never executed
+        -:  525:    // Generate optional insertion finalization code.
+    #####:  526:    if (op.getHasInserts())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  527:      genEndInsert(rewriter, op.getLoc(), srcType, fields);
+call    0 never executed
+        -:  528:    // Replace operation with resulting memrefs.
+    #####:  529:    rewriter.replaceOp(op, genTuple(rewriter, op.getLoc(), srcType, fields));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  530:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  531:  }
+        -:  532:};
+        -:  533:
+        -:  534:/// Sparse codegen rule for the expand op.
+        -:  535:class SparseExpandConverter : public OpConversionPattern<ExpandOp> {
+        -:  536:public:
+        -:  537:  using OpConversionPattern::OpConversionPattern;
+        -:  538:  LogicalResult
+function _ZNK12_GLOBAL__N_121SparseExpandConverter15matchAndRewriteEN4mlir13sparse_tensor8ExpandOpENS2_15ExpandOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  539:  matchAndRewrite(ExpandOp op, OpAdaptor adaptor,
+        -:  540:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  541:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  542:    RankedTensorType srcType =
+    #####:  543:        op.getTensor().getType().cast<RankedTensorType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  544:    Type eltType = srcType.getElementType();
+call    0 never executed
+    #####:  545:    Type boolType = rewriter.getIntegerType(1);
+call    0 never executed
+    #####:  546:    Type idxType = rewriter.getIndexType();
+call    0 never executed
+        -:  547:    // All initialization should be done on entry of the loop nest.
+    #####:  548:    rewriter.setInsertionPointAfter(op.getTensor().getDefiningOp());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  549:    // Determine the size for access expansion (always the innermost stored
+        -:  550:    // dimension size, translated back to original dimension). Note that we
+        -:  551:    // recursively rewrite the new DimOp on the **original** tensor.
+    #####:  552:    unsigned innerDim = toOrigDim(srcType, srcType.getRank() - 1);
+call    0 never executed
+call    1 never executed
+    #####:  553:    auto sz = sizeFromTensorAtDim(rewriter, loc, srcType, adaptor.getTensor(),
+    #####:  554:                                  innerDim);
+call    0 never executed
+call    1 never executed
+    #####:  555:    assert(sz); // This for sure is a sparse tensor
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  556:    // Generate a memref for `sz` elements of type `t`.
+function _ZZNK12_GLOBAL__N_121SparseExpandConverter15matchAndRewriteEN4mlir13sparse_tensor8ExpandOpENS2_15ExpandOpAdaptorERNS1_25ConversionPatternRewriterEENKUlNS1_4TypeEE_clES7_ called 0 returned 0% blocks executed 0%
+    #####:  557:    auto genAlloc = [&](Type t) {
+    #####:  558:      auto memTp = MemRefType::get({ShapedType::kDynamicSize}, t);
+call    0 never executed
+call    1 never executed
+    #####:  559:      return rewriter.create<memref::AllocOp>(loc, memTp, ValueRange{*sz});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  560:    };
+        -:  561:    // Allocate temporary buffers for values/filled-switch and added.
+        -:  562:    // We do not use stack buffers for this, since the expanded size may
+        -:  563:    // be rather large (as it envelops a single expanded dense dimension).
+    #####:  564:    Value values = genAlloc(eltType);
+call    0 never executed
+call    1 never executed
+    #####:  565:    Value filled = genAlloc(boolType);
+call    0 never executed
+call    1 never executed
+    #####:  566:    Value added = genAlloc(idxType);
+call    0 never executed
+call    1 never executed
+    #####:  567:    Value zero = constantZero(rewriter, loc, idxType);
+call    0 never executed
+        -:  568:    // Reset the values/filled-switch to all-zero/false. Note that this
+        -:  569:    // introduces an O(N) operation into the computation, but this reset
+        -:  570:    // operation is amortized over the innermost loops for the access
+        -:  571:    // pattern expansion. As noted in the operation doc, we would like
+        -:  572:    // to amortize this setup cost even between kernels.
+    #####:  573:    rewriter.create<linalg::FillOp>(
+    #####:  574:        loc, ValueRange{constantZero(rewriter, loc, eltType)},
+call    0 never executed
+    #####:  575:        ValueRange{values});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  576:    rewriter.create<linalg::FillOp>(
+    #####:  577:        loc, ValueRange{constantZero(rewriter, loc, boolType)},
+call    0 never executed
+    #####:  578:        ValueRange{filled});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  579:    // Replace expansion op with these buffers and initial index.
+    #####:  580:    assert(op.getNumResults() == 4);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  581:    rewriter.replaceOp(op, {values, filled, added, zero});
+call    0 never executed
+call    1 never executed
+    #####:  582:    return success();
+        -:  583:  }
+        -:  584:};
+        -:  585:
+        -:  586:/// Sparse codegen rule for the compress operator.
+        -:  587:class SparseCompressConverter : public OpConversionPattern<CompressOp> {
+        -:  588:public:
+        -:  589:  using OpConversionPattern::OpConversionPattern;
+        -:  590:  LogicalResult
+function _ZNK12_GLOBAL__N_123SparseCompressConverter15matchAndRewriteEN4mlir13sparse_tensor10CompressOpENS2_17CompressOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  591:  matchAndRewrite(CompressOp op, OpAdaptor adaptor,
+        -:  592:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  593:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  594:    RankedTensorType dstType =
+    #####:  595:        op.getTensor().getType().cast<RankedTensorType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  596:    Type eltType = dstType.getElementType();
+call    0 never executed
+    #####:  597:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  598:    Value values = adaptor.getValues();
+call    0 never executed
+    #####:  599:    Value filled = adaptor.getFilled();
+call    0 never executed
+    #####:  600:    Value added = adaptor.getAdded();
+call    0 never executed
+    #####:  601:    Value count = adaptor.getCount();
+call    0 never executed
+        -:  602:    // Prepare fields and indices.
+    #####:  603:    SmallVector<Value, 8> fields(tuple.getInputs());
+call    0 never executed
+call    1 never executed
+    #####:  604:    SmallVector<Value, 8> indices(adaptor.getIndices());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  605:    // If the innermost dimension is ordered, we need to sort the indices
+        -:  606:    // in the "added" array prior to applying the compression.
+    #####:  607:    unsigned rank = dstType.getShape().size();
+call    0 never executed
+call    1 never executed
+    #####:  608:    if (isOrderedDim(dstType, rank - 1))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  609:      rewriter.create<SortOp>(loc, count, ValueRange{added}, ValueRange{});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  610:    // While performing the insertions, we also need to reset the elements
+        -:  611:    // of the values/filled-switch by only iterating over the set elements,
+        -:  612:    // to ensure that the runtime complexity remains proportional to the
+        -:  613:    // sparsity of the expanded access pattern.
+        -:  614:    //
+        -:  615:    // Generate
+        -:  616:    //    out_memrefs = for (i = 0; i < count; i++)(in_memrefs) {
+        -:  617:    //      index = added[i];
+        -:  618:    //      value = values[index];
+        -:  619:    //      insert({prev_indices, index}, value);
+        -:  620:    //      new_memrefs = insert(in_memrefs, {prev_indices, index}, value);
+        -:  621:    //      values[index] = 0;
+        -:  622:    //      filled[index] = false;
+        -:  623:    //      yield new_memrefs
+        -:  624:    //    }
+    #####:  625:    scf::ForOp loop = createFor(rewriter, loc, count, fields);
+call    0 never executed
+    #####:  626:    Value i = loop.getInductionVar();
+call    0 never executed
+    #####:  627:    Value index = rewriter.create<memref::LoadOp>(loc, added, i);
+call    0 never executed
+call    1 never executed
+    #####:  628:    Value value = rewriter.create<memref::LoadOp>(loc, values, index);
+call    0 never executed
+call    1 never executed
+    #####:  629:    indices.push_back(index);
+call    0 never executed
+    #####:  630:    genInsert(rewriter, loc, dstType, fields, indices, value);
+call    0 never executed
+    #####:  631:    rewriter.create<memref::StoreOp>(loc, constantZero(rewriter, loc, eltType),
+call    0 never executed
+    #####:  632:                                     values, index);
+call    0 never executed
+    #####:  633:    rewriter.create<memref::StoreOp>(loc, constantI1(rewriter, loc, false),
+call    0 never executed
+    #####:  634:                                     filled, index);
+call    0 never executed
+    #####:  635:    rewriter.create<scf::YieldOp>(loc, fields);
+call    0 never executed
+        -:  636:    // Deallocate the buffers on exit of the full loop nest.
+    #####:  637:    Operation *parent = getTop(op);
+call    0 never executed
+    #####:  638:    rewriter.setInsertionPointAfter(parent);
+call    0 never executed
+    #####:  639:    rewriter.create<memref::DeallocOp>(loc, values);
+call    0 never executed
+    #####:  640:    rewriter.create<memref::DeallocOp>(loc, filled);
+call    0 never executed
+    #####:  641:    rewriter.create<memref::DeallocOp>(loc, added);
+call    0 never executed
+        -:  642:    // Replace operation with resulting memrefs.
+    #####:  643:    rewriter.replaceOp(op,
+call    0 never executed
+    #####:  644:                       genTuple(rewriter, loc, dstType, loop->getResults()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  645:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  646:  }
+        -:  647:};
+        -:  648:
+        -:  649:/// Sparse codegen rule for the insert operator.
+        -:  650:class SparseInsertConverter : public OpConversionPattern<InsertOp> {
+        -:  651:public:
+        -:  652:  using OpConversionPattern::OpConversionPattern;
+        -:  653:  LogicalResult
+function _ZNK12_GLOBAL__N_121SparseInsertConverter15matchAndRewriteEN4mlir13sparse_tensor8InsertOpENS2_15InsertOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  654:  matchAndRewrite(InsertOp op, OpAdaptor adaptor,
+        -:  655:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  656:    RankedTensorType dstType =
+    #####:  657:        op.getTensor().getType().cast<RankedTensorType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  658:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+        -:  659:    // Prepare fields and indices.
+    #####:  660:    SmallVector<Value, 8> fields(tuple.getInputs());
+call    0 never executed
+call    1 never executed
+    #####:  661:    SmallVector<Value, 8> indices(adaptor.getIndices());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  662:    // Generate insertion.
+    #####:  663:    Value value = adaptor.getValue();
+call    0 never executed
+    #####:  664:    genInsert(rewriter, op->getLoc(), dstType, fields, indices, value);
+call    0 never executed
+        -:  665:    // Replace operation with resulting memrefs.
+    #####:  666:    rewriter.replaceOp(op, genTuple(rewriter, op.getLoc(), dstType, fields));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  667:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  668:  }
+        -:  669:};
+        -:  670:
+        -:  671:/// Base class for getter-like operations, e.g., to_indices, to_pointers.
+        -:  672:template <typename SourceOp, typename Base>
+        -:  673:class SparseGetterOpConverter : public OpConversionPattern<SourceOp> {
+        -:  674:public:
+        -:  675:  using OpAdaptor = typename SourceOp::Adaptor;
+        -:  676:  using OpConversionPattern<SourceOp>::OpConversionPattern;
+        -:  677:  LogicalResult
+    #####:  678:  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+        -:  679:                  ConversionPatternRewriter &rewriter) const override {
+        -:  680:    // Replace the requested pointer access with corresponding field.
+        -:  681:    // The cast_op is inserted by type converter to intermix 1:N type
+        -:  682:    // conversion.
+    #####:  683:    auto tuple = getTuple(adaptor.getTensor());
+    #####:  684:    unsigned idx = Base::getIndexForOp(tuple, op);
+    #####:  685:    auto fields = tuple.getInputs();
+    #####:  686:    assert(idx < fields.size());
+    #####:  687:    rewriter.replaceOp(op, fields[idx]);
+    #####:  688:    return success();
+        -:  689:  }
+------------------
+_ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor12ToPointersOpENS_25SparseToPointersConverterEE15matchAndRewriteES3_NS2_19ToPointersOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor12ToPointersOpENS_25SparseToPointersConverterEE15matchAndRewriteES3_NS2_19ToPointersOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  678:  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+        -:  679:                  ConversionPatternRewriter &rewriter) const override {
+        -:  680:    // Replace the requested pointer access with corresponding field.
+        -:  681:    // The cast_op is inserted by type converter to intermix 1:N type
+        -:  682:    // conversion.
+    #####:  683:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  684:    unsigned idx = Base::getIndexForOp(tuple, op);
+call    0 never executed
+    #####:  685:    auto fields = tuple.getInputs();
+call    0 never executed
+    #####:  686:    assert(idx < fields.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  687:    rewriter.replaceOp(op, fields[idx]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  688:    return success();
+        -:  689:  }
+------------------
+_ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor11ToIndicesOpENS_24SparseToIndicesConverterEE15matchAndRewriteES3_NS2_18ToIndicesOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor11ToIndicesOpENS_24SparseToIndicesConverterEE15matchAndRewriteES3_NS2_18ToIndicesOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  678:  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+        -:  679:                  ConversionPatternRewriter &rewriter) const override {
+        -:  680:    // Replace the requested pointer access with corresponding field.
+        -:  681:    // The cast_op is inserted by type converter to intermix 1:N type
+        -:  682:    // conversion.
+    #####:  683:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  684:    unsigned idx = Base::getIndexForOp(tuple, op);
+call    0 never executed
+    #####:  685:    auto fields = tuple.getInputs();
+call    0 never executed
+    #####:  686:    assert(idx < fields.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  687:    rewriter.replaceOp(op, fields[idx]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  688:    return success();
+        -:  689:  }
+------------------
+_ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor10ToValuesOpENS_23SparseToValuesConverterEE15matchAndRewriteES3_NS2_17ToValuesOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_123SparseGetterOpConverterIN4mlir13sparse_tensor10ToValuesOpENS_23SparseToValuesConverterEE15matchAndRewriteES3_NS2_17ToValuesOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  678:  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+        -:  679:                  ConversionPatternRewriter &rewriter) const override {
+        -:  680:    // Replace the requested pointer access with corresponding field.
+        -:  681:    // The cast_op is inserted by type converter to intermix 1:N type
+        -:  682:    // conversion.
+    #####:  683:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  684:    unsigned idx = Base::getIndexForOp(tuple, op);
+    #####:  685:    auto fields = tuple.getInputs();
+call    0 never executed
+    #####:  686:    assert(idx < fields.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  687:    rewriter.replaceOp(op, fields[idx]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  688:    return success();
+        -:  689:  }
+------------------
+        -:  690:};
+        -:  691:
+        -:  692:/// Sparse codegen rule for pointer accesses.
+        -:  693:class SparseToPointersConverter
+        -:  694:    : public SparseGetterOpConverter<ToPointersOp, SparseToPointersConverter> {
+        -:  695:public:
+        -:  696:  using SparseGetterOpConverter::SparseGetterOpConverter;
+        -:  697:  // Callback for SparseGetterOpConverter.
+        -:  698:  static unsigned getIndexForOp(UnrealizedConversionCastOp /*tuple*/,
+        -:  699:                                ToPointersOp op) {
+        -:  700:    uint64_t dim = op.getDimension().getZExtValue();
+        -:  701:    return getFieldIndex(op.getTensor().getType(), /*ptrDim=*/dim, -1u);
+        -:  702:  }
+        -:  703:};
+        -:  704:
+        -:  705:/// Sparse codegen rule for index accesses.
+        -:  706:class SparseToIndicesConverter
+        -:  707:    : public SparseGetterOpConverter<ToIndicesOp, SparseToIndicesConverter> {
+        -:  708:public:
+        -:  709:  using SparseGetterOpConverter::SparseGetterOpConverter;
+        -:  710:  // Callback for SparseGetterOpConverter.
+        -:  711:  static unsigned getIndexForOp(UnrealizedConversionCastOp /*tuple*/,
+        -:  712:                                ToIndicesOp op) {
+        -:  713:    uint64_t dim = op.getDimension().getZExtValue();
+        -:  714:    return getFieldIndex(op.getTensor().getType(), -1u, /*idxDim=*/dim);
+        -:  715:  }
+        -:  716:};
+        -:  717:
+        -:  718:/// Sparse codegen rule for value accesses.
+        -:  719:class SparseToValuesConverter
+        -:  720:    : public SparseGetterOpConverter<ToValuesOp, SparseToValuesConverter> {
+        -:  721:public:
+        -:  722:  using SparseGetterOpConverter::SparseGetterOpConverter;
+        -:  723:  // Callback for SparseGetterOpConverter.
+    #####:  724:  static unsigned getIndexForOp(UnrealizedConversionCastOp tuple,
+        -:  725:                                ToValuesOp /*op*/) {
+        -:  726:    // The last field holds the value buffer.
+    #####:  727:    return tuple.getInputs().size() - 1;
+call    0 never executed
+call    1 never executed
+        -:  728:  }
+        -:  729:};
+        -:  730:
+        -:  731:/// Sparse codegen rule for the convert operator.
+        -:  732:class SparseConvertConverter : public OpConversionPattern<ConvertOp> {
+        -:  733:public:
+        -:  734:  using OpConversionPattern::OpConversionPattern;
+        -:  735:  LogicalResult
+function _ZNK12_GLOBAL__N_122SparseConvertConverter15matchAndRewriteEN4mlir13sparse_tensor9ConvertOpENS2_16ConvertOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  736:  matchAndRewrite(ConvertOp op, OpAdaptor adaptor,
+        -:  737:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  738:    SparseTensorEncodingAttr encDst = getSparseTensorEncoding(op.getType());
+call    0 never executed
+call    1 never executed
+    #####:  739:    SparseTensorEncodingAttr encSrc =
+    #####:  740:        getSparseTensorEncoding(op.getSource().getType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  741:    if (encDst != encSrc) {
+branch  0 never executed
+branch  1 never executed
+        -:  742:      // This should be handled by rewriting before codegen.
+    #####:  743:      return failure();
+        -:  744:    }
+    #####:  745:    rewriter.replaceOp(op, adaptor.getSource());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  746:    return success();
+        -:  747:  }
+        -:  748:};
+        -:  749:
+        -:  750:/// Sparse codegen rule for number of entries operator.
+        -:  751:class SparseNumberOfEntriesConverter
+        -:  752:    : public OpConversionPattern<NumberOfEntriesOp> {
+        -:  753:public:
+        -:  754:  using OpConversionPattern::OpConversionPattern;
+        -:  755:  LogicalResult
+function _ZNK12_GLOBAL__N_130SparseNumberOfEntriesConverter15matchAndRewriteEN4mlir13sparse_tensor17NumberOfEntriesOpENS2_24NumberOfEntriesOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  756:  matchAndRewrite(NumberOfEntriesOp op, OpAdaptor adaptor,
+        -:  757:                  ConversionPatternRewriter &rewriter) const override {
+        -:  758:    // Query memSizes for the actually stored values size.
+    #####:  759:    auto tuple = getTuple(adaptor.getTensor());
+call    0 never executed
+    #####:  760:    auto fields = tuple.getInputs();
+call    0 never executed
+    #####:  761:    unsigned lastField = fields.size() - 1;
+branch  0 never executed
+branch  1 never executed
+    #####:  762:    Value field =
+branch  0 never executed
+branch  1 never executed
+    #####:  763:        constantIndex(rewriter, op.getLoc(), getMemSizesIndex(lastField));
+call    0 never executed
+    #####:  764:    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, fields[MemSizesIdx], field);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  765:    return success();
+        -:  766:  }
+        -:  767:};
+        -:  768:
+        -:  769:} // namespace
+        -:  770:
+        -:  771://===----------------------------------------------------------------------===//
+        -:  772:// Sparse tensor type conversion into an actual buffer.
+        -:  773://===----------------------------------------------------------------------===//
+        -:  774:
+function _ZN4mlir33SparseTensorTypeToBufferConverterC2Ev called 508 returned 100% blocks executed 100%
+      508:  775:mlir::SparseTensorTypeToBufferConverter::SparseTensorTypeToBufferConverter() {
+call    0 returned 100%
+     508*:  776:  addConversion([](Type type) { return type; });
+call    0 never executed
+call    1 returned 100%
+      508:  777:  addConversion(convertSparseTensorType);
+call    0 returned 100%
+        -:  778:
+        -:  779:  // Required by scf.for 1:N type conversion.
+function _ZZN4mlir33SparseTensorTypeToBufferConverterC4EvENKUlRNS_9OpBuilderENS_16RankedTensorTypeENS_10ValueRangeENS_8LocationEE0_clES2_S3_S4_S5_.isra.0 called 0 returned 0% blocks executed 0%
+     508*:  780:  addSourceMaterialization([](OpBuilder &builder, RankedTensorType tp,
+call    0 returned 100%
+        -:  781:                              ValueRange inputs,
+        -:  782:                              Location loc) -> Optional<Value> {
+    #####:  783:    if (!getSparseTensorEncoding(tp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  784:      // Not a sparse tensor.
+    #####:  785:      return llvm::None;
+        -:  786:    // Sparse compiler knows how to cancel out these casts.
+    #####:  787:    return genTuple(builder, loc, tp, inputs);
+call    0 never executed
+        -:  788:  });
+      508:  789:}
+        -:  790:
+        -:  791://===----------------------------------------------------------------------===//
+        -:  792:// Public method for populating conversion rules.
+        -:  793://===----------------------------------------------------------------------===//
+        -:  794:
+        -:  795:/// Populates the given patterns list with conversion rules required for
+        -:  796:/// the sparsification of linear algebra operations.
+function _ZN4mlir35populateSparseTensorCodegenPatternsERNS_13TypeConverterERNS_17RewritePatternSetE called 508 returned 100% blocks executed 100%
+      508:  797:void mlir::populateSparseTensorCodegenPatterns(TypeConverter &typeConverter,
+        -:  798:                                               RewritePatternSet &patterns) {
+      508:  799:  patterns.add<SparseReturnConverter, SparseCallConverter, SparseDimOpConverter,
+        -:  800:               SparseCastConverter, SparseTensorAllocConverter,
+        -:  801:               SparseTensorDeallocConverter, SparseTensorLoadConverter,
+        -:  802:               SparseExpandConverter, SparseCompressConverter,
+        -:  803:               SparseInsertConverter, SparseToPointersConverter,
+        -:  804:               SparseToIndicesConverter, SparseToValuesConverter,
+        -:  805:               SparseConvertConverter, SparseNumberOfEntriesConverter>(
+      508:  806:      typeConverter, patterns.getContext());
+call    0 returned 100%
+      508:  807:}

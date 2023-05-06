@@ -1,0 +1,3887 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/ADT/IntervalMap.h
+        -:    0:Graph:../tools/mlir/lib/Rewrite/CMakeFiles/obj.MLIRRewrite.dir/ByteCode.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Rewrite/CMakeFiles/obj.MLIRRewrite.dir/ByteCode.cpp.gcda
+        -:    0:Runs:128655
+        -:    1://===- llvm/ADT/IntervalMap.h - A sorted interval map -----------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:///
+        -:    9:/// \file
+        -:   10:/// This file implements a coalescing interval map for small objects.
+        -:   11:///
+        -:   12:/// KeyT objects are mapped to ValT objects. Intervals of keys that map to the
+        -:   13:/// same value are represented in a compressed form.
+        -:   14:///
+        -:   15:/// Iterators provide ordered access to the compressed intervals rather than the
+        -:   16:/// individual keys, and insert and erase operations use key intervals as well.
+        -:   17:///
+        -:   18:/// Like SmallVector, IntervalMap will store the first N intervals in the map
+        -:   19:/// object itself without any allocations. When space is exhausted it switches
+        -:   20:/// to a B+-tree representation with very small overhead for small key and
+        -:   21:/// value objects.
+        -:   22:///
+        -:   23:/// A Traits class specifies how keys are compared. It also allows IntervalMap
+        -:   24:/// to work with both closed and half-open intervals.
+        -:   25:///
+        -:   26:/// Keys and values are not stored next to each other in a std::pair, so we
+        -:   27:/// don't provide such a value_type. Dereferencing iterators only returns the
+        -:   28:/// mapped value. The interval bounds are accessible through the start() and
+        -:   29:/// stop() iterator methods.
+        -:   30:///
+        -:   31:/// IntervalMap is optimized for small key and value objects, 4 or 8 bytes
+        -:   32:/// each is the optimal size. For large objects use std::map instead.
+        -:   33://
+        -:   34://===----------------------------------------------------------------------===//
+        -:   35://
+        -:   36:// Synopsis:
+        -:   37://
+        -:   38:// template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -:   39:// class IntervalMap {
+        -:   40:// public:
+        -:   41://   typedef KeyT key_type;
+        -:   42://   typedef ValT mapped_type;
+        -:   43://   typedef RecyclingAllocator<...> Allocator;
+        -:   44://   class iterator;
+        -:   45://   class const_iterator;
+        -:   46://
+        -:   47://   explicit IntervalMap(Allocator&);
+        -:   48://   ~IntervalMap():
+        -:   49://
+        -:   50://   bool empty() const;
+        -:   51://   KeyT start() const;
+        -:   52://   KeyT stop() const;
+        -:   53://   ValT lookup(KeyT x, Value NotFound = Value()) const;
+        -:   54://
+        -:   55://   const_iterator begin() const;
+        -:   56://   const_iterator end() const;
+        -:   57://   iterator begin();
+        -:   58://   iterator end();
+        -:   59://   const_iterator find(KeyT x) const;
+        -:   60://   iterator find(KeyT x);
+        -:   61://
+        -:   62://   void insert(KeyT a, KeyT b, ValT y);
+        -:   63://   void clear();
+        -:   64:// };
+        -:   65://
+        -:   66:// template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -:   67:// class IntervalMap::const_iterator {
+        -:   68:// public:
+        -:   69://   using iterator_category = std::bidirectional_iterator_tag;
+        -:   70://   using value_type = ValT;
+        -:   71://   using difference_type = std::ptrdiff_t;
+        -:   72://   using pointer = value_type *;
+        -:   73://   using reference = value_type &;
+        -:   74://
+        -:   75://   bool operator==(const const_iterator &) const;
+        -:   76://   bool operator!=(const const_iterator &) const;
+        -:   77://   bool valid() const;
+        -:   78://
+        -:   79://   const KeyT &start() const;
+        -:   80://   const KeyT &stop() const;
+        -:   81://   const ValT &value() const;
+        -:   82://   const ValT &operator*() const;
+        -:   83://   const ValT *operator->() const;
+        -:   84://
+        -:   85://   const_iterator &operator++();
+        -:   86://   const_iterator &operator++(int);
+        -:   87://   const_iterator &operator--();
+        -:   88://   const_iterator &operator--(int);
+        -:   89://   void goToBegin();
+        -:   90://   void goToEnd();
+        -:   91://   void find(KeyT x);
+        -:   92://   void advanceTo(KeyT x);
+        -:   93:// };
+        -:   94://
+        -:   95:// template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -:   96:// class IntervalMap::iterator : public const_iterator {
+        -:   97:// public:
+        -:   98://   void insert(KeyT a, KeyT b, Value y);
+        -:   99://   void erase();
+        -:  100:// };
+        -:  101://
+        -:  102://===----------------------------------------------------------------------===//
+        -:  103:
+        -:  104:#ifndef LLVM_ADT_INTERVALMAP_H
+        -:  105:#define LLVM_ADT_INTERVALMAP_H
+        -:  106:
+        -:  107:#include "llvm/ADT/PointerIntPair.h"
+        -:  108:#include "llvm/ADT/SmallVector.h"
+        -:  109:#include "llvm/Support/Allocator.h"
+        -:  110:#include "llvm/Support/RecyclingAllocator.h"
+        -:  111:#include <algorithm>
+        -:  112:#include <cassert>
+        -:  113:#include <iterator>
+        -:  114:#include <new>
+        -:  115:#include <utility>
+        -:  116:
+        -:  117:namespace llvm {
+        -:  118:
+        -:  119://===----------------------------------------------------------------------===//
+        -:  120://---                              Key traits                              ---//
+        -:  121://===----------------------------------------------------------------------===//
+        -:  122://
+        -:  123:// The IntervalMap works with closed or half-open intervals.
+        -:  124:// Adjacent intervals that map to the same value are coalesced.
+        -:  125://
+        -:  126:// The IntervalMapInfo traits class is used to determine if a key is contained
+        -:  127:// in an interval, and if two intervals are adjacent so they can be coalesced.
+        -:  128:// The provided implementation works for closed integer intervals, other keys
+        -:  129:// probably need a specialized version.
+        -:  130://
+        -:  131:// The point x is contained in [a;b] when !startLess(x, a) && !stopLess(b, x).
+        -:  132://
+        -:  133:// It is assumed that (a;b] half-open intervals are not used, only [a;b) is
+        -:  134:// allowed. This is so that stopLess(a, b) can be used to determine if two
+        -:  135:// intervals overlap.
+        -:  136://
+        -:  137://===----------------------------------------------------------------------===//
+        -:  138:
+        -:  139:template <typename T>
+        -:  140:struct IntervalMapInfo {
+        -:  141:  /// startLess - Return true if x is not in [a;b].
+        -:  142:  /// This is x < a both for closed intervals and for [a;b) half-open intervals.
+    #####:  143:  static inline bool startLess(const T &x, const T &a) {
+        -:  144:    return x < a;
+        -:  145:  }
+        -:  146:
+        -:  147:  /// stopLess - Return true if x is not in [a;b].
+        -:  148:  /// This is b < x for a closed interval, b <= x for [a;b) half-open intervals.
+    #####:  149:  static inline bool stopLess(const T &b, const T &x) {
+        -:  150:    return b < x;
+        -:  151:  }
+        -:  152:
+        -:  153:  /// adjacent - Return true when the intervals [x;a] and [b;y] can coalesce.
+        -:  154:  /// This is a+1 == b for closed intervals, a == b for half-open intervals.
+    #####:  155:  static inline bool adjacent(const T &a, const T &b) {
+    #####:  156:    return a+1 == b;
+        -:  157:  }
+        -:  158:
+        -:  159:  /// nonEmpty - Return true if [a;b] is non-empty.
+        -:  160:  /// This is a <= b for a closed interval, a < b for [a;b) half-open intervals.
+        -:  161:  static inline bool nonEmpty(const T &a, const T &b) {
+        -:  162:    return a <= b;
+        -:  163:  }
+        -:  164:};
+        -:  165:
+        -:  166:template <typename T>
+        -:  167:struct IntervalMapHalfOpenInfo {
+        -:  168:  /// startLess - Return true if x is not in [a;b).
+        -:  169:  static inline bool startLess(const T &x, const T &a) {
+        -:  170:    return x < a;
+        -:  171:  }
+        -:  172:
+        -:  173:  /// stopLess - Return true if x is not in [a;b).
+        -:  174:  static inline bool stopLess(const T &b, const T &x) {
+        -:  175:    return b <= x;
+        -:  176:  }
+        -:  177:
+        -:  178:  /// adjacent - Return true when the intervals [x;a) and [b;y) can coalesce.
+        -:  179:  static inline bool adjacent(const T &a, const T &b) {
+        -:  180:    return a == b;
+        -:  181:  }
+        -:  182:
+        -:  183:  /// nonEmpty - Return true if [a;b) is non-empty.
+        -:  184:  static inline bool nonEmpty(const T &a, const T &b) {
+        -:  185:    return a < b;
+        -:  186:  }
+        -:  187:};
+        -:  188:
+        -:  189:/// IntervalMapImpl - Namespace used for IntervalMap implementation details.
+        -:  190:/// It should be considered private to the implementation.
+        -:  191:namespace IntervalMapImpl {
+        -:  192:
+        -:  193:using IdxPair = std::pair<unsigned,unsigned>;
+        -:  194:
+        -:  195://===----------------------------------------------------------------------===//
+        -:  196://---                    IntervalMapImpl::NodeBase                         ---//
+        -:  197://===----------------------------------------------------------------------===//
+        -:  198://
+        -:  199:// Both leaf and branch nodes store vectors of pairs.
+        -:  200:// Leaves store ((KeyT, KeyT), ValT) pairs, branches use (NodeRef, KeyT).
+        -:  201://
+        -:  202:// Keys and values are stored in separate arrays to avoid padding caused by
+        -:  203:// different object alignments. This also helps improve locality of reference
+        -:  204:// when searching the keys.
+        -:  205://
+        -:  206:// The nodes don't know how many elements they contain - that information is
+        -:  207:// stored elsewhere. Omitting the size field prevents padding and allows a node
+        -:  208:// to fill the allocated cache lines completely.
+        -:  209://
+        -:  210:// These are typical key and value sizes, the node branching factor (N), and
+        -:  211:// wasted space when nodes are sized to fit in three cache lines (192 bytes):
+        -:  212://
+        -:  213://   T1  T2   N Waste  Used by
+        -:  214://    4   4  24   0    Branch<4> (32-bit pointers)
+        -:  215://    8   4  16   0    Leaf<4,4>, Branch<4>
+        -:  216://    8   8  12   0    Leaf<4,8>, Branch<8>
+        -:  217://   16   4   9  12    Leaf<8,4>
+        -:  218://   16   8   8   0    Leaf<8,8>
+        -:  219://
+        -:  220://===----------------------------------------------------------------------===//
+        -:  221:
+        -:  222:template <typename T1, typename T2, unsigned N>
+    #####:  223:class NodeBase {
+        -:  224:public:
+        -:  225:  enum { Capacity = N };
+        -:  226:
+        -:  227:  T1 first[N];
+        -:  228:  T2 second[N];
+        -:  229:
+        -:  230:  /// copy - Copy elements from another node.
+        -:  231:  /// @param Other Node elements are copied from.
+        -:  232:  /// @param i     Beginning of the source range in other.
+        -:  233:  /// @param j     Beginning of the destination range in this.
+        -:  234:  /// @param Count Number of elements to copy.
+        -:  235:  template <unsigned M>
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE4copyILj12EEEvRKNS1_IS2_mXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE4copyILj12EEEvRKNS1_IS2_mXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE4copyILj16EEEvRKNS1_IS2_mXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE4copyILj16EEEvRKNS1_IS2_mXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE4copyILj11EEEvRKNS1_IS3_cXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE4copyILj11EEEvRKNS1_IS3_cXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE4copyILj16EEEvRKNS1_IS2_mXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE4copyILj16EEEvRKNS1_IS2_mXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE4copyILj16EEEvRKNS1_IS3_cXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE4copyILj16EEEvRKNS1_IS3_cXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE4copyILj16EEEvRKNS1_IS3_cXT_EEEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE4copyILj16EEEvRKNS1_IS3_cXT_EEEjjj called 0 returned 0% blocks executed 0%
+    #####:  236:  void copy(const NodeBase<T1, T2, M> &Other, unsigned i,
+        -:  237:            unsigned j, unsigned Count) {
+    #####:  238:    assert(i + Count <= M && "Invalid source range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  239:    assert(j + Count <= N && "Invalid dest range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  240:    for (unsigned e = i + Count; i != e; ++i, ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  241:      first[j]  = Other.first[i];
+    #####:  242:      second[j] = Other.second[i];
+        -:  243:    }
+    #####:  244:  }
+------------------
+        -:  245:
+        -:  246:  /// moveLeft - Move elements to the left.
+        -:  247:  /// @param i     Beginning of the source range.
+        -:  248:  /// @param j     Beginning of the destination range.
+        -:  249:  /// @param Count Number of elements to copy.
+    #####:  250:  void moveLeft(unsigned i, unsigned j, unsigned Count) {
+    #####:  251:    assert(j <= i && "Use moveRight shift elements right");
+    #####:  252:    copy(*this, i, j, Count);
+    #####:  253:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE8moveLeftEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE8moveLeftEjjj called 0 returned 0% blocks executed 0%
+    #####:  250:  void moveLeft(unsigned i, unsigned j, unsigned Count) {
+    #####:  251:    assert(j <= i && "Use moveRight shift elements right");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  252:    copy(*this, i, j, Count);
+call    0 never executed
+    #####:  253:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE8moveLeftEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE8moveLeftEjjj called 0 returned 0% blocks executed 0%
+    #####:  250:  void moveLeft(unsigned i, unsigned j, unsigned Count) {
+    #####:  251:    assert(j <= i && "Use moveRight shift elements right");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  252:    copy(*this, i, j, Count);
+call    0 never executed
+    #####:  253:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE8moveLeftEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE8moveLeftEjjj called 0 returned 0% blocks executed 0%
+    #####:  250:  void moveLeft(unsigned i, unsigned j, unsigned Count) {
+    #####:  251:    assert(j <= i && "Use moveRight shift elements right");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  252:    copy(*this, i, j, Count);
+call    0 never executed
+    #####:  253:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE8moveLeftEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE8moveLeftEjjj called 0 returned 0% blocks executed 0%
+    #####:  250:  void moveLeft(unsigned i, unsigned j, unsigned Count) {
+    #####:  251:    assert(j <= i && "Use moveRight shift elements right");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  252:    copy(*this, i, j, Count);
+call    0 never executed
+    #####:  253:  }
+------------------
+        -:  254:
+        -:  255:  /// moveRight - Move elements to the right.
+        -:  256:  /// @param i     Beginning of the source range.
+        -:  257:  /// @param j     Beginning of the destination range.
+        -:  258:  /// @param Count Number of elements to copy.
+    #####:  259:  void moveRight(unsigned i, unsigned j, unsigned Count) {
+    #####:  260:    assert(i <= j && "Use moveLeft shift elements left");
+    #####:  261:    assert(j + Count <= N && "Invalid range");
+    #####:  262:    while (Count--) {
+    #####:  263:      first[j + Count]  = first[i + Count];
+    #####:  264:      second[j + Count] = second[i + Count];
+        -:  265:    }
+    #####:  266:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE9moveRightEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE9moveRightEjjj called 0 returned 0% blocks executed 0%
+    #####:  259:  void moveRight(unsigned i, unsigned j, unsigned Count) {
+    #####:  260:    assert(i <= j && "Use moveLeft shift elements left");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  261:    assert(j + Count <= N && "Invalid range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:    while (Count--) {
+branch  0 never executed
+branch  1 never executed
+    #####:  263:      first[j + Count]  = first[i + Count];
+    #####:  264:      second[j + Count] = second[i + Count];
+        -:  265:    }
+    #####:  266:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE9moveRightEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj16EE9moveRightEjjj called 0 returned 0% blocks executed 0%
+    #####:  259:  void moveRight(unsigned i, unsigned j, unsigned Count) {
+    #####:  260:    assert(i <= j && "Use moveLeft shift elements left");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  261:    assert(j + Count <= N && "Invalid range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:    while (Count--) {
+branch  0 never executed
+branch  1 never executed
+    #####:  263:      first[j + Count]  = first[i + Count];
+    #####:  264:      second[j + Count] = second[i + Count];
+        -:  265:    }
+    #####:  266:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE9moveRightEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE9moveRightEjjj called 0 returned 0% blocks executed 0%
+    #####:  259:  void moveRight(unsigned i, unsigned j, unsigned Count) {
+    #####:  260:    assert(i <= j && "Use moveLeft shift elements left");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  261:    assert(j + Count <= N && "Invalid range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:    while (Count--) {
+branch  0 never executed
+branch  1 never executed
+    #####:  263:      first[j + Count]  = first[i + Count];
+    #####:  264:      second[j + Count] = second[i + Count];
+        -:  265:    }
+    #####:  266:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE9moveRightEjjj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj16EE9moveRightEjjj called 0 returned 0% blocks executed 0%
+    #####:  259:  void moveRight(unsigned i, unsigned j, unsigned Count) {
+    #####:  260:    assert(i <= j && "Use moveLeft shift elements left");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  261:    assert(j + Count <= N && "Invalid range");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:    while (Count--) {
+branch  0 never executed
+branch  1 never executed
+    #####:  263:      first[j + Count]  = first[i + Count];
+    #####:  264:      second[j + Count] = second[i + Count];
+        -:  265:    }
+    #####:  266:  }
+------------------
+        -:  267:
+        -:  268:  /// erase - Erase elements [i;j).
+        -:  269:  /// @param i    Beginning of the range to erase.
+        -:  270:  /// @param j    End of the range. (Exclusive).
+        -:  271:  /// @param Size Number of elements in node.
+    #####:  272:  void erase(unsigned i, unsigned j, unsigned Size) {
+    #####:  273:    moveLeft(j, i, Size - j);
+        -:  274:  }
+        -:  275:
+        -:  276:  /// erase - Erase element at i.
+        -:  277:  /// @param i    Index of element to erase.
+        -:  278:  /// @param Size Number of elements in node.
+    #####:  279:  void erase(unsigned i, unsigned Size) {
+    #####:  280:    erase(i, i+1, Size);
+call    0 never executed
+        -:  281:  }
+        -:  282:
+        -:  283:  /// shift - Shift elements [i;size) 1 position to the right.
+        -:  284:  /// @param i    Beginning of the range to move.
+        -:  285:  /// @param Size Number of elements in node.
+    #####:  286:  void shift(unsigned i, unsigned Size) {
+    #####:  287:    moveRight(i, i + 1, Size - i);
+        -:  288:  }
+        -:  289:
+        -:  290:  /// transferToLeftSib - Transfer elements to a left sibling node.
+        -:  291:  /// @param Size  Number of elements in this.
+        -:  292:  /// @param Sib   Left sibling node.
+        -:  293:  /// @param SSize Number of elements in sib.
+        -:  294:  /// @param Count Number of elements to transfer.
+    #####:  295:  void transferToLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  296:                         unsigned Count) {
+    #####:  297:    Sib.copy(*this, 0, SSize, Count);
+    #####:  298:    erase(0, Count, Size);
+    #####:  299:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE17transferToLeftSibEjRS3_jj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE17transferToLeftSibEjRS3_jj called 0 returned 0% blocks executed 0%
+    #####:  295:  void transferToLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  296:                         unsigned Count) {
+    #####:  297:    Sib.copy(*this, 0, SSize, Count);
+call    0 never executed
+call    1 never executed
+    #####:  298:    erase(0, Count, Size);
+    #####:  299:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE17transferToLeftSibEjRS4_jj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE17transferToLeftSibEjRS4_jj called 0 returned 0% blocks executed 0%
+    #####:  295:  void transferToLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  296:                         unsigned Count) {
+    #####:  297:    Sib.copy(*this, 0, SSize, Count);
+call    0 never executed
+call    1 never executed
+    #####:  298:    erase(0, Count, Size);
+    #####:  299:  }
+------------------
+        -:  300:
+        -:  301:  /// transferToRightSib - Transfer elements to a right sibling node.
+        -:  302:  /// @param Size  Number of elements in this.
+        -:  303:  /// @param Sib   Right sibling node.
+        -:  304:  /// @param SSize Number of elements in sib.
+        -:  305:  /// @param Count Number of elements to transfer.
+    #####:  306:  void transferToRightSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  307:                          unsigned Count) {
+    #####:  308:    Sib.moveRight(0, Count, SSize);
+    #####:  309:    Sib.copy(*this, Size-Count, 0, Count);
+    #####:  310:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE18transferToRightSibEjRS3_jj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE18transferToRightSibEjRS3_jj called 0 returned 0% blocks executed 0%
+    #####:  306:  void transferToRightSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  307:                          unsigned Count) {
+    #####:  308:    Sib.moveRight(0, Count, SSize);
+call    0 never executed
+    #####:  309:    Sib.copy(*this, Size-Count, 0, Count);
+call    0 never executed
+    #####:  310:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE18transferToRightSibEjRS4_jj:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE18transferToRightSibEjRS4_jj called 0 returned 0% blocks executed 0%
+    #####:  306:  void transferToRightSib(unsigned Size, NodeBase &Sib, unsigned SSize,
+        -:  307:                          unsigned Count) {
+    #####:  308:    Sib.moveRight(0, Count, SSize);
+call    0 never executed
+    #####:  309:    Sib.copy(*this, Size-Count, 0, Count);
+call    0 never executed
+    #####:  310:  }
+------------------
+        -:  311:
+        -:  312:  /// adjustFromLeftSib - Adjust the number if elements in this node by moving
+        -:  313:  /// elements to or from a left sibling node.
+        -:  314:  /// @param Size  Number of elements in this.
+        -:  315:  /// @param Sib   Right sibling node.
+        -:  316:  /// @param SSize Number of elements in sib.
+        -:  317:  /// @param Add   The number of elements to add to this node, possibly < 0.
+        -:  318:  /// @return      Number of elements added to this node, possibly negative.
+    #####:  319:  int adjustFromLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize, int Add) {
+    #####:  320:    if (Add > 0) {
+        -:  321:      // We want to grow, copy from sib.
+    #####:  322:      unsigned Count = std::min(std::min(unsigned(Add), SSize), N - Size);
+    #####:  323:      Sib.transferToRightSib(SSize, *this, Size, Count);
+    #####:  324:      return Count;
+        -:  325:    } else {
+        -:  326:      // We want to shrink, copy to sib.
+    #####:  327:      unsigned Count = std::min(std::min(unsigned(-Add), Size), N - SSize);
+    #####:  328:      transferToLeftSib(Size, Sib, SSize, Count);
+    #####:  329:      return -Count;
+        -:  330:    }
+        -:  331:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE17adjustFromLeftSibEjRS3_ji:
+function _ZN4llvm15IntervalMapImpl8NodeBaseINS0_7NodeRefEmLj12EE17adjustFromLeftSibEjRS3_ji called 0 returned 0% blocks executed 0%
+    #####:  319:  int adjustFromLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize, int Add) {
+    #####:  320:    if (Add > 0) {
+branch  0 never executed
+branch  1 never executed
+        -:  321:      // We want to grow, copy from sib.
+    #####:  322:      unsigned Count = std::min(std::min(unsigned(Add), SSize), N - Size);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  323:      Sib.transferToRightSib(SSize, *this, Size, Count);
+call    0 never executed
+    #####:  324:      return Count;
+        -:  325:    } else {
+        -:  326:      // We want to shrink, copy to sib.
+    #####:  327:      unsigned Count = std::min(std::min(unsigned(-Add), Size), N - SSize);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  328:      transferToLeftSib(Size, Sib, SSize, Count);
+call    0 never executed
+    #####:  329:      return -Count;
+        -:  330:    }
+        -:  331:  }
+------------------
+_ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE17adjustFromLeftSibEjRS4_ji:
+function _ZN4llvm15IntervalMapImpl8NodeBaseISt4pairImmEcLj11EE17adjustFromLeftSibEjRS4_ji called 0 returned 0% blocks executed 0%
+    #####:  319:  int adjustFromLeftSib(unsigned Size, NodeBase &Sib, unsigned SSize, int Add) {
+    #####:  320:    if (Add > 0) {
+branch  0 never executed
+branch  1 never executed
+        -:  321:      // We want to grow, copy from sib.
+    #####:  322:      unsigned Count = std::min(std::min(unsigned(Add), SSize), N - Size);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  323:      Sib.transferToRightSib(SSize, *this, Size, Count);
+call    0 never executed
+    #####:  324:      return Count;
+        -:  325:    } else {
+        -:  326:      // We want to shrink, copy to sib.
+    #####:  327:      unsigned Count = std::min(std::min(unsigned(-Add), Size), N - SSize);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  328:      transferToLeftSib(Size, Sib, SSize, Count);
+call    0 never executed
+    #####:  329:      return -Count;
+        -:  330:    }
+        -:  331:  }
+------------------
+        -:  332:};
+        -:  333:
+        -:  334:/// IntervalMapImpl::adjustSiblingSizes - Move elements between sibling nodes.
+        -:  335:/// @param Node  Array of pointers to sibling nodes.
+        -:  336:/// @param Nodes Number of nodes.
+        -:  337:/// @param CurSize Array of current node sizes, will be overwritten.
+        -:  338:/// @param NewSize Array of desired node sizes.
+        -:  339:template <typename NodeT>
+    #####:  340:void adjustSiblingSizes(NodeT *Node[], unsigned Nodes,
+        -:  341:                        unsigned CurSize[], const unsigned NewSize[]) {
+        -:  342:  // Move elements right.
+    #####:  343:  for (int n = Nodes - 1; n; --n) {
+    #####:  344:    if (CurSize[n] == NewSize[n])
+    #####:  345:      continue;
+    #####:  346:    for (int m = n - 1; m != -1; --m) {
+    #####:  347:      int d = Node[n]->adjustFromLeftSib(CurSize[n], *Node[m], CurSize[m],
+    #####:  348:                                         NewSize[n] - CurSize[n]);
+    #####:  349:      CurSize[m] -= d;
+    #####:  350:      CurSize[n] += d;
+        -:  351:      // Keep going if the current node was exhausted.
+    #####:  352:      if (CurSize[n] >= NewSize[n])
+        -:  353:          break;
+        -:  354:    }
+        -:  355:  }
+        -:  356:
+    #####:  357:  if (Nodes == 0)
+        -:  358:    return;
+        -:  359:
+        -:  360:  // Move elements left.
+    #####:  361:  for (unsigned n = 0; n != Nodes - 1; ++n) {
+    #####:  362:    if (CurSize[n] == NewSize[n])
+    #####:  363:      continue;
+    #####:  364:    for (unsigned m = n + 1; m != Nodes; ++m) {
+    #####:  365:      int d = Node[m]->adjustFromLeftSib(CurSize[m], *Node[n], CurSize[n],
+    #####:  366:                                        CurSize[n] -  NewSize[n]);
+    #####:  367:      CurSize[m] += d;
+    #####:  368:      CurSize[n] -= d;
+        -:  369:      // Keep going if the current node was exhausted.
+    #####:  370:      if (CurSize[n] >= NewSize[n])
+        -:  371:          break;
+        -:  372:    }
+        -:  373:  }
+        -:  374:
+        -:  375:#ifndef NDEBUG
+    #####:  376:  for (unsigned n = 0; n != Nodes; n++)
+    #####:  377:    assert(CurSize[n] == NewSize[n] && "Insufficient element shuffle");
+        -:  378:#endif
+        -:  379:}
+------------------
+_ZN4llvm15IntervalMapImpl18adjustSiblingSizesINS0_10BranchNodeImcLj12ENS_15IntervalMapInfoImEEEEEEvPPT_jPjPKj:
+function _ZN4llvm15IntervalMapImpl18adjustSiblingSizesINS0_10BranchNodeImcLj12ENS_15IntervalMapInfoImEEEEEEvPPT_jPjPKj called 0 returned 0% blocks executed 0%
+    #####:  340:void adjustSiblingSizes(NodeT *Node[], unsigned Nodes,
+        -:  341:                        unsigned CurSize[], const unsigned NewSize[]) {
+        -:  342:  // Move elements right.
+    #####:  343:  for (int n = Nodes - 1; n; --n) {
+branch  0 never executed
+branch  1 never executed
+    #####:  344:    if (CurSize[n] == NewSize[n])
+branch  0 never executed
+branch  1 never executed
+    #####:  345:      continue;
+    #####:  346:    for (int m = n - 1; m != -1; --m) {
+branch  0 never executed
+branch  1 never executed
+    #####:  347:      int d = Node[n]->adjustFromLeftSib(CurSize[n], *Node[m], CurSize[m],
+    #####:  348:                                         NewSize[n] - CurSize[n]);
+call    0 never executed
+    #####:  349:      CurSize[m] -= d;
+    #####:  350:      CurSize[n] += d;
+        -:  351:      // Keep going if the current node was exhausted.
+    #####:  352:      if (CurSize[n] >= NewSize[n])
+branch  0 never executed
+branch  1 never executed
+        -:  353:          break;
+        -:  354:    }
+        -:  355:  }
+        -:  356:
+    #####:  357:  if (Nodes == 0)
+branch  0 never executed
+branch  1 never executed
+        -:  358:    return;
+        -:  359:
+        -:  360:  // Move elements left.
+    #####:  361:  for (unsigned n = 0; n != Nodes - 1; ++n) {
+branch  0 never executed
+branch  1 never executed
+    #####:  362:    if (CurSize[n] == NewSize[n])
+branch  0 never executed
+branch  1 never executed
+    #####:  363:      continue;
+    #####:  364:    for (unsigned m = n + 1; m != Nodes; ++m) {
+branch  0 never executed
+branch  1 never executed
+    #####:  365:      int d = Node[m]->adjustFromLeftSib(CurSize[m], *Node[n], CurSize[n],
+    #####:  366:                                        CurSize[n] -  NewSize[n]);
+call    0 never executed
+    #####:  367:      CurSize[m] += d;
+    #####:  368:      CurSize[n] -= d;
+        -:  369:      // Keep going if the current node was exhausted.
+    #####:  370:      if (CurSize[n] >= NewSize[n])
+branch  0 never executed
+branch  1 never executed
+        -:  371:          break;
+        -:  372:    }
+        -:  373:  }
+        -:  374:
+        -:  375:#ifndef NDEBUG
+    #####:  376:  for (unsigned n = 0; n != Nodes; n++)
+branch  0 never executed
+branch  1 never executed
+    #####:  377:    assert(CurSize[n] == NewSize[n] && "Insufficient element shuffle");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  378:#endif
+        -:  379:}
+------------------
+_ZN4llvm15IntervalMapImpl18adjustSiblingSizesINS0_8LeafNodeImcLj11ENS_15IntervalMapInfoImEEEEEEvPPT_jPjPKj:
+function _ZN4llvm15IntervalMapImpl18adjustSiblingSizesINS0_8LeafNodeImcLj11ENS_15IntervalMapInfoImEEEEEEvPPT_jPjPKj called 0 returned 0% blocks executed 0%
+    #####:  340:void adjustSiblingSizes(NodeT *Node[], unsigned Nodes,
+        -:  341:                        unsigned CurSize[], const unsigned NewSize[]) {
+        -:  342:  // Move elements right.
+    #####:  343:  for (int n = Nodes - 1; n; --n) {
+branch  0 never executed
+branch  1 never executed
+    #####:  344:    if (CurSize[n] == NewSize[n])
+branch  0 never executed
+branch  1 never executed
+    #####:  345:      continue;
+    #####:  346:    for (int m = n - 1; m != -1; --m) {
+branch  0 never executed
+branch  1 never executed
+    #####:  347:      int d = Node[n]->adjustFromLeftSib(CurSize[n], *Node[m], CurSize[m],
+    #####:  348:                                         NewSize[n] - CurSize[n]);
+call    0 never executed
+    #####:  349:      CurSize[m] -= d;
+    #####:  350:      CurSize[n] += d;
+        -:  351:      // Keep going if the current node was exhausted.
+    #####:  352:      if (CurSize[n] >= NewSize[n])
+branch  0 never executed
+branch  1 never executed
+        -:  353:          break;
+        -:  354:    }
+        -:  355:  }
+        -:  356:
+    #####:  357:  if (Nodes == 0)
+branch  0 never executed
+branch  1 never executed
+        -:  358:    return;
+        -:  359:
+        -:  360:  // Move elements left.
+    #####:  361:  for (unsigned n = 0; n != Nodes - 1; ++n) {
+branch  0 never executed
+branch  1 never executed
+    #####:  362:    if (CurSize[n] == NewSize[n])
+branch  0 never executed
+branch  1 never executed
+    #####:  363:      continue;
+    #####:  364:    for (unsigned m = n + 1; m != Nodes; ++m) {
+branch  0 never executed
+branch  1 never executed
+    #####:  365:      int d = Node[m]->adjustFromLeftSib(CurSize[m], *Node[n], CurSize[n],
+    #####:  366:                                        CurSize[n] -  NewSize[n]);
+call    0 never executed
+    #####:  367:      CurSize[m] += d;
+    #####:  368:      CurSize[n] -= d;
+        -:  369:      // Keep going if the current node was exhausted.
+    #####:  370:      if (CurSize[n] >= NewSize[n])
+branch  0 never executed
+branch  1 never executed
+        -:  371:          break;
+        -:  372:    }
+        -:  373:  }
+        -:  374:
+        -:  375:#ifndef NDEBUG
+    #####:  376:  for (unsigned n = 0; n != Nodes; n++)
+branch  0 never executed
+branch  1 never executed
+    #####:  377:    assert(CurSize[n] == NewSize[n] && "Insufficient element shuffle");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  378:#endif
+        -:  379:}
+------------------
+        -:  380:
+        -:  381:/// IntervalMapImpl::distribute - Compute a new distribution of node elements
+        -:  382:/// after an overflow or underflow. Reserve space for a new element at Position,
+        -:  383:/// and compute the node that will hold Position after redistributing node
+        -:  384:/// elements.
+        -:  385:///
+        -:  386:/// It is required that
+        -:  387:///
+        -:  388:///   Elements == sum(CurSize), and
+        -:  389:///   Elements + Grow <= Nodes * Capacity.
+        -:  390:///
+        -:  391:/// NewSize[] will be filled in such that:
+        -:  392:///
+        -:  393:///   sum(NewSize) == Elements, and
+        -:  394:///   NewSize[i] <= Capacity.
+        -:  395:///
+        -:  396:/// The returned index is the node where Position will go, so:
+        -:  397:///
+        -:  398:///   sum(NewSize[0..idx-1]) <= Position
+        -:  399:///   sum(NewSize[0..idx])   >= Position
+        -:  400:///
+        -:  401:/// The last equality, sum(NewSize[0..idx]) == Position, can only happen when
+        -:  402:/// Grow is set and NewSize[idx] == Capacity-1. The index points to the node
+        -:  403:/// before the one holding the Position'th element where there is room for an
+        -:  404:/// insertion.
+        -:  405:///
+        -:  406:/// @param Nodes    The number of nodes.
+        -:  407:/// @param Elements Total elements in all nodes.
+        -:  408:/// @param Capacity The capacity of each node.
+        -:  409:/// @param CurSize  Array[Nodes] of current node sizes, or NULL.
+        -:  410:/// @param NewSize  Array[Nodes] to receive the new node sizes.
+        -:  411:/// @param Position Insert position.
+        -:  412:/// @param Grow     Reserve space for a new element at Position.
+        -:  413:/// @return         (node, offset) for Position.
+        -:  414:IdxPair distribute(unsigned Nodes, unsigned Elements, unsigned Capacity,
+        -:  415:                   const unsigned *CurSize, unsigned NewSize[],
+        -:  416:                   unsigned Position, bool Grow);
+        -:  417:
+        -:  418://===----------------------------------------------------------------------===//
+        -:  419://---                   IntervalMapImpl::NodeSizer                         ---//
+        -:  420://===----------------------------------------------------------------------===//
+        -:  421://
+        -:  422:// Compute node sizes from key and value types.
+        -:  423://
+        -:  424:// The branching factors are chosen to make nodes fit in three cache lines.
+        -:  425:// This may not be possible if keys or values are very large. Such large objects
+        -:  426:// are handled correctly, but a std::map would probably give better performance.
+        -:  427://
+        -:  428://===----------------------------------------------------------------------===//
+        -:  429:
+        -:  430:enum {
+        -:  431:  // Cache line size. Most architectures have 32 or 64 byte cache lines.
+        -:  432:  // We use 64 bytes here because it provides good branching factors.
+        -:  433:  Log2CacheLine = 6,
+        -:  434:  CacheLineBytes = 1 << Log2CacheLine,
+        -:  435:  DesiredNodeBytes = 3 * CacheLineBytes
+        -:  436:};
+        -:  437:
+        -:  438:template <typename KeyT, typename ValT>
+        -:  439:struct NodeSizer {
+        -:  440:  enum {
+        -:  441:    // Compute the leaf node branching factor that makes a node fit in three
+        -:  442:    // cache lines. The branching factor must be at least 3, or some B+-tree
+        -:  443:    // balancing algorithms won't work.
+        -:  444:    // LeafSize can't be larger than CacheLineBytes. This is required by the
+        -:  445:    // PointerIntPair used by NodeRef.
+        -:  446:    DesiredLeafSize = DesiredNodeBytes /
+        -:  447:      static_cast<unsigned>(2*sizeof(KeyT)+sizeof(ValT)),
+        -:  448:    MinLeafSize = 3,
+        -:  449:    LeafSize = DesiredLeafSize > MinLeafSize ? DesiredLeafSize : MinLeafSize
+        -:  450:  };
+        -:  451:
+        -:  452:  using LeafBase = NodeBase<std::pair<KeyT, KeyT>, ValT, LeafSize>;
+        -:  453:
+        -:  454:  enum {
+        -:  455:    // Now that we have the leaf branching factor, compute the actual allocation
+        -:  456:    // unit size by rounding up to a whole number of cache lines.
+        -:  457:    AllocBytes = (sizeof(LeafBase) + CacheLineBytes-1) & ~(CacheLineBytes-1),
+        -:  458:
+        -:  459:    // Determine the branching factor for branch nodes.
+        -:  460:    BranchSize = AllocBytes /
+        -:  461:      static_cast<unsigned>(sizeof(KeyT) + sizeof(void*))
+        -:  462:  };
+        -:  463:
+        -:  464:  /// Allocator - The recycling allocator used for both branch and leaf nodes.
+        -:  465:  /// This typedef is very likely to be identical for all IntervalMaps with
+        -:  466:  /// reasonably sized entries, so the same allocator can be shared among
+        -:  467:  /// different kinds of maps.
+        -:  468:  using Allocator =
+        -:  469:      RecyclingAllocator<BumpPtrAllocator, char, AllocBytes, CacheLineBytes>;
+        -:  470:};
+        -:  471:
+        -:  472://===----------------------------------------------------------------------===//
+        -:  473://---                     IntervalMapImpl::NodeRef                         ---//
+        -:  474://===----------------------------------------------------------------------===//
+        -:  475://
+        -:  476:// B+-tree nodes can be leaves or branches, so we need a polymorphic node
+        -:  477:// pointer that can point to both kinds.
+        -:  478://
+        -:  479:// All nodes are cache line aligned and the low 6 bits of a node pointer are
+        -:  480:// always 0. These bits are used to store the number of elements in the
+        -:  481:// referenced node. Besides saving space, placing node sizes in the parents
+        -:  482:// allow tree balancing algorithms to run without faulting cache lines for nodes
+        -:  483:// that may not need to be modified.
+        -:  484://
+        -:  485:// A NodeRef doesn't know whether it references a leaf node or a branch node.
+        -:  486:// It is the responsibility of the caller to use the correct types.
+        -:  487://
+        -:  488:// Nodes are never supposed to be empty, and it is invalid to store a node size
+        -:  489:// of 0 in a NodeRef. The valid range of sizes is 1-64.
+        -:  490://
+        -:  491://===----------------------------------------------------------------------===//
+        -:  492:
+        -:  493:class NodeRef {
+        -:  494:  struct CacheAlignedPointerTraits {
+        -:  495:    static inline void *getAsVoidPointer(void *P) { return P; }
+    #####:  496:    static inline void *getFromVoidPointer(void *P) { return P; }
+call    0 never executed
+call    1 never executed
+        -:  497:    static constexpr int NumLowBitsAvailable = Log2CacheLine;
+        -:  498:  };
+        -:  499:  PointerIntPair<void*, Log2CacheLine, unsigned, CacheAlignedPointerTraits> pip;
+        -:  500:
+        -:  501:public:
+        -:  502:  /// NodeRef - Create a null ref.
+        -:  503:  NodeRef() = default;
+        -:  504:
+        -:  505:  /// operator bool - Detect a null ref.
+    #####:  506:  explicit operator bool() const { return pip.getOpaqueValue(); }
+        -:  507:
+        -:  508:  /// NodeRef - Create a reference to the node p with n elements.
+        -:  509:  template <typename NodeT>
+    #####:  510:  NodeRef(NodeT *p, unsigned n) : pip(p, n - 1) {
+    #####:  511:    assert(n <= NodeT::Capacity && "Size too big for node");
+    #####:  512:  }
+------------------
+_ZN4llvm15IntervalMapImpl7NodeRefC2INS0_10BranchNodeImcLj12ENS_15IntervalMapInfoImEEEEEEPT_j:
+function _ZN4llvm15IntervalMapImpl7NodeRefC2INS0_10BranchNodeImcLj12ENS_15IntervalMapInfoImEEEEEEPT_j called 0 returned 0% blocks executed 0%
+    #####:  510:  NodeRef(NodeT *p, unsigned n) : pip(p, n - 1) {
+call    0 never executed
+    #####:  511:    assert(n <= NodeT::Capacity && "Size too big for node");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  512:  }
+------------------
+_ZN4llvm15IntervalMapImpl7NodeRefC2INS0_8LeafNodeImcLj11ENS_15IntervalMapInfoImEEEEEEPT_j:
+function _ZN4llvm15IntervalMapImpl7NodeRefC2INS0_8LeafNodeImcLj11ENS_15IntervalMapInfoImEEEEEEPT_j called 0 returned 0% blocks executed 0%
+    #####:  510:  NodeRef(NodeT *p, unsigned n) : pip(p, n - 1) {
+call    0 never executed
+    #####:  511:    assert(n <= NodeT::Capacity && "Size too big for node");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  512:  }
+------------------
+        -:  513:
+        -:  514:  /// size - Return the number of elements in the referenced node.
+    #####:  515:  unsigned size() const { return pip.getInt() + 1; }
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  516:
+        -:  517:  /// setSize - Update the node size.
+    #####:  518:  void setSize(unsigned n) { pip.setInt(n - 1); }
+        -:  519:
+        -:  520:  /// subtree - Access the i'th subtree reference in a branch node.
+        -:  521:  /// This depends on branch nodes storing the NodeRef array as their first
+        -:  522:  /// member.
+    #####:  523:  NodeRef &subtree(unsigned i) const {
+    #####:  524:    return reinterpret_cast<NodeRef*>(pip.getPointer())[i];
+        -:  525:  }
+        -:  526:
+        -:  527:  /// get - Dereference as a NodeT reference.
+        -:  528:  template <typename NodeT>
+    #####:  529:  NodeT &get() const {
+    #####:  530:    return *reinterpret_cast<NodeT*>(pip.getPointer());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  531:  }
+        -:  532:
+        -:  533:  bool operator==(const NodeRef &RHS) const {
+        -:  534:    if (pip == RHS.pip)
+        -:  535:      return true;
+        -:  536:    assert(pip.getPointer() != RHS.pip.getPointer() && "Inconsistent NodeRefs");
+        -:  537:    return false;
+        -:  538:  }
+        -:  539:
+        -:  540:  bool operator!=(const NodeRef &RHS) const {
+        -:  541:    return !operator==(RHS);
+        -:  542:  }
+        -:  543:};
+        -:  544:
+        -:  545://===----------------------------------------------------------------------===//
+        -:  546://---                      IntervalMapImpl::LeafNode                       ---//
+        -:  547://===----------------------------------------------------------------------===//
+        -:  548://
+        -:  549:// Leaf nodes store up to N disjoint intervals with corresponding values.
+        -:  550://
+        -:  551:// The intervals are kept sorted and fully coalesced so there are no adjacent
+        -:  552:// intervals mapping to the same value.
+        -:  553://
+        -:  554:// These constraints are always satisfied:
+        -:  555://
+        -:  556:// - Traits::stopLess(start(i), stop(i))    - Non-empty, sane intervals.
+        -:  557://
+        -:  558:// - Traits::stopLess(stop(i), start(i + 1) - Sorted.
+        -:  559://
+        -:  560:// - value(i) != value(i + 1) || !Traits::adjacent(stop(i), start(i + 1))
+        -:  561://                                          - Fully coalesced.
+        -:  562://
+        -:  563://===----------------------------------------------------------------------===//
+        -:  564:
+        -:  565:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+    #####:  566:class LeafNode : public NodeBase<std::pair<KeyT, KeyT>, ValT, N> {
+        -:  567:public:
+    #####:  568:  const KeyT &start(unsigned i) const { return this->first[i].first; }
+    #####:  569:  const KeyT &stop(unsigned i) const { return this->first[i].second; }
+        -:  570:  const ValT &value(unsigned i) const { return this->second[i]; }
+        -:  571:
+    #####:  572:  KeyT &start(unsigned i) { return this->first[i].first; }
+    #####:  573:  KeyT &stop(unsigned i) { return this->first[i].second; }
+    #####:  574:  ValT &value(unsigned i) { return this->second[i]; }
+        -:  575:
+        -:  576:  /// findFrom - Find the first interval after i that may contain x.
+        -:  577:  /// @param i    Starting index for the search.
+        -:  578:  /// @param Size Number of elements in node.
+        -:  579:  /// @param x    Key to search for.
+        -:  580:  /// @return     First index with !stopLess(key[i].stop, x), or size.
+        -:  581:  ///             This is the first interval that can possibly contain x.
+function _ZNK4llvm15IntervalMapImpl8LeafNodeImcLj16ENS_15IntervalMapInfoImEEE8findFromEjjm called 0 returned 0% blocks executed 0%
+    #####:  582:  unsigned findFrom(unsigned i, unsigned Size, KeyT x) const {
+    #####:  583:    assert(i <= Size && Size <= N && "Bad indices");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  584:    assert((i == 0 || Traits::stopLess(stop(i - 1), x)) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  585:           "Index is past the needed point");
+    #####:  586:    while (i != Size && Traits::stopLess(stop(i), x)) ++i;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  587:    return i;
+        -:  588:  }
+        -:  589:
+        -:  590:  /// safeFind - Find an interval that is known to exist. This is the same as
+        -:  591:  /// findFrom except is it assumed that x is at least within range of the last
+        -:  592:  /// interval.
+        -:  593:  /// @param i Starting index for the search.
+        -:  594:  /// @param x Key to search for.
+        -:  595:  /// @return  First index with !stopLess(key[i].stop, x), never size.
+        -:  596:  ///          This is the first interval that can possibly contain x.
+function _ZNK4llvm15IntervalMapImpl8LeafNodeImcLj11ENS_15IntervalMapInfoImEEE8safeFindEjm called 0 returned 0% blocks executed 0%
+    #####:  597:  unsigned safeFind(unsigned i, KeyT x) const {
+    #####:  598:    assert(i < N && "Bad index");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  599:    assert((i == 0 || Traits::stopLess(stop(i - 1), x)) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  600:           "Index is past the needed point");
+    #####:  601:    while (Traits::stopLess(stop(i), x)) ++i;
+branch  0 never executed
+branch  1 never executed
+    #####:  602:    assert(i < N && "Unsafe intervals");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  603:    return i;
+        -:  604:  }
+        -:  605:
+        -:  606:  /// safeLookup - Lookup mapped value for a safe key.
+        -:  607:  /// It is assumed that x is within range of the last entry.
+        -:  608:  /// @param x        Key to search for.
+        -:  609:  /// @param NotFound Value to return if x is not in any interval.
+        -:  610:  /// @return         The mapped value at x or NotFound.
+        -:  611:  ValT safeLookup(KeyT x, ValT NotFound) const {
+        -:  612:    unsigned i = safeFind(0, x);
+        -:  613:    return Traits::startLess(x, start(i)) ? NotFound : value(i);
+        -:  614:  }
+        -:  615:
+        -:  616:  unsigned insertFrom(unsigned &Pos, unsigned Size, KeyT a, KeyT b, ValT y);
+        -:  617:};
+        -:  618:
+        -:  619:/// insertFrom - Add mapping of [a;b] to y if possible, coalescing as much as
+        -:  620:/// possible. This may cause the node to grow by 1, or it may cause the node
+        -:  621:/// to shrink because of coalescing.
+        -:  622:/// @param Pos  Starting index = insertFrom(0, size, a)
+        -:  623:/// @param Size Number of elements in node.
+        -:  624:/// @param a    Interval start.
+        -:  625:/// @param b    Interval stop.
+        -:  626:/// @param y    Value be mapped.
+        -:  627:/// @return     (insert position, new size), or (i, Capacity+1) on overflow.
+        -:  628:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+    #####:  629:unsigned LeafNode<KeyT, ValT, N, Traits>::
+        -:  630:insertFrom(unsigned &Pos, unsigned Size, KeyT a, KeyT b, ValT y) {
+    #####:  631:  unsigned i = Pos;
+    #####:  632:  assert(i <= Size && Size <= N && "Invalid index");
+    #####:  633:  assert(!Traits::stopLess(b, a) && "Invalid interval");
+        -:  634:
+        -:  635:  // Verify the findFrom invariant.
+    #####:  636:  assert((i == 0 || Traits::stopLess(stop(i - 1), a)));
+    #####:  637:  assert((i == Size || !Traits::stopLess(stop(i), a)));
+    #####:  638:  assert((i == Size || Traits::stopLess(b, start(i))) && "Overlapping insert");
+        -:  639:
+        -:  640:  // Coalesce with previous interval.
+    #####:  641:  if (i && value(i - 1) == y && Traits::adjacent(stop(i - 1), a)) {
+    #####:  642:    Pos = i - 1;
+        -:  643:    // Also coalesce with next interval?
+    #####:  644:    if (i != Size && value(i) == y && Traits::adjacent(b, start(i))) {
+    #####:  645:      stop(i - 1) = stop(i);
+    #####:  646:      this->erase(i, Size);
+    #####:  647:      return Size - 1;
+        -:  648:    }
+    #####:  649:    stop(i - 1) = b;
+    #####:  650:    return Size;
+        -:  651:  }
+        -:  652:
+        -:  653:  // Detect overflow.
+    #####:  654:  if (i == N)
+        -:  655:    return N + 1;
+        -:  656:
+        -:  657:  // Add new interval at end.
+    #####:  658:  if (i == Size) {
+    #####:  659:    start(i) = a;
+    #####:  660:    stop(i) = b;
+    #####:  661:    value(i) = y;
+    #####:  662:    return Size + 1;
+        -:  663:  }
+        -:  664:
+        -:  665:  // Try to coalesce with following interval.
+    #####:  666:  if (value(i) == y && Traits::adjacent(b, start(i))) {
+    #####:  667:    start(i) = a;
+    #####:  668:    return Size;
+        -:  669:  }
+        -:  670:
+        -:  671:  // We must insert before i. Detect overflow.
+    #####:  672:  if (Size == N)
+        -:  673:    return N + 1;
+        -:  674:
+        -:  675:  // Insert before i.
+    #####:  676:  this->shift(i, Size);
+    #####:  677:  start(i) = a;
+    #####:  678:  stop(i) = b;
+    #####:  679:  value(i) = y;
+    #####:  680:  return Size + 1;
+        -:  681:}
+------------------
+_ZN4llvm15IntervalMapImpl8LeafNodeImcLj11ENS_15IntervalMapInfoImEEE10insertFromERjjmmc:
+function _ZN4llvm15IntervalMapImpl8LeafNodeImcLj11ENS_15IntervalMapInfoImEEE10insertFromERjjmmc called 0 returned 0% blocks executed 0%
+    #####:  629:unsigned LeafNode<KeyT, ValT, N, Traits>::
+        -:  630:insertFrom(unsigned &Pos, unsigned Size, KeyT a, KeyT b, ValT y) {
+    #####:  631:  unsigned i = Pos;
+    #####:  632:  assert(i <= Size && Size <= N && "Invalid index");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  633:  assert(!Traits::stopLess(b, a) && "Invalid interval");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  634:
+        -:  635:  // Verify the findFrom invariant.
+    #####:  636:  assert((i == 0 || Traits::stopLess(stop(i - 1), a)));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  637:  assert((i == Size || !Traits::stopLess(stop(i), a)));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  638:  assert((i == Size || Traits::stopLess(b, start(i))) && "Overlapping insert");
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  639:
+        -:  640:  // Coalesce with previous interval.
+    #####:  641:  if (i && value(i - 1) == y && Traits::adjacent(stop(i - 1), a)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  642:    Pos = i - 1;
+        -:  643:    // Also coalesce with next interval?
+    #####:  644:    if (i != Size && value(i) == y && Traits::adjacent(b, start(i))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  645:      stop(i - 1) = stop(i);
+    #####:  646:      this->erase(i, Size);
+call    0 never executed
+    #####:  647:      return Size - 1;
+        -:  648:    }
+    #####:  649:    stop(i - 1) = b;
+    #####:  650:    return Size;
+        -:  651:  }
+        -:  652:
+        -:  653:  // Detect overflow.
+    #####:  654:  if (i == N)
+branch  0 never executed
+branch  1 never executed
+        -:  655:    return N + 1;
+        -:  656:
+        -:  657:  // Add new interval at end.
+    #####:  658:  if (i == Size) {
+branch  0 never executed
+branch  1 never executed
+    #####:  659:    start(i) = a;
+    #####:  660:    stop(i) = b;
+    #####:  661:    value(i) = y;
+    #####:  662:    return Size + 1;
+        -:  663:  }
+        -:  664:
+        -:  665:  // Try to coalesce with following interval.
+    #####:  666:  if (value(i) == y && Traits::adjacent(b, start(i))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  667:    start(i) = a;
+    #####:  668:    return Size;
+        -:  669:  }
+        -:  670:
+        -:  671:  // We must insert before i. Detect overflow.
+    #####:  672:  if (Size == N)
+branch  0 never executed
+branch  1 never executed
+        -:  673:    return N + 1;
+        -:  674:
+        -:  675:  // Insert before i.
+    #####:  676:  this->shift(i, Size);
+call    0 never executed
+    #####:  677:  start(i) = a;
+    #####:  678:  stop(i) = b;
+    #####:  679:  value(i) = y;
+    #####:  680:  return Size + 1;
+        -:  681:}
+------------------
+_ZN4llvm15IntervalMapImpl8LeafNodeImcLj16ENS_15IntervalMapInfoImEEE10insertFromERjjmmc:
+function _ZN4llvm15IntervalMapImpl8LeafNodeImcLj16ENS_15IntervalMapInfoImEEE10insertFromERjjmmc called 0 returned 0% blocks executed 0%
+    #####:  629:unsigned LeafNode<KeyT, ValT, N, Traits>::
+        -:  630:insertFrom(unsigned &Pos, unsigned Size, KeyT a, KeyT b, ValT y) {
+    #####:  631:  unsigned i = Pos;
+    #####:  632:  assert(i <= Size && Size <= N && "Invalid index");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  633:  assert(!Traits::stopLess(b, a) && "Invalid interval");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  634:
+        -:  635:  // Verify the findFrom invariant.
+    #####:  636:  assert((i == 0 || Traits::stopLess(stop(i - 1), a)));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  637:  assert((i == Size || !Traits::stopLess(stop(i), a)));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  638:  assert((i == Size || Traits::stopLess(b, start(i))) && "Overlapping insert");
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  639:
+        -:  640:  // Coalesce with previous interval.
+    #####:  641:  if (i && value(i - 1) == y && Traits::adjacent(stop(i - 1), a)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  642:    Pos = i - 1;
+        -:  643:    // Also coalesce with next interval?
+    #####:  644:    if (i != Size && value(i) == y && Traits::adjacent(b, start(i))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  645:      stop(i - 1) = stop(i);
+    #####:  646:      this->erase(i, Size);
+call    0 never executed
+    #####:  647:      return Size - 1;
+        -:  648:    }
+    #####:  649:    stop(i - 1) = b;
+    #####:  650:    return Size;
+        -:  651:  }
+        -:  652:
+        -:  653:  // Detect overflow.
+    #####:  654:  if (i == N)
+branch  0 never executed
+branch  1 never executed
+        -:  655:    return N + 1;
+        -:  656:
+        -:  657:  // Add new interval at end.
+    #####:  658:  if (i == Size) {
+branch  0 never executed
+branch  1 never executed
+    #####:  659:    start(i) = a;
+    #####:  660:    stop(i) = b;
+    #####:  661:    value(i) = y;
+    #####:  662:    return Size + 1;
+        -:  663:  }
+        -:  664:
+        -:  665:  // Try to coalesce with following interval.
+    #####:  666:  if (value(i) == y && Traits::adjacent(b, start(i))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  667:    start(i) = a;
+    #####:  668:    return Size;
+        -:  669:  }
+        -:  670:
+        -:  671:  // We must insert before i. Detect overflow.
+    #####:  672:  if (Size == N)
+branch  0 never executed
+branch  1 never executed
+        -:  673:    return N + 1;
+        -:  674:
+        -:  675:  // Insert before i.
+    #####:  676:  this->shift(i, Size);
+call    0 never executed
+    #####:  677:  start(i) = a;
+    #####:  678:  stop(i) = b;
+    #####:  679:  value(i) = y;
+    #####:  680:  return Size + 1;
+        -:  681:}
+------------------
+        -:  682:
+        -:  683://===----------------------------------------------------------------------===//
+        -:  684://---                   IntervalMapImpl::BranchNode                        ---//
+        -:  685://===----------------------------------------------------------------------===//
+        -:  686://
+        -:  687:// A branch node stores references to 1--N subtrees all of the same height.
+        -:  688://
+        -:  689:// The key array in a branch node holds the rightmost stop key of each subtree.
+        -:  690:// It is redundant to store the last stop key since it can be found in the
+        -:  691:// parent node, but doing so makes tree balancing a lot simpler.
+        -:  692://
+        -:  693:// It is unusual for a branch node to only have one subtree, but it can happen
+        -:  694:// in the root node if it is smaller than the normal nodes.
+        -:  695://
+        -:  696:// When all of the leaf nodes from all the subtrees are concatenated, they must
+        -:  697:// satisfy the same constraints as a single leaf node. They must be sorted,
+        -:  698:// sane, and fully coalesced.
+        -:  699://
+        -:  700://===----------------------------------------------------------------------===//
+        -:  701:
+        -:  702:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+    #####:  703:class BranchNode : public NodeBase<NodeRef, KeyT, N> {
+        -:  704:public:
+    #####:  705:  const KeyT &stop(unsigned i) const { return this->second[i]; }
+        -:  706:  const NodeRef &subtree(unsigned i) const { return this->first[i]; }
+        -:  707:
+    #####:  708:  KeyT &stop(unsigned i) { return this->second[i]; }
+branch  0 never executed
+branch  1 never executed
+    #####:  709:  NodeRef &subtree(unsigned i) { return this->first[i]; }
+        -:  710:
+        -:  711:  /// findFrom - Find the first subtree after i that may contain x.
+        -:  712:  /// @param i    Starting index for the search.
+        -:  713:  /// @param Size Number of elements in node.
+        -:  714:  /// @param x    Key to search for.
+        -:  715:  /// @return     First index with !stopLess(key[i], x), or size.
+        -:  716:  ///             This is the first subtree that can possibly contain x.
+function _ZNK4llvm15IntervalMapImpl10BranchNodeImcLj16ENS_15IntervalMapInfoImEEE8findFromEjjm called 0 returned 0% blocks executed 0%
+    #####:  717:  unsigned findFrom(unsigned i, unsigned Size, KeyT x) const {
+    #####:  718:    assert(i <= Size && Size <= N && "Bad indices");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  719:    assert((i == 0 || Traits::stopLess(stop(i - 1), x)) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  720:           "Index to findFrom is past the needed point");
+    #####:  721:    while (i != Size && Traits::stopLess(stop(i), x)) ++i;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  722:    return i;
+        -:  723:  }
+        -:  724:
+        -:  725:  /// safeFind - Find a subtree that is known to exist. This is the same as
+        -:  726:  /// findFrom except is it assumed that x is in range.
+        -:  727:  /// @param i Starting index for the search.
+        -:  728:  /// @param x Key to search for.
+        -:  729:  /// @return  First index with !stopLess(key[i], x), never size.
+        -:  730:  ///          This is the first subtree that can possibly contain x.
+function _ZNK4llvm15IntervalMapImpl10BranchNodeImcLj12ENS_15IntervalMapInfoImEEE8safeFindEjm called 0 returned 0% blocks executed 0%
+    #####:  731:  unsigned safeFind(unsigned i, KeyT x) const {
+    #####:  732:    assert(i < N && "Bad index");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  733:    assert((i == 0 || Traits::stopLess(stop(i - 1), x)) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  734:           "Index is past the needed point");
+    #####:  735:    while (Traits::stopLess(stop(i), x)) ++i;
+branch  0 never executed
+branch  1 never executed
+    #####:  736:    assert(i < N && "Unsafe intervals");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  737:    return i;
+        -:  738:  }
+        -:  739:
+        -:  740:  /// safeLookup - Get the subtree containing x, Assuming that x is in range.
+        -:  741:  /// @param x Key to search for.
+        -:  742:  /// @return  Subtree containing x
+        -:  743:  NodeRef safeLookup(KeyT x) const {
+        -:  744:    return subtree(safeFind(0, x));
+        -:  745:  }
+        -:  746:
+        -:  747:  /// insert - Insert a new (subtree, stop) pair.
+        -:  748:  /// @param i    Insert position, following entries will be shifted.
+        -:  749:  /// @param Size Number of elements in node.
+        -:  750:  /// @param Node Subtree to insert.
+        -:  751:  /// @param Stop Last key in subtree.
+    #####:  752:  void insert(unsigned i, unsigned Size, NodeRef Node, KeyT Stop) {
+    #####:  753:    assert(Size < N && "branch node overflow");
+    #####:  754:    assert(i <= Size && "Bad insert position");
+    #####:  755:    this->shift(i, Size);
+    #####:  756:    subtree(i) = Node;
+    #####:  757:    stop(i) = Stop;
+    #####:  758:  }
+------------------
+_ZN4llvm15IntervalMapImpl10BranchNodeImcLj12ENS_15IntervalMapInfoImEEE6insertEjjNS0_7NodeRefEm:
+function _ZN4llvm15IntervalMapImpl10BranchNodeImcLj12ENS_15IntervalMapInfoImEEE6insertEjjNS0_7NodeRefEm called 0 returned 0% blocks executed 0%
+    #####:  752:  void insert(unsigned i, unsigned Size, NodeRef Node, KeyT Stop) {
+    #####:  753:    assert(Size < N && "branch node overflow");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  754:    assert(i <= Size && "Bad insert position");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  755:    this->shift(i, Size);
+call    0 never executed
+    #####:  756:    subtree(i) = Node;
+    #####:  757:    stop(i) = Stop;
+    #####:  758:  }
+------------------
+_ZN4llvm15IntervalMapImpl10BranchNodeImcLj16ENS_15IntervalMapInfoImEEE6insertEjjNS0_7NodeRefEm:
+function _ZN4llvm15IntervalMapImpl10BranchNodeImcLj16ENS_15IntervalMapInfoImEEE6insertEjjNS0_7NodeRefEm called 0 returned 0% blocks executed 0%
+    #####:  752:  void insert(unsigned i, unsigned Size, NodeRef Node, KeyT Stop) {
+    #####:  753:    assert(Size < N && "branch node overflow");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  754:    assert(i <= Size && "Bad insert position");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  755:    this->shift(i, Size);
+call    0 never executed
+    #####:  756:    subtree(i) = Node;
+    #####:  757:    stop(i) = Stop;
+    #####:  758:  }
+------------------
+        -:  759:};
+        -:  760:
+        -:  761://===----------------------------------------------------------------------===//
+        -:  762://---                         IntervalMapImpl::Path                        ---//
+        -:  763://===----------------------------------------------------------------------===//
+        -:  764://
+        -:  765:// A Path is used by iterators to represent a position in a B+-tree, and the
+        -:  766:// path to get there from the root.
+        -:  767://
+        -:  768:// The Path class also contains the tree navigation code that doesn't have to
+        -:  769:// be templatized.
+        -:  770://
+        -:  771://===----------------------------------------------------------------------===//
+        -:  772:
+    #####:  773:class Path {
+        -:  774:  /// Entry - Each step in the path is a node pointer and an offset into that
+        -:  775:  /// node.
+        -:  776:  struct Entry {
+        -:  777:    void *node;
+        -:  778:    unsigned size;
+        -:  779:    unsigned offset;
+        -:  780:
+    #####:  781:    Entry(void *Node, unsigned Size, unsigned Offset)
+    #####:  782:      : node(Node), size(Size), offset(Offset) {}
+        -:  783:
+    #####:  784:    Entry(NodeRef Node, unsigned Offset)
+    #####:  785:      : node(&Node.subtree(0)), size(Node.size()), offset(Offset) {}
+        -:  786:
+    #####:  787:    NodeRef &subtree(unsigned i) const {
+    #####:  788:      return reinterpret_cast<NodeRef*>(node)[i];
+        -:  789:    }
+        -:  790:  };
+        -:  791:
+        -:  792:  /// path - The path entries, path[0] is the root node, path.back() is a leaf.
+        -:  793:  SmallVector<Entry, 4> path;
+        -:  794:
+        -:  795:public:
+        -:  796:  // Node accessors.
+    #####:  797:  template <typename NodeT> NodeT &node(unsigned Level) const {
+    #####:  798:    return *reinterpret_cast<NodeT*>(path[Level].node);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  799:  }
+    #####:  800:  unsigned size(unsigned Level) const { return path[Level].size; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  801:  unsigned offset(unsigned Level) const { return path[Level].offset; }
+    #####:  802:  unsigned &offset(unsigned Level) { return path[Level].offset; }
+call    0 never executed
+call    1 never executed
+        -:  803:
+        -:  804:  // Leaf accessors.
+    #####:  805:  template <typename NodeT> NodeT &leaf() const {
+    #####:  806:    return *reinterpret_cast<NodeT*>(path.back().node);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  807:  }
+    #####:  808:  unsigned leafSize() const { return path.back().size; }
+call    0 never executed
+    #####:  809:  unsigned leafOffset() const { return path.back().offset; }
+    #####:  810:  unsigned &leafOffset() { return path.back().offset; }
+call    0 never executed
+        -:  811:
+        -:  812:  /// valid - Return true if path is at a valid node, not at end().
+    #####:  813:  bool valid() const {
+    #####:  814:    return !path.empty() && path.front().offset < path.front().size;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+branch 20 never executed
+branch 21 never executed
+branch 22 never executed
+branch 23 never executed
+branch 24 never executed
+branch 25 never executed
+branch 26 never executed
+branch 27 never executed
+branch 28 never executed
+branch 29 never executed
+branch 30 never executed
+branch 31 never executed
+branch 32 never executed
+branch 33 never executed
+branch 34 never executed
+branch 35 never executed
+branch 36 never executed
+branch 37 never executed
+branch 38 never executed
+branch 39 never executed
+branch 40 never executed
+branch 41 never executed
+branch 42 never executed
+branch 43 never executed
+branch 44 never executed
+branch 45 never executed
+        -:  815:  }
+        -:  816:
+        -:  817:  /// height - Return the height of the tree corresponding to this path.
+        -:  818:  /// This matches map->height in a full path.
+    #####:  819:  unsigned height() const { return path.size() - 1; }
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  820:
+        -:  821:  /// subtree - Get the subtree referenced from Level. When the path is
+        -:  822:  /// consistent, node(Level + 1) == subtree(Level).
+        -:  823:  /// @param Level 0..height-1. The leaves have no subtrees.
+function _ZNK4llvm15IntervalMapImpl4Path7subtreeEj called 0 returned 0% blocks executed 0%
+    #####:  824:  NodeRef &subtree(unsigned Level) const {
+    #####:  825:    return path[Level].subtree(path[Level].offset);
+branch  0 never executed
+branch  1 never executed
+        -:  826:  }
+        -:  827:
+        -:  828:  /// reset - Reset cached information about node(Level) from subtree(Level -1).
+        -:  829:  /// @param Level 1..height. The node to update after parent node changed.
+function _ZN4llvm15IntervalMapImpl4Path5resetEj called 0 returned 0% blocks executed 0%
+    #####:  830:  void reset(unsigned Level) {
+    #####:  831:    path[Level] = Entry(subtree(Level - 1), offset(Level));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  832:  }
+        -:  833:
+        -:  834:  /// push - Add entry to path.
+        -:  835:  /// @param Node Node to add, should be subtree(path.size()-1).
+        -:  836:  /// @param Offset Offset into Node.
+    #####:  837:  void push(NodeRef Node, unsigned Offset) {
+    #####:  838:    path.push_back(Entry(Node, Offset));
+        -:  839:  }
+        -:  840:
+        -:  841:  /// pop - Remove the last path entry.
+    #####:  842:  void pop() {
+    #####:  843:    path.pop_back();
+        -:  844:  }
+        -:  845:
+        -:  846:  /// setSize - Set the size of a node both in the path and in the tree.
+        -:  847:  /// @param Level 0..height. Note that setting the root size won't change
+        -:  848:  ///              map->rootSize.
+        -:  849:  /// @param Size New node size.
+function _ZN4llvm15IntervalMapImpl4Path7setSizeEjj called 0 returned 0% blocks executed 0%
+    #####:  850:  void setSize(unsigned Level, unsigned Size) {
+    #####:  851:    path[Level].size = Size;
+branch  0 never executed
+branch  1 never executed
+    #####:  852:    if (Level)
+branch  0 never executed
+branch  1 never executed
+    #####:  853:      subtree(Level - 1).setSize(Size);
+call    0 never executed
+call    1 never executed
+    #####:  854:  }
+        -:  855:
+        -:  856:  /// setRoot - Clear the path and set a new root node.
+        -:  857:  /// @param Node New root node.
+        -:  858:  /// @param Size New root size.
+        -:  859:  /// @param Offset Offset into root node.
+    #####:  860:  void setRoot(void *Node, unsigned Size, unsigned Offset) {
+    #####:  861:    path.clear();
+    #####:  862:    path.push_back(Entry(Node, Size, Offset));
+call    0 never executed
+call    1 never executed
+    #####:  863:  }
+        -:  864:
+        -:  865:  /// replaceRoot - Replace the current root node with two new entries after the
+        -:  866:  /// tree height has increased.
+        -:  867:  /// @param Root The new root node.
+        -:  868:  /// @param Size Number of entries in the new root.
+        -:  869:  /// @param Offsets Offsets into the root and first branch nodes.
+        -:  870:  void replaceRoot(void *Root, unsigned Size, IdxPair Offsets);
+        -:  871:
+        -:  872:  /// getLeftSibling - Get the left sibling node at Level, or a null NodeRef.
+        -:  873:  /// @param Level Get the sibling to node(Level).
+        -:  874:  /// @return Left sibling, or NodeRef().
+        -:  875:  NodeRef getLeftSibling(unsigned Level) const;
+        -:  876:
+        -:  877:  /// moveLeft - Move path to the left sibling at Level. Leave nodes below Level
+        -:  878:  /// unaltered.
+        -:  879:  /// @param Level Move node(Level).
+        -:  880:  void moveLeft(unsigned Level);
+        -:  881:
+        -:  882:  /// fillLeft - Grow path to Height by taking leftmost branches.
+        -:  883:  /// @param Height The target height.
+function _ZN4llvm15IntervalMapImpl4Path8fillLeftEj called 0 returned 0% blocks executed 0%
+    #####:  884:  void fillLeft(unsigned Height) {
+    #####:  885:    while (height() < Height)
+branch  0 never executed
+branch  1 never executed
+    #####:  886:      push(subtree(height()), 0);
+call    0 never executed
+call    1 never executed
+    #####:  887:  }
+        -:  888:
+        -:  889:  /// getLeftSibling - Get the left sibling node at Level, or a null NodeRef.
+        -:  890:  /// @param Level Get the sibling to node(Level).
+        -:  891:  /// @return Left sibling, or NodeRef().
+        -:  892:  NodeRef getRightSibling(unsigned Level) const;
+        -:  893:
+        -:  894:  /// moveRight - Move path to the left sibling at Level. Leave nodes below
+        -:  895:  /// Level unaltered.
+        -:  896:  /// @param Level Move node(Level).
+        -:  897:  void moveRight(unsigned Level);
+        -:  898:
+        -:  899:  /// atBegin - Return true if path is at begin().
+function _ZNK4llvm15IntervalMapImpl4Path7atBeginEv called 0 returned 0% blocks executed 0%
+    #####:  900:  bool atBegin() const {
+    #####:  901:    for (unsigned i = 0, e = path.size(); i != e; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  902:      if (path[i].offset != 0)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  903:        return false;
+        -:  904:    return true;
+        -:  905:  }
+        -:  906:
+        -:  907:  /// atLastEntry - Return true if the path is at the last entry of the node at
+        -:  908:  /// Level.
+        -:  909:  /// @param Level Node to examine.
+function _ZNK4llvm15IntervalMapImpl4Path11atLastEntryEj called 0 returned 0% blocks executed 0%
+    #####:  910:  bool atLastEntry(unsigned Level) const {
+    #####:  911:    return path[Level].offset == path[Level].size - 1;
+branch  0 never executed
+branch  1 never executed
+        -:  912:  }
+        -:  913:
+        -:  914:  /// legalizeForInsert - Prepare the path for an insertion at Level. When the
+        -:  915:  /// path is at end(), node(Level) may not be a legal node. legalizeForInsert
+        -:  916:  /// ensures that node(Level) is real by moving back to the last node at Level,
+        -:  917:  /// and setting offset(Level) to size(Level) if required.
+        -:  918:  /// @param Level The level where an insertion is about to take place.
+function _ZN4llvm15IntervalMapImpl4Path17legalizeForInsertEj called 0 returned 0% blocks executed 0%
+    #####:  919:  void legalizeForInsert(unsigned Level) {
+    #####:  920:    if (valid())
+branch  0 never executed
+branch  1 never executed
+        -:  921:      return;
+    #####:  922:    moveLeft(Level);
+call    0 never executed
+    #####:  923:    ++path[Level].offset;
+branch  0 never executed
+branch  1 never executed
+        -:  924:  }
+        -:  925:};
+        -:  926:
+        -:  927:} // end namespace IntervalMapImpl
+        -:  928:
+        -:  929://===----------------------------------------------------------------------===//
+        -:  930://---                          IntervalMap                                ----//
+        -:  931://===----------------------------------------------------------------------===//
+        -:  932:
+        -:  933:template <typename KeyT, typename ValT,
+        -:  934:          unsigned N = IntervalMapImpl::NodeSizer<KeyT, ValT>::LeafSize,
+        -:  935:          typename Traits = IntervalMapInfo<KeyT>>
+        -:  936:class IntervalMap {
+        -:  937:  using Sizer = IntervalMapImpl::NodeSizer<KeyT, ValT>;
+        -:  938:  using Leaf = IntervalMapImpl::LeafNode<KeyT, ValT, Sizer::LeafSize, Traits>;
+        -:  939:  using Branch =
+        -:  940:      IntervalMapImpl::BranchNode<KeyT, ValT, Sizer::BranchSize, Traits>;
+        -:  941:  using RootLeaf = IntervalMapImpl::LeafNode<KeyT, ValT, N, Traits>;
+        -:  942:  using IdxPair = IntervalMapImpl::IdxPair;
+        -:  943:
+        -:  944:  // The RootLeaf capacity is given as a template parameter. We must compute the
+        -:  945:  // corresponding RootBranch capacity.
+        -:  946:  enum {
+        -:  947:    DesiredRootBranchCap = (sizeof(RootLeaf) - sizeof(KeyT)) /
+        -:  948:      (sizeof(KeyT) + sizeof(IntervalMapImpl::NodeRef)),
+        -:  949:    RootBranchCap = DesiredRootBranchCap ? DesiredRootBranchCap : 1
+        -:  950:  };
+        -:  951:
+        -:  952:  using RootBranch =
+        -:  953:      IntervalMapImpl::BranchNode<KeyT, ValT, RootBranchCap, Traits>;
+        -:  954:
+        -:  955:  // When branched, we store a global start key as well as the branch node.
+    #####:  956:  struct RootBranchData {
+        -:  957:    KeyT start;
+        -:  958:    RootBranch node;
+        -:  959:  };
+        -:  960:
+        -:  961:public:
+        -:  962:  using Allocator = typename Sizer::Allocator;
+        -:  963:  using KeyType = KeyT;
+        -:  964:  using ValueType = ValT;
+        -:  965:  using KeyTraits = Traits;
+        -:  966:
+        -:  967:private:
+        -:  968:  // The root data is either a RootLeaf or a RootBranchData instance.
+        -:  969:  union {
+        -:  970:    RootLeaf leaf;
+        -:  971:    RootBranchData branchData;
+        -:  972:  };
+        -:  973:
+        -:  974:  // Tree height.
+        -:  975:  // 0: Leaves in root.
+        -:  976:  // 1: Root points to leaf.
+        -:  977:  // 2: root->branch->leaf ...
+        -:  978:  unsigned height = 0;
+        -:  979:
+        -:  980:  // Number of entries in the root node.
+        -:  981:  unsigned rootSize = 0;
+        -:  982:
+        -:  983:  // Allocator used for creating external nodes.
+        -:  984:  Allocator *allocator = nullptr;
+        -:  985:
+    #####:  986:  const RootLeaf &rootLeaf() const {
+    #####:  987:    assert(!branched() && "Cannot acces leaf data in branched root");
+    #####:  988:    return leaf;
+        -:  989:  }
+    #####:  990:  RootLeaf &rootLeaf() {
+    #####:  991:    assert(!branched() && "Cannot acces leaf data in branched root");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  992:    return leaf;
+        -:  993:  }
+        -:  994:
+    #####:  995:  const RootBranchData &rootBranchData() const {
+    #####:  996:    assert(branched() && "Cannot access branch data in non-branched root");
+        -:  997:    return branchData;
+        -:  998:  }
+    #####:  999:  RootBranchData &rootBranchData() {
+    #####: 1000:    assert(branched() && "Cannot access branch data in non-branched root");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+    #####: 1001:    return branchData;
+        -: 1002:  }
+        -: 1003:
+        -: 1004:  const RootBranch &rootBranch() const { return rootBranchData().node; }
+    #####: 1005:  RootBranch &rootBranch()             { return rootBranchData().node; }
+    #####: 1006:  KeyT rootBranchStart() const { return rootBranchData().start; }
+    #####: 1007:  KeyT &rootBranchStart()      { return rootBranchData().start; }
+        -: 1008:
+        -: 1009:  template <typename NodeT> NodeT *newNode() {
+        -: 1010:    return new (allocator->template Allocate<NodeT>()) NodeT();
+        -: 1011:  }
+        -: 1012:
+    #####: 1013:  template <typename NodeT> void deleteNode(NodeT *P) {
+    #####: 1014:    P->~NodeT();
+    #####: 1015:    allocator->Deallocate(P);
+    #####: 1016:  }
+        -: 1017:
+        -: 1018:  IdxPair branchRoot(unsigned Position);
+        -: 1019:  IdxPair splitRoot(unsigned Position);
+        -: 1020:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE18switchRootToBranchEv called 0 returned 0% blocks executed 0%
+    #####: 1021:  void switchRootToBranch() {
+    #####: 1022:    rootLeaf().~RootLeaf();
+    #####: 1023:    height = 1;
+    #####: 1024:    new (&rootBranchData()) RootBranchData();
+    #####: 1025:  }
+        -: 1026:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE16switchRootToLeafEv called 0 returned 0% blocks executed 0%
+    #####: 1027:  void switchRootToLeaf() {
+    #####: 1028:    rootBranchData().~RootBranchData();
+    #####: 1029:    height = 0;
+    #####: 1030:    new(&rootLeaf()) RootLeaf();
+    #####: 1031:  }
+        -: 1032:
+    #####: 1033:  bool branched() const { return height > 0; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+        -: 1034:
+        -: 1035:  ValT treeSafeLookup(KeyT x, ValT NotFound) const;
+        -: 1036:  void visitNodes(void (IntervalMap::*f)(IntervalMapImpl::NodeRef,
+        -: 1037:                  unsigned Level));
+        -: 1038:  void deleteNode(IntervalMapImpl::NodeRef Node, unsigned Level);
+        -: 1039:
+        -: 1040:public:
+    #####: 1041:  explicit IntervalMap(Allocator &a) : allocator(&a) {
+    #####: 1042:    new (&rootLeaf()) RootLeaf();
+        -: 1043:  }
+        -: 1044:
+        -: 1045:  ///@{
+        -: 1046:  /// NOTE: The moved-from or copied-from object's allocator needs to have a
+        -: 1047:  /// lifetime equal to or exceeding the moved-to or copied-to object to avoid
+        -: 1048:  /// undefined behaviour.
+        -: 1049:  IntervalMap(IntervalMap const &RHS) : IntervalMap(*RHS.allocator) {
+        -: 1050:    // Future-proofing assertion: this function assumes the IntervalMap
+        -: 1051:    // constructor doesn't add any nodes.
+        -: 1052:    assert(empty() && "Expected emptry tree");
+        -: 1053:    *this = RHS;
+        -: 1054:  }
+        -: 1055:  IntervalMap &operator=(IntervalMap const &RHS) {
+        -: 1056:    clear();
+        -: 1057:    allocator = RHS.allocator;
+        -: 1058:    for (auto It = RHS.begin(), End = RHS.end(); It != End; ++It)
+        -: 1059:      insert(It.start(), It.stop(), It.value());
+        -: 1060:    return *this;
+        -: 1061:  }
+        -: 1062:
+        -: 1063:  IntervalMap(IntervalMap &&RHS) : IntervalMap(*RHS.allocator) {
+        -: 1064:    // Future-proofing assertion: this function assumes the IntervalMap
+        -: 1065:    // constructor doesn't add any nodes.
+        -: 1066:    assert(empty() && "Expected emptry tree");
+        -: 1067:    *this = std::move(RHS);
+        -: 1068:  }
+        -: 1069:  IntervalMap &operator=(IntervalMap &&RHS) {
+        -: 1070:    // Calling clear deallocates memory and switches to rootLeaf.
+        -: 1071:    clear();
+        -: 1072:    // Destroy the new rootLeaf.
+        -: 1073:    rootLeaf().~RootLeaf();
+        -: 1074:
+        -: 1075:    height = RHS.height;
+        -: 1076:    rootSize = RHS.rootSize;
+        -: 1077:    allocator = RHS.allocator;
+        -: 1078:
+        -: 1079:    // rootLeaf and rootBranch are both uninitialized. Move RHS data into
+        -: 1080:    // appropriate field.
+        -: 1081:    if (RHS.branched()) {
+        -: 1082:      rootBranch() = std::move(RHS.rootBranch());
+        -: 1083:      // Prevent RHS deallocating memory LHS now owns by replacing RHS
+        -: 1084:      // rootBranch with a new rootLeaf.
+        -: 1085:      RHS.rootBranch().~RootBranch();
+        -: 1086:      RHS.height = 0;
+        -: 1087:      new (&RHS.rootLeaf()) RootLeaf();
+        -: 1088:    } else {
+        -: 1089:      rootLeaf() = std::move(RHS.rootLeaf());
+        -: 1090:    }
+        -: 1091:    return *this;
+        -: 1092:  }
+        -: 1093:  ///@}
+        -: 1094:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEED2Ev called 0 returned 0% blocks executed 0%
+    #####: 1095:  ~IntervalMap() {
+    #####: 1096:    clear();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1097:    rootLeaf().~RootLeaf();
+    #####: 1098:  }
+        -: 1099:
+        -: 1100:  /// empty -  Return true when no intervals are mapped.
+    #####: 1101:  bool empty() const {
+        -: 1102:    return rootSize == 0;
+        -: 1103:  }
+        -: 1104:
+        -: 1105:  /// start - Return the smallest mapped key in a non-empty map.
+function _ZNK4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE5startEv called 0 returned 0% blocks executed 0%
+    #####: 1106:  KeyT start() const {
+    #####: 1107:    assert(!empty() && "Empty IntervalMap has no start");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1108:    return !branched() ? rootLeaf().start(0) : rootBranchStart();
+branch  0 never executed
+branch  1 never executed
+        -: 1109:  }
+        -: 1110:
+        -: 1111:  /// stop - Return the largest mapped key in a non-empty map.
+        -: 1112:  KeyT stop() const {
+        -: 1113:    assert(!empty() && "Empty IntervalMap has no stop");
+        -: 1114:    return !branched() ? rootLeaf().stop(rootSize - 1) :
+        -: 1115:                         rootBranch().stop(rootSize - 1);
+        -: 1116:  }
+        -: 1117:
+        -: 1118:  /// lookup - Return the mapped value at x or NotFound.
+        -: 1119:  ValT lookup(KeyT x, ValT NotFound = ValT()) const {
+        -: 1120:    if (empty() || Traits::startLess(x, start()) || Traits::stopLess(stop(), x))
+        -: 1121:      return NotFound;
+        -: 1122:    return branched() ? treeSafeLookup(x, NotFound) :
+        -: 1123:                        rootLeaf().safeLookup(x, NotFound);
+        -: 1124:  }
+        -: 1125:
+        -: 1126:  /// insert - Add a mapping of [a;b] to y, coalesce with adjacent intervals.
+        -: 1127:  /// It is assumed that no key in the interval is mapped to another value, but
+        -: 1128:  /// overlapping intervals already mapped to y will be coalesced.
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE6insertEmmc called 0 returned 0% blocks executed 0%
+    #####: 1129:  void insert(KeyT a, KeyT b, ValT y) {
+    #####: 1130:    if (branched() || rootSize == RootLeaf::Capacity)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1131:      return find(a).insert(a, b, y);
+call    0 never executed
+        -: 1132:
+        -: 1133:    // Easy insert into root leaf.
+    #####: 1134:    unsigned p = rootLeaf().findFrom(0, rootSize, a);
+call    0 never executed
+    #####: 1135:    rootSize = rootLeaf().insertFrom(p, rootSize, a, b, y);
+call    0 never executed
+        -: 1136:  }
+        -: 1137:
+        -: 1138:  /// clear - Remove all entries.
+        -: 1139:  void clear();
+        -: 1140:
+        -: 1141:  class const_iterator;
+        -: 1142:  class iterator;
+        -: 1143:  friend class const_iterator;
+        -: 1144:  friend class iterator;
+        -: 1145:
+        -: 1146:  const_iterator begin() const {
+        -: 1147:    const_iterator I(*this);
+        -: 1148:    I.goToBegin();
+        -: 1149:    return I;
+        -: 1150:  }
+        -: 1151:
+    #####: 1152:  iterator begin() {
+    #####: 1153:    iterator I(*this);
+    #####: 1154:    I.goToBegin();
+call    0 never executed
+        -: 1155:    return I;
+        -: 1156:  }
+        -: 1157:
+    #####: 1158:  const_iterator end() const {
+    #####: 1159:    const_iterator I(*this);
+    #####: 1160:    I.goToEnd();
+    #####: 1161:    return I;
+        -: 1162:  }
+        -: 1163:
+    #####: 1164:  iterator end() {
+    #####: 1165:    iterator I(*this);
+    #####: 1166:    I.goToEnd();
+    #####: 1167:    return I;
+        -: 1168:  }
+        -: 1169:
+        -: 1170:  /// find - Return an iterator pointing to the first interval ending at or
+        -: 1171:  /// after x, or end().
+    #####: 1172:  const_iterator find(KeyT x) const {
+    #####: 1173:    const_iterator I(*this);
+    #####: 1174:    I.find(x);
+call    0 never executed
+call    1 never executed
+    #####: 1175:    return I;
+        -: 1176:  }
+        -: 1177:
+    #####: 1178:  iterator find(KeyT x) {
+    #####: 1179:    iterator I(*this);
+    #####: 1180:    I.find(x);
+call    0 never executed
+        -: 1181:    return I;
+        -: 1182:  }
+        -: 1183:
+        -: 1184:  /// overlaps(a, b) - Return true if the intervals in this map overlap with the
+        -: 1185:  /// interval [a;b].
+        -: 1186:  bool overlaps(KeyT a, KeyT b) const {
+        -: 1187:    assert(Traits::nonEmpty(a, b));
+        -: 1188:    const_iterator I = find(a);
+        -: 1189:    if (!I.valid())
+        -: 1190:      return false;
+        -: 1191:    // [a;b] and [x;y] overlap iff x<=b and a<=y. The find() call guarantees the
+        -: 1192:    // second part (y = find(a).stop()), so it is sufficient to check the first
+        -: 1193:    // one.
+        -: 1194:    return !Traits::stopLess(b, I.start());
+        -: 1195:  }
+        -: 1196:};
+        -: 1197:
+        -: 1198:/// treeSafeLookup - Return the mapped value at x or NotFound, assuming a
+        -: 1199:/// branched root.
+        -: 1200:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1201:ValT IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1202:treeSafeLookup(KeyT x, ValT NotFound) const {
+        -: 1203:  assert(branched() && "treeLookup assumes a branched root");
+        -: 1204:
+        -: 1205:  IntervalMapImpl::NodeRef NR = rootBranch().safeLookup(x);
+        -: 1206:  for (unsigned h = height-1; h; --h)
+        -: 1207:    NR = NR.get<Branch>().safeLookup(x);
+        -: 1208:  return NR.get<Leaf>().safeLookup(x, NotFound);
+        -: 1209:}
+        -: 1210:
+        -: 1211:// branchRoot - Switch from a leaf root to a branched root.
+        -: 1212:// Return the new (root offset, node offset) corresponding to Position.
+        -: 1213:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE10branchRootEj called 0 returned 0% blocks executed 0%
+    #####: 1214:IntervalMapImpl::IdxPair IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1215:branchRoot(unsigned Position) {
+        -: 1216:  using namespace IntervalMapImpl;
+        -: 1217:  // How many external leaf nodes to hold RootLeaf+1?
+    #####: 1218:  const unsigned Nodes = RootLeaf::Capacity / Leaf::Capacity + 1;
+        -: 1219:
+        -: 1220:  // Compute element distribution among new nodes.
+        -: 1221:  unsigned size[Nodes];
+    #####: 1222:  IdxPair NewOffset(0, Position);
+call    0 never executed
+        -: 1223:
+        -: 1224:  // Is is very common for the root node to be smaller than external nodes.
+        -: 1225:  if (Nodes == 1)
+        -: 1226:    size[0] = rootSize;
+        -: 1227:  else
+    #####: 1228:    NewOffset = distribute(Nodes, rootSize, Leaf::Capacity,  nullptr, size,
+call    0 never executed
+        -: 1229:                           Position, true);
+        -: 1230:
+        -: 1231:  // Allocate new nodes.
+    #####: 1232:  unsigned pos = 0;
+    #####: 1233:  NodeRef node[Nodes];
+    #####: 1234:  for (unsigned n = 0; n != Nodes; ++n) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1235:    Leaf *L = newNode<Leaf>();
+call    0 never executed
+    #####: 1236:    L->copy(rootLeaf(), pos, 0, size[n]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1237:    node[n] = NodeRef(L, size[n]);
+call    0 never executed
+    #####: 1238:    pos += size[n];
+        -: 1239:  }
+        -: 1240:
+        -: 1241:  // Destroy the old leaf node, construct branch node instead.
+    #####: 1242:  switchRootToBranch();
+    #####: 1243:  for (unsigned n = 0; n != Nodes; ++n) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1244:    rootBranch().stop(n) = node[n].template get<Leaf>().stop(size[n]-1);
+branch  0 never executed
+branch  1 never executed
+    #####: 1245:    rootBranch().subtree(n) = node[n];
+        -: 1246:  }
+    #####: 1247:  rootBranchStart() = node[0].template get<Leaf>().start(0);
+branch  0 never executed
+branch  1 never executed
+    #####: 1248:  rootSize = Nodes;
+    #####: 1249:  return NewOffset;
+        -: 1250:}
+        -: 1251:
+        -: 1252:// splitRoot - Split the current BranchRoot into multiple Branch nodes.
+        -: 1253:// Return the new (root offset, node offset) corresponding to Position.
+        -: 1254:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE9splitRootEj called 0 returned 0% blocks executed 0%
+    #####: 1255:IntervalMapImpl::IdxPair IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1256:splitRoot(unsigned Position) {
+        -: 1257:  using namespace IntervalMapImpl;
+        -: 1258:  // How many external leaf nodes to hold RootBranch+1?
+    #####: 1259:  const unsigned Nodes = RootBranch::Capacity / Branch::Capacity + 1;
+        -: 1260:
+        -: 1261:  // Compute element distribution among new nodes.
+        -: 1262:  unsigned Size[Nodes];
+    #####: 1263:  IdxPair NewOffset(0, Position);
+call    0 never executed
+        -: 1264:
+        -: 1265:  // Is is very common for the root node to be smaller than external nodes.
+        -: 1266:  if (Nodes == 1)
+        -: 1267:    Size[0] = rootSize;
+        -: 1268:  else
+    #####: 1269:    NewOffset = distribute(Nodes, rootSize, Leaf::Capacity,  nullptr, Size,
+call    0 never executed
+        -: 1270:                           Position, true);
+        -: 1271:
+        -: 1272:  // Allocate new nodes.
+    #####: 1273:  unsigned Pos = 0;
+    #####: 1274:  NodeRef Node[Nodes];
+    #####: 1275:  for (unsigned n = 0; n != Nodes; ++n) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1276:    Branch *B = newNode<Branch>();
+call    0 never executed
+    #####: 1277:    B->copy(rootBranch(), Pos, 0, Size[n]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1278:    Node[n] = NodeRef(B, Size[n]);
+call    0 never executed
+    #####: 1279:    Pos += Size[n];
+        -: 1280:  }
+        -: 1281:
+    #####: 1282:  for (unsigned n = 0; n != Nodes; ++n) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1283:    rootBranch().stop(n) = Node[n].template get<Branch>().stop(Size[n]-1);
+branch  0 never executed
+branch  1 never executed
+    #####: 1284:    rootBranch().subtree(n) = Node[n];
+        -: 1285:  }
+    #####: 1286:  rootSize = Nodes;
+    #####: 1287:  ++height;
+    #####: 1288:  return NewOffset;
+        -: 1289:}
+        -: 1290:
+        -: 1291:/// visitNodes - Visit each external node.
+        -: 1292:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE10visitNodesEMS3_FvNS_15IntervalMapImpl7NodeRefEjE called 0 returned 0% blocks executed 0%
+    #####: 1293:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1294:visitNodes(void (IntervalMap::*f)(IntervalMapImpl::NodeRef, unsigned Height)) {
+    #####: 1295:  if (!branched())
+branch  0 never executed
+branch  1 never executed
+    #####: 1296:    return;
+    #####: 1297:  SmallVector<IntervalMapImpl::NodeRef, 4> Refs, NextRefs;
+branch  0 never executed
+branch  1 never executed
+        -: 1298:
+        -: 1299:  // Collect level 0 nodes from the root.
+    #####: 1300:  for (unsigned i = 0; i != rootSize; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####: 1301:    Refs.push_back(rootBranch().subtree(i));
+call    0 never executed
+        -: 1302:
+        -: 1303:  // Visit all branch nodes.
+    #####: 1304:  for (unsigned h = height - 1; h; --h) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1305:    for (unsigned i = 0, e = Refs.size(); i != e; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1306:      for (unsigned j = 0, s = Refs[i].size(); j != s; ++j)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1307:        NextRefs.push_back(Refs[i].subtree(j));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1308:      (this->*f)(Refs[i], h);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1309:    }
+    #####: 1310:    Refs.clear();
+call    0 never executed
+    #####: 1311:    Refs.swap(NextRefs);
+call    0 never executed
+        -: 1312:  }
+        -: 1313:
+        -: 1314:  // Visit all leaf nodes.
+    #####: 1315:  for (unsigned i = 0, e = Refs.size(); i != e; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####: 1316:    (this->*f)(Refs[i], 0);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1317:}
+        -: 1318:
+        -: 1319:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE10deleteNodeENS_15IntervalMapImpl7NodeRefEj called 0 returned 0% blocks executed 0%
+    #####: 1320:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1321:deleteNode(IntervalMapImpl::NodeRef Node, unsigned Level) {
+    #####: 1322:  if (Level)
+branch  0 never executed
+branch  1 never executed
+    #####: 1323:    deleteNode(&Node.get<Branch>());
+        -: 1324:  else
+    #####: 1325:    deleteNode(&Node.get<Leaf>());
+    #####: 1326:}
+        -: 1327:
+        -: 1328:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE5clearEv called 0 returned 0% blocks executed 0%
+    #####: 1329:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1330:clear() {
+    #####: 1331:  if (branched()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1332:    visitNodes(&IntervalMap::deleteNode);
+call    0 never executed
+    #####: 1333:    switchRootToLeaf();
+call    0 never executed
+        -: 1334:  }
+    #####: 1335:  rootSize = 0;
+    #####: 1336:}
+        -: 1337:
+        -: 1338://===----------------------------------------------------------------------===//
+        -: 1339://---                   IntervalMap::const_iterator                       ----//
+        -: 1340://===----------------------------------------------------------------------===//
+        -: 1341:
+        -: 1342:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+    #####: 1343:class IntervalMap<KeyT, ValT, N, Traits>::const_iterator {
+        -: 1344:  friend class IntervalMap;
+        -: 1345:
+        -: 1346:public:
+        -: 1347:  using iterator_category = std::bidirectional_iterator_tag;
+        -: 1348:  using value_type = ValT;
+        -: 1349:  using difference_type = std::ptrdiff_t;
+        -: 1350:  using pointer = value_type *;
+        -: 1351:  using reference = value_type &;
+        -: 1352:
+        -: 1353:protected:
+        -: 1354:  // The map referred to.
+        -: 1355:  IntervalMap *map = nullptr;
+        -: 1356:
+        -: 1357:  // We store a full path from the root to the current position.
+        -: 1358:  // The path may be partially filled, but never between iterator calls.
+        -: 1359:  IntervalMapImpl::Path path;
+        -: 1360:
+    #####: 1361:  explicit const_iterator(const IntervalMap &map) :
+    #####: 1362:    map(const_cast<IntervalMap*>(&map)) {}
+call    0 never executed
+        -: 1363:
+    #####: 1364:  bool branched() const {
+    #####: 1365:    assert(map && "Invalid iterator");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1366:    return map->branched();
+        -: 1367:  }
+        -: 1368:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator7setRootEj called 0 returned 0% blocks executed 0%
+    #####: 1369:  void setRoot(unsigned Offset) {
+    #####: 1370:    if (branched())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1371:      path.setRoot(&map->rootBranch(), map->rootSize, Offset);
+call    0 never executed
+        -: 1372:    else
+    #####: 1373:      path.setRoot(&map->rootLeaf(), map->rootSize, Offset);
+call    0 never executed
+    #####: 1374:  }
+        -: 1375:
+        -: 1376:  void pathFillFind(KeyT x);
+        -: 1377:  void treeFind(KeyT x);
+        -: 1378:  void treeAdvanceTo(KeyT x);
+        -: 1379:
+        -: 1380:  /// unsafeStart - Writable access to start() for iterator.
+function _ZNK4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator11unsafeStartEv called 0 returned 0% blocks executed 0%
+    #####: 1381:  KeyT &unsafeStart() const {
+    #####: 1382:    assert(valid() && "Cannot access invalid iterator");
+    #####: 1383:    return branched() ? path.leaf<Leaf>().start(path.leafOffset()) :
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1384:                        path.leaf<RootLeaf>().start(path.leafOffset());
+call    0 never executed
+        -: 1385:  }
+        -: 1386:
+        -: 1387:  /// unsafeStop - Writable access to stop() for iterator.
+function _ZNK4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator10unsafeStopEv called 0 returned 0% blocks executed 0%
+    #####: 1388:  KeyT &unsafeStop() const {
+    #####: 1389:    assert(valid() && "Cannot access invalid iterator");
+    #####: 1390:    return branched() ? path.leaf<Leaf>().stop(path.leafOffset()) :
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1391:                        path.leaf<RootLeaf>().stop(path.leafOffset());
+call    0 never executed
+        -: 1392:  }
+        -: 1393:
+        -: 1394:  /// unsafeValue - Writable access to value() for iterator.
+        -: 1395:  ValT &unsafeValue() const {
+        -: 1396:    assert(valid() && "Cannot access invalid iterator");
+        -: 1397:    return branched() ? path.leaf<Leaf>().value(path.leafOffset()) :
+        -: 1398:                        path.leaf<RootLeaf>().value(path.leafOffset());
+        -: 1399:  }
+        -: 1400:
+        -: 1401:public:
+        -: 1402:  /// const_iterator - Create an iterator that isn't pointing anywhere.
+        -: 1403:  const_iterator() = default;
+        -: 1404:
+        -: 1405:  /// setMap - Change the map iterated over. This call must be followed by a
+        -: 1406:  /// call to goToBegin(), goToEnd(), or find()
+        -: 1407:  void setMap(const IntervalMap &m) { map = const_cast<IntervalMap*>(&m); }
+        -: 1408:
+        -: 1409:  /// valid - Return true if the current position is valid, false for end().
+    #####: 1410:  bool valid() const { return path.valid(); }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+        -: 1411:
+        -: 1412:  /// atBegin - Return true if the current position is the first map entry.
+        -: 1413:  bool atBegin() const { return path.atBegin(); }
+        -: 1414:
+        -: 1415:  /// start - Return the beginning of the current interval.
+    #####: 1416:  const KeyT &start() const { return unsafeStart(); }
+call    0 never executed
+        -: 1417:
+        -: 1418:  /// stop - Return the end of the current interval.
+    #####: 1419:  const KeyT &stop() const { return unsafeStop(); }
+call    0 never executed
+        -: 1420:
+        -: 1421:  /// value - Return the mapped value at the current interval.
+        -: 1422:  const ValT &value() const { return unsafeValue(); }
+        -: 1423:
+        -: 1424:  const ValT &operator*() const { return value(); }
+        -: 1425:
+function _ZNK4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iteratoreqERKS4_ called 0 returned 0% blocks executed 0%
+    #####: 1426:  bool operator==(const const_iterator &RHS) const {
+    #####: 1427:    assert(map == RHS.map && "Cannot compare iterators from different maps");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1428:    if (!valid())
+branch  0 never executed
+branch  1 never executed
+    #####: 1429:      return !RHS.valid();
+    #####: 1430:    if (path.leafOffset() != RHS.path.leafOffset())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1431:      return false;
+    #####: 1432:    return &path.template leaf<Leaf>() == &RHS.path.template leaf<Leaf>();
+        -: 1433:  }
+        -: 1434:
+    #####: 1435:  bool operator!=(const const_iterator &RHS) const {
+    #####: 1436:    return !operator==(RHS);
+call    0 never executed
+        -: 1437:  }
+        -: 1438:
+        -: 1439:  /// goToBegin - Move to the first interval in map.
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator9goToBeginEv called 0 returned 0% blocks executed 0%
+    #####: 1440:  void goToBegin() {
+    #####: 1441:    setRoot(0);
+call    0 never executed
+    #####: 1442:    if (branched())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1443:      path.fillLeft(map->height);
+call    0 never executed
+    #####: 1444:  }
+        -: 1445:
+        -: 1446:  /// goToEnd - Move beyond the last interval in map.
+    #####: 1447:  void goToEnd() {
+    #####: 1448:    setRoot(map->rootSize);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1449:  }
+        -: 1450:
+        -: 1451:  /// preincrement - Move to the next interval.
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iteratorppEv called 0 returned 0% blocks executed 0%
+    #####: 1452:  const_iterator &operator++() {
+branch  0 never executed
+branch  1 never executed
+    #####: 1453:    assert(valid() && "Cannot increment end()");
+call    0 never executed
+    #####: 1454:    if (++path.leafOffset() == path.leafSize() && branched())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1455:      path.moveRight(map->height);
+call    0 never executed
+    #####: 1456:    return *this;
+        -: 1457:  }
+        -: 1458:
+        -: 1459:  /// postincrement - Don't do that!
+        -: 1460:  const_iterator operator++(int) {
+        -: 1461:    const_iterator tmp = *this;
+        -: 1462:    operator++();
+        -: 1463:    return tmp;
+        -: 1464:  }
+        -: 1465:
+        -: 1466:  /// predecrement - Move to the previous interval.
+        -: 1467:  const_iterator &operator--() {
+        -: 1468:    if (path.leafOffset() && (valid() || !branched()))
+        -: 1469:      --path.leafOffset();
+        -: 1470:    else
+        -: 1471:      path.moveLeft(map->height);
+        -: 1472:    return *this;
+        -: 1473:  }
+        -: 1474:
+        -: 1475:  /// postdecrement - Don't do that!
+        -: 1476:  const_iterator operator--(int) {
+        -: 1477:    const_iterator tmp = *this;
+        -: 1478:    operator--();
+        -: 1479:    return tmp;
+        -: 1480:  }
+        -: 1481:
+        -: 1482:  /// find - Move to the first interval with stop >= x, or end().
+        -: 1483:  /// This is a full search from the root, the current position is ignored.
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator4findEm called 0 returned 0% blocks executed 0%
+    #####: 1484:  void find(KeyT x) {
+    #####: 1485:    if (branched())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1486:      treeFind(x);
+call    0 never executed
+        -: 1487:    else
+    #####: 1488:      setRoot(map->rootLeaf().findFrom(0, map->rootSize, x));
+call    0 never executed
+call    1 never executed
+    #####: 1489:  }
+        -: 1490:
+        -: 1491:  /// advanceTo - Move to the first interval with stop >= x, or end().
+        -: 1492:  /// The search is started from the current position, and no earlier positions
+        -: 1493:  /// can be found. This is much faster than find() for small moves.
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator9advanceToEm called 0 returned 0% blocks executed 0%
+    #####: 1494:  void advanceTo(KeyT x) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1495:    if (!valid())
+        -: 1496:      return;
+    #####: 1497:    if (branched())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1498:      treeAdvanceTo(x);
+call    0 never executed
+        -: 1499:    else
+    #####: 1500:      path.leafOffset() =
+    #####: 1501:        map->rootLeaf().findFrom(path.leafOffset(), map->rootSize, x);
+call    0 never executed
+call    1 never executed
+        -: 1502:  }
+        -: 1503:};
+        -: 1504:
+        -: 1505:/// pathFillFind - Complete path by searching for x.
+        -: 1506:/// @param x Key to search for.
+        -: 1507:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator12pathFillFindEm called 0 returned 0% blocks executed 0%
+    #####: 1508:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1509:const_iterator::pathFillFind(KeyT x) {
+    #####: 1510:  IntervalMapImpl::NodeRef NR = path.subtree(path.height());
+call    0 never executed
+    #####: 1511:  for (unsigned i = map->height - path.height() - 1; i; --i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1512:    unsigned p = NR.get<Branch>().safeFind(0, x);
+call    0 never executed
+    #####: 1513:    path.push(NR, p);
+call    0 never executed
+    #####: 1514:    NR = NR.subtree(p);
+        -: 1515:  }
+    #####: 1516:  path.push(NR, NR.get<Leaf>().safeFind(0, x));
+call    0 never executed
+call    1 never executed
+    #####: 1517:}
+        -: 1518:
+        -: 1519:/// treeFind - Find in a branched tree.
+        -: 1520:/// @param x Key to search for.
+        -: 1521:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator8treeFindEm called 0 returned 0% blocks executed 0%
+    #####: 1522:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1523:const_iterator::treeFind(KeyT x) {
+    #####: 1524:  setRoot(map->rootBranch().findFrom(0, map->rootSize, x));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1525:  if (valid())
+    #####: 1526:    pathFillFind(x);
+call    0 never executed
+    #####: 1527:}
+        -: 1528:
+        -: 1529:/// treeAdvanceTo - Find position after the current one.
+        -: 1530:/// @param x Key to search for.
+        -: 1531:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE14const_iterator13treeAdvanceToEm called 0 returned 0% blocks executed 0%
+    #####: 1532:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1533:const_iterator::treeAdvanceTo(KeyT x) {
+        -: 1534:  // Can we stay on the same leaf node?
+    #####: 1535:  if (!Traits::stopLess(path.leaf<Leaf>().stop(path.leafSize() - 1), x)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1536:    path.leafOffset() = path.leaf<Leaf>().safeFind(path.leafOffset(), x);
+call    0 never executed
+call    1 never executed
+    #####: 1537:    return;
+        -: 1538:  }
+        -: 1539:
+        -: 1540:  // Drop the current leaf.
+    #####: 1541:  path.pop();
+call    0 never executed
+        -: 1542:
+        -: 1543:  // Search towards the root for a usable subtree.
+    #####: 1544:  if (path.height()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1545:    for (unsigned l = path.height() - 1; l; --l) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1546:      if (!Traits::stopLess(path.node<Branch>(l).stop(path.offset(l)), x)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1547:        // The branch node at l+1 is usable
+    #####: 1548:        path.offset(l + 1) =
+call    0 never executed
+call    1 never executed
+    #####: 1549:          path.node<Branch>(l + 1).safeFind(path.offset(l + 1), x);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1550:        return pathFillFind(x);
+call    0 never executed
+        -: 1551:      }
+    #####: 1552:      path.pop();
+call    0 never executed
+        -: 1553:    }
+        -: 1554:    // Is the level-1 Branch usable?
+    #####: 1555:    if (!Traits::stopLess(map->rootBranch().stop(path.offset(0)), x)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1556:      path.offset(1) = path.node<Branch>(1).safeFind(path.offset(1), x);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1557:      return pathFillFind(x);
+call    0 never executed
+        -: 1558:    }
+        -: 1559:  }
+        -: 1560:
+        -: 1561:  // We reached the root.
+    #####: 1562:  setRoot(map->rootBranch().findFrom(path.offset(0), map->rootSize, x));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1563:  if (valid())
+    #####: 1564:    pathFillFind(x);
+call    0 never executed
+        -: 1565:}
+        -: 1566:
+        -: 1567://===----------------------------------------------------------------------===//
+        -: 1568://---                       IntervalMap::iterator                         ----//
+        -: 1569://===----------------------------------------------------------------------===//
+        -: 1570:
+        -: 1571:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+    #####: 1572:class IntervalMap<KeyT, ValT, N, Traits>::iterator : public const_iterator {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1573:  friend class IntervalMap;
+        -: 1574:
+        -: 1575:  using IdxPair = IntervalMapImpl::IdxPair;
+        -: 1576:
+    #####: 1577:  explicit iterator(IntervalMap &map) : const_iterator(map) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1578:
+        -: 1579:  void setNodeStop(unsigned Level, KeyT Stop);
+        -: 1580:  bool insertNode(unsigned Level, IntervalMapImpl::NodeRef Node, KeyT Stop);
+        -: 1581:  template <typename NodeT> bool overflow(unsigned Level);
+        -: 1582:  void treeInsert(KeyT a, KeyT b, ValT y);
+        -: 1583:  void eraseNode(unsigned Level);
+        -: 1584:  void treeErase(bool UpdateRoot = true);
+        -: 1585:  bool canCoalesceLeft(KeyT Start, ValT x);
+        -: 1586:  bool canCoalesceRight(KeyT Stop, ValT x);
+        -: 1587:
+        -: 1588:public:
+        -: 1589:  /// iterator - Create null iterator.
+        -: 1590:  iterator() = default;
+        -: 1591:
+        -: 1592:  /// setStart - Move the start of the current interval.
+        -: 1593:  /// This may cause coalescing with the previous interval.
+        -: 1594:  /// @param a New start key, must not overlap the previous interval.
+        -: 1595:  void setStart(KeyT a);
+        -: 1596:
+        -: 1597:  /// setStop - Move the end of the current interval.
+        -: 1598:  /// This may cause coalescing with the following interval.
+        -: 1599:  /// @param b New stop key, must not overlap the following interval.
+        -: 1600:  void setStop(KeyT b);
+        -: 1601:
+        -: 1602:  /// setValue - Change the mapped value of the current interval.
+        -: 1603:  /// This may cause coalescing with the previous and following intervals.
+        -: 1604:  /// @param x New value.
+        -: 1605:  void setValue(ValT x);
+        -: 1606:
+        -: 1607:  /// setStartUnchecked - Move the start of the current interval without
+        -: 1608:  /// checking for coalescing or overlaps.
+        -: 1609:  /// This should only be used when it is known that coalescing is not required.
+        -: 1610:  /// @param a New start key.
+        -: 1611:  void setStartUnchecked(KeyT a) { this->unsafeStart() = a; }
+        -: 1612:
+        -: 1613:  /// setStopUnchecked - Move the end of the current interval without checking
+        -: 1614:  /// for coalescing or overlaps.
+        -: 1615:  /// This should only be used when it is known that coalescing is not required.
+        -: 1616:  /// @param b New stop key.
+        -: 1617:  void setStopUnchecked(KeyT b) {
+        -: 1618:    this->unsafeStop() = b;
+        -: 1619:    // Update keys in branch nodes as well.
+        -: 1620:    if (this->path.atLastEntry(this->path.height()))
+        -: 1621:      setNodeStop(this->path.height(), b);
+        -: 1622:  }
+        -: 1623:
+        -: 1624:  /// setValueUnchecked - Change the mapped value of the current interval
+        -: 1625:  /// without checking for coalescing.
+        -: 1626:  /// @param x New value.
+        -: 1627:  void setValueUnchecked(ValT x) { this->unsafeValue() = x; }
+        -: 1628:
+        -: 1629:  /// insert - Insert mapping [a;b] -> y before the current position.
+        -: 1630:  void insert(KeyT a, KeyT b, ValT y);
+        -: 1631:
+        -: 1632:  /// erase - Erase the current interval.
+        -: 1633:  void erase();
+        -: 1634:
+    #####: 1635:  iterator &operator++() {
+    #####: 1636:    const_iterator::operator++();
+call    0 never executed
+    #####: 1637:    return *this;
+        -: 1638:  }
+        -: 1639:
+        -: 1640:  iterator operator++(int) {
+        -: 1641:    iterator tmp = *this;
+        -: 1642:    operator++();
+        -: 1643:    return tmp;
+        -: 1644:  }
+        -: 1645:
+        -: 1646:  iterator &operator--() {
+        -: 1647:    const_iterator::operator--();
+        -: 1648:    return *this;
+        -: 1649:  }
+        -: 1650:
+        -: 1651:  iterator operator--(int) {
+        -: 1652:    iterator tmp = *this;
+        -: 1653:    operator--();
+        -: 1654:    return tmp;
+        -: 1655:  }
+        -: 1656:};
+        -: 1657:
+        -: 1658:/// canCoalesceLeft - Can the current interval coalesce to the left after
+        -: 1659:/// changing start or value?
+        -: 1660:/// @param Start New start of current interval.
+        -: 1661:/// @param Value New value for current interval.
+        -: 1662:/// @return True when updating the current interval would enable coalescing.
+        -: 1663:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1664:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1665:iterator::canCoalesceLeft(KeyT Start, ValT Value) {
+        -: 1666:  using namespace IntervalMapImpl;
+        -: 1667:  Path &P = this->path;
+        -: 1668:  if (!this->branched()) {
+        -: 1669:    unsigned i = P.leafOffset();
+        -: 1670:    RootLeaf &Node = P.leaf<RootLeaf>();
+        -: 1671:    return i && Node.value(i-1) == Value &&
+        -: 1672:                Traits::adjacent(Node.stop(i-1), Start);
+        -: 1673:  }
+        -: 1674:  // Branched.
+        -: 1675:  if (unsigned i = P.leafOffset()) {
+        -: 1676:    Leaf &Node = P.leaf<Leaf>();
+        -: 1677:    return Node.value(i-1) == Value && Traits::adjacent(Node.stop(i-1), Start);
+        -: 1678:  } else if (NodeRef NR = P.getLeftSibling(P.height())) {
+        -: 1679:    unsigned i = NR.size() - 1;
+        -: 1680:    Leaf &Node = NR.get<Leaf>();
+        -: 1681:    return Node.value(i) == Value && Traits::adjacent(Node.stop(i), Start);
+        -: 1682:  }
+        -: 1683:  return false;
+        -: 1684:}
+        -: 1685:
+        -: 1686:/// canCoalesceRight - Can the current interval coalesce to the right after
+        -: 1687:/// changing stop or value?
+        -: 1688:/// @param Stop New stop of current interval.
+        -: 1689:/// @param Value New value for current interval.
+        -: 1690:/// @return True when updating the current interval would enable coalescing.
+        -: 1691:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1692:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1693:iterator::canCoalesceRight(KeyT Stop, ValT Value) {
+        -: 1694:  using namespace IntervalMapImpl;
+        -: 1695:  Path &P = this->path;
+        -: 1696:  unsigned i = P.leafOffset() + 1;
+        -: 1697:  if (!this->branched()) {
+        -: 1698:    if (i >= P.leafSize())
+        -: 1699:      return false;
+        -: 1700:    RootLeaf &Node = P.leaf<RootLeaf>();
+        -: 1701:    return Node.value(i) == Value && Traits::adjacent(Stop, Node.start(i));
+        -: 1702:  }
+        -: 1703:  // Branched.
+        -: 1704:  if (i < P.leafSize()) {
+        -: 1705:    Leaf &Node = P.leaf<Leaf>();
+        -: 1706:    return Node.value(i) == Value && Traits::adjacent(Stop, Node.start(i));
+        -: 1707:  } else if (NodeRef NR = P.getRightSibling(P.height())) {
+        -: 1708:    Leaf &Node = NR.get<Leaf>();
+        -: 1709:    return Node.value(0) == Value && Traits::adjacent(Stop, Node.start(0));
+        -: 1710:  }
+        -: 1711:  return false;
+        -: 1712:}
+        -: 1713:
+        -: 1714:/// setNodeStop - Update the stop key of the current node at level and above.
+        -: 1715:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator11setNodeStopEjm called 0 returned 0% blocks executed 0%
+    #####: 1716:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1717:iterator::setNodeStop(unsigned Level, KeyT Stop) {
+        -: 1718:  // There are no references to the root node, so nothing to update.
+    #####: 1719:  if (!Level)
+branch  0 never executed
+branch  1 never executed
+        -: 1720:    return;
+    #####: 1721:  IntervalMapImpl::Path &P = this->path;
+        -: 1722:  // Update nodes pointing to the current node.
+    #####: 1723:  while (--Level) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1724:    P.node<Branch>(Level).stop(P.offset(Level)) = Stop;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1725:    if (!P.atLastEntry(Level))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1726:      return;
+        -: 1727:  }
+        -: 1728:  // Update root separately since it has a different layout.
+    #####: 1729:  P.node<RootBranch>(Level).stop(P.offset(Level)) = Stop;
+branch  0 never executed
+branch  1 never executed
+        -: 1730:}
+        -: 1731:
+        -: 1732:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1733:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1734:iterator::setStart(KeyT a) {
+        -: 1735:  assert(Traits::nonEmpty(a, this->stop()) && "Cannot move start beyond stop");
+        -: 1736:  KeyT &CurStart = this->unsafeStart();
+        -: 1737:  if (!Traits::startLess(a, CurStart) || !canCoalesceLeft(a, this->value())) {
+        -: 1738:    CurStart = a;
+        -: 1739:    return;
+        -: 1740:  }
+        -: 1741:  // Coalesce with the interval to the left.
+        -: 1742:  --*this;
+        -: 1743:  a = this->start();
+        -: 1744:  erase();
+        -: 1745:  setStartUnchecked(a);
+        -: 1746:}
+        -: 1747:
+        -: 1748:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1749:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1750:iterator::setStop(KeyT b) {
+        -: 1751:  assert(Traits::nonEmpty(this->start(), b) && "Cannot move stop beyond start");
+        -: 1752:  if (Traits::startLess(b, this->stop()) ||
+        -: 1753:      !canCoalesceRight(b, this->value())) {
+        -: 1754:    setStopUnchecked(b);
+        -: 1755:    return;
+        -: 1756:  }
+        -: 1757:  // Coalesce with interval to the right.
+        -: 1758:  KeyT a = this->start();
+        -: 1759:  erase();
+        -: 1760:  setStartUnchecked(a);
+        -: 1761:}
+        -: 1762:
+        -: 1763:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1764:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1765:iterator::setValue(ValT x) {
+        -: 1766:  setValueUnchecked(x);
+        -: 1767:  if (canCoalesceRight(this->stop(), x)) {
+        -: 1768:    KeyT a = this->start();
+        -: 1769:    erase();
+        -: 1770:    setStartUnchecked(a);
+        -: 1771:  }
+        -: 1772:  if (canCoalesceLeft(this->start(), x)) {
+        -: 1773:    --*this;
+        -: 1774:    KeyT a = this->start();
+        -: 1775:    erase();
+        -: 1776:    setStartUnchecked(a);
+        -: 1777:  }
+        -: 1778:}
+        -: 1779:
+        -: 1780:/// insertNode - insert a node before the current path at level.
+        -: 1781:/// Leave the current path pointing at the new node.
+        -: 1782:/// @param Level path index of the node to be inserted.
+        -: 1783:/// @param Node The node to be inserted.
+        -: 1784:/// @param Stop The last index in the new node.
+        -: 1785:/// @return True if the tree height was increased.
+        -: 1786:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator10insertNodeEjNS_15IntervalMapImpl7NodeRefEm called 0 returned 0% blocks executed 0%
+    #####: 1787:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1788:iterator::insertNode(unsigned Level, IntervalMapImpl::NodeRef Node, KeyT Stop) {
+    #####: 1789:  assert(Level && "Cannot insert next to the root");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1790:  bool SplitRoot = false;
+    #####: 1791:  IntervalMap &IM = *this->map;
+    #####: 1792:  IntervalMapImpl::Path &P = this->path;
+        -: 1793:
+    #####: 1794:  if (Level == 1) {
+branch  0 never executed
+branch  1 never executed
+        -: 1795:    // Insert into the root branch node.
+    #####: 1796:    if (IM.rootSize < RootBranch::Capacity) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1797:      IM.rootBranch().insert(P.offset(0), IM.rootSize, Node, Stop);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1798:      P.setSize(0, ++IM.rootSize);
+call    0 never executed
+    #####: 1799:      P.reset(Level);
+call    0 never executed
+    #####: 1800:      return SplitRoot;
+        -: 1801:    }
+        -: 1802:
+        -: 1803:    // We need to split the root while keeping our position.
+    #####: 1804:    SplitRoot = true;
+branch  0 never executed
+branch  1 never executed
+    #####: 1805:    IdxPair Offset = IM.splitRoot(P.offset(0));
+call    0 never executed
+    #####: 1806:    P.replaceRoot(&IM.rootBranch(), IM.rootSize, Offset);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1807:
+        -: 1808:    // Fall through to insert at the new higher level.
+    #####: 1809:    ++Level;
+        -: 1810:  }
+        -: 1811:
+        -: 1812:  // When inserting before end(), make sure we have a valid path.
+    #####: 1813:  P.legalizeForInsert(--Level);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1814:
+        -: 1815:  // Insert into the branch node at Level-1.
+    #####: 1816:  if (P.size(Level) == Branch::Capacity) {
+branch  0 never executed
+branch  1 never executed
+        -: 1817:    // Branch node is full, handle handle the overflow.
+    #####: 1818:    assert(!SplitRoot && "Cannot overflow after splitting the root");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1819:    SplitRoot = overflow<Branch>(Level);
+call    0 never executed
+    #####: 1820:    Level += SplitRoot;
+        -: 1821:  }
+    #####: 1822:  P.node<Branch>(Level).insert(P.offset(Level), P.size(Level), Node, Stop);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1823:  P.setSize(Level, P.size(Level) + 1);
+call    0 never executed
+    #####: 1824:  if (P.atLastEntry(Level))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1825:    setNodeStop(Level, Stop);
+call    0 never executed
+    #####: 1826:  P.reset(Level + 1);
+call    0 never executed
+    #####: 1827:  return SplitRoot;
+        -: 1828:}
+        -: 1829:
+        -: 1830:// insert
+        -: 1831:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator6insertEmmc called 0 returned 0% blocks executed 0%
+    #####: 1832:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1833:iterator::insert(KeyT a, KeyT b, ValT y) {
+    #####: 1834:  if (this->branched())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1835:    return treeInsert(a, b, y);
+call    0 never executed
+    #####: 1836:  IntervalMap &IM = *this->map;
+    #####: 1837:  IntervalMapImpl::Path &P = this->path;
+        -: 1838:
+        -: 1839:  // Try simple root leaf insert.
+    #####: 1840:  unsigned Size = IM.rootLeaf().insertFrom(P.leafOffset(), IM.rootSize, a, b, y);
+call    0 never executed
+call    1 never executed
+        -: 1841:
+        -: 1842:  // Was the root node insert successful?
+    #####: 1843:  if (Size <= RootLeaf::Capacity) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1844:    P.setSize(0, IM.rootSize = Size);
+call    0 never executed
+    #####: 1845:    return;
+        -: 1846:  }
+        -: 1847:
+        -: 1848:  // Root leaf node is full, we must branch.
+    #####: 1849:  IdxPair Offset = IM.branchRoot(P.leafOffset());
+call    0 never executed
+    #####: 1850:  P.replaceRoot(&IM.rootBranch(), IM.rootSize, Offset);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1851:
+        -: 1852:  // Now it fits in the new leaf.
+    #####: 1853:  treeInsert(a, b, y);
+call    0 never executed
+        -: 1854:}
+        -: 1855:
+        -: 1856:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator10treeInsertEmmc called 0 returned 0% blocks executed 0%
+    #####: 1857:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1858:iterator::treeInsert(KeyT a, KeyT b, ValT y) {
+        -: 1859:  using namespace IntervalMapImpl;
+    #####: 1860:  Path &P = this->path;
+branch  0 never executed
+branch  1 never executed
+        -: 1861:
+    #####: 1862:  if (!P.valid())
+call    0 never executed
+    #####: 1863:    P.legalizeForInsert(this->map->height);
+call    0 never executed
+        -: 1864:
+        -: 1865:  // Check if this insertion will extend the node to the left.
+    #####: 1866:  if (P.leafOffset() == 0 && Traits::startLess(a, P.leaf<Leaf>().start(0))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1867:    // Node is growing to the left, will it affect a left sibling node?
+    #####: 1868:    if (NodeRef Sib = P.getLeftSibling(P.height())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1869:      Leaf &SibLeaf = Sib.get<Leaf>();
+branch  0 never executed
+branch  1 never executed
+    #####: 1870:      unsigned SibOfs = Sib.size() - 1;
+    #####: 1871:      if (SibLeaf.value(SibOfs) == y &&
+branch  0 never executed
+branch  1 never executed
+    #####: 1872:          Traits::adjacent(SibLeaf.stop(SibOfs), a)) {
+branch  0 never executed
+branch  1 never executed
+        -: 1873:        // This insertion will coalesce with the last entry in SibLeaf. We can
+        -: 1874:        // handle it in two ways:
+        -: 1875:        //  1. Extend SibLeaf.stop to b and be done, or
+        -: 1876:        //  2. Extend a to SibLeaf, erase the SibLeaf entry and continue.
+        -: 1877:        // We prefer 1., but need 2 when coalescing to the right as well.
+    #####: 1878:        Leaf &CurLeaf = P.leaf<Leaf>();
+call    0 never executed
+    #####: 1879:        P.moveLeft(P.height());
+call    0 never executed
+    #####: 1880:        if (Traits::stopLess(b, CurLeaf.start(0)) &&
+branch  0 never executed
+branch  1 never executed
+    #####: 1881:            (y != CurLeaf.value(0) || !Traits::adjacent(b, CurLeaf.start(0)))) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1882:          // Easy, just extend SibLeaf and we're done.
+    #####: 1883:          setNodeStop(P.height(), SibLeaf.stop(SibOfs) = b);
+call    0 never executed
+    #####: 1884:          return;
+call    0 never executed
+        -: 1885:        } else {
+        -: 1886:          // We have both left and right coalescing. Erase the old SibLeaf entry
+        -: 1887:          // and continue inserting the larger interval.
+    #####: 1888:          a = SibLeaf.start(SibOfs);
+    #####: 1889:          treeErase(/* UpdateRoot= */false);
+call    0 never executed
+        -: 1890:        }
+        -: 1891:      }
+        -: 1892:    } else {
+        -: 1893:      // No left sibling means we are at begin(). Update cached bound.
+    #####: 1894:      this->map->rootBranchStart() = a;
+branch  0 never executed
+branch  1 never executed
+        -: 1895:    }
+        -: 1896:  }
+        -: 1897:
+        -: 1898:  // When we are inserting at the end of a leaf node, we must update stops.
+    #####: 1899:  unsigned Size = P.leafSize();
+call    0 never executed
+    #####: 1900:  bool Grow = P.leafOffset() == Size;
+    #####: 1901:  Size = P.leaf<Leaf>().insertFrom(P.leafOffset(), Size, a, b, y);
+call    0 never executed
+        -: 1902:
+        -: 1903:  // Leaf insertion unsuccessful? Overflow and try again.
+    #####: 1904:  if (Size > Leaf::Capacity) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1905:    overflow<Leaf>(P.height());
+call    0 never executed
+call    1 never executed
+    #####: 1906:    Grow = P.leafOffset() == P.leafSize();
+call    0 never executed
+    #####: 1907:    Size = P.leaf<Leaf>().insertFrom(P.leafOffset(), P.leafSize(), a, b, y);
+call    0 never executed
+    #####: 1908:    assert(Size <= Leaf::Capacity && "overflow() didn't make room");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1909:  }
+        -: 1910:
+        -: 1911:  // Inserted, update offset and leaf size.
+    #####: 1912:  P.setSize(P.height(), Size);
+call    0 never executed
+        -: 1913:
+        -: 1914:  // Insert was the last node entry, update stops.
+    #####: 1915:  if (Grow)
+branch  0 never executed
+branch  1 never executed
+    #####: 1916:    setNodeStop(P.height(), b);
+call    0 never executed
+        -: 1917:}
+        -: 1918:
+        -: 1919:/// erase - erase the current interval and move to the next position.
+        -: 1920:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 1921:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1922:iterator::erase() {
+        -: 1923:  IntervalMap &IM = *this->map;
+        -: 1924:  IntervalMapImpl::Path &P = this->path;
+        -: 1925:  assert(P.valid() && "Cannot erase end()");
+        -: 1926:  if (this->branched())
+        -: 1927:    return treeErase();
+        -: 1928:  IM.rootLeaf().erase(P.leafOffset(), IM.rootSize);
+        -: 1929:  P.setSize(0, --IM.rootSize);
+        -: 1930:}
+        -: 1931:
+        -: 1932:/// treeErase - erase() for a branched tree.
+        -: 1933:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator9treeEraseEb called 0 returned 0% blocks executed 0%
+    #####: 1934:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1935:iterator::treeErase(bool UpdateRoot) {
+    #####: 1936:  IntervalMap &IM = *this->map;
+    #####: 1937:  IntervalMapImpl::Path &P = this->path;
+call    0 never executed
+    #####: 1938:  Leaf &Node = P.leaf<Leaf>();
+        -: 1939:
+        -: 1940:  // Nodes are not allowed to become empty.
+    #####: 1941:  if (P.leafSize() == 1) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1942:    IM.deleteNode(&Node);
+call    0 never executed
+    #####: 1943:    eraseNode(IM.height);
+call    0 never executed
+        -: 1944:    // Update rootBranchStart if we erased begin().
+    #####: 1945:    if (UpdateRoot && IM.branched() && P.valid() && P.atBegin())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1946:      IM.rootBranchStart() = P.leaf<Leaf>().start(0);
+    #####: 1947:    return;
+        -: 1948:  }
+        -: 1949:
+        -: 1950:  // Erase current entry.
+    #####: 1951:  Node.erase(P.leafOffset(), P.leafSize());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1952:  unsigned NewSize = P.leafSize() - 1;
+    #####: 1953:  P.setSize(IM.height, NewSize);
+call    0 never executed
+call    1 never executed
+        -: 1954:  // When we erase the last entry, update stop and move to a legal position.
+    #####: 1955:  if (P.leafOffset() == NewSize) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1956:    setNodeStop(IM.height, Node.stop(NewSize - 1));
+call    0 never executed
+    #####: 1957:    P.moveRight(IM.height);
+call    0 never executed
+    #####: 1958:  } else if (UpdateRoot && P.atBegin())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1959:    IM.rootBranchStart() = P.leaf<Leaf>().start(0);
+branch  0 never executed
+branch  1 never executed
+        -: 1960:}
+        -: 1961:
+        -: 1962:/// eraseNode - Erase the current node at Level from its parent and move path to
+        -: 1963:/// the first entry of the next sibling node.
+        -: 1964:/// The node must be deallocated by the caller.
+        -: 1965:/// @param Level 1..height, the root node cannot be erased.
+        -: 1966:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator9eraseNodeEj called 0 returned 0% blocks executed 0%
+    #####: 1967:void IntervalMap<KeyT, ValT, N, Traits>::
+        -: 1968:iterator::eraseNode(unsigned Level) {
+    #####: 1969:  assert(Level && "Cannot erase root node");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1970:  IntervalMap &IM = *this->map;
+    #####: 1971:  IntervalMapImpl::Path &P = this->path;
+        -: 1972:
+    #####: 1973:  if (--Level == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1974:    IM.rootBranch().erase(P.offset(0), IM.rootSize);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1975:    P.setSize(0, --IM.rootSize);
+call    0 never executed
+        -: 1976:    // If this cleared the root, switch to height=0.
+    #####: 1977:    if (IM.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1978:      IM.switchRootToLeaf();
+call    0 never executed
+    #####: 1979:      this->setRoot(0);
+call    0 never executed
+    #####: 1980:      return;
+        -: 1981:    }
+        -: 1982:  } else {
+        -: 1983:    // Remove node ref from branch node at Level.
+    #####: 1984:    Branch &Parent = P.node<Branch>(Level);
+branch  0 never executed
+branch  1 never executed
+    #####: 1985:    if (P.size(Level) == 1) {
+branch  0 never executed
+branch  1 never executed
+        -: 1986:      // Branch node became empty, remove it recursively.
+    #####: 1987:      IM.deleteNode(&Parent);
+call    0 never executed
+    #####: 1988:      eraseNode(Level);
+call    0 never executed
+        -: 1989:    } else {
+        -: 1990:      // Branch node won't become empty.
+    #####: 1991:      Parent.erase(P.offset(Level), P.size(Level));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1992:      unsigned NewSize = P.size(Level) - 1;
+    #####: 1993:      P.setSize(Level, NewSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1994:      // If we removed the last branch, update stop and move to a legal pos.
+    #####: 1995:      if (P.offset(Level) == NewSize) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1996:        setNodeStop(Level, Parent.stop(NewSize - 1));
+call    0 never executed
+    #####: 1997:        P.moveRight(Level);
+call    0 never executed
+        -: 1998:      }
+        -: 1999:    }
+        -: 2000:  }
+        -: 2001:  // Update path cache for the new right sibling position.
+    #####: 2002:  if (P.valid()) {
+    #####: 2003:    P.reset(Level + 1);
+call    0 never executed
+    #####: 2004:    P.offset(Level + 1) = 0;
+branch  0 never executed
+branch  1 never executed
+        -: 2005:  }
+        -: 2006:}
+        -: 2007:
+        -: 2008:/// overflow - Distribute entries of the current node evenly among
+        -: 2009:/// its siblings and ensure that the current node is not full.
+        -: 2010:/// This may require allocating a new node.
+        -: 2011:/// @tparam NodeT The type of node at Level (Leaf or Branch).
+        -: 2012:/// @param Level path index of the overflowing node.
+        -: 2013:/// @return True when the tree height was changed.
+        -: 2014:template <typename KeyT, typename ValT, unsigned N, typename Traits>
+        -: 2015:template <typename NodeT>
+    #####: 2016:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 2017:iterator::overflow(unsigned Level) {
+        -: 2018:  using namespace IntervalMapImpl;
+    #####: 2019:  Path &P = this->path;
+        -: 2020:  unsigned CurSize[4];
+        -: 2021:  NodeT *Node[4];
+    #####: 2022:  unsigned Nodes = 0;
+    #####: 2023:  unsigned Elements = 0;
+    #####: 2024:  unsigned Offset = P.offset(Level);
+        -: 2025:
+        -: 2026:  // Do we have a left sibling?
+    #####: 2027:  NodeRef LeftSib = P.getLeftSibling(Level);
+    #####: 2028:  if (LeftSib) {
+    #####: 2029:    Offset += Elements = CurSize[Nodes] = LeftSib.size();
+    #####: 2030:    Node[Nodes++] = &LeftSib.get<NodeT>();
+        -: 2031:  }
+        -: 2032:
+        -: 2033:  // Current node.
+    #####: 2034:  Elements += CurSize[Nodes] = P.size(Level);
+    #####: 2035:  Node[Nodes++] = &P.node<NodeT>(Level);
+        -: 2036:
+        -: 2037:  // Do we have a right sibling?
+    #####: 2038:  NodeRef RightSib = P.getRightSibling(Level);
+    #####: 2039:  if (RightSib) {
+    #####: 2040:    Elements += CurSize[Nodes] = RightSib.size();
+    #####: 2041:    Node[Nodes++] = &RightSib.get<NodeT>();
+        -: 2042:  }
+        -: 2043:
+        -: 2044:  // Do we need to allocate a new node?
+    #####: 2045:  unsigned NewNode = 0;
+    #####: 2046:  if (Elements + 1 > Nodes * NodeT::Capacity) {
+        -: 2047:    // Insert NewNode at the penultimate position, or after a single node.
+    #####: 2048:    NewNode = Nodes == 1 ? 1 : Nodes - 1;
+    #####: 2049:    CurSize[Nodes] = CurSize[NewNode];
+    #####: 2050:    Node[Nodes] = Node[NewNode];
+    #####: 2051:    CurSize[NewNode] = 0;
+    #####: 2052:    Node[NewNode] = this->map->template newNode<NodeT>();
+    #####: 2053:    ++Nodes;
+        -: 2054:  }
+        -: 2055:
+        -: 2056:  // Compute the new element distribution.
+        -: 2057:  unsigned NewSize[4];
+    #####: 2058:  IdxPair NewOffset = distribute(Nodes, Elements, NodeT::Capacity,
+        -: 2059:                                 CurSize, NewSize, Offset, true);
+    #####: 2060:  adjustSiblingSizes(Node, Nodes, CurSize, NewSize);
+        -: 2061:
+        -: 2062:  // Move current location to the leftmost node.
+    #####: 2063:  if (LeftSib)
+    #####: 2064:    P.moveLeft(Level);
+        -: 2065:
+        -: 2066:  // Elements have been rearranged, now update node sizes and stops.
+        -: 2067:  bool SplitRoot = false;
+        -: 2068:  unsigned Pos = 0;
+    #####: 2069:  while (true) {
+    #####: 2070:    KeyT Stop = Node[Pos]->stop(NewSize[Pos]-1);
+    #####: 2071:    if (NewNode && Pos == NewNode) {
+    #####: 2072:      SplitRoot = insertNode(Level, NodeRef(Node[Pos], NewSize[Pos]), Stop);
+    #####: 2073:      Level += SplitRoot;
+        -: 2074:    } else {
+    #####: 2075:      P.setSize(Level, NewSize[Pos]);
+    #####: 2076:      setNodeStop(Level, Stop);
+        -: 2077:    }
+    #####: 2078:    if (Pos + 1 == Nodes)
+        -: 2079:      break;
+    #####: 2080:    P.moveRight(Level);
+    #####: 2081:    ++Pos;
+        -: 2082:  }
+        -: 2083:
+        -: 2084:  // Where was I? Find NewOffset.
+    #####: 2085:  while(Pos != NewOffset.first) {
+    #####: 2086:    P.moveLeft(Level);
+    #####: 2087:    --Pos;
+        -: 2088:  }
+    #####: 2089:  P.offset(Level) = NewOffset.second;
+    #####: 2090:  return SplitRoot;
+        -: 2091:}
+------------------
+_ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator8overflowINS_15IntervalMapImpl10BranchNodeImcLj12ES2_EEEEbj:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator8overflowINS_15IntervalMapImpl10BranchNodeImcLj12ES2_EEEEbj called 0 returned 0% blocks executed 0%
+    #####: 2016:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 2017:iterator::overflow(unsigned Level) {
+        -: 2018:  using namespace IntervalMapImpl;
+    #####: 2019:  Path &P = this->path;
+        -: 2020:  unsigned CurSize[4];
+        -: 2021:  NodeT *Node[4];
+    #####: 2022:  unsigned Nodes = 0;
+    #####: 2023:  unsigned Elements = 0;
+branch  0 never executed
+branch  1 never executed
+    #####: 2024:  unsigned Offset = P.offset(Level);
+        -: 2025:
+        -: 2026:  // Do we have a left sibling?
+    #####: 2027:  NodeRef LeftSib = P.getLeftSibling(Level);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 2028:  if (LeftSib) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2029:    Offset += Elements = CurSize[Nodes] = LeftSib.size();
+    #####: 2030:    Node[Nodes++] = &LeftSib.get<NodeT>();
+        -: 2031:  }
+        -: 2032:
+        -: 2033:  // Current node.
+    #####: 2034:  Elements += CurSize[Nodes] = P.size(Level);
+call    0 never executed
+    #####: 2035:  Node[Nodes++] = &P.node<NodeT>(Level);
+        -: 2036:
+        -: 2037:  // Do we have a right sibling?
+    #####: 2038:  NodeRef RightSib = P.getRightSibling(Level);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 2039:  if (RightSib) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2040:    Elements += CurSize[Nodes] = RightSib.size();
+    #####: 2041:    Node[Nodes++] = &RightSib.get<NodeT>();
+        -: 2042:  }
+        -: 2043:
+        -: 2044:  // Do we need to allocate a new node?
+    #####: 2045:  unsigned NewNode = 0;
+    #####: 2046:  if (Elements + 1 > Nodes * NodeT::Capacity) {
+branch  0 never executed
+branch  1 never executed
+        -: 2047:    // Insert NewNode at the penultimate position, or after a single node.
+    #####: 2048:    NewNode = Nodes == 1 ? 1 : Nodes - 1;
+branch  0 never executed
+branch  1 never executed
+    #####: 2049:    CurSize[Nodes] = CurSize[NewNode];
+    #####: 2050:    Node[Nodes] = Node[NewNode];
+    #####: 2051:    CurSize[NewNode] = 0;
+    #####: 2052:    Node[NewNode] = this->map->template newNode<NodeT>();
+call    0 never executed
+    #####: 2053:    ++Nodes;
+        -: 2054:  }
+        -: 2055:
+        -: 2056:  // Compute the new element distribution.
+        -: 2057:  unsigned NewSize[4];
+    #####: 2058:  IdxPair NewOffset = distribute(Nodes, Elements, NodeT::Capacity,
+call    0 never executed
+        -: 2059:                                 CurSize, NewSize, Offset, true);
+    #####: 2060:  adjustSiblingSizes(Node, Nodes, CurSize, NewSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 2061:
+        -: 2062:  // Move current location to the leftmost node.
+    #####: 2063:  if (LeftSib)
+branch  0 never executed
+branch  1 never executed
+    #####: 2064:    P.moveLeft(Level);
+call    0 never executed
+        -: 2065:
+        -: 2066:  // Elements have been rearranged, now update node sizes and stops.
+        -: 2067:  bool SplitRoot = false;
+        -: 2068:  unsigned Pos = 0;
+    #####: 2069:  while (true) {
+    #####: 2070:    KeyT Stop = Node[Pos]->stop(NewSize[Pos]-1);
+    #####: 2071:    if (NewNode && Pos == NewNode) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2072:      SplitRoot = insertNode(Level, NodeRef(Node[Pos], NewSize[Pos]), Stop);
+call    0 never executed
+call    1 never executed
+    #####: 2073:      Level += SplitRoot;
+        -: 2074:    } else {
+    #####: 2075:      P.setSize(Level, NewSize[Pos]);
+call    0 never executed
+    #####: 2076:      setNodeStop(Level, Stop);
+call    0 never executed
+        -: 2077:    }
+    #####: 2078:    if (Pos + 1 == Nodes)
+branch  0 never executed
+branch  1 never executed
+        -: 2079:      break;
+    #####: 2080:    P.moveRight(Level);
+    #####: 2081:    ++Pos;
+call    0 never executed
+        -: 2082:  }
+        -: 2083:
+        -: 2084:  // Where was I? Find NewOffset.
+    #####: 2085:  while(Pos != NewOffset.first) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2086:    P.moveLeft(Level);
+call    0 never executed
+    #####: 2087:    --Pos;
+        -: 2088:  }
+    #####: 2089:  P.offset(Level) = NewOffset.second;
+branch  0 never executed
+branch  1 never executed
+    #####: 2090:  return SplitRoot;
+        -: 2091:}
+------------------
+_ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator8overflowINS_15IntervalMapImpl8LeafNodeImcLj11ES2_EEEEbj:
+function _ZN4llvm11IntervalMapImcLj16ENS_15IntervalMapInfoImEEE8iterator8overflowINS_15IntervalMapImpl8LeafNodeImcLj11ES2_EEEEbj called 0 returned 0% blocks executed 0%
+    #####: 2016:bool IntervalMap<KeyT, ValT, N, Traits>::
+        -: 2017:iterator::overflow(unsigned Level) {
+        -: 2018:  using namespace IntervalMapImpl;
+    #####: 2019:  Path &P = this->path;
+        -: 2020:  unsigned CurSize[4];
+        -: 2021:  NodeT *Node[4];
+    #####: 2022:  unsigned Nodes = 0;
+    #####: 2023:  unsigned Elements = 0;
+branch  0 never executed
+branch  1 never executed
+    #####: 2024:  unsigned Offset = P.offset(Level);
+        -: 2025:
+        -: 2026:  // Do we have a left sibling?
+    #####: 2027:  NodeRef LeftSib = P.getLeftSibling(Level);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 2028:  if (LeftSib) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2029:    Offset += Elements = CurSize[Nodes] = LeftSib.size();
+    #####: 2030:    Node[Nodes++] = &LeftSib.get<NodeT>();
+        -: 2031:  }
+        -: 2032:
+        -: 2033:  // Current node.
+    #####: 2034:  Elements += CurSize[Nodes] = P.size(Level);
+call    0 never executed
+    #####: 2035:  Node[Nodes++] = &P.node<NodeT>(Level);
+        -: 2036:
+        -: 2037:  // Do we have a right sibling?
+    #####: 2038:  NodeRef RightSib = P.getRightSibling(Level);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 2039:  if (RightSib) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2040:    Elements += CurSize[Nodes] = RightSib.size();
+    #####: 2041:    Node[Nodes++] = &RightSib.get<NodeT>();
+        -: 2042:  }
+        -: 2043:
+        -: 2044:  // Do we need to allocate a new node?
+    #####: 2045:  unsigned NewNode = 0;
+    #####: 2046:  if (Elements + 1 > Nodes * NodeT::Capacity) {
+branch  0 never executed
+branch  1 never executed
+        -: 2047:    // Insert NewNode at the penultimate position, or after a single node.
+    #####: 2048:    NewNode = Nodes == 1 ? 1 : Nodes - 1;
+branch  0 never executed
+branch  1 never executed
+    #####: 2049:    CurSize[Nodes] = CurSize[NewNode];
+    #####: 2050:    Node[Nodes] = Node[NewNode];
+    #####: 2051:    CurSize[NewNode] = 0;
+    #####: 2052:    Node[NewNode] = this->map->template newNode<NodeT>();
+call    0 never executed
+    #####: 2053:    ++Nodes;
+        -: 2054:  }
+        -: 2055:
+        -: 2056:  // Compute the new element distribution.
+        -: 2057:  unsigned NewSize[4];
+    #####: 2058:  IdxPair NewOffset = distribute(Nodes, Elements, NodeT::Capacity,
+call    0 never executed
+        -: 2059:                                 CurSize, NewSize, Offset, true);
+    #####: 2060:  adjustSiblingSizes(Node, Nodes, CurSize, NewSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 2061:
+        -: 2062:  // Move current location to the leftmost node.
+    #####: 2063:  if (LeftSib)
+branch  0 never executed
+branch  1 never executed
+    #####: 2064:    P.moveLeft(Level);
+call    0 never executed
+        -: 2065:
+        -: 2066:  // Elements have been rearranged, now update node sizes and stops.
+        -: 2067:  bool SplitRoot = false;
+        -: 2068:  unsigned Pos = 0;
+    #####: 2069:  while (true) {
+    #####: 2070:    KeyT Stop = Node[Pos]->stop(NewSize[Pos]-1);
+    #####: 2071:    if (NewNode && Pos == NewNode) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2072:      SplitRoot = insertNode(Level, NodeRef(Node[Pos], NewSize[Pos]), Stop);
+call    0 never executed
+call    1 never executed
+    #####: 2073:      Level += SplitRoot;
+        -: 2074:    } else {
+    #####: 2075:      P.setSize(Level, NewSize[Pos]);
+call    0 never executed
+    #####: 2076:      setNodeStop(Level, Stop);
+call    0 never executed
+        -: 2077:    }
+    #####: 2078:    if (Pos + 1 == Nodes)
+branch  0 never executed
+branch  1 never executed
+        -: 2079:      break;
+    #####: 2080:    P.moveRight(Level);
+    #####: 2081:    ++Pos;
+call    0 never executed
+        -: 2082:  }
+        -: 2083:
+        -: 2084:  // Where was I? Find NewOffset.
+    #####: 2085:  while(Pos != NewOffset.first) {
+branch  0 never executed
+branch  1 never executed
+    #####: 2086:    P.moveLeft(Level);
+call    0 never executed
+    #####: 2087:    --Pos;
+        -: 2088:  }
+    #####: 2089:  P.offset(Level) = NewOffset.second;
+branch  0 never executed
+branch  1 never executed
+    #####: 2090:  return SplitRoot;
+        -: 2091:}
+------------------
+        -: 2092:
+        -: 2093://===----------------------------------------------------------------------===//
+        -: 2094://---                       IntervalMapOverlaps                           ----//
+        -: 2095://===----------------------------------------------------------------------===//
+        -: 2096:
+        -: 2097:/// IntervalMapOverlaps - Iterate over the overlaps of mapped intervals in two
+        -: 2098:/// IntervalMaps. The maps may be different, but the KeyT and Traits types
+        -: 2099:/// should be the same.
+        -: 2100:///
+        -: 2101:/// Typical uses:
+        -: 2102:///
+        -: 2103:/// 1. Test for overlap:
+        -: 2104:///    bool overlap = IntervalMapOverlaps(a, b).valid();
+        -: 2105:///
+        -: 2106:/// 2. Enumerate overlaps:
+        -: 2107:///    for (IntervalMapOverlaps I(a, b); I.valid() ; ++I) { ... }
+        -: 2108:///
+        -: 2109:template <typename MapA, typename MapB>
+        -: 2110:class IntervalMapOverlaps {
+        -: 2111:  using KeyType = typename MapA::KeyType;
+        -: 2112:  using Traits = typename MapA::KeyTraits;
+        -: 2113:
+        -: 2114:  typename MapA::const_iterator posA;
+        -: 2115:  typename MapB::const_iterator posB;
+        -: 2116:
+        -: 2117:  /// advance - Move posA and posB forward until reaching an overlap, or until
+        -: 2118:  /// either meets end.
+        -: 2119:  /// Don't move the iterators if they are already overlapping.
+function _ZN4llvm19IntervalMapOverlapsINS_11IntervalMapImcLj16ENS_15IntervalMapInfoImEEEES4_E7advanceEv called 0 returned 0% blocks executed 0%
+    #####: 2120:  void advance() {
+    #####: 2121:    if (!valid())
+        -: 2122:      return;
+        -: 2123:
+    #####: 2124:    if (Traits::stopLess(posA.stop(), posB.start())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 2125:      // A ends before B begins. Catch up.
+    #####: 2126:      posA.advanceTo(posB.start());
+call    0 never executed
+    #####: 2127:      if (!posA.valid() || !Traits::stopLess(posB.stop(), posA.start()))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 2128:        return;
+    #####: 2129:    } else if (Traits::stopLess(posB.stop(), posA.start())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 2130:      // B ends before A begins. Catch up.
+    #####: 2131:      posB.advanceTo(posA.start());
+call    0 never executed
+    #####: 2132:      if (!posB.valid() || !Traits::stopLess(posA.stop(), posB.start()))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 2133:        return;
+        -: 2134:    } else
+        -: 2135:      // Already overlapping.
+        -: 2136:      return;
+        -: 2137:
+        -: 2138:    while (true) {
+        -: 2139:      // Make a.end > b.start.
+    #####: 2140:      posA.advanceTo(posB.start());
+call    0 never executed
+call    1 never executed
+    #####: 2141:      if (!posA.valid() || !Traits::stopLess(posB.stop(), posA.start()))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 2142:        return;
+        -: 2143:      // Make b.end > a.start.
+    #####: 2144:      posB.advanceTo(posA.start());
+call    0 never executed
+    #####: 2145:      if (!posB.valid() || !Traits::stopLess(posA.stop(), posB.start()))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 2146:        return;
+        -: 2147:    }
+        -: 2148:  }
+        -: 2149:
+        -: 2150:public:
+        -: 2151:  /// IntervalMapOverlaps - Create an iterator for the overlaps of a and b.
+function _ZN4llvm19IntervalMapOverlapsINS_11IntervalMapImcLj16ENS_15IntervalMapInfoImEEEES4_EC2ERKS4_S7_ called 0 returned 0% blocks executed 0%
+    #####: 2152:  IntervalMapOverlaps(const MapA &a, const MapB &b)
+    #####: 2153:    : posA(b.empty() ? a.end() : a.find(b.start())),
+    #####: 2154:      posB(posA.valid() ? b.find(posA.start()) : b.end()) { advance(); }
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+        -: 2155:
+        -: 2156:  /// valid - Return true if iterator is at an overlap.
+    #####: 2157:  bool valid() const {
+    #####: 2158:    return posA.valid() && posB.valid();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+        -: 2159:  }
+        -: 2160:
+        -: 2161:  /// a - access the left hand side in the overlap.
+        -: 2162:  const typename MapA::const_iterator &a() const { return posA; }
+        -: 2163:
+        -: 2164:  /// b - access the right hand side in the overlap.
+        -: 2165:  const typename MapB::const_iterator &b() const { return posB; }
+        -: 2166:
+        -: 2167:  /// start - Beginning of the overlapping interval.
+        -: 2168:  KeyType start() const {
+        -: 2169:    KeyType ak = a().start();
+        -: 2170:    KeyType bk = b().start();
+        -: 2171:    return Traits::startLess(ak, bk) ? bk : ak;
+        -: 2172:  }
+        -: 2173:
+        -: 2174:  /// stop - End of the overlapping interval.
+        -: 2175:  KeyType stop() const {
+        -: 2176:    KeyType ak = a().stop();
+        -: 2177:    KeyType bk = b().stop();
+        -: 2178:    return Traits::startLess(ak, bk) ? ak : bk;
+        -: 2179:  }
+        -: 2180:
+        -: 2181:  /// skipA - Move to the next overlap that doesn't involve a().
+        -: 2182:  void skipA() {
+        -: 2183:    ++posA;
+        -: 2184:    advance();
+        -: 2185:  }
+        -: 2186:
+        -: 2187:  /// skipB - Move to the next overlap that doesn't involve b().
+        -: 2188:  void skipB() {
+        -: 2189:    ++posB;
+        -: 2190:    advance();
+        -: 2191:  }
+        -: 2192:
+        -: 2193:  /// Preincrement - Move to the next overlap.
+        -: 2194:  IntervalMapOverlaps &operator++() {
+        -: 2195:    // Bump the iterator that ends first. The other one may have more overlaps.
+        -: 2196:    if (Traits::startLess(posB.stop(), posA.stop()))
+        -: 2197:      skipB();
+        -: 2198:    else
+        -: 2199:      skipA();
+        -: 2200:    return *this;
+        -: 2201:  }
+        -: 2202:
+        -: 2203:  /// advanceTo - Move to the first overlapping interval with
+        -: 2204:  /// stopLess(x, stop()).
+        -: 2205:  void advanceTo(KeyType x) {
+        -: 2206:    if (!valid())
+        -: 2207:      return;
+        -: 2208:    // Make sure advanceTo sees monotonic keys.
+        -: 2209:    if (Traits::stopLess(posA.stop(), x))
+        -: 2210:      posA.advanceTo(x);
+        -: 2211:    if (Traits::stopLess(posB.stop(), x))
+        -: 2212:      posB.advanceTo(x);
+        -: 2213:    advance();
+        -: 2214:  }
+        -: 2215:};
+        -: 2216:
+        -: 2217:} // end namespace llvm
+        -: 2218:
+        -: 2219:#endif // LLVM_ADT_INTERVALMAP_H

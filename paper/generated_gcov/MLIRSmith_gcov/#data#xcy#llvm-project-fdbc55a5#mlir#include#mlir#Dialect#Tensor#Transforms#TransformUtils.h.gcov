@@ -1,0 +1,281 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/include/mlir/Dialect/Tensor/Transforms/TransformUtils.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/Tensor/Transforms/CMakeFiles/obj.MLIRTensorTransforms.dir/ExtractSliceFromReshapeUtils.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Tensor/Transforms/CMakeFiles/obj.MLIRTensorTransforms.dir/ExtractSliceFromReshapeUtils.cpp.gcda
+        -:    0:Runs:116171
+        -:    1://===- TransformsUtils.h - Tensor Transformation Utilities-------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:#ifndef MLIR_DIALECT_TENSOR_TRANSFORMS_TRANSFORMUTILS_H
+        -:    9:#define MLIR_DIALECT_TENSOR_TRANSFORMS_TRANSFORMUTILS_H
+        -:   10:
+        -:   11:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   12:#include "mlir/IR/PatternMatch.h"
+        -:   13:
+        -:   14:namespace mlir {
+        -:   15:namespace tensor {
+        -:   16:
+        -:   17://===----------------------------------------------------------------------===//
+        -:   18:// Extract slice from `tensor.collapse_shape`
+        -:   19://===----------------------------------------------------------------------===//
+        -:   20:
+        -:   21:/// This class assists with generating IR required to materialize an
+        -:   22:/// arbitrary-sized slice from the result of a CollapseShapeOp. In order to
+        -:   23:/// accomplish this, a loop nest or similar operation must be created by the
+        -:   24:/// caller. The purpose of the loop nest is to generate a "tiling by 1" of all
+        -:   25:/// sliced dimensions. The "tiling by 1" assembles all elements of the result
+        -:   26:/// tile over dimensions that would have been impossible to directly slice.
+        -:   27:///
+        -:   28:/// The class provides three methods:
+        -:   29:/// 1. `ExtractSliceFromCollapseHelper::create`: emits IR that should
+        -:   30:/// appear before the loop nest and populates the internal state.
+        -:   31:/// 2. `ExtractSliceFromCollapseHelper::getIterationSpaceSizes`: returns
+        -:   32:/// parameters used by the caller to construct the loop nest.
+        -:   33:/// 3. `ExtractSliceFromCollapseHelper::emitLoopNestBody`:
+        -:   34:/// emits IR to construct a "size-1 tile" of the desired result and returns a
+        -:   35:/// set of ranges where the tile should be inserted into the destination
+        -:   36:/// tensor.
+        -:   37:///
+        -:   38:/// ### Intended usage:
+        -:   39:///
+        -:   40:/// The caller should first call `ExtractSliceFromCollapseHelper::create` and
+        -:   41:/// then create a destination tensor that is the same size as the desired slice.
+        -:   42:/// The caller then creates a loop nest that iterates over the multi-dimensional
+        -:   43:/// iteration space defined by `[0, ub[0]) x [0, ub[1]] x ... x [0, ub[N-1]]`
+        -:   44:/// where `ub` is the upper bound given by
+        -:   45:/// `ExtractSliceFromCollapseHelper::getIterationSpaceSizes`. Inside the body of
+        -:   46:/// the loop nest, the caller should call
+        -:   47:/// `ExtractSliceFromCollapseHelper::emitLoopNestBody` and provide the induction
+        -:   48:/// variables. This returns a sub-tile and a set of ranges that describe where
+        -:   49:/// this tile should be inserted into the result by the caller. For a complete
+        -:   50:/// example of usage, see the examples in the TestTensorTransforms pass.
+        -:   51:///
+        -:   52:/// ### Example:
+        -:   53:/// Consider the following IR:
+        -:   54:/// ```
+        -:   55:/// %0 = linalg.generic ... -> tensor<3x?x?x11x?xf32>
+        -:   56:/// %1 = tensor.collapse_shape %0 [[0, 1, 2], [3, 4]]
+        -:   57:///        : tensor<3x?x?x11x?xf32> into tensor<?x?xf32>
+        -:   58:/// %2 = tensor.extract_slice %1 [%offt0, %offt1][%size0, %size1][1, 1]
+        -:   59:///        : tensor<?x?xf32> to tensor<?x?xf32>
+        -:   60:/// ```
+        -:   61:///
+        -:   62:/// We can construct %2 by generating the following, which only uses `%0`:
+        -:   63:///
+        -:   64:/// ```
+        -:   65:/// %dest = tensor.empty(%size0, %size1) : tensor<?x?xf32>
+        -:   66:/// %1 = tensor.dim %0, %c1 : tensor<3x?x?x11x?xf32>
+        -:   67:/// %2 = tensor.dim %0, %c2 : tensor<3x?x?x11x?xf32>
+        -:   68:/// %3 = tensor.dim %0, %c4 : tensor<3x?x?x11x?xf32>
+        -:   69:///
+        -:   70:/// %result = scf.for %iv0 = %c0 to %arg2 step %c1 iter_args(%arg6 = %dest) ->
+        -:   71:///                                                  (tensor<?x?xf32>) {
+        -:   72:///   %5 = scf.for %iv1 = %c0 to %arg4 step %c1 iter_args(%arg8 = %arg6)
+        -:   73:///                                                  -> (tensor<?x?xf32>) {
+        -:   74:///     %lin0 = (affine.apply) %iv0 + %offt0
+        -:   75:///     %lin1 = (affine.apply) %iv1 + %offt1
+        -:   76:///
+        -:   77:///     %mi0:3 = affine.delinearize_index %lin0 into (%c3, %1, %2)
+        -:   78:///     %mi1:2 = affine.delinearize_index %lin1 into (%c11, %3)
+        -:   79:///
+        -:   80:///     %sub_tile = tensor.extract_slice %0
+        -:   81:///                    [%mi0#0, %mi0#1, %mi0#2, %mi1#0, %mi1#1]
+        -:   82:///                    [1, 1, 1, 1, 1]
+        -:   83:///                    [1, 1, 1, 1, 1]
+        -:   84:///            : tensor<3x?x?x11x?xf32> to tensor<1x1x1x1x1xf32>
+        -:   85:///     %sub_tile_collapsed = tensor.collapse_shape %sub_tile
+        -:   86:///             [[0, 1, 2], [3, 4]]
+        -:   87:///            : tensor<1x1x1x1x1xf32> into tensor<1x1xf3
+        -:   88:///
+        -:   89:///     %12 = tensor.insert_slice %sub_tile_collapsed into
+        -:   90:///             %arg8[%iv0, %iv1] [1, 1] [1, 1]
+        -:   91:///             : tensor<1x1xf32> into tensor<?x?xf32>
+        -:   92:///     scf.yield %12 : tensor<?x?xf32>
+        -:   93:///   }
+        -:   94:///   scf.yield %5 : tensor<?x?xf32>
+        -:   95:/// }
+        -:   96:/// ```
+        -:   97:///
+        -:   98:/// ### Explanation of example:
+        -:   99:///
+        -:  100:/// Each step above is explained below.
+        -:  101:///
+        -:  102:/// #### Step 0: Create %dest and materialization of shapes.
+        -:  103:/// This step is self-explanatory and performed by the caller. It can be
+        -:  104:/// done before or after calling `ExtractSliceFromCollapseHelper::create`,
+        -:  105:/// which materializes the source shape (`%0, %1, %2`).
+        -:  106:///
+        -:  107:/// #### Step 1: Create loop nest.
+        -:  108:///
+        -:  109:/// The caller creates the loop nest (depicted here is `scf.for`, but any other
+        -:  110:/// similar op can be used). The iteration should start at zero and proceed with
+        -:  111:/// step size 1 to the upper bounds given by
+        -:  112:/// `ExtractSliceFromCollapseHelper::getIterationSpaceSizes`. This forms the
+        -:  113:/// basis for the "tiling by 1".
+        -:  114:///
+        -:  115:/// #### Step 2: Transform (%iv0, %iv1) from the index space of %3 to the index
+        -:  116:/// space of %0.
+        -:  117:///
+        -:  118:/// This step is performed by
+        -:  119:/// `ExtractSliceFromCollapseHelper::emitLoopNestBody`.
+        -:  120:///
+        -:  121:/// The induction variables `%iv0` and `%iv1` live in the
+        -:  122:/// index space of %2 (for dimensions 0 and 1, respectively). `%lin0` and
+        -:  123:/// `%lin1` are the result of inverting or resolve the index space
+        -:  124:/// transformation represented by the slice operation, accounting for offset and
+        -:  125:/// stride. Subsequently, `%mi0` and `%mi1` are the result of applying the
+        -:  126:/// inverse index space transformation represented by `tensor.collapse_shape`.
+        -:  127:/// This is accomplished using `affine.delinearize_index`. Note that %iv0
+        -:  128:/// and %iv1 now correspond to multi-indices `%mi0:3` and `%mi1:2`.
+        -:  129:///
+        -:  130:/// #### Step 3: Extract a sub-tile slice from the source.
+        -:  131:///
+        -:  132:/// This step is also performed by
+        -:  133:/// `ExtractSliceFromCollapseHelper::emitLoopNestBody`.
+        -:  134:///
+        -:  135:/// The indices `%mi0` and `%mi1` are used to extract a slice from %0.  This
+        -:  136:/// slice is then collapsed down to match the result rank.
+        -:  137:///
+        -:  138:/// #### Step 4: Insert sub-tile into the destination
+        -:  139:///
+        -:  140:/// This step is performed by the caller using the results of
+        -:  141:/// `ExtractSliceFromCollapseHelper::emitLoopNestBody`.
+        -:  142:///
+        -:  143:/// In the above example, the slice insertion parameters are straightforward,
+        -:  144:/// but in other possible situations, the slice parameters are more complicated,
+        -:  145:/// which is why this helper calculates them for the caller. These other
+        -:  146:/// situations correspond to:
+        -:  147:/// 1. The presence of linearized dimensions that are not sliced
+        -:  148:/// 2. The presence of non-linearized dimensions that are sliced.
+        -:  149:class ExtractSliceFromCollapseHelper {
+        -:  150:public:
+        -:  151:  /// Given a CollapseShapeOp and a set of ranges describing the desired slice
+        -:  152:  /// of its result, emits IR to materialize the shapes of the input and output
+        -:  153:  /// tensors, and returns an instance of the initialized class. Returns failure
+        -:  154:  /// if the slice is rank-reducing.
+        -:  155:  static FailureOr<ExtractSliceFromCollapseHelper>
+        -:  156:  create(OpBuilder &b, tensor::CollapseShapeOp op, ArrayRef<Range> sliceParams);
+        -:  157:
+        -:  158:  /// Given a CollapseShapeOp and an ExtractSliceOp acting on its result, emits
+        -:  159:  /// IR to materialize the shapes of the input and output tensors of the
+        -:  160:  /// CollapseShapeOp, and returns an instance of the initialized class. Returns
+        -:  161:  /// failure if the slice is rank-reducing.
+        -:  162:  static FailureOr<ExtractSliceFromCollapseHelper>
+        -:  163:  create(OpBuilder &b, tensor::CollapseShapeOp collapseOp,
+        -:  164:         tensor::ExtractSliceOp extractOp);
+        -:  165:
+function _ZN4mlir6tensor30ExtractSliceFromCollapseHelperC2ENS0_15CollapseShapeOpEN4llvm8ArrayRefINS_12OpFoldResultEEES6_NS4_INS_5RangeEEERKNS3_14SmallBitVectorESB_NS4_INS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  166:  ExtractSliceFromCollapseHelper(
+        -:  167:      tensor::CollapseShapeOp collapseShapeOp,
+        -:  168:      ArrayRef<OpFoldResult> collapseShapeInputShape,
+        -:  169:      ArrayRef<OpFoldResult> collapseShapeOutputShape,
+        -:  170:      ArrayRef<Range> extractSliceParams,
+        -:  171:      const llvm::SmallBitVector &linearizedDimensions,
+        -:  172:      const llvm::SmallBitVector &slicedDimensions, ArrayRef<Value> tiledSizes)
+    #####:  173:      : collapseShapeOp(collapseShapeOp),
+        -:  174:        collapseShapeInputShape(collapseShapeInputShape),
+        -:  175:        collapseShapeOutputShape(collapseShapeOutputShape),
+        -:  176:        sliceParams(extractSliceParams),
+        -:  177:        linearizedDimensions(linearizedDimensions),
+    #####:  178:        slicedDimensions(slicedDimensions), tiledSizes(tiledSizes) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  179:
+        -:  180:  /// Return the upper bounds of the iteration space (with 0 offset and stride
+        -:  181:  /// 1) required to create the desired slice. Note that this is not the same
+        -:  182:  /// as the `sizes` parameters of the ExtractSliceOp because not all dimensions
+        -:  183:  /// of the slice are required to be tiled to form the result.
+        -:  184:  const SmallVector<Value> &getIterationSpaceSizes() { return tiledSizes; }
+        -:  185:
+        -:  186:  /// Generates the IR inside of the caller's loop nest for 1) inverting the
+        -:  187:  /// index mappings of the ExtractSliceOp->CollapseShapeOp chain and 2)
+        -:  188:  /// extracting the CollapseShapeOp source tensor tile for this specified
+        -:  189:  /// iteration space point `tileInductionVars` and 3) calculating where to
+        -:  190:  /// insert the extracted tile. The returned pair consists of the results of
+        -:  191:  /// (2) and (3) and should be used by the caller to insert into the
+        -:  192:  /// destination tensor.
+        -:  193:  std::pair<Value, SmallVector<Range>>
+        -:  194:  emitLoopNestBody(OpBuilder &builder, Location loc,
+        -:  195:                   ValueRange tileInductionVars);
+        -:  196:
+        -:  197:private:
+        -:  198:  tensor::CollapseShapeOp collapseShapeOp;
+        -:  199:  SmallVector<OpFoldResult> collapseShapeInputShape;
+        -:  200:  SmallVector<OpFoldResult> collapseShapeOutputShape;
+        -:  201:  SmallVector<Range> sliceParams;
+        -:  202:  llvm::SmallBitVector linearizedDimensions;
+        -:  203:  llvm::SmallBitVector slicedDimensions;
+        -:  204:  SmallVector<Value> tiledSizes;
+        -:  205:};
+        -:  206:
+        -:  207:/// Tries to simplify a `tensor.collapse_shape` operation by inserting a single
+        -:  208:/// rank-reducing `tensor.extract_slice` operation. The `extract_slice` op will
+        -:  209:/// either take the place of the source, allowing for a new, simpler
+        -:  210:/// `collapse_shape` op to replace `op`, or the `collapse_shape` op will be
+        -:  211:/// completely replaced by the `extract_slice` result. Either way, `op` is
+        -:  212:/// replaced and new new op is returned.
+        -:  213:///
+        -:  214:/// ### Example:
+        -:  215:/// ```
+        -:  216:/// %result = tensor.collapse_shape %0 [[0, 1], [2, 3]]
+        -:  217:///    : tensor<?x1x30x10xf32> to tensor<?x300xf32>
+        -:  218:/// ```
+        -:  219:/// can be transformed to
+        -:  220:///
+        -:  221:/// ```
+        -:  222:/// %tmp = tensor.extract_slice %0 [0, 0, 0, 0]
+        -:  223:///                         [0, %dim1, 30, 30]
+        -:  224:///                         [1, 1, 1 1]
+        -:  225:///   : tensor<?x1x30x10xf32> to tensor<?x30x10xf32>
+        -:  226:/// %result = tensor.collapse_shape %tmp [[0], [1, 2]]
+        -:  227:///   : tensor<?x30x10xf32> to tensor<?x300xf32>
+        -:  228:/// ```
+        -:  229:///
+        -:  230:/// ### Example:
+        -:  231:///
+        -:  232:/// ```
+        -:  233:/// %result = tensor.collapse_shape %1 [[0, 1], [2]]
+        -:  234:///    : tensor<?x1x30xf32> to tensor<?x30xf32>
+        -:  235:/// ```
+        -:  236:/// can be transformed to
+        -:  237:/// ```
+        -:  238:/// %result = tensor.extract_slice %1 [0, 0, 0]
+        -:  239:///                                   [%dim2, 1, 30]
+        -:  240:///                                   [1, 1, 1]
+        -:  241:///    : tensor<?x1x30xf32> to tensor<?x30xf32>
+        -:  242:/// ```
+        -:  243:///
+        -:  244:/// ### Unsupported cases:
+        -:  245:///
+        -:  246:/// This transform doesn't yet support reducing the rank of the reassociation
+        -:  247:/// indices, which would require inserting a `tensor.expand_shape` op similar to
+        -:  248:/// the following example:
+        -:  249:/// ```
+        -:  250:/// %result = tensor.collapse_shape %0 [[0, 1], [2, 3]]
+        -:  251:///    : tensor<1x1x30x10xf32> to tensor<1x300xf32>
+        -:  252:/// ```
+        -:  253:/// can be transformed to
+        -:  254:/// ```
+        -:  255:/// %tmp = tensor.extract_slice %0 [0, 0, 0, 0]
+        -:  256:///                         [0, 1, 30, 30]
+        -:  257:///                         [1, 1, 1 1]
+        -:  258:///   : tensor<1x1x30x10xf32> to tensor<30x10xf32>
+        -:  259:/// %result0 = tensor.collapse_shape %tmp [[0, 1]]
+        -:  260:///   : tensor<30x10xf32> to tensor<300xf32>
+        -:  261:/// %result1 = tensor.expand_shape %tmp [[0, 1], [2]] :... tensor<1x300xf32>
+        -:  262:/// ```
+        -:  263:///
+        -:  264:FailureOr<Operation *>
+        -:  265:simplifyCollapseShapeWithRankReducingExtractSlice(tensor::CollapseShapeOp op,
+        -:  266:                                                  RewriterBase &rewriter);
+        -:  267:} // namespace tensor
+        -:  268:} // namespace mlir
+        -:  269:
+        -:  270:#endif // MLIR_DIALECT_TENSOR_TRANSFORMS_TRANSFORMUTILS_H

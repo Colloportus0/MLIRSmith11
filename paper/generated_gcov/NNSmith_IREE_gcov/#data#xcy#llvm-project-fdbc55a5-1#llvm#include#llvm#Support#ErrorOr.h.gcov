@@ -1,0 +1,288 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/llvm/include/llvm/Support/ErrorOr.h
+        -:    0:Graph:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcda
+        -:    0:Runs:325564
+        -:    1://===- llvm/Support/ErrorOr.h - Error Smart Pointer -------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:///
+        -:    9:/// \file
+        -:   10:///
+        -:   11:/// Provides ErrorOr<T> smart pointer.
+        -:   12:///
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#ifndef LLVM_SUPPORT_ERROROR_H
+        -:   16:#define LLVM_SUPPORT_ERROROR_H
+        -:   17:
+        -:   18:#include "llvm/Support/AlignOf.h"
+        -:   19:#include <cassert>
+        -:   20:#include <system_error>
+        -:   21:#include <type_traits>
+        -:   22:#include <utility>
+        -:   23:
+        -:   24:namespace llvm {
+        -:   25:
+        -:   26:/// Represents either an error or a value T.
+        -:   27:///
+        -:   28:/// ErrorOr<T> is a pointer-like class that represents the result of an
+        -:   29:/// operation. The result is either an error, or a value of type T. This is
+        -:   30:/// designed to emulate the usage of returning a pointer where nullptr indicates
+        -:   31:/// failure. However instead of just knowing that the operation failed, we also
+        -:   32:/// have an error_code and optional user data that describes why it failed.
+        -:   33:///
+        -:   34:/// It is used like the following.
+        -:   35:/// \code
+        -:   36:///   ErrorOr<Buffer> getBuffer();
+        -:   37:///
+        -:   38:///   auto buffer = getBuffer();
+        -:   39:///   if (error_code ec = buffer.getError())
+        -:   40:///     return ec;
+        -:   41:///   buffer->write("adena");
+        -:   42:/// \endcode
+        -:   43:///
+        -:   44:///
+        -:   45:/// Implicit conversion to bool returns true if there is a usable value. The
+        -:   46:/// unary * and -> operators provide pointer like access to the value. Accessing
+        -:   47:/// the value when there is an error has undefined behavior.
+        -:   48:///
+        -:   49:/// When T is a reference type the behavior is slightly different. The reference
+        -:   50:/// is held in a std::reference_wrapper<std::remove_reference<T>::type>, and
+        -:   51:/// there is special handling to make operator -> work as if T was not a
+        -:   52:/// reference.
+        -:   53:///
+        -:   54:/// T cannot be a rvalue reference.
+        -:   55:template<class T>
+        -:   56:class ErrorOr {
+        -:   57:  template <class OtherT> friend class ErrorOr;
+        -:   58:
+        -:   59:  static constexpr bool isRef = std::is_reference<T>::value;
+        -:   60:
+        -:   61:  using wrap = std::reference_wrapper<std::remove_reference_t<T>>;
+        -:   62:
+        -:   63:public:
+        -:   64:  using storage_type = std::conditional_t<isRef, wrap, T>;
+        -:   65:
+        -:   66:private:
+        -:   67:  using reference = std::remove_reference_t<T> &;
+        -:   68:  using const_reference = const std::remove_reference_t<T> &;
+        -:   69:  using pointer = std::remove_reference_t<T> *;
+        -:   70:  using const_pointer = const std::remove_reference_t<T> *;
+        -:   71:
+        -:   72:public:
+        -:   73:  template <class E>
+        -:   74:  ErrorOr(E ErrorCode,
+        -:   75:          std::enable_if_t<std::is_error_code_enum<E>::value ||
+        -:   76:                               std::is_error_condition_enum<E>::value,
+        -:   77:                           void *> = nullptr)
+        -:   78:      : HasError(true) {
+        -:   79:    new (getErrorStorage()) std::error_code(make_error_code(ErrorCode));
+        -:   80:  }
+        -:   81:
+        -:   82:  ErrorOr(std::error_code EC) : HasError(true) {
+        -:   83:    new (getErrorStorage()) std::error_code(EC);
+        -:   84:  }
+        -:   85:
+        -:   86:  template <class OtherT>
+        -:   87:  ErrorOr(OtherT &&Val,
+        -:   88:          std::enable_if_t<std::is_convertible<OtherT, T>::value> * = nullptr)
+        -:   89:      : HasError(false) {
+        -:   90:    new (getStorage()) storage_type(std::forward<OtherT>(Val));
+        -:   91:  }
+        -:   92:
+        -:   93:  ErrorOr(const ErrorOr &Other) {
+        -:   94:    copyConstruct(Other);
+        -:   95:  }
+        -:   96:
+        -:   97:  template <class OtherT>
+        -:   98:  ErrorOr(const ErrorOr<OtherT> &Other,
+        -:   99:          std::enable_if_t<std::is_convertible<OtherT, T>::value> * = nullptr) {
+        -:  100:    copyConstruct(Other);
+        -:  101:  }
+        -:  102:
+        -:  103:  template <class OtherT>
+        -:  104:  explicit ErrorOr(
+        -:  105:      const ErrorOr<OtherT> &Other,
+        -:  106:      std::enable_if_t<!std::is_convertible<OtherT, const T &>::value> * =
+        -:  107:          nullptr) {
+        -:  108:    copyConstruct(Other);
+        -:  109:  }
+        -:  110:
+        -:  111:  ErrorOr(ErrorOr &&Other) {
+        -:  112:    moveConstruct(std::move(Other));
+        -:  113:  }
+        -:  114:
+        -:  115:  template <class OtherT>
+        -:  116:  ErrorOr(ErrorOr<OtherT> &&Other,
+        -:  117:          std::enable_if_t<std::is_convertible<OtherT, T>::value> * = nullptr) {
+        -:  118:    moveConstruct(std::move(Other));
+        -:  119:  }
+        -:  120:
+        -:  121:  // This might eventually need SFINAE but it's more complex than is_convertible
+        -:  122:  // & I'm too lazy to write it right now.
+        -:  123:  template <class OtherT>
+        -:  124:  explicit ErrorOr(
+        -:  125:      ErrorOr<OtherT> &&Other,
+        -:  126:      std::enable_if_t<!std::is_convertible<OtherT, T>::value> * = nullptr) {
+        -:  127:    moveConstruct(std::move(Other));
+        -:  128:  }
+        -:  129:
+        -:  130:  ErrorOr &operator=(const ErrorOr &Other) {
+        -:  131:    copyAssign(Other);
+        -:  132:    return *this;
+        -:  133:  }
+        -:  134:
+        -:  135:  ErrorOr &operator=(ErrorOr &&Other) {
+        -:  136:    moveAssign(std::move(Other));
+        -:  137:    return *this;
+        -:  138:  }
+        -:  139:
+    #####:  140:  ~ErrorOr() {
+    #####:  141:    if (!HasError)
+branch  0 never executed
+branch  1 never executed
+    #####:  142:      getStorage()->~storage_type();
+    #####:  143:  }
+        -:  144:
+        -:  145:  /// Return false if there is an error.
+        -:  146:  explicit operator bool() const {
+        -:  147:    return !HasError;
+        -:  148:  }
+        -:  149:
+        -:  150:  reference get() { return *getStorage(); }
+        -:  151:  const_reference get() const { return const_cast<ErrorOr<T> *>(this)->get(); }
+        -:  152:
+    #####:  153:  std::error_code getError() const {
+    #####:  154:    return HasError ? *getErrorStorage() : std::error_code();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  155:  }
+        -:  156:
+        -:  157:  pointer operator ->() {
+        -:  158:    return toPointer(getStorage());
+        -:  159:  }
+        -:  160:
+        -:  161:  const_pointer operator->() const { return toPointer(getStorage()); }
+        -:  162:
+    #####:  163:  reference operator *() {
+    #####:  164:    return *getStorage();
+call    0 never executed
+        -:  165:  }
+        -:  166:
+        -:  167:  const_reference operator*() const { return *getStorage(); }
+        -:  168:
+        -:  169:private:
+        -:  170:  template <class OtherT>
+        -:  171:  void copyConstruct(const ErrorOr<OtherT> &Other) {
+        -:  172:    if (!Other.HasError) {
+        -:  173:      // Get the other value.
+        -:  174:      HasError = false;
+        -:  175:      new (getStorage()) storage_type(*Other.getStorage());
+        -:  176:    } else {
+        -:  177:      // Get other's error.
+        -:  178:      HasError = true;
+        -:  179:      new (getErrorStorage()) std::error_code(Other.getError());
+        -:  180:    }
+        -:  181:  }
+        -:  182:
+        -:  183:  template <class T1>
+        -:  184:  static bool compareThisIfSameType(const T1 &a, const T1 &b) {
+        -:  185:    return &a == &b;
+        -:  186:  }
+        -:  187:
+        -:  188:  template <class T1, class T2>
+        -:  189:  static bool compareThisIfSameType(const T1 &a, const T2 &b) {
+        -:  190:    return false;
+        -:  191:  }
+        -:  192:
+        -:  193:  template <class OtherT>
+        -:  194:  void copyAssign(const ErrorOr<OtherT> &Other) {
+        -:  195:    if (compareThisIfSameType(*this, Other))
+        -:  196:      return;
+        -:  197:
+        -:  198:    this->~ErrorOr();
+        -:  199:    new (this) ErrorOr(Other);
+        -:  200:  }
+        -:  201:
+        -:  202:  template <class OtherT>
+        -:  203:  void moveConstruct(ErrorOr<OtherT> &&Other) {
+        -:  204:    if (!Other.HasError) {
+        -:  205:      // Get the other value.
+        -:  206:      HasError = false;
+        -:  207:      new (getStorage()) storage_type(std::move(*Other.getStorage()));
+        -:  208:    } else {
+        -:  209:      // Get other's error.
+        -:  210:      HasError = true;
+        -:  211:      new (getErrorStorage()) std::error_code(Other.getError());
+        -:  212:    }
+        -:  213:  }
+        -:  214:
+        -:  215:  template <class OtherT>
+        -:  216:  void moveAssign(ErrorOr<OtherT> &&Other) {
+        -:  217:    if (compareThisIfSameType(*this, Other))
+        -:  218:      return;
+        -:  219:
+        -:  220:    this->~ErrorOr();
+        -:  221:    new (this) ErrorOr(std::move(Other));
+        -:  222:  }
+        -:  223:
+        -:  224:  pointer toPointer(pointer Val) {
+        -:  225:    return Val;
+        -:  226:  }
+        -:  227:
+        -:  228:  const_pointer toPointer(const_pointer Val) const { return Val; }
+        -:  229:
+        -:  230:  pointer toPointer(wrap *Val) {
+        -:  231:    return &Val->get();
+        -:  232:  }
+        -:  233:
+        -:  234:  const_pointer toPointer(const wrap *Val) const { return &Val->get(); }
+        -:  235:
+    #####:  236:  storage_type *getStorage() {
+    #####:  237:    assert(!HasError && "Cannot get value when an error exists!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  238:    return reinterpret_cast<storage_type *>(&TStorage);
+branch  0 never executed
+branch  1 never executed
+        -:  239:  }
+        -:  240:
+        -:  241:  const storage_type *getStorage() const {
+        -:  242:    assert(!HasError && "Cannot get value when an error exists!");
+        -:  243:    return reinterpret_cast<const storage_type *>(&TStorage);
+        -:  244:  }
+        -:  245:
+    #####:  246:  std::error_code *getErrorStorage() {
+        -:  247:    assert(HasError && "Cannot get error when a value exists!");
+        -:  248:    return reinterpret_cast<std::error_code *>(&ErrorStorage);
+        -:  249:  }
+        -:  250:
+    #####:  251:  const std::error_code *getErrorStorage() const {
+    #####:  252:    return const_cast<ErrorOr<T> *>(this)->getErrorStorage();
+        -:  253:  }
+        -:  254:
+        -:  255:  union {
+        -:  256:    AlignedCharArrayUnion<storage_type> TStorage;
+        -:  257:    AlignedCharArrayUnion<std::error_code> ErrorStorage;
+        -:  258:  };
+        -:  259:  bool HasError : 1;
+        -:  260:};
+        -:  261:
+        -:  262:template <class T, class E>
+        -:  263:std::enable_if_t<std::is_error_code_enum<E>::value ||
+        -:  264:                     std::is_error_condition_enum<E>::value,
+        -:  265:                 bool>
+        -:  266:operator==(const ErrorOr<T> &Err, E Code) {
+        -:  267:  return Err.getError() == Code;
+        -:  268:}
+        -:  269:
+        -:  270:} // end namespace llvm
+        -:  271:
+        -:  272:#endif // LLVM_SUPPORT_ERROROR_H

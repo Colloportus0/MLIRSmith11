@@ -1,0 +1,1481 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Transforms/Inliner.cpp
+        -:    0:Graph:../tools/mlir/lib/Transforms/CMakeFiles/obj.MLIRTransforms.dir/Inliner.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Transforms/CMakeFiles/obj.MLIRTransforms.dir/Inliner.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===- Inliner.cpp - Pass to inline function calls ------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a basic inlining algorithm that operates bottom up over
+        -:   10:// the Strongly Connect Components(SCCs) of the CallGraph. This enables a more
+        -:   11:// incremental propagation of inlining decisions from the leafs to the roots of
+        -:   12:// the callgraph.
+        -:   13://
+        -:   14://===----------------------------------------------------------------------===//
+        -:   15:
+        -:   16:#include "mlir/Transforms/Passes.h"
+        -:   17:
+        -:   18:#include "mlir/Analysis/CallGraph.h"
+        -:   19:#include "mlir/IR/Threading.h"
+        -:   20:#include "mlir/Interfaces/CallInterfaces.h"
+        -:   21:#include "mlir/Interfaces/SideEffectInterfaces.h"
+        -:   22:#include "mlir/Pass/PassManager.h"
+        -:   23:#include "mlir/Support/DebugStringHelper.h"
+        -:   24:#include "mlir/Transforms/InliningUtils.h"
+        -:   25:#include "llvm/ADT/SCCIterator.h"
+        -:   26:#include "llvm/Support/Debug.h"
+        -:   27:
+        -:   28:namespace mlir {
+        -:   29:#define GEN_PASS_DEF_INLINER
+        -:   30:#include "mlir/Transforms/Passes.h.inc"
+        -:   31:} // namespace mlir
+        -:   32:
+        -:   33:#define DEBUG_TYPE "inlining"
+        -:   34:
+        -:   35:using namespace mlir;
+        -:   36:
+        -:   37:/// This function implements the default inliner optimization pipeline.
+function _ZL25defaultInlinerOptPipelineRN4mlir13OpPassManagerE called 515 returned 100% blocks executed 67%
+      515:   38:static void defaultInlinerOptPipeline(OpPassManager &pm) {
+      515:   39:  pm.addPass(createCanonicalizerPass());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+      515:   40:}
+        -:   41:
+        -:   42://===----------------------------------------------------------------------===//
+        -:   43:// Symbol Use Tracking
+        -:   44://===----------------------------------------------------------------------===//
+        -:   45:
+        -:   46:/// Walk all of the used symbol callgraph nodes referenced with the given op.
+function _ZL25walkReferencedSymbolNodesPN4mlir9OperationERNS_9CallGraphERNS_21SymbolTableCollectionERN4llvm8DenseMapINS_9AttributeEPNS_13CallGraphNodeENS6_12DenseMapInfoIS8_vEENS6_6detail12DenseMapPairIS8_SA_EEEENS6_12function_refIFvSA_S1_EEE called 23781 returned 100% blocks executed 93%
+    23781:   47:static void walkReferencedSymbolNodes(
+        -:   48:    Operation *op, CallGraph &cg, SymbolTableCollection &symbolTable,
+        -:   49:    DenseMap<Attribute, CallGraphNode *> &resolvedRefs,
+        -:   50:    function_ref<void(CallGraphNode *, Operation *)> callback) {
+    23781:   51:  auto symbolUses = SymbolTable::getSymbolUses(op);
+call    0 returned 100%
+   23781*:   52:  assert(symbolUses && "expected uses to be valid");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:   53:
+    23781:   54:  Operation *symbolTableOp = op->getParentOp();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    62450:   55:  for (const SymbolTable::SymbolUse &use : *symbolUses) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 62% (fallthrough)
+branch  3 taken 38%
+call    4 returned 100%
+    38669:   56:    auto refIt = resolvedRefs.insert({use.getSymbolRef(), nullptr});
+call    0 returned 100%
+    38669:   57:    CallGraphNode *&node = refIt.first->second;
+call    0 returned 100%
+        -:   58:
+        -:   59:    // If this is the first instance of this reference, try to resolve a
+        -:   60:    // callgraph node for it.
+    38669:   61:    if (refIt.second) {
+branch  0 taken 58% (fallthrough)
+branch  1 taken 42%
+    22297:   62:      auto *symbolOp = symbolTable.lookupNearestSymbolFrom(symbolTableOp,
+call    0 returned 100%
+        -:   63:                                                           use.getSymbolRef());
+    22297:   64:      auto callableOp = dyn_cast_or_null<CallableOpInterface>(symbolOp);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    22297:   65:      if (!callableOp)
+branch  0 taken 35% (fallthrough)
+branch  1 taken 65%
+     7847:   66:        continue;
+    14450:   67:      node = cg.lookupNode(callableOp.getCallableRegion());
+call    0 returned 100%
+call    1 returned 100%
+        -:   68:    }
+    30822:   69:    if (node)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+    30822:   70:      callback(node, use.getUser());
+call    0 returned 100%
+        -:   71:  }
+    23781:   72:}
+        -:   73:
+        -:   74://===----------------------------------------------------------------------===//
+        -:   75:// CGUseList
+        -:   76:
+        -:   77:namespace {
+        -:   78:/// This struct tracks the uses of callgraph nodes that can be dropped when
+        -:   79:/// use_empty. It directly tracks and manages a use-list for all of the
+        -:   80:/// call-graph nodes. This is necessary because many callgraph nodes are
+        -:   81:/// referenced by SymbolRefAttr, which has no mechanism akin to the SSA `Use`
+        -:   82:/// class.
+        -:   83:struct CGUseList {
+        -:   84:  /// This struct tracks the uses of callgraph nodes within a specific
+        -:   85:  /// operation.
+   20620*:   86:  struct CGUser {
+call    0 never executed
+call    1 returned 100%
+        -:   87:    /// Any nodes referenced in the top-level attribute list of this user. We
+        -:   88:    /// use a set here because the number of references does not matter.
+        -:   89:    DenseSet<CallGraphNode *> topLevelUses;
+        -:   90:
+        -:   91:    /// Uses of nodes referenced by nested operations.
+        -:   92:    DenseMap<CallGraphNode *, int> innerUses;
+        -:   93:  };
+        -:   94:
+        -:   95:  CGUseList(Operation *op, CallGraph &cg, SymbolTableCollection &symbolTable);
+        -:   96:
+        -:   97:  /// Drop uses of nodes referred to by the given call operation that resides
+        -:   98:  /// within 'userNode'.
+        -:   99:  void dropCallUses(CallGraphNode *userNode, Operation *callOp, CallGraph &cg);
+        -:  100:
+        -:  101:  /// Remove the given node from the use list.
+        -:  102:  void eraseNode(CallGraphNode *node);
+        -:  103:
+        -:  104:  /// Returns true if the given callgraph node has no uses and can be pruned.
+        -:  105:  bool isDead(CallGraphNode *node) const;
+        -:  106:
+        -:  107:  /// Returns true if the given callgraph node has a single use and can be
+        -:  108:  /// discarded.
+        -:  109:  bool hasOneUseAndDiscardable(CallGraphNode *node) const;
+        -:  110:
+        -:  111:  /// Recompute the uses held by the given callgraph node.
+        -:  112:  void recomputeUses(CallGraphNode *node, CallGraph &cg);
+        -:  113:
+        -:  114:  /// Merge the uses of 'lhs' with the uses of the 'rhs' after inlining a copy
+        -:  115:  /// of 'lhs' into 'rhs'.
+        -:  116:  void mergeUsesAfterInlining(CallGraphNode *lhs, CallGraphNode *rhs);
+        -:  117:
+        -:  118:private:
+        -:  119:  /// Decrement the uses of discardable nodes referenced by the given user.
+        -:  120:  void decrementDiscardableUses(CGUser &uses);
+        -:  121:
+        -:  122:  /// A mapping between a discardable callgraph node (that is a symbol) and the
+        -:  123:  /// number of uses for this node.
+        -:  124:  DenseMap<CallGraphNode *, int> discardableSymNodeUses;
+        -:  125:
+        -:  126:  /// A mapping between a callgraph node and the symbol callgraph nodes that it
+        -:  127:  /// uses.
+        -:  128:  DenseMap<CallGraphNode *, CGUser> nodeUses;
+        -:  129:
+        -:  130:  /// A symbol table to use when resolving call lookups.
+        -:  131:  SymbolTableCollection &symbolTable;
+        -:  132:};
+        -:  133:} // namespace
+        -:  134:
+function _ZN12_GLOBAL__N_19CGUseListC2EPN4mlir9OperationERNS1_9CallGraphERNS1_21SymbolTableCollectionE called 515 returned 100% blocks executed 100%
+      515:  135:CGUseList::CGUseList(Operation *op, CallGraph &cg,
+      515:  136:                     SymbolTableCollection &symbolTable)
+      515:  137:    : symbolTable(symbolTable) {
+call    0 returned 100%
+call    1 returned 100%
+        -:  138:  /// A set of callgraph nodes that are always known to be live during inlining.
+      515:  139:  DenseMap<Attribute, CallGraphNode *> alwaysLiveNodes;
+call    0 returned 100%
+        -:  140:
+        -:  141:  // Walk each of the symbol tables looking for discardable callgraph nodes.
+function _ZZN12_GLOBAL__N_19CGUseListC4EPN4mlir9OperationERNS1_9CallGraphERNS1_21SymbolTableCollectionEENKUlS3_bE_clES3_b called 520 returned 100% blocks executed 88%
+     1035:  142:  auto walkFn = [&](Operation *symbolTableOp, bool allUsesVisible) {
+    13991:  143:    for (Operation &op : symbolTableOp->getRegion(0).getOps()) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 96% (fallthrough)
+branch  3 taken 4%
+call    4 returned 100%
+        -:  144:      // If this is a callgraph operation, check to see if it is discardable.
+    13471:  145:      if (auto callable = dyn_cast<CallableOpInterface>(&op)) {
+call    0 returned 100%
+branch  1 taken 77% (fallthrough)
+branch  2 taken 23%
+    13471:  146:        if (auto *node = cg.lookupNode(callable.getCallableRegion())) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+call    4 returned 100%
+    10310:  147:          SymbolOpInterface symbol = dyn_cast<SymbolOpInterface>(&op);
+call    0 returned 100%
+   20620*:  148:          if (symbol && (allUsesVisible || symbol.isPrivate()) &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 taken 1% (fallthrough)
+branch  8 taken 100%
+    10310:  149:              symbol.canDiscardOnUseEmpty()) {
+call    0 returned 100%
+       40:  150:            discardableSymNodeUses.try_emplace(node, 0);
+call    0 returned 100%
+        -:  151:          }
+    10310:  152:          continue;
+        -:  153:        }
+        -:  154:      }
+        -:  155:      // Otherwise, check for any referenced nodes. These will be always-live.
+     3161:  156:      walkReferencedSymbolNodes(&op, cg, symbolTable, alwaysLiveNodes,
+call    0 returned 100%
+    #####:  157:                                [](CallGraphNode *, Operation *) {});
+        -:  158:    }
+     1035:  159:  };
+      515:  160:  SymbolTable::walkSymbolTables(op, /*allSymUsesVisible=*/!op->getBlock(),
+call    0 returned 100%
+        -:  161:                                walkFn);
+        -:  162:
+        -:  163:  // Drop the use information for any discardable nodes that are always live.
+     1545:  164:  for (auto &it : alwaysLiveNodes)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 50% (fallthrough)
+branch  4 taken 50%
+call    5 returned 100%
+call    6 returned 100%
+      515:  165:    discardableSymNodeUses.erase(it.second);
+call    0 returned 100%
+        -:  166:
+        -:  167:  // Compute the uses for each of the callable nodes in the graph.
+    10825:  168:  for (CallGraphNode *node : cg)
+branch  0 taken 95% (fallthrough)
+branch  1 taken 5%
+    10310:  169:    recomputeUses(node, cg);
+call    0 returned 100%
+      515:  170:}
+        -:  171:
+function _ZN12_GLOBAL__N_19CGUseList12dropCallUsesEPN4mlir13CallGraphNodeEPNS1_9OperationERNS1_9CallGraphE called 0 returned 0% blocks executed 0%
+    #####:  172:void CGUseList::dropCallUses(CallGraphNode *userNode, Operation *callOp,
+        -:  173:                             CallGraph &cg) {
+    #####:  174:  auto &userRefs = nodeUses[userNode].innerUses;
+call    0 never executed
+function _ZZN12_GLOBAL__N_19CGUseList12dropCallUsesEPN4mlir13CallGraphNodeEPNS1_9OperationERNS1_9CallGraphEENKUlS3_S5_E_clES3_S5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  175:  auto walkFn = [&](CallGraphNode *node, Operation *user) {
+    #####:  176:    auto parentIt = userRefs.find(node);
+call    0 never executed
+    #####:  177:    if (parentIt == userRefs.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  178:      return;
+    #####:  179:    --parentIt->second;
+call    0 never executed
+    #####:  180:    --discardableSymNodeUses[node];
+call    0 never executed
+    #####:  181:  };
+    #####:  182:  DenseMap<Attribute, CallGraphNode *> resolvedRefs;
+call    0 never executed
+    #####:  183:  walkReferencedSymbolNodes(callOp, cg, symbolTable, resolvedRefs, walkFn);
+call    0 never executed
+call    1 never executed
+    #####:  184:}
+        -:  185:
+function _ZN12_GLOBAL__N_19CGUseList9eraseNodeEPN4mlir13CallGraphNodeE called 0 returned 0% blocks executed 0%
+    #####:  186:void CGUseList::eraseNode(CallGraphNode *node) {
+        -:  187:  // Drop all child nodes.
+    #####:  188:  for (auto &edge : *node)
+branch  0 never executed
+branch  1 never executed
+    #####:  189:    if (edge.isChild())
+branch  0 never executed
+branch  1 never executed
+    #####:  190:      eraseNode(edge.getTarget());
+call    0 never executed
+        -:  191:
+        -:  192:  // Drop the uses held by this node and erase it.
+    #####:  193:  auto useIt = nodeUses.find(node);
+call    0 never executed
+    #####:  194:  assert(useIt != nodeUses.end() && "expected node to be valid");
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  195:  decrementDiscardableUses(useIt->getSecond());
+call    0 never executed
+call    1 never executed
+    #####:  196:  nodeUses.erase(useIt);
+call    0 never executed
+    #####:  197:  discardableSymNodeUses.erase(node);
+call    0 never executed
+    #####:  198:}
+        -:  199:
+function _ZNK12_GLOBAL__N_19CGUseList6isDeadEPN4mlir13CallGraphNodeE called 10310 returned 100% blocks executed 63%
+    10310:  200:bool CGUseList::isDead(CallGraphNode *node) const {
+        -:  201:  // If the parent operation isn't a symbol, simply check normal SSA deadness.
+    10310:  202:  Operation *nodeOp = node->getCallableRegion()->getParentOp();
+call    0 returned 100%
+call    1 returned 100%
+    10310:  203:  if (!isa<SymbolOpInterface>(nodeOp))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  204:    return MemoryEffectOpInterface::hasNoEffect(nodeOp) && nodeOp->use_empty();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  205:
+        -:  206:  // Otherwise, check the number of symbol uses.
+    10310:  207:  auto symbolIt = discardableSymNodeUses.find(node);
+call    0 returned 100%
+    10334:  208:  return symbolIt != discardableSymNodeUses.end() && symbolIt->second == 0;
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+call    4 returned 100%
+branch  5 taken 60% (fallthrough)
+branch  6 taken 40%
+        -:  209:}
+        -:  210:
+function _ZNK12_GLOBAL__N_19CGUseList23hasOneUseAndDiscardableEPN4mlir13CallGraphNodeE called 15358 returned 100% blocks executed 71%
+    15358:  211:bool CGUseList::hasOneUseAndDiscardable(CallGraphNode *node) const {
+        -:  212:  // If this isn't a symbol node, check for side-effects and SSA use count.
+    15358:  213:  Operation *nodeOp = node->getCallableRegion()->getParentOp();
+call    0 returned 100%
+call    1 returned 100%
+    15358:  214:  if (!isa<SymbolOpInterface>(nodeOp))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  215:    return MemoryEffectOpInterface::hasNoEffect(nodeOp) && nodeOp->hasOneUse();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  216:
+        -:  217:  // Otherwise, check the number of symbol uses.
+    15358:  218:  auto symbolIt = discardableSymNodeUses.find(node);
+call    0 returned 100%
+    15369:  219:  return symbolIt != discardableSymNodeUses.end() && symbolIt->second == 1;
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+call    4 returned 100%
+branch  5 taken 85% (fallthrough)
+branch  6 taken 15%
+        -:  220:}
+        -:  221:
+function _ZN12_GLOBAL__N_19CGUseList13recomputeUsesEPN4mlir13CallGraphNodeERNS1_9CallGraphE called 20620 returned 100% blocks executed 100%
+    20620:  222:void CGUseList::recomputeUses(CallGraphNode *node, CallGraph &cg) {
+    20620:  223:  Operation *parentOp = node->getCallableRegion()->getParentOp();
+call    0 returned 100%
+call    1 returned 100%
+    20620:  224:  CGUser &uses = nodeUses[node];
+call    0 returned 100%
+    20620:  225:  decrementDiscardableUses(uses);
+call    0 returned 100%
+        -:  226:
+        -:  227:  // Collect the new discardable uses within this node.
+    41240:  228:  uses = CGUser();
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    20620:  229:  DenseMap<Attribute, CallGraphNode *> resolvedRefs;
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_19CGUseList13recomputeUsesEPN4mlir13CallGraphNodeERNS1_9CallGraphEENKUlS3_PNS1_9OperationEE_clES3_S7_ called 30792 returned 100% blocks executed 85%
+    51412:  230:  auto walkFn = [&](CallGraphNode *refNode, Operation *user) {
+    30792:  231:    auto discardSymIt = discardableSymNodeUses.find(refNode);
+call    0 returned 100%
+    30792:  232:    if (discardSymIt == discardableSymNodeUses.end())
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+    30690:  233:      return;
+        -:  234:
+      102:  235:    if (user != parentOp)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     102*:  236:      ++uses.innerUses[refNode];
+call    0 returned 100%
+    #####:  237:    else if (!uses.topLevelUses.insert(refNode).second)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  238:      return;
+      102:  239:    ++discardSymIt->second;
+call    0 returned 100%
+    20620:  240:  };
+    20620:  241:  walkReferencedSymbolNodes(parentOp, cg, symbolTable, resolvedRefs, walkFn);
+call    0 returned 100%
+call    1 returned 100%
+    20620:  242:}
+        -:  243:
+function _ZN12_GLOBAL__N_19CGUseList22mergeUsesAfterInliningEPN4mlir13CallGraphNodeES3_ called 0 returned 0% blocks executed 0%
+    #####:  244:void CGUseList::mergeUsesAfterInlining(CallGraphNode *lhs, CallGraphNode *rhs) {
+    #####:  245:  auto &lhsUses = nodeUses[lhs], &rhsUses = nodeUses[rhs];
+call    0 never executed
+call    1 never executed
+    #####:  246:  for (auto &useIt : lhsUses.innerUses) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  247:    rhsUses.innerUses[useIt.first] += useIt.second;
+call    0 never executed
+    #####:  248:    discardableSymNodeUses[useIt.first] += useIt.second;
+call    0 never executed
+call    1 never executed
+        -:  249:  }
+    #####:  250:}
+        -:  251:
+function _ZN12_GLOBAL__N_19CGUseList24decrementDiscardableUsesERNS0_6CGUserE called 20620 returned 100% blocks executed 81%
+    20620:  252:void CGUseList::decrementDiscardableUses(CGUser &uses) {
+   20620*:  253:  for (CallGraphNode *node : uses.topLevelUses)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  254:    --discardableSymNodeUses[node];
+call    0 never executed
+call    1 never executed
+    41268:  255:  for (auto &it : uses.innerUses)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 1% (fallthrough)
+branch  4 taken 100%
+call    5 returned 100%
+       28:  256:    discardableSymNodeUses[it.first] -= it.second;
+call    0 returned 100%
+call    1 returned 100%
+    20620:  257:}
+        -:  258:
+        -:  259://===----------------------------------------------------------------------===//
+        -:  260:// CallGraph traversal
+        -:  261://===----------------------------------------------------------------------===//
+        -:  262:
+        -:  263:namespace {
+        -:  264:/// This class represents a specific callgraph SCC.
+     1030:  265:class CallGraphSCC {
+        -:  266:public:
+      515:  267:  CallGraphSCC(llvm::scc_iterator<const CallGraph *> &parentIterator)
+      515:  268:      : parentIterator(parentIterator) {}
+        -:  269:  /// Return a range over the nodes within this SCC.
+    21650:  270:  std::vector<CallGraphNode *>::iterator begin() { return nodes.begin(); }
+    21650:  271:  std::vector<CallGraphNode *>::iterator end() { return nodes.end(); }
+        -:  272:
+        -:  273:  /// Reset the nodes of this SCC with those provided.
+    10825:  274:  void reset(const std::vector<CallGraphNode *> &newNodes) { nodes = newNodes; }
+        -:  275:
+        -:  276:  /// Remove the given node from this SCC.
+function _ZN12_GLOBAL__N_112CallGraphSCC6removeEPN4mlir13CallGraphNodeE called 16 returned 100% blocks executed 100%
+       16:  277:  void remove(CallGraphNode *node) {
+       16:  278:    auto it = llvm::find(nodes, node);
+call    0 returned 100%
+       16:  279:    if (it != nodes.end()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       16:  280:      nodes.erase(it);
+call    0 returned 100%
+       16:  281:      parentIterator.ReplaceNode(node, nullptr);
+call    0 returned 100%
+        -:  282:    }
+       16:  283:  }
+        -:  284:
+        -:  285:private:
+        -:  286:  std::vector<CallGraphNode *> nodes;
+        -:  287:  llvm::scc_iterator<const CallGraph *> &parentIterator;
+        -:  288:};
+        -:  289:} // namespace
+        -:  290:
+        -:  291:/// Run a given transformation over the SCCs of the callgraph in a bottom up
+        -:  292:/// traversal.
+function _ZL20runTransformOnCGSCCsRKN4mlir9CallGraphEN4llvm12function_refIFNS_13LogicalResultERN12_GLOBAL__N_112CallGraphSCCEEEE called 515 returned 100% blocks executed 88%
+      515:  293:static LogicalResult runTransformOnCGSCCs(
+        -:  294:    const CallGraph &cg,
+        -:  295:    function_ref<LogicalResult(CallGraphSCC &)> sccTransformer) {
+      515:  296:  llvm::scc_iterator<const CallGraph *> cgi = llvm::scc_begin(&cg);
+call    0 returned 100%
+     1030:  297:  CallGraphSCC currentSCC(cgi);
+call    0 returned 100%
+    11340:  298:  while (!cgi.isAtEnd()) {
+call    0 returned 100%
+branch  1 taken 95% (fallthrough)
+branch  2 taken 5%
+        -:  299:    // Copy the current SCC and increment so that the transformer can modify the
+        -:  300:    // SCC without invalidating our iterator.
+    10825:  301:    currentSCC.reset(*cgi);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+    10825:  302:    ++cgi;
+call    0 returned 100%
+    10825:  303:    if (failed(sccTransformer(currentSCC)))
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0% (fallthrough)
+    #####:  304:      return failure();
+        -:  305:  }
+      515:  306:  return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  307:}
+        -:  308:
+        -:  309:namespace {
+        -:  310:/// This struct represents a resolved call to a given callgraph node. Given that
+        -:  311:/// the call does not actually contain a direct reference to the
+        -:  312:/// Region(CallGraphNode) that it is dispatching to, we need to resolve them
+        -:  313:/// explicitly.
+        -:  314:struct ResolvedCall {
+        -:  315:  ResolvedCall(CallOpInterface call, CallGraphNode *sourceNode,
+        -:  316:               CallGraphNode *targetNode)
+        -:  317:      : call(call), sourceNode(sourceNode), targetNode(targetNode) {}
+        -:  318:  CallOpInterface call;
+        -:  319:  CallGraphNode *sourceNode, *targetNode;
+        -:  320:};
+        -:  321:} // namespace
+        -:  322:
+        -:  323:/// Collect all of the callable operations within the given range of blocks. If
+        -:  324:/// `traverseNestedCGNodes` is true, this will also collect call operations
+        -:  325:/// inside of nested callgraph nodes.
+function _ZL14collectCallOpsN4llvm14iterator_rangeINS_14ilist_iteratorINS_12ilist_detail12node_optionsIN4mlir5BlockELb1ELb0EvEELb0ELb0EEEEEPNS4_13CallGraphNodeERNS4_9CallGraphERNS4_21SymbolTableCollectionERNS_15SmallVectorImplIN12_GLOBAL__N_112ResolvedCallEEEb called 10294 returned 100% blocks executed 78%
+    10294:  326:static void collectCallOps(iterator_range<Region::iterator> blocks,
+        -:  327:                           CallGraphNode *sourceNode, CallGraph &cg,
+        -:  328:                           SymbolTableCollection &symbolTable,
+        -:  329:                           SmallVectorImpl<ResolvedCall> &calls,
+        -:  330:                           bool traverseNestedCGNodes) {
+    10294:  331:  SmallVector<std::pair<Block *, CallGraphNode *>, 8> worklist;
+call    0 returned 100%
+function _ZZL14collectCallOpsN4llvm14iterator_rangeINS_14ilist_iteratorINS_12ilist_detail12node_optionsIN4mlir5BlockELb1ELb0EvEELb0ELb0EEEEEPNS4_13CallGraphNodeERNS4_9CallGraphERNS4_21SymbolTableCollectionERNS_15SmallVectorImplIN12_GLOBAL__N_112ResolvedCallEEEbENKUlSA_S8_E_clESA_S8_.isra.0 called 10294 returned 100% blocks executed 88%
+    10294:  332:  auto addToWorklist = [&](CallGraphNode *node,
+        -:  333:                           iterator_range<Region::iterator> blocks) {
+    54446:  334:    for (Block &block : blocks)
+branch  0 taken 81% (fallthrough)
+branch  1 taken 19%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    44152:  335:      worklist.emplace_back(&block, node);
+call    0 returned 100%
+    20588:  336:  };
+        -:  337:
+    10294:  338:  addToWorklist(sourceNode, blocks);
+call    0 returned 100%
+    54446:  339:  while (!worklist.empty()) {
+branch  0 taken 81% (fallthrough)
+branch  1 taken 19%
+    44152:  340:    Block *block;
+    44152:  341:    std::tie(block, sourceNode) = worklist.pop_back_val();
+call    0 returned 100%
+        -:  342:
+   316910:  343:    for (Operation &op : *block) {
+branch  0 taken 86% (fallthrough)
+branch  1 taken 14%
+call    2 returned 100%
+   272758:  344:      if (auto call = dyn_cast<CallOpInterface>(op)) {
+call    0 returned 100%
+branch  1 taken 6% (fallthrough)
+branch  2 taken 94%
+        -:  345:        // TODO: Support inlining nested call references.
+    15358:  346:        CallInterfaceCallable callable = call.getCallableForCallee();
+call    0 returned 100%
+    15358:  347:        if (SymbolRefAttr symRef = dyn_cast<SymbolRefAttr>(callable)) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+   15358*:  348:          if (!symRef.isa<FlatSymbolRefAttr>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  349:            continue;
+        -:  350:        }
+        -:  351:
+    15358:  352:        CallGraphNode *targetNode = cg.resolveCallable(call, symbolTable);
+call    0 returned 100%
+    15358:  353:        if (!targetNode->isExternal())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+    15358:  354:          calls.emplace_back(call, sourceNode, targetNode);
+call    0 returned 100%
+    15358:  355:        continue;
+        -:  356:      }
+        -:  357:
+        -:  358:      // If this is not a call, traverse the nested regions. If
+        -:  359:      // `traverseNestedCGNodes` is false, then don't traverse nested call graph
+        -:  360:      // regions.
+  277549*:  361:      for (auto &nestedRegion : op.getRegions()) {
+branch  0 taken 8% (fallthrough)
+branch  1 taken 92%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  362:        CallGraphNode *nestedNode = cg.lookupNode(&nestedRegion);
+call    0 never executed
+    #####:  363:        if (traverseNestedCGNodes || !nestedNode)
+branch  0 never executed
+branch  1 never executed
+    #####:  364:          addToWorklist(nestedNode ? nestedNode : sourceNode, nestedRegion);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  365:      }
+        -:  366:    }
+        -:  367:  }
+    10294:  368:}
+        -:  369:
+        -:  370://===----------------------------------------------------------------------===//
+        -:  371:// Inliner
+        -:  372://===----------------------------------------------------------------------===//
+        -:  373:
+        -:  374:#ifndef NDEBUG
+function _ZL11getNodeNameN4mlir15CallOpInterfaceE called 0 returned 0% blocks executed 0%
+    #####:  375:static std::string getNodeName(CallOpInterface op) {
+    #####:  376:  if (auto sym = op.getCallableForCallee().dyn_cast<SymbolRefAttr>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  377:    return debugString(op);
+call    0 never executed
+    #####:  378:  return "_unnamed_callee_";
+call    0 never executed
+        -:  379:}
+        -:  380:#endif
+        -:  381:
+        -:  382:/// Return true if the specified `inlineHistoryID`  indicates an inline history
+        -:  383:/// that already includes `node`.
+        -:  384:static bool inlineHistoryIncludes(
+        -:  385:    CallGraphNode *node, Optional<size_t> inlineHistoryID,
+        -:  386:    MutableArrayRef<std::pair<CallGraphNode *, Optional<size_t>>>
+        -:  387:        inlineHistory) {
+        -:  388:  while (inlineHistoryID.has_value()) {
+        -:  389:    assert(inlineHistoryID.value() < inlineHistory.size() &&
+        -:  390:           "Invalid inline history ID");
+        -:  391:    if (inlineHistory[inlineHistoryID.value()].first == node)
+        -:  392:      return true;
+        -:  393:    inlineHistoryID = inlineHistory[inlineHistoryID.value()].second;
+        -:  394:  }
+        -:  395:  return false;
+        -:  396:}
+        -:  397:
+        -:  398:namespace {
+        -:  399:/// This class provides a specialization of the main inlining interface.
+        -:  400:struct Inliner : public InlinerInterface {
+function _ZN12_GLOBAL__N_17InlinerC2EPN4mlir11MLIRContextERNS1_9CallGraphERNS1_21SymbolTableCollectionE called 515 returned 100% blocks executed 100%
+      515:  401:  Inliner(MLIRContext *context, CallGraph &cg,
+        -:  402:          SymbolTableCollection &symbolTable)
+      515:  403:      : InlinerInterface(context), cg(cg), symbolTable(symbolTable) {}
+call    0 returned 100%
+call    1 returned 100%
+        -:  404:
+        -:  405:  /// Process a set of blocks that have been inlined. This callback is invoked
+        -:  406:  /// *before* inlined terminator operations have been processed.
+        -:  407:  void
+function _ZN12_GLOBAL__N_17Inliner20processInlinedBlocksEN4llvm14iterator_rangeINS1_14ilist_iteratorINS1_12ilist_detail12node_optionsIN4mlir5BlockELb1ELb0EvEELb0ELb0EEEEE called 0 returned 0% blocks executed 0%
+    #####:  408:  processInlinedBlocks(iterator_range<Region::iterator> inlinedBlocks) final {
+        -:  409:    // Find the closest callgraph node from the first block.
+    #####:  410:    CallGraphNode *node;
+    #####:  411:    Region *region = inlinedBlocks.begin()->getParent();
+call    0 never executed
+call    1 never executed
+    #####:  412:    while (!(node = cg.lookupNode(region))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  413:      region = region->getParentRegion();
+call    0 never executed
+    #####:  414:      assert(region && "expected valid parent node");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  415:    }
+        -:  416:
+    #####:  417:    collectCallOps(inlinedBlocks, node, cg, symbolTable, calls,
+call    0 never executed
+        -:  418:                   /*traverseNestedCGNodes=*/true);
+    #####:  419:  }
+        -:  420:
+        -:  421:  /// Mark the given callgraph node for deletion.
+       32:  422:  void markForDeletion(CallGraphNode *node) { deadNodes.insert(node); }
+        -:  423:
+        -:  424:  /// This method properly disposes of callables that became dead during
+        -:  425:  /// inlining. This should not be called while iterating over the SCCs.
+function _ZN12_GLOBAL__N_17Inliner18eraseDeadCallablesEv called 515 returned 100% blocks executed 100%
+      515:  426:  void eraseDeadCallables() {
+      531:  427:    for (CallGraphNode *node : deadNodes)
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 3% (fallthrough)
+branch  3 taken 97%
+call    4 returned 100%
+call    5 returned 100%
+       16:  428:      node->getCallableRegion()->getParentOp()->erase();
+call    0 returned 100%
+call    1 returned 100%
+      515:  429:  }
+        -:  430:
+        -:  431:  /// The set of callables known to be dead.
+        -:  432:  SmallPtrSet<CallGraphNode *, 8> deadNodes;
+        -:  433:
+        -:  434:  /// The current set of call instructions to consider for inlining.
+        -:  435:  SmallVector<ResolvedCall, 8> calls;
+        -:  436:
+        -:  437:  /// The callgraph being operated on.
+        -:  438:  CallGraph &cg;
+        -:  439:
+        -:  440:  /// A symbol table to use when resolving call lookups.
+        -:  441:  SymbolTableCollection &symbolTable;
+        -:  442:};
+        -:  443:} // namespace
+        -:  444:
+        -:  445:/// Returns true if the given call should be inlined.
+function _ZL12shouldInlineRN12_GLOBAL__N_112ResolvedCallE called 15358 returned 100% blocks executed 90%
+    15358:  446:static bool shouldInline(ResolvedCall &resolvedCall) {
+        -:  447:  // Don't allow inlining terminator calls. We currently don't support this
+        -:  448:  // case.
+    15358:  449:  if (resolvedCall.call->hasTrait<OpTrait::IsTerminator>())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  450:    return false;
+        -:  451:
+        -:  452:  // Don't allow inlining if the target is an ancestor of the call. This
+        -:  453:  // prevents inlining recursively.
+   30716*:  454:  if (resolvedCall.targetNode->getCallableRegion()->isAncestor(
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+        -:  455:          resolvedCall.call->getParentRegion()))
+    #####:  456:    return false;
+        -:  457:
+        -:  458:  // Otherwise, inline.
+        -:  459:  return true;
+        -:  460:}
+        -:  461:
+        -:  462:/// Attempt to inline calls within the given scc. This function returns
+        -:  463:/// success if any calls were inlined, failure otherwise.
+function _ZL16inlineCallsInSCCRN12_GLOBAL__N_17InlinerERNS_9CGUseListERNS_12CallGraphSCCE called 10825 returned 100% blocks executed 33%
+    10825:  464:static LogicalResult inlineCallsInSCC(Inliner &inliner, CGUseList &useList,
+        -:  465:                                      CallGraphSCC &currentSCC) {
+    10825:  466:  CallGraph &cg = inliner.cg;
+    10825:  467:  auto &calls = inliner.calls;
+        -:  468:
+        -:  469:  // A set of dead nodes to remove after inlining.
+    10825:  470:  llvm::SmallSetVector<CallGraphNode *, 1> deadNodes;
+call    0 returned 100%
+        -:  471:
+        -:  472:  // Collect all of the direct calls within the nodes of the current SCC. We
+        -:  473:  // don't traverse nested callgraph nodes, because they are handled separately
+        -:  474:  // likely within a different SCC.
+    21650:  475:  for (CallGraphNode *node : currentSCC) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+    10825:  476:    if (node->isExternal())
+call    0 returned 100%
+branch  1 taken 5% (fallthrough)
+branch  2 taken 95%
+      515:  477:      continue;
+        -:  478:
+        -:  479:    // Don't collect calls if the node is already dead.
+    10310:  480:    if (useList.isDead(node)) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+       16:  481:      deadNodes.insert(node);
+call    0 returned 100%
+        -:  482:    } else {
+    10294:  483:      collectCallOps(*node->getCallableRegion(), node, cg, inliner.symbolTable,
+call    0 returned 100%
+call    1 returned 100%
+        -:  484:                     calls, /*traverseNestedCGNodes=*/false);
+        -:  485:    }
+        -:  486:  }
+        -:  487:
+        -:  488:  // When inlining a callee produces new call sites, we want to keep track of
+        -:  489:  // the fact that they were inlined from the callee. This allows us to avoid
+        -:  490:  // infinite inlining.
+    10825:  491:  using InlineHistoryT = Optional<size_t>;
+    21650:  492:  SmallVector<std::pair<CallGraphNode *, InlineHistoryT>, 8> inlineHistory;
+call    0 returned 100%
+call    1 returned 100%
+    21650:  493:  std::vector<InlineHistoryT> callHistory(calls.size(), InlineHistoryT{});
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+        -:  494:
+   10825*:  495:  LLVM_DEBUG({
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+branch 13 never executed
+branch 14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+        -:  496:    llvm::dbgs() << "* Inliner: Initial calls in SCC are: {\n";
+        -:  497:    for (unsigned i = 0, e = calls.size(); i < e; ++i)
+        -:  498:      llvm::dbgs() << "  " << i << ". " << calls[i].call << ",\n";
+        -:  499:    llvm::dbgs() << "}\n";
+        -:  500:  });
+        -:  501:
+        -:  502:  // Try to inline each of the call operations. Don't cache the end iterator
+        -:  503:  // here as more calls may be added during inlining.
+        -:  504:  bool inlinedAnyCalls = false;
+    26183:  505:  for (unsigned i = 0; i < calls.size(); ++i) {
+branch  0 taken 59% (fallthrough)
+branch  1 taken 41%
+   15358*:  506:    if (deadNodes.contains(calls[i].sourceNode))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+   15358*:  507:      continue;
+    15358:  508:    ResolvedCall it = calls[i];
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  509:
+    15358:  510:    InlineHistoryT inlineHistoryID = callHistory[i];
+call    0 returned 100%
+    15358:  511:    bool inHistory =
+call    0 returned 100%
+    15358:  512:        inlineHistoryIncludes(it.targetNode, inlineHistoryID, inlineHistory);
+call    0 returned 100%
+    15358:  513:    bool doInline = !inHistory && shouldInline(it);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    15358:  514:    CallOpInterface call = it.call;
+   15358*:  515:    LLVM_DEBUG({
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+        -:  516:      if (doInline)
+        -:  517:        llvm::dbgs() << "* Inlining call: " << i << ". " << call << "\n";
+        -:  518:      else
+        -:  519:        llvm::dbgs() << "* Not inlining call: " << i << ". " << call << "\n";
+        -:  520:    });
+   15358*:  521:    if (!doInline)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  522:      continue;
+        -:  523:
+    15358:  524:    unsigned prevSize = calls.size();
+call    0 returned 100%
+    15358:  525:    Region *targetRegion = it.targetNode->getCallableRegion();
+call    0 returned 100%
+        -:  526:
+        -:  527:    // If this is the last call to the target node and the node is discardable,
+        -:  528:    // then inline it in-place and delete the node if successful.
+    15358:  529:    bool inlineInPlace = useList.hasOneUseAndDiscardable(it.targetNode);
+call    0 returned 100%
+        -:  530:
+    15358:  531:    LogicalResult inlineResult = inlineCall(
+        -:  532:        inliner, call, cast<CallableOpInterface>(targetRegion->getParentOp()),
+    15358:  533:        targetRegion, /*shouldCloneInlinedRegion=*/!inlineInPlace);
+call    0 returned 100%
+call    1 returned 100%
+    15358:  534:    if (failed(inlineResult)) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+   15358*:  535:      LLVM_DEBUG(llvm::dbgs() << "** Failed to inline\n");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    15358:  536:      continue;
+        -:  537:    }
+    #####:  538:    inlinedAnyCalls = true;
+        -:  539:
+        -:  540:    // Create a inline history entry for this inlined call, so that we remember
+        -:  541:    // that new callsites came about due to inlining Callee.
+    #####:  542:    InlineHistoryT newInlineHistoryID{inlineHistory.size()};
+call    0 never executed
+    #####:  543:    inlineHistory.push_back(std::make_pair(it.targetNode, inlineHistoryID));
+call    0 never executed
+        -:  544:
+function _ZZL16inlineCallsInSCCRN12_GLOBAL__N_17InlinerERNS_9CGUseListERNS_12CallGraphSCCEENKUlN4llvm8OptionalImEEE_clES8_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  545:    auto historyToString = [](InlineHistoryT h) {
+    #####:  546:      return h.has_value() ? std::to_string(h.value()) : "root";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  547:    };
+    #####:  548:    (void)historyToString;
+    #####:  549:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+        -:  550:               << "* new inlineHistory entry: " << newInlineHistoryID << ". ["
+        -:  551:               << getNodeName(call) << ", " << historyToString(inlineHistoryID)
+        -:  552:               << "]\n");
+        -:  553:
+    #####:  554:    for (unsigned k = prevSize; k != calls.size(); ++k) {
+branch  0 never executed
+branch  1 never executed
+    #####:  555:      callHistory.push_back(newInlineHistoryID);
+call    0 never executed
+    #####:  556:      LLVM_DEBUG(llvm::dbgs() << "* new call " << k << " {" << calls[i].call
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+branch  9 never executed
+branch 10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+call   19 never executed
+branch 20 never executed
+branch 21 never executed
+        -:  557:                              << "}\n   with historyID = " << newInlineHistoryID
+        -:  558:                              << ", added due to inlining of\n  call {" << call
+        -:  559:                              << "}\n with historyID = "
+        -:  560:                              << historyToString(inlineHistoryID) << "\n");
+        -:  561:    }
+        -:  562:
+        -:  563:    // If the inlining was successful, Merge the new uses into the source node.
+    #####:  564:    useList.dropCallUses(it.sourceNode, call.getOperation(), cg);
+call    0 never executed
+    #####:  565:    useList.mergeUsesAfterInlining(it.targetNode, it.sourceNode);
+call    0 never executed
+        -:  566:
+        -:  567:    // then erase the call.
+    #####:  568:    call.erase();
+call    0 never executed
+        -:  569:
+        -:  570:    // If we inlined in place, mark the node for deletion.
+    #####:  571:    if (inlineInPlace) {
+branch  0 never executed
+branch  1 never executed
+    #####:  572:      useList.eraseNode(it.targetNode);
+call    0 never executed
+    #####:  573:      deadNodes.insert(it.targetNode);
+call    0 never executed
+        -:  574:    }
+        -:  575:  }
+        -:  576:
+    10841:  577:  for (CallGraphNode *node : deadNodes) {
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+       16:  578:    currentSCC.remove(node);
+call    0 returned 100%
+       16:  579:    inliner.markForDeletion(node);
+call    0 returned 100%
+        -:  580:  }
+    10825:  581:  calls.clear();
+branch  0 taken 24% (fallthrough)
+branch  1 taken 76%
+    10825:  582:  return success(inlinedAnyCalls);
+branch  0 taken 24% (fallthrough)
+branch  1 taken 76%
+        -:  583:}
+        -:  584:
+        -:  585://===----------------------------------------------------------------------===//
+        -:  586:// InlinerPass
+        -:  587://===----------------------------------------------------------------------===//
+        -:  588:
+        -:  589:namespace {
+        -:  590:class InlinerPass : public impl::InlinerBase<InlinerPass> {
+        -:  591:public:
+        -:  592:  InlinerPass();
+function _ZN12_GLOBAL__N_111InlinerPassC2ERKS0_ called 0 returned 0% blocks executed 0%
+    #####:  593:  InlinerPass(const InlinerPass &) = default;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  594:  InlinerPass(std::function<void(OpPassManager &)> defaultPipeline);
+        -:  595:  InlinerPass(std::function<void(OpPassManager &)> defaultPipeline,
+        -:  596:              llvm::StringMap<OpPassManager> opPipelines);
+        -:  597:  void runOnOperation() override;
+        -:  598:
+        -:  599:private:
+        -:  600:  /// Attempt to inline calls within the given scc, and run simplifications,
+        -:  601:  /// until a fixed point is reached. This allows for the inlining of newly
+        -:  602:  /// devirtualized calls. Returns failure if there was a fatal error during
+        -:  603:  /// inlining.
+        -:  604:  LogicalResult inlineSCC(Inliner &inliner, CGUseList &useList,
+        -:  605:                          CallGraphSCC &currentSCC, MLIRContext *context);
+        -:  606:
+        -:  607:  /// Optimize the nodes within the given SCC with one of the held optimization
+        -:  608:  /// pass pipelines. Returns failure if an error occurred during the
+        -:  609:  /// optimization of the SCC, success otherwise.
+        -:  610:  LogicalResult optimizeSCC(CallGraph &cg, CGUseList &useList,
+        -:  611:                            CallGraphSCC &currentSCC, MLIRContext *context);
+        -:  612:
+        -:  613:  /// Optimize the nodes within the given SCC in parallel. Returns failure if an
+        -:  614:  /// error occurred during the optimization of the SCC, success otherwise.
+        -:  615:  LogicalResult optimizeSCCAsync(MutableArrayRef<CallGraphNode *> nodesToVisit,
+        -:  616:                                 MLIRContext *context);
+        -:  617:
+        -:  618:  /// Optimize the given callable node with one of the pass managers provided
+        -:  619:  /// with `pipelines`, or the default pipeline. Returns failure if an error
+        -:  620:  /// occurred during the optimization of the callable, success otherwise.
+        -:  621:  LogicalResult optimizeCallable(CallGraphNode *node,
+        -:  622:                                 llvm::StringMap<OpPassManager> &pipelines);
+        -:  623:
+        -:  624:  /// Attempt to initialize the options of this pass from the given string.
+        -:  625:  /// Derived classes may override this method to hook into the point at which
+        -:  626:  /// options are initialized, but should generally always invoke this base
+        -:  627:  /// class variant.
+        -:  628:  LogicalResult initializeOptions(StringRef options) override;
+        -:  629:
+        -:  630:  /// An optional function that constructs a default optimization pipeline for
+        -:  631:  /// a given operation.
+        -:  632:  std::function<void(OpPassManager &)> defaultPipeline;
+        -:  633:  /// A map of operation names to pass pipelines to use when optimizing
+        -:  634:  /// callable operations of these types. This provides a specialized pipeline
+        -:  635:  /// instead of the default. The vector size is the number of threads used
+        -:  636:  /// during optimization.
+        -:  637:  SmallVector<llvm::StringMap<OpPassManager>, 8> opPipelines;
+        -:  638:};
+        -:  639:} // namespace
+        -:  640:
+function _ZN12_GLOBAL__N_111InlinerPassC2Ev called 129237 returned 100% blocks executed 75%
+   129237:  641:InlinerPass::InlinerPass() : InlinerPass(defaultInlinerOptPipeline) {}
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+function _ZN12_GLOBAL__N_111InlinerPassC2ESt8functionIFvRN4mlir13OpPassManagerEEE called 129237 returned 100% blocks executed 100%
+   129237:  642:InlinerPass::InlinerPass(
+   129237:  643:    std::function<void(OpPassManager &)> defaultPipelineArg)
+   129237:  644:    : defaultPipeline(std::move(defaultPipelineArg)) {
+call    0 returned 100%
+call    1 returned 100%
+   129237:  645:  opPipelines.push_back({});
+call    0 returned 100%
+call    1 returned 100%
+   129237:  646:}
+        -:  647:
+function _ZN12_GLOBAL__N_111InlinerPassC2ESt8functionIFvRN4mlir13OpPassManagerEEEN4llvm9StringMapIS3_NS7_15MallocAllocatorEEE called 0 returned 0% blocks executed 0%
+    #####:  648:InlinerPass::InlinerPass(std::function<void(OpPassManager &)> defaultPipeline,
+    #####:  649:                         llvm::StringMap<OpPassManager> opPipelines)
+call    0 never executed
+    #####:  650:    : InlinerPass(std::move(defaultPipeline)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  651:  if (opPipelines.empty())
+branch  0 never executed
+branch  1 never executed
+        -:  652:    return;
+        -:  653:
+        -:  654:  // Update the option for the op specific optimization pipelines.
+    #####:  655:  for (auto &it : opPipelines)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  656:    opPipelineList.addValue(it.second);
+call    0 never executed
+    #####:  657:  this->opPipelines.emplace_back(std::move(opPipelines));
+call    0 never executed
+        -:  658:}
+        -:  659:
+function _ZN12_GLOBAL__N_111InlinerPass14runOnOperationEv called 515 returned 100% blocks executed 59%
+      515:  660:void InlinerPass::runOnOperation() {
+      515:  661:  CallGraph &cg = getAnalysis<CallGraph>();
+call    0 returned 100%
+      515:  662:  auto *context = &getContext();
+call    0 returned 100%
+        -:  663:
+        -:  664:  // The inliner should only be run on operations that define a symbol table,
+        -:  665:  // as the callgraph will need to resolve references.
+      515:  666:  Operation *op = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      515:  667:  if (!op->hasTrait<OpTrait::SymbolTable>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  668:    op->emitOpError() << " was scheduled to run under the inliner, but does "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  669:                         "not define a symbol table";
+call    0 never executed
+    #####:  670:    return signalPassFailure();
+call    0 never executed
+        -:  671:  }
+        -:  672:
+        -:  673:  // Run the inline transform in post-order over the SCCs in the callgraph.
+     1030:  674:  SymbolTableCollection symbolTable;
+call    0 returned 100%
+     1030:  675:  Inliner inliner(context, cg, symbolTable);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     1030:  676:  CGUseList useList(getOperation(), cg, symbolTable);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+call    3 returned 100%
+    11340:  677:  LogicalResult result = runTransformOnCGSCCs(cg, [&](CallGraphSCC &scc) {
+    10825:  678:    return inlineSCC(inliner, useList, scc, context);
+call    0 returned 100%
+      515:  679:  });
+call    0 returned 100%
+      515:  680:  if (failed(result))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  681:    return signalPassFailure();
+call    0 never executed
+call    1 never executed
+        -:  682:
+        -:  683:  // After inlining, make sure to erase any callables proven to be dead.
+      515:  684:  inliner.eraseDeadCallables();
+call    0 returned 100%
+        -:  685:}
+        -:  686:
+function _ZN12_GLOBAL__N_111InlinerPass9inlineSCCERNS_7InlinerERNS_9CGUseListERNS_12CallGraphSCCEPN4mlir11MLIRContextE called 10825 returned 100% blocks executed 70%
+    10825:  687:LogicalResult InlinerPass::inlineSCC(Inliner &inliner, CGUseList &useList,
+        -:  688:                                     CallGraphSCC &currentSCC,
+        -:  689:                                     MLIRContext *context) {
+        -:  690:  // Continuously simplify and inline until we either reach a fixed point, or
+        -:  691:  // hit the maximum iteration count. Simplifying early helps to refine the cost
+        -:  692:  // model, and in future iterations may devirtualize new calls.
+    10825:  693:  unsigned iterationCount = 0;
+    10825:  694:  do {
+    10825:  695:    if (failed(optimizeSCC(inliner.cg, useList, currentSCC, context)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  696:      return failure();
+    10825:  697:    if (failed(inlineCallsInSCC(inliner, useList, currentSCC)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  698:      break;
+    #####:  699:  } while (++iterationCount < maxInliningIterations);
+branch  0 never executed
+branch  1 never executed
+    10825:  700:  return success();
+        -:  701:}
+        -:  702:
+function _ZN12_GLOBAL__N_111InlinerPass11optimizeSCCERN4mlir9CallGraphERNS_9CGUseListERNS_12CallGraphSCCEPNS1_11MLIRContextE called 10825 returned 100% blocks executed 85%
+    10825:  703:LogicalResult InlinerPass::optimizeSCC(CallGraph &cg, CGUseList &useList,
+        -:  704:                                       CallGraphSCC &currentSCC,
+        -:  705:                                       MLIRContext *context) {
+        -:  706:  // Collect the sets of nodes to simplify.
+    10825:  707:  SmallVector<CallGraphNode *, 4> nodesToVisit;
+    21650:  708:  for (auto *node : currentSCC) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+    10825:  709:    if (node->isExternal())
+call    0 returned 100%
+branch  1 taken 5% (fallthrough)
+branch  2 taken 95%
+      515:  710:      continue;
+        -:  711:
+        -:  712:    // Don't simplify nodes with children. Nodes with children require special
+        -:  713:    // handling as we may remove the node during simplification. In the future,
+        -:  714:    // we should be able to handle this case with proper node deletion tracking.
+   10310*:  715:    if (node->hasChildren())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  716:      continue;
+        -:  717:
+        -:  718:    // We also won't apply simplifications to nodes that can't have passes
+        -:  719:    // scheduled on them.
+    10310:  720:    auto *region = node->getCallableRegion();
+call    0 returned 100%
+   10310*:  721:    if (!region->getParentOp()->hasTrait<OpTrait::IsIsolatedFromAbove>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  722:      continue;
+    10310:  723:    nodesToVisit.push_back(node);
+call    0 returned 100%
+        -:  724:  }
+    10825:  725:  if (nodesToVisit.empty())
+branch  0 taken 5% (fallthrough)
+branch  1 taken 95%
+      515:  726:    return success();
+        -:  727:
+        -:  728:  // Optimize each of the nodes within the SCC in parallel.
+    10310:  729:  if (failed(optimizeSCCAsync(nodesToVisit, context)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  730:    return failure();
+        -:  731:
+        -:  732:  // Recompute the uses held by each of the nodes.
+    20620:  733:  for (CallGraphNode *node : nodesToVisit)
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    10310:  734:    useList.recomputeUses(node, cg);
+call    0 returned 100%
+    10825:  735:  return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  736:}
+        -:  737:
+        -:  738:LogicalResult
+function _ZN12_GLOBAL__N_111InlinerPass16optimizeSCCAsyncEN4llvm15MutableArrayRefIPN4mlir13CallGraphNodeEEEPNS3_11MLIRContextE called 10310 returned 100% blocks executed 91%
+    10310:  739:InlinerPass::optimizeSCCAsync(MutableArrayRef<CallGraphNode *> nodesToVisit,
+        -:  740:                              MLIRContext *ctx) {
+        -:  741:  // We must maintain a fixed pool of pass managers which is at least as large
+        -:  742:  // as the maximum parallelism of the failableParallelForEach below.
+        -:  743:  // Note: The number of pass managers here needs to remain constant
+        -:  744:  // to prevent issues with pass instrumentations that rely on having the same
+        -:  745:  // pass manager for the main thread.
+    10310:  746:  size_t numThreads = ctx->getNumThreads();
+call    0 returned 100%
+    10310:  747:  if (opPipelines.size() < numThreads) {
+branch  0 taken 5% (fallthrough)
+branch  1 taken 95%
+        -:  748:    // Reserve before resizing so that we can use a reference to the first
+        -:  749:    // element.
+      508:  750:    opPipelines.reserve(numThreads);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+      508:  751:    opPipelines.resize(numThreads, opPipelines.front());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+        -:  752:  }
+        -:  753:
+        -:  754:  // Ensure an analysis manager has been constructed for each of the nodes.
+        -:  755:  // This prevents thread races when running the nested pipelines.
+    20620:  756:  for (CallGraphNode *node : nodesToVisit)
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    10310:  757:    getAnalysisManager().nest(node->getCallableRegion()->getParentOp());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  758:
+        -:  759:  // An atomic failure variable for the async executors.
+    10310:  760:  std::vector<std::atomic<bool>> activePMs(opPipelines.size());
+call    0 returned 100%
+    10310:  761:  std::fill(activePMs.begin(), activePMs.end(), false);
+function _ZZN12_GLOBAL__N_111InlinerPass16optimizeSCCAsyncEN4llvm15MutableArrayRefIPN4mlir13CallGraphNodeEEEPNS3_11MLIRContextEENKUlS5_E_clES5_.isra.0 called 10310 returned 100% blocks executed 75%
+    10310:  762:  return failableParallelForEach(ctx, nodesToVisit, [&](CallGraphNode *node) {
+        -:  763:    // Find a pass manager for this operation.
+    41240:  764:    auto it = llvm::find_if(activePMs, [](std::atomic<bool> &isActive) {
+        -:  765:      bool expectedInactive = false;
+        -:  766:      return isActive.compare_exchange_strong(expectedInactive, true);
+    10310:  767:    });
+call    0 returned 100%
+   10310*:  768:    assert(it != activePMs.end() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  769:           "could not find inactive pass manager for thread");
+    10310:  770:    unsigned pmIndex = it - activePMs.begin();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  771:
+        -:  772:    // Optimize this callable node.
+    10310:  773:    LogicalResult result = optimizeCallable(node, opPipelines[pmIndex]);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+        -:  774:
+        -:  775:    // Reset the active bit for this pass manager.
+    10310:  776:    activePMs[pmIndex].store(false);
+    10310:  777:    return result;
+    10310:  778:  });
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  779:}
+        -:  780:
+        -:  781:LogicalResult
+function _ZN12_GLOBAL__N_111InlinerPass16optimizeCallableEPN4mlir13CallGraphNodeERN4llvm9StringMapINS1_13OpPassManagerENS4_15MallocAllocatorEEE called 10310 returned 100% blocks executed 87%
+    10310:  782:InlinerPass::optimizeCallable(CallGraphNode *node,
+        -:  783:                              llvm::StringMap<OpPassManager> &pipelines) {
+    10310:  784:  Operation *callable = node->getCallableRegion()->getParentOp();
+call    0 returned 100%
+call    1 returned 100%
+    10310:  785:  StringRef opName = callable->getName().getStringRef();
+call    0 returned 100%
+    10310:  786:  auto pipelineIt = pipelines.find(opName);
+call    0 returned 100%
+    10310:  787:  if (pipelineIt == pipelines.end()) {
+branch  0 taken 5% (fallthrough)
+branch  1 taken 95%
+        -:  788:    // If a pipeline didn't exist, use the default if possible.
+      515:  789:    if (!defaultPipeline)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  790:      return success();
+        -:  791:
+      515:  792:    OpPassManager defaultPM(opName);
+call    0 returned 100%
+      515:  793:    defaultPipeline(defaultPM);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      515:  794:    pipelineIt = pipelines.try_emplace(opName, std::move(defaultPM)).first;
+call    0 returned 100%
+call    1 returned 100%
+        -:  795:  }
+    10310:  796:  return runPipeline(pipelineIt->second, callable);
+call    0 returned 100%
+        -:  797:}
+        -:  798:
+function _ZN12_GLOBAL__N_111InlinerPass17initializeOptionsEN4llvm9StringRefE called 599 returned 100% blocks executed 34%
+      599:  799:LogicalResult InlinerPass::initializeOptions(StringRef options) {
+      599:  800:  if (failed(Pass::initializeOptions(options)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  801:    return failure();
+        -:  802:
+        -:  803:  // Initialize the default pipeline builder to use the option string.
+        -:  804:  // TODO: Use a generic pass manager for default pipelines, and remove this.
+      599:  805:  if (!defaultPipelineStr.empty()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  806:    std::string defaultPipelineCopy = defaultPipelineStr;
+call    0 never executed
+function _ZZN12_GLOBAL__N_111InlinerPass17initializeOptionsEN4llvm9StringRefEENKUlRN4mlir13OpPassManagerEE_clES5_ called 0 returned 0% blocks executed 0%
+    #####:  807:    defaultPipeline = [=](OpPassManager &pm) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  808:      (void)parsePassPipeline(defaultPipelineCopy, pm);
+call    0 never executed
+call    1 never executed
+    #####:  809:    };
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+      599:  810:  } else if (defaultPipelineStr.getNumOccurrences()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  811:    defaultPipeline = nullptr;
+branch  0 never executed
+branch  1 never executed
+        -:  812:  }
+        -:  813:
+        -:  814:  // Initialize the op specific pass pipelines.
+     1198:  815:  llvm::StringMap<OpPassManager> pipelines;
+call    0 returned 100%
+     599*:  816:  for (OpPassManager pipeline : opPipelineList)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  817:    if (!pipeline.empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  818:      pipelines.try_emplace(pipeline.getOpAnchorName(), pipeline);
+call    0 never executed
+call    1 never executed
+     1198:  819:  opPipelines.assign({std::move(pipelines)});
+call    0 returned 100%
+branch  1 taken 50% (fallthrough)
+branch  2 taken 50%
+call    3 returned 100%
+        -:  820:
+      599:  821:  return success();
+call    0 returned 100%
+        -:  822:}
+        -:  823:
+function _ZN4mlir17createInlinerPassEv called 129237 returned 100% blocks executed 100%
+   129237:  824:std::unique_ptr<Pass> mlir::createInlinerPass() {
+   129237:  825:  return std::make_unique<InlinerPass>();
+call    0 returned 100%
+        -:  826:}
+        -:  827:std::unique_ptr<Pass>
+function _ZN4mlir17createInlinerPassEN4llvm9StringMapINS_13OpPassManagerENS0_15MallocAllocatorEEE called 0 returned 0% blocks executed 0%
+    #####:  828:mlir::createInlinerPass(llvm::StringMap<OpPassManager> opPipelines) {
+    #####:  829:  return std::make_unique<InlinerPass>(defaultInlinerOptPipeline,
+call    0 never executed
+    #####:  830:                                       std::move(opPipelines));
+call    0 never executed
+        -:  831:}
+function _ZN4mlir17createInlinerPassEN4llvm9StringMapINS_13OpPassManagerENS0_15MallocAllocatorEEESt8functionIFvRS2_EE called 0 returned 0% blocks executed 0%
+    #####:  832:std::unique_ptr<Pass> mlir::createInlinerPass(
+        -:  833:    llvm::StringMap<OpPassManager> opPipelines,
+        -:  834:    std::function<void(OpPassManager &)> defaultPipelineBuilder) {
+    #####:  835:  return std::make_unique<InlinerPass>(std::move(defaultPipelineBuilder),
+call    0 never executed
+    #####:  836:                                       std::move(opPipelines));
+call    0 never executed
+        -:  837:}

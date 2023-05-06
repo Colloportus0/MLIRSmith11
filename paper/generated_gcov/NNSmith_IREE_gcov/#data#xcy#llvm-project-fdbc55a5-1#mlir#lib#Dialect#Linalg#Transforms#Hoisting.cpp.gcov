@@ -1,0 +1,1227 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Linalg/Transforms/Hoisting.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Hoisting.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Hoisting.cpp.gcda
+        -:    0:Runs:325587
+        -:    1://===- Hoisting.cpp - Linalg hoisting transformations ---------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements functions concerned with hoisting invariant operations
+        -:   10:// in the context of Linalg transformations.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
+        -:   15:#include "mlir/Analysis/SliceAnalysis.h"
+        -:   16:#include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
+        -:   17:#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
+        -:   18:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   19:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   20:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   21:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   22:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   23:#include "mlir/Dialect/SCF/Utils/Utils.h"
+        -:   24:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   25:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   26:#include "mlir/Dialect/Vector/Utils/VectorUtils.h"
+        -:   27:#include "mlir/IR/BuiltinOps.h"
+        -:   28:#include "mlir/IR/Dominance.h"
+        -:   29:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   30:#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
+        -:   31:#include "llvm/ADT/StringRef.h"
+        -:   32:#include "llvm/Support/Debug.h"
+        -:   33:
+        -:   34:using llvm::dbgs;
+        -:   35:
+        -:   36:#define DEBUG_TYPE "linalg-hoisting"
+        -:   37:
+        -:   38:#define DBGS() (dbgs() << '[' << DEBUG_TYPE << "] ")
+        -:   39:
+        -:   40:using namespace mlir;
+        -:   41:using namespace mlir::linalg;
+        -:   42:
+        -:   43:namespace {
+        -:   44:/// Represents a unit of hoistable TransferWriteOp. This may comprise other
+        -:   45:/// instructions that need to be hoisted too.
+    #####:   46:struct HoistableWrite {
+        -:   47:  vector::TransferWriteOp transferWriteOp;
+        -:   48:  tensor::InsertSliceOp insertSliceOp;
+        -:   49:};
+        -:   50:/// Represents a unit of hoistable TransferReadOp. This may comprise other
+        -:   51:/// instructions that need to be hoisted too.
+    #####:   52:struct HoistableRead {
+        -:   53:  vector::TransferReadOp transferReadOp;
+        -:   54:  tensor::ExtractSliceOp extractSliceOp;
+        -:   55:};
+        -:   56:} // namespace
+        -:   57:
+        -:   58:/// Return true if op1 and op2 are the same constant or the same SSA value.
+function _ZL25isEqualOffsetSizeOrStrideN4mlir12OpFoldResultES0_ called 0 returned 0% blocks executed 0%
+    #####:   59:static bool isEqualOffsetSizeOrStride(OpFoldResult op1, OpFoldResult op2) {
+function _ZZL25isEqualOffsetSizeOrStrideN4mlir12OpFoldResultES0_ENKUlS0_E_clES0_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:   60:  auto getConstantIntValue = [](OpFoldResult ofr) -> llvm::Optional<int64_t> {
+    #####:   61:    Attribute attr = ofr.dyn_cast<Attribute>();
+call    0 never executed
+        -:   62:    // Note: isa+cast-like pattern allows writing the condition below as 1 line.
+    #####:   63:    if (!attr && ofr.get<Value>().getDefiningOp<arith::ConstantOp>())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:   64:      attr = ofr.get<Value>().getDefiningOp<arith::ConstantOp>().getValue();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   65:    if (auto intAttr = attr.dyn_cast_or_null<IntegerAttr>())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   66:      return intAttr.getValue().getSExtValue();
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   67:    return llvm::None;
+        -:   68:  };
+    #####:   69:  auto cst1 = getConstantIntValue(op1), cst2 = getConstantIntValue(op2);
+call    0 never executed
+call    1 never executed
+    #####:   70:  if (cst1 && cst2 && *cst1 == *cst2)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   71:    return true;
+    #####:   72:  auto v1 = op1.dyn_cast<Value>(), v2 = op2.dyn_cast<Value>();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   73:  return v1 && v2 && v1 == v2;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   74:}
+        -:   75:
+        -:   76:/// Return true is all offsets, sizes and strides are equal.
+function _ZL26sameOffsetsSizesAndStridesN4mlir6tensor14ExtractSliceOpENS0_13InsertSliceOpE called 0 returned 0% blocks executed 0%
+    #####:   77:static bool sameOffsetsSizesAndStrides(tensor::ExtractSliceOp s,
+        -:   78:                                       tensor::InsertSliceOp si) {
+    #####:   79:  if (s.getStaticOffsets().size() != si.getStaticOffsets().size())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   80:    return false;
+    #####:   81:  if (s.getStaticSizes().size() != si.getStaticSizes().size())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   82:    return false;
+    #####:   83:  if (s.getStaticStrides().size() != si.getStaticStrides().size())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   84:    return false;
+    #####:   85:  for (auto it : llvm::zip(s.getMixedOffsets(), si.getMixedOffsets()))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:   86:    if (!isEqualOffsetSizeOrStride(std::get<0>(it), std::get<1>(it)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   87:      return false;
+call    0 never executed
+    #####:   88:  for (auto it : llvm::zip(s.getMixedSizes(), si.getMixedSizes()))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:   89:    if (!isEqualOffsetSizeOrStride(std::get<0>(it), std::get<1>(it)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   90:      return false;
+call    0 never executed
+    #####:   91:  for (auto it : llvm::zip(s.getMixedStrides(), si.getMixedStrides()))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:   92:    if (!isEqualOffsetSizeOrStride(std::get<0>(it), std::get<1>(it)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   93:      return false;
+call    0 never executed
+    #####:   94:  return true;
+        -:   95:}
+        -:   96:
+        -:   97:/// Look for a HoistableRead, in the given tensor uses, accessing the same
+        -:   98:/// offset as the HoistableWrite.
+function _ZL24findMatchingTransferReadN12_GLOBAL__N_114HoistableWriteEN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:   99:static HoistableRead findMatchingTransferRead(HoistableWrite write,
+        -:  100:                                              Value srcTensor) {
+    #####:  101:  assert(write.transferWriteOp &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  102:         "expected hoistable write to have a .transfer_write");
+        -:  103:
+    #####:  104:  LLVM_DEBUG(DBGS() << "findMatchingTransferRead for: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  105:                    << *write.transferWriteOp.getOperation() << "\n");
+    #####:  106:  if (write.insertSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  107:    LLVM_DEBUG(DBGS() << "findMatchingTransferRead inserSliceOp: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  108:                      << *write.insertSliceOp.getOperation() << "\n");
+    #####:  109:  SmallVector<Operation *> users(srcTensor.getUsers().begin(),
+call    0 never executed
+    #####:  110:                                 srcTensor.getUsers().end());
+call    0 never executed
+    #####:  111:  while (!users.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  112:    Operation *user = users.pop_back_val();
+call    0 never executed
+    #####:  113:    LLVM_DEBUG(DBGS() << "findMatchingTransferRead inspect user: " << *user
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  114:                      << "\n");
+        -:  115:
+        -:  116:    // If HoistableWrite involves a InsertSliceOp, we need to find a
+        -:  117:    // matching ExtractSliceOp.
+    #####:  118:    tensor::ExtractSliceOp sliceOp;
+branch  0 never executed
+branch  1 never executed
+    #####:  119:    Operation *maybeTransferReadUser = user;
+    #####:  120:    if (write.insertSliceOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  121:      sliceOp = dyn_cast<tensor::ExtractSliceOp>(user);
+call    0 never executed
+    #####:  122:      if (!sliceOp || sliceOp.getResult().getType() !=
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  123:                          write.insertSliceOp.getSource().getType())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  124:        continue;
+        -:  125:
+    #####:  126:      LLVM_DEBUG(DBGS() << "check whether sameOffsetsSizesAndStrides: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+        -:  127:                        << *sliceOp << " vs " << *write.insertSliceOp << "\n");
+    #####:  128:      if (!sameOffsetsSizesAndStrides(sliceOp, write.insertSliceOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  129:        continue;
+        -:  130:
+    #####:  131:      LLVM_DEBUG(DBGS() << "sameOffsetsSizesAndStrides: SUCCESS\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  132:      // If we got here, sliceOp is hoistable iff it has exactly 2 uses:
+        -:  133:      //   1. the transfer_write we want to hoist.
+        -:  134:      //   2. a matching transfer_read.
+        -:  135:      // Anything else, we skip.
+    #####:  136:      bool skip = false;
+    #####:  137:      Operation *otherUser = nullptr;
+    #####:  138:      for (Operation *u : sliceOp->getUsers()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  139:        if (u == write.transferWriteOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  140:          continue;
+    #####:  141:        if (otherUser) {
+branch  0 never executed
+branch  1 never executed
+        -:  142:          skip = true;
+        -:  143:          break;
+        -:  144:        }
+        -:  145:        otherUser = u;
+        -:  146:      }
+    #####:  147:      if (skip || !otherUser)
+branch  0 never executed
+branch  1 never executed
+    #####:  148:        continue;
+        -:  149:      maybeTransferReadUser = otherUser;
+        -:  150:    }
+        -:  151:
+    #####:  152:    LLVM_DEBUG(DBGS() << "maybeTransferReadUser: " << *maybeTransferReadUser
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  153:                      << "\n");
+    #####:  154:    auto read = dyn_cast<vector::TransferReadOp>(maybeTransferReadUser);
+call    0 never executed
+    #####:  155:    if (read && read.getIndices() == write.transferWriteOp.getIndices() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:  156:        read.getVectorType() == write.transferWriteOp.getVectorType())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  157:      return HoistableRead{read, sliceOp};
+        -:  158:
+    #####:  159:    if (isa<vector::TransferWriteOp>(user)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  160:      // If we find a write with disjoint indices recurse through its uses.
+    #####:  161:      if (vector::isDisjointTransferIndices(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  162:              cast<VectorTransferOpInterface>(user),
+        -:  163:              cast<VectorTransferOpInterface>(
+        -:  164:                  write.transferWriteOp.getOperation()))) {
+    #####:  165:        users.append(user->getUsers().begin(), user->getUsers().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  166:      }
+        -:  167:    }
+        -:  168:  }
+    #####:  169:  return HoistableRead();
+        -:  170:}
+        -:  171:
+        -:  172:/// Check if the chunk of data inserted by the HoistableWrite are read by any
+        -:  173:/// other op than the HoistableRead candidate.
+function _ZL30tensorChunkAccessedByUnknownOpN12_GLOBAL__N_114HoistableWriteENS_13HoistableReadEN4mlir13BlockArgumentE called 0 returned 0% blocks executed 0%
+    #####:  174:static bool tensorChunkAccessedByUnknownOp(HoistableWrite write,
+        -:  175:                                           HoistableRead candidateRead,
+        -:  176:                                           BlockArgument tensorArg) {
+        -:  177:  // Make sure none of the other uses read the part of the tensor modified
+        -:  178:  // by the transfer_write.
+    #####:  179:  llvm::SmallVector<Value::use_range, 1> uses;
+call    0 never executed
+    #####:  180:  uses.push_back(tensorArg.getUses());
+call    0 never executed
+    #####:  181:  while (!uses.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  182:    for (OpOperand &use : uses.pop_back_val()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  183:      Operation *user = use.getOwner();
+branch  0 never executed
+branch  1 never executed
+        -:  184:      // Skip the candidate use, only inspect the "other" uses.
+    #####:  185:      if (user == candidateRead.transferReadOp ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  186:          user == candidateRead.extractSliceOp ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  187:          user == write.transferWriteOp || user == write.insertSliceOp)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  188:        continue;
+        -:  189:      // Consider all transitive uses through a extract_slice / insert_slice.
+        -:  190:      // TODO: atm we just bail because a stronger analysis is needed for these
+        -:  191:      // cases.
+    #####:  192:      if (isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  193:        return true;
+        -:  194:      // Consider all transitive uses through a vector.transfer_write.
+    #####:  195:      if (auto writeUser = dyn_cast<vector::TransferWriteOp>(user)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  196:        uses.push_back(writeUser->getResult(0).getUses());
+call    0 never executed
+    #####:  197:        continue;
+        -:  198:      }
+        -:  199:      // Consider all nested uses through an scf::ForOp. We may have
+        -:  200:      // pass-through tensor arguments left from previous level of
+        -:  201:      // hoisting.
+    #####:  202:      if (auto forUser = dyn_cast<scf::ForOp>(user)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  203:        Value arg = forUser.getLoopBody().getArgument(
+call    0 never executed
+    #####:  204:            use.getOperandNumber() - forUser.getNumControlOperands() +
+call    0 never executed
+call    1 never executed
+    #####:  205:            /*iv value*/ 1);
+call    0 never executed
+    #####:  206:        uses.push_back(arg.getUses());
+call    0 never executed
+    #####:  207:        continue;
+        -:  208:      }
+        -:  209:      // Follow the use yield as long as it doesn't escape the original
+        -:  210:      // region.
+    #####:  211:      scf::YieldOp yieldUser = dyn_cast<scf::YieldOp>(user);
+call    0 never executed
+    #####:  212:      if (yieldUser && write.transferWriteOp->getParentOp()->isAncestor(
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  213:                           yieldUser->getParentOp())) {
+branch  0 never executed
+branch  1 never executed
+    #####:  214:        Value ret = yieldUser->getParentOp()->getResult(use.getOperandNumber());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  215:        uses.push_back(ret.getUses());
+call    0 never executed
+    #####:  216:        continue;
+        -:  217:      }
+    #####:  218:      auto read = dyn_cast<vector::TransferReadOp>(user);
+call    0 never executed
+    #####:  219:      if (!read || !vector::isDisjointTransferIndices(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  220:                       cast<VectorTransferOpInterface>(read.getOperation()),
+        -:  221:                       cast<VectorTransferOpInterface>(
+        -:  222:                           write.transferWriteOp.getOperation()))) {
+    #####:  223:        return true;
+        -:  224:      }
+        -:  225:    }
+        -:  226:  }
+        -:  227:  return false;
+        -:  228:}
+        -:  229:
+        -:  230:/// Return the `forOp`-invariant HoistableWrite that produces `yieldOperand`.
+        -:  231:/// Return the null HoistableWrite() if it is not comprised of a
+        -:  232:/// vector.transfer_write + optional insert_slice or if any of the indexings
+        -:  233:/// is `forOp`-dependent.
+        -:  234:static HoistableWrite
+function _ZL39getLoopInvariantTransferWriteOpDefiningN4mlir3scf5ForOpERNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  235:getLoopInvariantTransferWriteOpDefining(scf::ForOp forOp,
+        -:  236:                                        OpOperand &yieldOperand) {
+    #####:  237:  Value v = yieldOperand.get();
+call    0 never executed
+    #####:  238:  if (auto write = v.getDefiningOp<vector::TransferWriteOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  239:    // Indexing must not depend on `forOp`.
+    #####:  240:    for (Value operand : write.getIndices())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  241:      if (!forOp.isDefinedOutsideOfLoop(operand))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  242:        return HoistableWrite();
+        -:  243:
+    #####:  244:    return HoistableWrite{write, nullptr};
+        -:  245:  }
+        -:  246:
+    #####:  247:  if (auto insertSliceOp = v.getDefiningOp<tensor::InsertSliceOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  248:    // Inserted slice must come from vector.transfer_write.
+    #####:  249:    auto write =
+    #####:  250:        insertSliceOp.getSource().getDefiningOp<vector::TransferWriteOp>();
+call    0 never executed
+call    1 never executed
+    #####:  251:    if (!write)
+branch  0 never executed
+branch  1 never executed
+    #####:  252:      return HoistableWrite();
+        -:  253:
+        -:  254:    // Tensor inserted into must be a BBArg at position matching yieldOperand's.
+    #####:  255:    auto bbArg = insertSliceOp.getDest().dyn_cast<BlockArgument>();
+call    0 never executed
+call    1 never executed
+    #####:  256:    if (!bbArg || bbArg.getOwner()->getParentOp() != forOp ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  257:        bbArg.getArgNumber() != /*num iv=*/1 + yieldOperand.getOperandNumber())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  258:      return HoistableWrite();
+        -:  259:
+        -:  260:    // Indexing inserted into must not depend on `forOp`.
+    #####:  261:    for (Value operand : insertSliceOp->getOperands().drop_front(
+call    0 never executed
+call    1 never executed
+    #####:  262:             tensor::InsertSliceOp::getOffsetSizeAndStrideStartOperandIndex()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  263:      if (!forOp.isDefinedOutsideOfLoop(operand))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  264:        return HoistableWrite();
+        -:  265:
+    #####:  266:    return HoistableWrite{write, insertSliceOp};
+        -:  267:  }
+        -:  268:
+    #####:  269:  return HoistableWrite();
+        -:  270:}
+        -:  271:
+        -:  272:/// Mechanical hoisting of a matching HoistableRead / HoistableWrite pair.
+function _ZL14hoistReadWriteN12_GLOBAL__N_113HoistableReadENS_14HoistableWriteEN4mlir13BlockArgumentE called 0 returned 0% blocks executed 0%
+    #####:  273:static void hoistReadWrite(HoistableRead read, HoistableWrite write,
+        -:  274:                           BlockArgument tensorBBArg) {
+    #####:  275:  scf::ForOp forOp = cast<scf::ForOp>(tensorBBArg.getOwner()->getParentOp());
+call    0 never executed
+call    1 never executed
+    #####:  276:  assert(read.transferReadOp && write.transferWriteOp &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  277:         "expected transfer_read and transfer_write ops to be set");
+    #####:  278:  assert(((read.extractSliceOp && write.insertSliceOp) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+        -:  279:          (!read.extractSliceOp && !write.insertSliceOp)) &&
+        -:  280:         "expected matching extract_slice / insert_slice");
+    #####:  281:  LLVM_DEBUG(DBGS() << "In forOp:\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+        -:  282:                    << *forOp.getOperation()
+        -:  283:                    << "\nHoist: " << *read.transferReadOp.getOperation()
+        -:  284:                    << "\nHoist: " << *write.transferWriteOp.getOperation()
+        -:  285:                    << "\nInvolving: " << tensorBBArg << "\n");
+        -:  286:
+        -:  287:  // If a read slice is present, hoist it.
+    #####:  288:  if (read.extractSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  289:    forOp.moveOutOfLoop(read.extractSliceOp);
+call    0 never executed
+        -:  290:
+        -:  291:  // Hoist the transfer_read op.
+    #####:  292:  forOp.moveOutOfLoop(read.transferReadOp);
+call    0 never executed
+        -:  293:
+        -:  294:  // TODO: don't hardcode /*numIvs=*/1.
+    #####:  295:  assert(tensorBBArg.getArgNumber() >= /*numIvs=*/1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  296:  unsigned initArgNumber = tensorBBArg.getArgNumber() - /*numIvs=*/1;
+branch  0 never executed
+branch  1 never executed
+        -:  297:
+        -:  298:  // Update the source tensor.
+    #####:  299:  if (read.extractSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  300:    read.extractSliceOp.getSourceMutable().assign(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  301:        forOp.getInitArgs()[initArgNumber]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  302:  else
+    #####:  303:    read.transferReadOp.getSourceMutable().assign(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  304:        forOp.getInitArgs()[initArgNumber]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  305:
+        -:  306:  // Hoist write after.
+    #####:  307:  if (write.insertSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  308:    write.insertSliceOp->moveAfter(forOp);
+call    0 never executed
+    #####:  309:  write.transferWriteOp->moveAfter(forOp);
+call    0 never executed
+        -:  310:
+        -:  311:  // Update the yield.
+    #####:  312:  auto yieldOp = cast<scf::YieldOp>(forOp.getRegion().front().getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  313:  if (write.insertSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  314:    yieldOp->setOperand(initArgNumber, write.insertSliceOp.getDest());
+call    0 never executed
+call    1 never executed
+        -:  315:  else
+    #####:  316:    yieldOp->setOperand(initArgNumber, write.transferWriteOp.getSource());
+call    0 never executed
+call    1 never executed
+        -:  317:
+        -:  318:  // Rewrite `loop` with additional new yields.
+    #####:  319:  OpBuilder b(read.transferReadOp);
+call    0 never executed
+function _ZZL14hoistReadWriteN12_GLOBAL__N_113HoistableReadENS_14HoistableWriteEN4mlir13BlockArgumentEENKUlRNS2_9OpBuilderENS2_8LocationEN4llvm8ArrayRefIS3_EEE_clES5_S6_S9_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  320:  NewYieldValueFn yieldFn = [&](OpBuilder &b, Location loc,
+        -:  321:                                ArrayRef<BlockArgument> newBBArgs) {
+    #####:  322:    return SmallVector<Value>{write.transferWriteOp.getVector()};
+call    0 never executed
+call    1 never executed
+    #####:  323:  };
+call    0 never executed
+    #####:  324:  auto newForOp = replaceLoopWithNewYields(
+    #####:  325:      b, forOp, read.transferReadOp.getVector(), yieldFn);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  326:
+        -:  327:  // Transfer write has been hoisted, need to update the vector and tensor
+        -:  328:  // source. Replace the result of the loop to use the new tensor created
+        -:  329:  // outside the loop.
+        -:  330:  // Depending on whether a insert_slice is present or not, it carries the
+        -:  331:  // update on the tensor operands.
+    #####:  332:  if (write.insertSliceOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  333:    newForOp.getResult(initArgNumber)
+branch  0 never executed
+branch  1 never executed
+    #####:  334:        .replaceAllUsesWith(write.insertSliceOp.getResult());
+call    0 never executed
+call    1 never executed
+    #####:  335:    write.transferWriteOp.getSourceMutable().assign(
+call    0 never executed
+call    1 never executed
+    #####:  336:        read.extractSliceOp.getResult());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  337:    write.insertSliceOp.getDestMutable().assign(
+call    0 never executed
+call    1 never executed
+    #####:  338:        read.extractSliceOp.getSource());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  339:  } else {
+    #####:  340:    newForOp.getResult(initArgNumber)
+branch  0 never executed
+branch  1 never executed
+    #####:  341:        .replaceAllUsesWith(write.transferWriteOp.getResult());
+call    0 never executed
+call    1 never executed
+    #####:  342:    write.transferWriteOp.getSourceMutable().assign(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  343:        newForOp.getResult(initArgNumber));
+        -:  344:  }
+        -:  345:
+        -:  346:  // Always update with the newly yield tensor and vector.
+    #####:  347:  write.transferWriteOp.getVectorMutable().assign(newForOp.getResults().back());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  348:}
+        -:  349:
+        -:  350:// To hoist transfer op on tensor the logic can be significantly simplified
+        -:  351:// compared to the case on buffer. The transformation follows this logic:
+        -:  352:// 1. Look for transfer_write with a single use from ForOp yield
+        -:  353:// 2. Check the uses of the matching block argument and look for a transfer_read
+        -:  354:// with the same indices.
+        -:  355:// 3. Check that all the other uses of the tensor argument are either disjoint
+        -:  356:// tensor_read or transfer_write. For transfer_write uses recurse to make sure
+        -:  357:// the new tensor has the same restrictions on its uses.
+        -:  358:// 4. Hoist the tensor_read/tensor_write and update the tensor SSA links.
+        -:  359:// After this transformation the scf.forOp may have unused arguments that can be
+        -:  360:// remove by the canonicalization pass.
+function _ZN4mlir6linalg37hoistRedundantVectorTransfersOnTensorENS_4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  361:void mlir::linalg::hoistRedundantVectorTransfersOnTensor(func::FuncOp func) {
+    #####:  362:  bool changed = true;
+    #####:  363:  while (changed) {
+branch  0 never executed
+branch  1 never executed
+    #####:  364:    changed = false;
+function _ZZN4mlir6linalg37hoistRedundantVectorTransfersOnTensorENS_4func6FuncOpEENKUlNS_3scf5ForOpEE_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  365:    func.walk([&](scf::ForOp forOp) {
+    #####:  366:      Operation *yield = forOp.getBody()->getTerminator();
+call    0 never executed
+call    1 never executed
+    #####:  367:      for (const auto &it : llvm::enumerate(forOp.getRegionIterArgs())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  368:        OpOperand &ret = yield->getOpOperand(it.index());
+call    0 never executed
+    #####:  369:        HoistableWrite write =
+    #####:  370:            getLoopInvariantTransferWriteOpDefining(forOp, ret);
+call    0 never executed
+    #####:  371:        if (!write.transferWriteOp || !write.transferWriteOp->hasOneUse())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  372:          continue;
+call    0 never executed
+    #####:  373:        LLVM_DEBUG(dbgs() << "\n";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+        -:  374:                   DBGS() << "Candidate write for hoisting: "
+        -:  375:                          << *write.transferWriteOp.getOperation() << "\n");
+    #####:  376:        if (write.insertSliceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  377:          LLVM_DEBUG(DBGS() << "Candidate insert_slice for hoisting: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  378:                            << *write.insertSliceOp.getOperation() << "\n");
+    #####:  379:        if (llvm::any_of(write.transferWriteOp.getIndices(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  380:                         [&forOp](Value index) {
+        -:  381:                           return !forOp.isDefinedOutsideOfLoop(index);
+        -:  382:                         }))
+    #####:  383:          continue;
+        -:  384:        // Find a read with the same type and indices.
+    #####:  385:        HoistableRead matchingRead =
+    #####:  386:            findMatchingTransferRead(write, it.value());
+call    0 never executed
+        -:  387:        // Make sure none of the other uses read the part of the tensor modified
+        -:  388:        // by the transfer_write.
+    #####:  389:        if (!matchingRead.transferReadOp ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  390:            tensorChunkAccessedByUnknownOp(write, matchingRead, it.value()))
+call    0 never executed
+    #####:  391:          continue;
+        -:  392:
+    #####:  393:        LLVM_DEBUG(DBGS() << "Start hoisting\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  394:        hoistReadWrite(matchingRead, write, it.value());
+call    0 never executed
+    #####:  395:        changed = true;
+    #####:  396:        forOp.erase();
+call    0 never executed
+        -:  397:
+        -:  398:        // Need to interrupt and restart: erasing the loop messes up the walk.
+    #####:  399:        return WalkResult::interrupt();
+        -:  400:      }
+    #####:  401:      return WalkResult::advance();
+    #####:  402:    });
+call    0 never executed
+        -:  403:    // Apply canonicalization so the newForOp + yield folds immediately, thus
+        -:  404:    // cleaning up the IR and potentially enabling more hoisting.
+    #####:  405:    if (changed) {
+branch  0 never executed
+branch  1 never executed
+    #####:  406:      RewritePatternSet patterns(func->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  407:      scf::ForOp::getCanonicalizationPatterns(patterns, func->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  408:      (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  409:    }
+        -:  410:  }
+    #####:  411:}
+        -:  412:
+function _ZN4mlir6linalg29hoistRedundantVectorTransfersENS_4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  413:void mlir::linalg::hoistRedundantVectorTransfers(func::FuncOp func) {
+    #####:  414:  bool changed = true;
+    #####:  415:  while (changed) {
+branch  0 never executed
+branch  1 never executed
+    #####:  416:    changed = false;
+        -:  417:    // First move loop invariant ops outside of their loop. This needs to be
+        -:  418:    // done before as we cannot move ops without interrupting the function walk.
+    #####:  419:    func.walk(
+call    0 never executed
+    #####:  420:        [&](LoopLikeOpInterface loopLike) { moveLoopInvariantCode(loopLike); });
+call    0 never executed
+        -:  421:
+function _ZZN4mlir6linalg29hoistRedundantVectorTransfersENS_4func6FuncOpEENKUlNS_6vector14TransferReadOpEE0_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  422:    func.walk([&](vector::TransferReadOp transferRead) {
+    #####:  423:      if (!transferRead.getShapedType().isa<MemRefType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  424:        return WalkResult::advance();
+        -:  425:
+    #####:  426:      LLVM_DEBUG(DBGS() << "Candidate for hoisting: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  427:                        << *transferRead.getOperation() << "\n");
+    #####:  428:      auto loop = dyn_cast<scf::ForOp>(transferRead->getParentOp());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  429:      LLVM_DEBUG(DBGS() << "Parent op: " << *transferRead->getParentOp()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+branch 11 never executed
+branch 12 never executed
+call   13 never executed
+call   14 never executed
+        -:  430:                        << "\n");
+    #####:  431:      if (!loop)
+branch  0 never executed
+branch  1 never executed
+    #####:  432:        return WalkResult::advance();
+        -:  433:
+    #####:  434:      LLVM_DEBUG(DBGS() << "Candidate read: " << *transferRead.getOperation()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  435:                        << "\n");
+        -:  436:
+    #####:  437:      SetVector<Operation *> forwardSlice;
+call    0 never executed
+    #####:  438:      getForwardSlice(transferRead.getOperation(), &forwardSlice);
+call    0 never executed
+        -:  439:
+        -:  440:      // Look for the last TransferWriteOp in the forwardSlice of
+        -:  441:      // `transferRead` that operates on the same memref.
+    #####:  442:      vector::TransferWriteOp transferWrite;
+    #####:  443:      for (auto *sliceOp : llvm::reverse(forwardSlice)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  444:        auto candidateWrite = dyn_cast<vector::TransferWriteOp>(sliceOp);
+call    0 never executed
+    #####:  445:        if (!candidateWrite ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  446:            candidateWrite.getSource() != transferRead.getSource())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  447:          continue;
+    #####:  448:        transferWrite = candidateWrite;
+        -:  449:      }
+        -:  450:
+        -:  451:      // All operands of the TransferRead must be defined outside of the loop.
+    #####:  452:      for (auto operand : transferRead.getOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  453:        if (!loop.isDefinedOutsideOfLoop(operand))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  454:          return WalkResult::advance();
+        -:  455:
+        -:  456:      // Only hoist transfer_read / transfer_write pairs for now.
+    #####:  457:      if (!transferWrite)
+branch  0 never executed
+branch  1 never executed
+    #####:  458:        return WalkResult::advance();
+        -:  459:
+    #####:  460:      LLVM_DEBUG(DBGS() << "Candidate: " << *transferWrite.getOperation()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  461:                        << "\n");
+        -:  462:
+        -:  463:      // Approximate aliasing by checking that:
+        -:  464:      //   1. indices are the same,
+        -:  465:      //   2. no other operations in the loop access the same memref except
+        -:  466:      //      for transfer_read/transfer_write accessing statically disjoint
+        -:  467:      //      slices.
+    #####:  468:      if (transferRead.getIndices() != transferWrite.getIndices() &&
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  469:          transferRead.getVectorType() == transferWrite.getVectorType())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  470:        return WalkResult::advance();
+        -:  471:
+        -:  472:      // TODO: may want to memoize this information for performance but it
+        -:  473:      // likely gets invalidated often.
+    #####:  474:      DominanceInfo dom(loop);
+call    0 never executed
+call    1 never executed
+    #####:  475:      if (!dom.properlyDominates(transferRead.getOperation(), transferWrite))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  476:        return WalkResult::advance();
+    #####:  477:      for (auto &use : transferRead.getSource().getUses()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  478:        if (!loop->isAncestor(use.getOwner()))
+branch  0 never executed
+branch  1 never executed
+    #####:  479:          continue;
+    #####:  480:        if (use.getOwner() == transferRead.getOperation() ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  481:            use.getOwner() == transferWrite.getOperation())
+branch  0 never executed
+branch  1 never executed
+    #####:  482:          continue;
+    #####:  483:        if (auto transferWriteUse =
+branch  0 never executed
+branch  1 never executed
+    #####:  484:                dyn_cast<vector::TransferWriteOp>(use.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  485:          if (!vector::isDisjointTransferSet(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  486:                  cast<VectorTransferOpInterface>(transferWrite.getOperation()),
+        -:  487:                  cast<VectorTransferOpInterface>(
+        -:  488:                      transferWriteUse.getOperation())))
+    #####:  489:            return WalkResult::advance();
+    #####:  490:        } else if (auto transferReadUse =
+branch  0 never executed
+branch  1 never executed
+    #####:  491:                       dyn_cast<vector::TransferReadOp>(use.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  492:          if (!vector::isDisjointTransferSet(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  493:                  cast<VectorTransferOpInterface>(transferWrite.getOperation()),
+        -:  494:                  cast<VectorTransferOpInterface>(
+        -:  495:                      transferReadUse.getOperation())))
+    #####:  496:            return WalkResult::advance();
+        -:  497:        } else {
+        -:  498:          // Unknown use, we cannot prove that it doesn't alias with the
+        -:  499:          // transferRead/transferWrite operations.
+    #####:  500:          return WalkResult::advance();
+        -:  501:        }
+        -:  502:      }
+        -:  503:
+        -:  504:      // Hoist read before.
+    #####:  505:      loop.moveOutOfLoop(transferRead);
+call    0 never executed
+        -:  506:
+        -:  507:      // Hoist write after.
+    #####:  508:      transferWrite->moveAfter(loop);
+call    0 never executed
+        -:  509:
+        -:  510:      // Rewrite `loop` with new yields by cloning and erase the original loop.
+    #####:  511:      OpBuilder b(transferRead);
+call    0 never executed
+function _ZZZN4mlir6linalg29hoistRedundantVectorTransfersENS_4func6FuncOpEENKUlNS_6vector14TransferReadOpEE0_clES4_ENKUlRNS_9OpBuilderENS_8LocationEN4llvm8ArrayRefINS_13BlockArgumentEEEE_clES7_S8_SC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  512:      NewYieldValueFn yieldFn = [&](OpBuilder &b, Location loc,
+        -:  513:                                    ArrayRef<BlockArgument> newBBArgs) {
+    #####:  514:        return SmallVector<Value>{transferWrite.getVector()};
+call    0 never executed
+call    1 never executed
+    #####:  515:      };
+call    0 never executed
+call    1 never executed
+    #####:  516:      auto newForOp =
+    #####:  517:          replaceLoopWithNewYields(b, loop, transferRead.getVector(), yieldFn);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  518:
+        -:  519:      // Transfer write has been hoisted, need to update the written vector by
+        -:  520:      // the value yielded by the newForOp.
+    #####:  521:      transferWrite.getVectorMutable().assign(newForOp.getResults().back());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  522:
+    #####:  523:      changed = true;
+    #####:  524:      loop.erase();
+call    0 never executed
+        -:  525:      // Need to interrupt and restart because erasing the loop messes up the
+        -:  526:      // walk.
+    #####:  527:      return WalkResult::interrupt();
+branch  0 never executed
+branch  1 never executed
+    #####:  528:    });
+call    0 never executed
+        -:  529:  }
+    #####:  530:}

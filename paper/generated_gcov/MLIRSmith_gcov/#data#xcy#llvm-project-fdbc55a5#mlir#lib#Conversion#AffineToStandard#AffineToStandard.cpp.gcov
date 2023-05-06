@@ -1,0 +1,1026 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Conversion/AffineToStandard/AffineToStandard.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/AffineToStandard/CMakeFiles/obj.MLIRAffineToStandard.dir/AffineToStandard.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/AffineToStandard/CMakeFiles/obj.MLIRAffineToStandard.dir/AffineToStandard.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- AffineToStandard.cpp - Lower affine constructs to primitives -------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file lowers affine constructs (If and For statements, AffineApply
+        -:   10:// operations) within a function into their standard If and For equivalent ops.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+        -:   15:
+        -:   16:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   17:#include "mlir/Dialect/Affine/Utils.h"
+        -:   18:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   19:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   20:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   21:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   22:#include "mlir/IR/IntegerSet.h"
+        -:   23:#include "mlir/IR/MLIRContext.h"
+        -:   24:#include "mlir/Transforms/DialectConversion.h"
+        -:   25:#include "mlir/Transforms/Passes.h"
+        -:   26:
+        -:   27:namespace mlir {
+        -:   28:#define GEN_PASS_DEF_CONVERTAFFINETOSTANDARD
+        -:   29:#include "mlir/Conversion/Passes.h.inc"
+        -:   30:} // namespace mlir
+        -:   31:
+        -:   32:using namespace mlir;
+        -:   33:using namespace mlir::vector;
+        -:   34:
+        -:   35:/// Given a range of values, emit the code that reduces them with "min" or "max"
+        -:   36:/// depending on the provided comparison predicate.  The predicate defines which
+        -:   37:/// comparison to perform, "lt" for "min", "gt" for "max" and is used for the
+        -:   38:/// `cmpi` operation followed by the `select` operation:
+        -:   39:///
+        -:   40:///   %cond   = arith.cmpi "predicate" %v0, %v1
+        -:   41:///   %result = select %cond, %v0, %v1
+        -:   42:///
+        -:   43:/// Multiple values are scanned in a linear sequence.  This creates a data
+        -:   44:/// dependences that wouldn't exist in a tree reduction, but is easier to
+        -:   45:/// recognize as a reduction by the subsequent passes.
+function _ZL23buildMinMaxReductionSeqN4mlir8LocationENS_5arith13CmpIPredicateENS_10ValueRangeERNS_9OpBuilderE called 9380 returned 100% blocks executed 92%
+     9380:   46:static Value buildMinMaxReductionSeq(Location loc,
+        -:   47:                                     arith::CmpIPredicate predicate,
+        -:   48:                                     ValueRange values, OpBuilder &builder) {
+    9380*:   49:  assert(!values.empty() && "empty min/max chain");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:   50:
+     9380:   51:  auto valueIt = values.begin();
+call    0 returned 100%
+     9380:   52:  Value value = *valueIt++;
+call    0 returned 100%
+    17546:   53:  for (; valueIt != values.end(); ++valueIt) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     8166:   54:    auto cmpOp = builder.create<arith::CmpIOp>(loc, predicate, value, *valueIt);
+call    0 returned 100%
+call    1 returned 100%
+     8166:   55:    value = builder.create<arith::SelectOp>(loc, cmpOp.getResult(), value,
+call    0 returned 100%
+     8166:   56:                                            *valueIt);
+call    0 returned 100%
+call    1 returned 100%
+        -:   57:  }
+        -:   58:
+     9380:   59:  return value;
+        -:   60:}
+        -:   61:
+        -:   62:/// Emit instructions that correspond to computing the maximum value among the
+        -:   63:/// values of a (potentially) multi-output affine map applied to `operands`.
+function _ZL17lowerAffineMapMaxRN4mlir9OpBuilderENS_8LocationENS_9AffineMapENS_10ValueRangeE called 4699 returned 100% blocks executed 80%
+     4699:   64:static Value lowerAffineMapMax(OpBuilder &builder, Location loc, AffineMap map,
+        -:   65:                               ValueRange operands) {
+    4699*:   66:  if (auto values = expandAffineMap(builder, loc, map, operands))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+     4699:   67:    return buildMinMaxReductionSeq(loc, arith::CmpIPredicate::sgt, *values,
+call    0 returned 100%
+     4699:   68:                                   builder);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+    #####:   69:  return nullptr;
+        -:   70:}
+        -:   71:
+        -:   72:/// Emit instructions that correspond to computing the minimum value among the
+        -:   73:/// values of a (potentially) multi-output affine map applied to `operands`.
+function _ZL17lowerAffineMapMinRN4mlir9OpBuilderENS_8LocationENS_9AffineMapENS_10ValueRangeE called 4681 returned 100% blocks executed 80%
+     4681:   74:static Value lowerAffineMapMin(OpBuilder &builder, Location loc, AffineMap map,
+        -:   75:                               ValueRange operands) {
+    4681*:   76:  if (auto values = expandAffineMap(builder, loc, map, operands))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+     4681:   77:    return buildMinMaxReductionSeq(loc, arith::CmpIPredicate::slt, *values,
+call    0 returned 100%
+     4681:   78:                                   builder);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+    #####:   79:  return nullptr;
+        -:   80:}
+        -:   81:
+        -:   82:/// Emit instructions that correspond to the affine map in the upper bound
+        -:   83:/// applied to the respective operands, and compute the minimum value across
+        -:   84:/// the results.
+function _ZN4mlir21lowerAffineUpperBoundENS_11AffineForOpERNS_9OpBuilderE called 2042 returned 100% blocks executed 100%
+     2042:   85:Value mlir::lowerAffineUpperBound(AffineForOp op, OpBuilder &builder) {
+     2042:   86:  return lowerAffineMapMin(builder, op.getLoc(), op.getUpperBoundMap(),
+     4084:   87:                           op.getUpperBoundOperands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:   88:}
+        -:   89:
+        -:   90:/// Emit instructions that correspond to the affine map in the lower bound
+        -:   91:/// applied to the respective operands, and compute the maximum value across
+        -:   92:/// the results.
+function _ZN4mlir21lowerAffineLowerBoundENS_11AffineForOpERNS_9OpBuilderE called 2042 returned 100% blocks executed 100%
+     2042:   93:Value mlir::lowerAffineLowerBound(AffineForOp op, OpBuilder &builder) {
+     2042:   94:  return lowerAffineMapMax(builder, op.getLoc(), op.getLowerBoundMap(),
+     4084:   95:                           op.getLowerBoundOperands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:   96:}
+        -:   97:
+        -:   98:namespace {
+        -:   99:class AffineMinLowering : public OpRewritePattern<AffineMinOp> {
+        -:  100:public:
+        -:  101:  using OpRewritePattern<AffineMinOp>::OpRewritePattern;
+        -:  102:
+function _ZNK12_GLOBAL__N_117AffineMinLowering15matchAndRewriteEN4mlir11AffineMinOpERNS1_15PatternRewriterE called 2639 returned 100% blocks executed 90%
+     2639:  103:  LogicalResult matchAndRewrite(AffineMinOp op,
+        -:  104:                                PatternRewriter &rewriter) const override {
+     2639:  105:    Value reduced =
+     2639:  106:        lowerAffineMapMin(rewriter, op.getLoc(), op.getMap(), op.operands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+     2639:  107:    if (!reduced)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  108:      return failure();
+        -:  109:
+     2639:  110:    rewriter.replaceOp(op, reduced);
+call    0 returned 100%
+call    1 returned 100%
+     2639:  111:    return success();
+        -:  112:  }
+        -:  113:};
+        -:  114:
+        -:  115:class AffineMaxLowering : public OpRewritePattern<AffineMaxOp> {
+        -:  116:public:
+        -:  117:  using OpRewritePattern<AffineMaxOp>::OpRewritePattern;
+        -:  118:
+function _ZNK12_GLOBAL__N_117AffineMaxLowering15matchAndRewriteEN4mlir11AffineMaxOpERNS1_15PatternRewriterE called 2657 returned 100% blocks executed 90%
+     2657:  119:  LogicalResult matchAndRewrite(AffineMaxOp op,
+        -:  120:                                PatternRewriter &rewriter) const override {
+     2657:  121:    Value reduced =
+     2657:  122:        lowerAffineMapMax(rewriter, op.getLoc(), op.getMap(), op.operands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+     2657:  123:    if (!reduced)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  124:      return failure();
+        -:  125:
+     2657:  126:    rewriter.replaceOp(op, reduced);
+call    0 returned 100%
+call    1 returned 100%
+     2657:  127:    return success();
+        -:  128:  }
+        -:  129:};
+        -:  130:
+        -:  131:/// Affine yields ops are removed.
+        -:  132:class AffineYieldOpLowering : public OpRewritePattern<AffineYieldOp> {
+        -:  133:public:
+        -:  134:  using OpRewritePattern<AffineYieldOp>::OpRewritePattern;
+        -:  135:
+function _ZNK12_GLOBAL__N_121AffineYieldOpLowering15matchAndRewriteEN4mlir13AffineYieldOpERNS1_15PatternRewriterE called 6406 returned 100% blocks executed 80%
+     6406:  136:  LogicalResult matchAndRewrite(AffineYieldOp op,
+        -:  137:                                PatternRewriter &rewriter) const override {
+    12812:  138:    if (isa<scf::ParallelOp>(op->getParentOp())) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+        -:  139:      // scf.parallel does not yield any values via its terminator scf.yield but
+        -:  140:      // models reductions differently using additional ops in its region.
+    #####:  141:      rewriter.replaceOpWithNewOp<scf::YieldOp>(op);
+call    0 never executed
+    #####:  142:      return success();
+        -:  143:    }
+     6406:  144:    rewriter.replaceOpWithNewOp<scf::YieldOp>(op, op.operands());
+call    0 returned 100%
+call    1 returned 100%
+     6406:  145:    return success();
+        -:  146:  }
+        -:  147:};
+        -:  148:
+        -:  149:class AffineForLowering : public OpRewritePattern<AffineForOp> {
+        -:  150:public:
+        -:  151:  using OpRewritePattern<AffineForOp>::OpRewritePattern;
+        -:  152:
+function _ZNK12_GLOBAL__N_117AffineForLowering15matchAndRewriteEN4mlir11AffineForOpERNS1_15PatternRewriterE called 2042 returned 100% blocks executed 100%
+     2042:  153:  LogicalResult matchAndRewrite(AffineForOp op,
+        -:  154:                                PatternRewriter &rewriter) const override {
+     2042:  155:    Location loc = op.getLoc();
+call    0 returned 100%
+     2042:  156:    Value lowerBound = lowerAffineLowerBound(op, rewriter);
+call    0 returned 100%
+     2042:  157:    Value upperBound = lowerAffineUpperBound(op, rewriter);
+call    0 returned 100%
+     2042:  158:    Value step = rewriter.create<arith::ConstantIndexOp>(loc, op.getStep());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2042:  159:    auto scfForOp = rewriter.create<scf::ForOp>(loc, lowerBound, upperBound,
+     2042:  160:                                                step, op.getIterOperands());
+call    0 returned 100%
+call    1 returned 100%
+     2042:  161:    rewriter.eraseBlock(scfForOp.getBody());
+call    0 returned 100%
+call    1 returned 100%
+     2042:  162:    rewriter.inlineRegionBefore(op.getRegion(), scfForOp.getRegion(),
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2042:  163:                                scfForOp.getRegion().end());
+call    0 returned 100%
+call    1 returned 100%
+     2042:  164:    rewriter.replaceOp(op, scfForOp.getResults());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2042:  165:    return success();
+        -:  166:  }
+        -:  167:};
+        -:  168:
+        -:  169:/// Convert an `affine.parallel` (loop nest) operation into a `scf.parallel`
+        -:  170:/// operation.
+        -:  171:class AffineParallelLowering : public OpRewritePattern<AffineParallelOp> {
+        -:  172:public:
+        -:  173:  using OpRewritePattern<AffineParallelOp>::OpRewritePattern;
+        -:  174:
+function _ZNK12_GLOBAL__N_122AffineParallelLowering15matchAndRewriteEN4mlir16AffineParallelOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  175:  LogicalResult matchAndRewrite(AffineParallelOp op,
+        -:  176:                                PatternRewriter &rewriter) const override {
+    #####:  177:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  178:    SmallVector<Value, 8> steps;
+call    0 never executed
+    #####:  179:    SmallVector<Value, 8> upperBoundTuple;
+branch  0 never executed
+branch  1 never executed
+    #####:  180:    SmallVector<Value, 8> lowerBoundTuple;
+branch  0 never executed
+branch  1 never executed
+    #####:  181:    SmallVector<Value, 8> identityVals;
+branch  0 never executed
+branch  1 never executed
+        -:  182:    // Emit IR computing the lower and upper bound by expanding the map
+        -:  183:    // expression.
+    #####:  184:    lowerBoundTuple.reserve(op.getNumDims());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  185:    upperBoundTuple.reserve(op.getNumDims());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  186:    for (unsigned i = 0, e = op.getNumDims(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  187:      Value lower = lowerAffineMapMax(rewriter, loc, op.getLowerBoundMap(i),
+    #####:  188:                                      op.getLowerBoundsOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  189:      if (!lower)
+branch  0 never executed
+branch  1 never executed
+    #####:  190:        return rewriter.notifyMatchFailure(op, "couldn't convert lower bounds");
+call    0 never executed
+    #####:  191:      lowerBoundTuple.push_back(lower);
+call    0 never executed
+        -:  192:
+    #####:  193:      Value upper = lowerAffineMapMin(rewriter, loc, op.getUpperBoundMap(i),
+    #####:  194:                                      op.getUpperBoundsOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  195:      if (!upper)
+branch  0 never executed
+branch  1 never executed
+    #####:  196:        return rewriter.notifyMatchFailure(op, "couldn't convert upper bounds");
+call    0 never executed
+    #####:  197:      upperBoundTuple.push_back(upper);
+call    0 never executed
+        -:  198:    }
+    #####:  199:    steps.reserve(op.getSteps().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  200:    for (int64_t step : op.getSteps())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  201:      steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, step));
+call    0 never executed
+call    1 never executed
+        -:  202:
+        -:  203:    // Get the terminator op.
+    #####:  204:    Operation *affineParOpTerminator = op.getBody()->getTerminator();
+call    0 never executed
+call    1 never executed
+    #####:  205:    scf::ParallelOp parOp;
+call    0 never executed
+    #####:  206:    if (op.getResults().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  207:      // Case with no reduction operations/return values.
+    #####:  208:      parOp = rewriter.create<scf::ParallelOp>(loc, lowerBoundTuple,
+        -:  209:                                               upperBoundTuple, steps,
+    #####:  210:                                               /*bodyBuilderFn=*/nullptr);
+call    0 never executed
+    #####:  211:      rewriter.eraseBlock(parOp.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  212:      rewriter.inlineRegionBefore(op.getRegion(), parOp.getRegion(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  213:                                  parOp.getRegion().end());
+call    0 never executed
+call    1 never executed
+    #####:  214:      rewriter.replaceOp(op, parOp.getResults());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  215:      return success();
+        -:  216:    }
+        -:  217:    // Case with affine.parallel with reduction operations/return values.
+        -:  218:    // scf.parallel handles the reduction operation differently unlike
+        -:  219:    // affine.parallel.
+    #####:  220:    ArrayRef<Attribute> reductions = op.getReductions().getValue();
+call    0 never executed
+call    1 never executed
+    #####:  221:    for (auto pair : llvm::zip(reductions, op.getResultTypes())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  222:      // For each of the reduction operations get the identity values for
+        -:  223:      // initialization of the result values.
+    #####:  224:      Attribute reduction = std::get<0>(pair);
+call    0 never executed
+    #####:  225:      Type resultType = std::get<1>(pair);
+call    0 never executed
+    #####:  226:      Optional<arith::AtomicRMWKind> reductionOp =
+call    0 never executed
+        -:  227:          arith::symbolizeAtomicRMWKind(
+    #####:  228:              static_cast<uint64_t>(reduction.cast<IntegerAttr>().getInt()));
+call    0 never executed
+call    1 never executed
+    #####:  229:      assert(reductionOp && "Reduction operation cannot be of None Type");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  230:      arith::AtomicRMWKind reductionOpValue = *reductionOp;
+call    0 never executed
+    #####:  231:      identityVals.push_back(
+call    0 never executed
+call    1 never executed
+        -:  232:          arith::getIdentityValue(reductionOpValue, resultType, rewriter, loc));
+        -:  233:    }
+    #####:  234:    parOp = rewriter.create<scf::ParallelOp>(
+        -:  235:        loc, lowerBoundTuple, upperBoundTuple, steps, identityVals,
+    #####:  236:        /*bodyBuilderFn=*/nullptr);
+call    0 never executed
+        -:  237:
+        -:  238:    //  Copy the body of the affine.parallel op.
+    #####:  239:    rewriter.eraseBlock(parOp.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  240:    rewriter.inlineRegionBefore(op.getRegion(), parOp.getRegion(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  241:                                parOp.getRegion().end());
+call    0 never executed
+call    1 never executed
+    #####:  242:    assert(reductions.size() == affineParOpTerminator->getNumOperands() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  243:           "Unequal number of reductions and operands.");
+    #####:  244:    for (unsigned i = 0, end = reductions.size(); i < end; i++) {
+branch  0 never executed
+branch  1 never executed
+        -:  245:      // For each of the reduction operations get the respective mlir::Value.
+    #####:  246:      Optional<arith::AtomicRMWKind> reductionOp =
+        -:  247:          arith::symbolizeAtomicRMWKind(
+    #####:  248:              reductions[i].cast<IntegerAttr>().getInt());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  249:      assert(reductionOp && "Reduction Operation cannot be of None Type");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  250:      arith::AtomicRMWKind reductionOpValue = *reductionOp;
+call    0 never executed
+    #####:  251:      rewriter.setInsertionPoint(&parOp.getBody()->back());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  252:      auto reduceOp = rewriter.create<scf::ReduceOp>(
+    #####:  253:          loc, affineParOpTerminator->getOperand(i));
+call    0 never executed
+call    1 never executed
+    #####:  254:      rewriter.setInsertionPointToEnd(&reduceOp.getReductionOperator().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  255:      Value reductionResult = arith::getReductionOp(
+        -:  256:          reductionOpValue, rewriter, loc,
+    #####:  257:          reduceOp.getReductionOperator().front().getArgument(0),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  258:          reduceOp.getReductionOperator().front().getArgument(1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  259:      rewriter.create<scf::ReduceReturnOp>(loc, reductionResult);
+call    0 never executed
+        -:  260:    }
+    #####:  261:    rewriter.replaceOp(op, parOp.getResults());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  262:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  263:  }
+        -:  264:};
+        -:  265:
+        -:  266:class AffineIfLowering : public OpRewritePattern<AffineIfOp> {
+        -:  267:public:
+        -:  268:  using OpRewritePattern<AffineIfOp>::OpRewritePattern;
+        -:  269:
+function _ZNK12_GLOBAL__N_116AffineIfLowering15matchAndRewriteEN4mlir10AffineIfOpERNS1_15PatternRewriterE called 2182 returned 100% blocks executed 91%
+     2182:  270:  LogicalResult matchAndRewrite(AffineIfOp op,
+        -:  271:                                PatternRewriter &rewriter) const override {
+     2182:  272:    auto loc = op.getLoc();
+call    0 returned 100%
+        -:  273:
+        -:  274:    // Now we just have to handle the condition logic.
+     2182:  275:    auto integerSet = op.getIntegerSet();
+call    0 returned 100%
+     2182:  276:    Value zeroConstant = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+call    0 returned 100%
+call    1 returned 100%
+     2182:  277:    SmallVector<Value, 8> operands(op.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+     2182:  278:    auto operandsRef = llvm::makeArrayRef(operands);
+call    0 returned 100%
+        -:  279:
+        -:  280:    // Calculate cond as a conjunction without short-circuiting.
+     2182:  281:    Value cond = nullptr;
+     7880:  282:    for (unsigned i = 0, e = integerSet.getNumConstraints(); i < e; ++i) {
+call    0 returned 100%
+branch  1 taken 72% (fallthrough)
+branch  2 taken 28%
+     5698:  283:      AffineExpr constraintExpr = integerSet.getConstraint(i);
+call    0 returned 100%
+     5698:  284:      bool isEquality = integerSet.isEq(i);
+call    0 returned 100%
+        -:  285:
+        -:  286:      // Build and apply an affine expression
+     5698:  287:      auto numDims = integerSet.getNumDims();
+call    0 returned 100%
+     5698:  288:      Value affResult = expandAffineExpr(rewriter, loc, constraintExpr,
+        -:  289:                                         operandsRef.take_front(numDims),
+    11396:  290:                                         operandsRef.drop_front(numDims));
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+call    4 returned 100%
+call    5 returned 100%
+     5698:  291:      if (!affResult)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  292:        return failure();
+    11396:  293:      auto pred =
+     5698:  294:          isEquality ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge;
+branch  0 taken 52% (fallthrough)
+branch  1 taken 48%
+     5698:  295:      Value cmpVal =
+     5698:  296:          rewriter.create<arith::CmpIOp>(loc, pred, affResult, zeroConstant);
+call    0 returned 100%
+branch  1 taken 62% (fallthrough)
+branch  2 taken 38%
+     2182:  297:      cond = cond
+     5698:  298:                 ? rewriter.create<arith::AndIOp>(loc, cond, cmpVal).getResult()
+call    0 returned 100%
+call    1 returned 100%
+     5698:  299:                 : cmpVal;
+branch  0 taken 62% (fallthrough)
+branch  1 taken 38%
+        -:  300:    }
+     2182:  301:    cond = cond ? cond
+    2182*:  302:                : rewriter.create<arith::ConstantIntOp>(loc, /*value=*/1,
+    2182*:  303:                                                        /*width=*/1);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  304:
+     2182:  305:    bool hasElseRegion = !op.getElseRegion().empty();
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+     6546:  306:    auto ifOp = rewriter.create<scf::IfOp>(loc, op.getResultTypes(), cond,
+     4364:  307:                                           hasElseRegion);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+     2182:  308:    rewriter.inlineRegionBefore(op.getThenRegion(),
+call    0 returned 100%
+     2182:  309:                                &ifOp.getThenRegion().back());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2182:  310:    rewriter.eraseBlock(&ifOp.getThenRegion().back());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2182:  311:    if (hasElseRegion) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     2182:  312:      rewriter.inlineRegionBefore(op.getElseRegion(),
+call    0 returned 100%
+     2182:  313:                                  &ifOp.getElseRegion().back());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2182:  314:      rewriter.eraseBlock(&ifOp.getElseRegion().back());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  315:    }
+        -:  316:
+        -:  317:    // Replace the Affine IfOp finally.
+     2182:  318:    rewriter.replaceOp(op, ifOp.getResults());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     2182:  319:    return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  320:  }
+        -:  321:};
+        -:  322:
+        -:  323:/// Convert an "affine.apply" operation into a sequence of arithmetic
+        -:  324:/// operations using the StandardOps dialect.
+        -:  325:class AffineApplyLowering : public OpRewritePattern<AffineApplyOp> {
+        -:  326:public:
+        -:  327:  using OpRewritePattern<AffineApplyOp>::OpRewritePattern;
+        -:  328:
+function _ZNK12_GLOBAL__N_119AffineApplyLowering15matchAndRewriteEN4mlir13AffineApplyOpERNS1_15PatternRewriterE called 1522 returned 100% blocks executed 81%
+     1522:  329:  LogicalResult matchAndRewrite(AffineApplyOp op,
+        -:  330:                                PatternRewriter &rewriter) const override {
+     1522:  331:    auto maybeExpandedMap =
+call    0 returned 100%
+        -:  332:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(),
+     1522:  333:                        llvm::to_vector<8>(op.getOperands()));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+     1522:  334:    if (!maybeExpandedMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  335:      return failure();
+     1522:  336:    rewriter.replaceOp(op, *maybeExpandedMap);
+call    0 returned 100%
+call    1 returned 100%
+     1522:  337:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  338:  }
+        -:  339:};
+        -:  340:
+        -:  341:/// Apply the affine map from an 'affine.load' operation to its operands, and
+        -:  342:/// feed the results to a newly created 'memref.load' operation (which replaces
+        -:  343:/// the original 'affine.load').
+        -:  344:class AffineLoadLowering : public OpRewritePattern<AffineLoadOp> {
+        -:  345:public:
+        -:  346:  using OpRewritePattern<AffineLoadOp>::OpRewritePattern;
+        -:  347:
+function _ZNK12_GLOBAL__N_118AffineLoadLowering15matchAndRewriteEN4mlir12AffineLoadOpERNS1_15PatternRewriterE called 3913 returned 100% blocks executed 81%
+     3913:  348:  LogicalResult matchAndRewrite(AffineLoadOp op,
+        -:  349:                                PatternRewriter &rewriter) const override {
+        -:  350:    // Expand affine map from 'affineLoadOp'.
+     3913:  351:    SmallVector<Value, 8> indices(op.getMapOperands());
+call    0 returned 100%
+call    1 returned 100%
+     3913:  352:    auto resultOperands =
+call    0 returned 100%
+     7826:  353:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+     3913:  354:    if (!resultOperands)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  355:      return failure();
+        -:  356:
+        -:  357:    // Build vector.load memref[expandedMap.results].
+     7826:  358:    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, op.getMemRef(),
+     3913:  359:                                                *resultOperands);
+call    0 returned 100%
+call    1 returned 100%
+     3913:  360:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  361:  }
+        -:  362:};
+        -:  363:
+        -:  364:/// Apply the affine map from an 'affine.prefetch' operation to its operands,
+        -:  365:/// and feed the results to a newly created 'memref.prefetch' operation (which
+        -:  366:/// replaces the original 'affine.prefetch').
+        -:  367:class AffinePrefetchLowering : public OpRewritePattern<AffinePrefetchOp> {
+        -:  368:public:
+        -:  369:  using OpRewritePattern<AffinePrefetchOp>::OpRewritePattern;
+        -:  370:
+function _ZNK12_GLOBAL__N_122AffinePrefetchLowering15matchAndRewriteEN4mlir16AffinePrefetchOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  371:  LogicalResult matchAndRewrite(AffinePrefetchOp op,
+        -:  372:                                PatternRewriter &rewriter) const override {
+        -:  373:    // Expand affine map from 'affinePrefetchOp'.
+    #####:  374:    SmallVector<Value, 8> indices(op.getMapOperands());
+call    0 never executed
+call    1 never executed
+    #####:  375:    auto resultOperands =
+call    0 never executed
+    #####:  376:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  377:    if (!resultOperands)
+branch  0 never executed
+branch  1 never executed
+    #####:  378:      return failure();
+        -:  379:
+        -:  380:    // Build memref.prefetch memref[expandedMap.results].
+    #####:  381:    rewriter.replaceOpWithNewOp<memref::PrefetchOp>(
+    #####:  382:        op, op.getMemref(), *resultOperands, op.getIsWrite(),
+branch  0 never executed
+branch  1 never executed
+    #####:  383:        op.getLocalityHint(), op.getIsDataCache());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  384:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  385:  }
+        -:  386:};
+        -:  387:
+        -:  388:/// Apply the affine map from an 'affine.store' operation to its operands, and
+        -:  389:/// feed the results to a newly created 'memref.store' operation (which replaces
+        -:  390:/// the original 'affine.store').
+        -:  391:class AffineStoreLowering : public OpRewritePattern<AffineStoreOp> {
+        -:  392:public:
+        -:  393:  using OpRewritePattern<AffineStoreOp>::OpRewritePattern;
+        -:  394:
+function _ZNK12_GLOBAL__N_119AffineStoreLowering15matchAndRewriteEN4mlir13AffineStoreOpERNS1_15PatternRewriterE called 3832 returned 100% blocks executed 82%
+     3832:  395:  LogicalResult matchAndRewrite(AffineStoreOp op,
+        -:  396:                                PatternRewriter &rewriter) const override {
+        -:  397:    // Expand affine map from 'affineStoreOp'.
+     3832:  398:    SmallVector<Value, 8> indices(op.getMapOperands());
+call    0 returned 100%
+call    1 returned 100%
+     3832:  399:    auto maybeExpandedMap =
+call    0 returned 100%
+     7664:  400:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+     3832:  401:    if (!maybeExpandedMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  402:      return failure();
+        -:  403:
+        -:  404:    // Build memref.store valueToStore, memref[expandedMap.results].
+     3832:  405:    rewriter.replaceOpWithNewOp<memref::StoreOp>(
+     3832:  406:        op, op.getValueToStore(), op.getMemRef(), *maybeExpandedMap);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     3832:  407:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  408:  }
+        -:  409:};
+        -:  410:
+        -:  411:/// Apply the affine maps from an 'affine.dma_start' operation to each of their
+        -:  412:/// respective map operands, and feed the results to a newly created
+        -:  413:/// 'memref.dma_start' operation (which replaces the original
+        -:  414:/// 'affine.dma_start').
+        -:  415:class AffineDmaStartLowering : public OpRewritePattern<AffineDmaStartOp> {
+        -:  416:public:
+        -:  417:  using OpRewritePattern<AffineDmaStartOp>::OpRewritePattern;
+        -:  418:
+function _ZNK12_GLOBAL__N_122AffineDmaStartLowering15matchAndRewriteEN4mlir16AffineDmaStartOpERNS1_15PatternRewriterE called 47 returned 100% blocks executed 83%
+       47:  419:  LogicalResult matchAndRewrite(AffineDmaStartOp op,
+        -:  420:                                PatternRewriter &rewriter) const override {
+       47:  421:    SmallVector<Value, 8> operands(op.getOperands());
+call    0 returned 100%
+call    1 returned 100%
+       47:  422:    auto operandsRef = llvm::makeArrayRef(operands);
+call    0 returned 100%
+        -:  423:
+        -:  424:    // Expand affine map for DMA source memref.
+       47:  425:    auto maybeExpandedSrcMap = expandAffineMap(
+        -:  426:        rewriter, op.getLoc(), op.getSrcMap(),
+      141:  427:        operandsRef.drop_front(op.getSrcMemRefOperandIndex() + 1));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 53% (fallthrough)
+branch  5 taken 47%
+       47:  428:    if (!maybeExpandedSrcMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  429:      return failure();
+        -:  430:    // Expand affine map for DMA destination memref.
+       47:  431:    auto maybeExpandedDstMap = expandAffineMap(
+        -:  432:        rewriter, op.getLoc(), op.getDstMap(),
+      141:  433:        operandsRef.drop_front(op.getDstMemRefOperandIndex() + 1));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 100% (fallthrough)
+branch  6 taken 0%
+       47:  434:    if (!maybeExpandedDstMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  435:      return failure();
+        -:  436:    // Expand affine map for DMA tag memref.
+       47:  437:    auto maybeExpandedTagMap = expandAffineMap(
+        -:  438:        rewriter, op.getLoc(), op.getTagMap(),
+      141:  439:        operandsRef.drop_front(op.getTagMemRefOperandIndex() + 1));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 100% (fallthrough)
+branch  6 taken 0%
+       47:  440:    if (!maybeExpandedTagMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  441:      return failure();
+        -:  442:
+        -:  443:    // Build memref.dma_start operation with affine map results.
+       47:  444:    rewriter.replaceOpWithNewOp<memref::DmaStartOp>(
+       47:  445:        op, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       47:  446:        *maybeExpandedDstMap, op.getNumElements(), op.getTagMemRef(),
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+      141:  447:        *maybeExpandedTagMap, op.getStride(), op.getNumElementsPerStride());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+       47:  448:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  449:  }
+        -:  450:};
+        -:  451:
+        -:  452:/// Apply the affine map from an 'affine.dma_wait' operation tag memref,
+        -:  453:/// and feed the results to a newly created 'memref.dma_wait' operation (which
+        -:  454:/// replaces the original 'affine.dma_wait').
+        -:  455:class AffineDmaWaitLowering : public OpRewritePattern<AffineDmaWaitOp> {
+        -:  456:public:
+        -:  457:  using OpRewritePattern<AffineDmaWaitOp>::OpRewritePattern;
+        -:  458:
+function _ZNK12_GLOBAL__N_121AffineDmaWaitLowering15matchAndRewriteEN4mlir15AffineDmaWaitOpERNS1_15PatternRewriterE called 47 returned 100% blocks executed 80%
+       47:  459:  LogicalResult matchAndRewrite(AffineDmaWaitOp op,
+        -:  460:                                PatternRewriter &rewriter) const override {
+        -:  461:    // Expand affine map for DMA tag memref.
+       47:  462:    SmallVector<Value, 8> indices(op.getTagIndices());
+call    0 returned 100%
+call    1 returned 100%
+       47:  463:    auto maybeExpandedTagMap =
+call    0 returned 100%
+      141:  464:        expandAffineMap(rewriter, op.getLoc(), op.getTagMap(), indices);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+       47:  465:    if (!maybeExpandedTagMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  466:      return failure();
+        -:  467:
+        -:  468:    // Build memref.dma_wait operation with affine map results.
+       47:  469:    rewriter.replaceOpWithNewOp<memref::DmaWaitOp>(
+       47:  470:        op, op.getTagMemRef(), *maybeExpandedTagMap, op.getNumElements());
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+call    4 returned 100%
+       47:  471:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  472:  }
+        -:  473:};
+        -:  474:
+        -:  475:/// Apply the affine map from an 'affine.vector_load' operation to its operands,
+        -:  476:/// and feed the results to a newly created 'vector.load' operation (which
+        -:  477:/// replaces the original 'affine.vector_load').
+        -:  478:class AffineVectorLoadLowering : public OpRewritePattern<AffineVectorLoadOp> {
+        -:  479:public:
+        -:  480:  using OpRewritePattern<AffineVectorLoadOp>::OpRewritePattern;
+        -:  481:
+function _ZNK12_GLOBAL__N_124AffineVectorLoadLowering15matchAndRewriteEN4mlir18AffineVectorLoadOpERNS1_15PatternRewriterE called 840 returned 100% blocks executed 82%
+      840:  482:  LogicalResult matchAndRewrite(AffineVectorLoadOp op,
+        -:  483:                                PatternRewriter &rewriter) const override {
+        -:  484:    // Expand affine map from 'affineVectorLoadOp'.
+      840:  485:    SmallVector<Value, 8> indices(op.getMapOperands());
+call    0 returned 100%
+call    1 returned 100%
+      840:  486:    auto resultOperands =
+call    0 returned 100%
+     1680:  487:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+      840:  488:    if (!resultOperands)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  489:      return failure();
+        -:  490:
+        -:  491:    // Build vector.load memref[expandedMap.results].
+      840:  492:    rewriter.replaceOpWithNewOp<vector::LoadOp>(
+      840:  493:        op, op.getVectorType(), op.getMemRef(), *resultOperands);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      840:  494:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  495:  }
+        -:  496:};
+        -:  497:
+        -:  498:/// Apply the affine map from an 'affine.vector_store' operation to its
+        -:  499:/// operands, and feed the results to a newly created 'vector.store' operation
+        -:  500:/// (which replaces the original 'affine.vector_store').
+        -:  501:class AffineVectorStoreLowering : public OpRewritePattern<AffineVectorStoreOp> {
+        -:  502:public:
+        -:  503:  using OpRewritePattern<AffineVectorStoreOp>::OpRewritePattern;
+        -:  504:
+function _ZNK12_GLOBAL__N_125AffineVectorStoreLowering15matchAndRewriteEN4mlir19AffineVectorStoreOpERNS1_15PatternRewriterE called 840 returned 100% blocks executed 82%
+      840:  505:  LogicalResult matchAndRewrite(AffineVectorStoreOp op,
+        -:  506:                                PatternRewriter &rewriter) const override {
+        -:  507:    // Expand affine map from 'affineVectorStoreOp'.
+      840:  508:    SmallVector<Value, 8> indices(op.getMapOperands());
+call    0 returned 100%
+call    1 returned 100%
+      840:  509:    auto maybeExpandedMap =
+call    0 returned 100%
+     1680:  510:        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+      840:  511:    if (!maybeExpandedMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  512:      return failure();
+        -:  513:
+      840:  514:    rewriter.replaceOpWithNewOp<vector::StoreOp>(
+      840:  515:        op, op.getValueToStore(), op.getMemRef(), *maybeExpandedMap);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      840:  516:    return success();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  517:  }
+        -:  518:};
+        -:  519:
+        -:  520:} // namespace
+        -:  521:
+function _ZN4mlir37populateAffineToStdConversionPatternsERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+     428*:  522:void mlir::populateAffineToStdConversionPatterns(RewritePatternSet &patterns) {
+        -:  523:  // clang-format off
+     428*:  524:  patterns.add<
+        -:  525:      AffineApplyLowering,
+        -:  526:      AffineDmaStartLowering,
+        -:  527:      AffineDmaWaitLowering,
+        -:  528:      AffineLoadLowering,
+        -:  529:      AffineMinLowering,
+        -:  530:      AffineMaxLowering,
+        -:  531:      AffineParallelLowering,
+        -:  532:      AffinePrefetchLowering,
+        -:  533:      AffineStoreLowering,
+        -:  534:      AffineForLowering,
+        -:  535:      AffineIfLowering,
+    #####:  536:      AffineYieldOpLowering>(patterns.getContext());
+call    0 never executed
+        -:  537:  // clang-format on
+    #####:  538:}
+        -:  539:
+function _ZN4mlir40populateAffineToVectorConversionPatternsERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+     428*:  540:void mlir::populateAffineToVectorConversionPatterns(
+        -:  541:    RewritePatternSet &patterns) {
+        -:  542:  // clang-format off
+     428*:  543:  patterns.add<
+        -:  544:      AffineVectorLoadLowering,
+    #####:  545:      AffineVectorStoreLowering>(patterns.getContext());
+call    0 never executed
+        -:  546:  // clang-format on
+    #####:  547:}
+        -:  548:
+        -:  549:namespace {
+  117107*:  550:class LowerAffinePass
+call    0 never executed
+call    1 returned 100%
+        -:  551:    : public impl::ConvertAffineToStandardBase<LowerAffinePass> {
+function _ZN12_GLOBAL__N_115LowerAffinePass14runOnOperationEv called 428 returned 100% blocks executed 88%
+      428:  552:  void runOnOperation() override {
+      428:  553:    RewritePatternSet patterns(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+      428:  554:    populateAffineToStdConversionPatterns(patterns);
+call    0 returned 100%
+      428:  555:    populateAffineToVectorConversionPatterns(patterns);
+call    0 returned 100%
+      856:  556:    ConversionTarget target(getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+      428:  557:    target.addLegalDialect<arith::ArithDialect, memref::MemRefDialect,
+      428:  558:                           scf::SCFDialect, VectorDialect>();
+call    0 returned 100%
+      428:  559:    if (failed(applyPartialConversion(getOperation(), target,
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 0% (fallthrough)
+branch  6 taken 100%
+      428:  560:                                      std::move(patterns))))
+call    0 returned 100%
+    #####:  561:      signalPassFailure();
+call    0 never executed
+      428:  562:  }
+        -:  563:};
+        -:  564:} // namespace
+        -:  565:
+        -:  566:/// Lowers If and For operations within a function into their lower level CFG
+        -:  567:/// equivalent blocks.
+function _ZN4mlir21createLowerAffinePassEv called 117107 returned 100% blocks executed 100%
+   117107:  568:std::unique_ptr<Pass> mlir::createLowerAffinePass() {
+   117107:  569:  return std::make_unique<LowerAffinePass>();
+call    0 returned 100%
+        -:  570:}

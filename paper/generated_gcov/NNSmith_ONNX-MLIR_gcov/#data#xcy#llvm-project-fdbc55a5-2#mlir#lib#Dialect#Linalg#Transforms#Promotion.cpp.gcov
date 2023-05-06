@@ -1,0 +1,661 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Linalg/Transforms/Promotion.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Promotion.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Promotion.cpp.gcda
+        -:    0:Runs:128628
+        -:    1://===- Promotion.cpp - Implementation of linalg Promotion -----------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the linalg dialect Promotion pass.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   14:#include "mlir/Dialect/Arith/Utils/Utils.h"
+        -:   15:#include "mlir/Dialect/Complex/IR/Complex.h"
+        -:   16:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   17:#include "mlir/Dialect/Linalg/Passes.h"
+        -:   18:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   19:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   20:#include "mlir/IR/AffineExpr.h"
+        -:   21:#include "mlir/IR/AffineExprVisitor.h"
+        -:   22:#include "mlir/IR/AffineMap.h"
+        -:   23:#include "mlir/IR/ImplicitLocOpBuilder.h"
+        -:   24:#include "mlir/Support/LLVM.h"
+        -:   25:#include "mlir/Transforms/FoldUtils.h"
+        -:   26:#include "llvm/ADT/MapVector.h"
+        -:   27:#include "llvm/ADT/SmallBitVector.h"
+        -:   28:#include "llvm/ADT/TypeSwitch.h"
+        -:   29:#include "llvm/Support/CommandLine.h"
+        -:   30:#include "llvm/Support/Debug.h"
+        -:   31:
+        -:   32:using namespace mlir;
+        -:   33:using namespace mlir::linalg;
+        -:   34:using namespace mlir::scf;
+        -:   35:
+        -:   36:using llvm::MapVector;
+        -:   37:
+        -:   38:#define DEBUG_TYPE "linalg-promotion"
+        -:   39:
+        -:   40:/// Alloc a new buffer of `size` * `width` i8; where `width` is given by the
+        -:   41:/// data `layout` for `elementType`.
+        -:   42:/// Use AllocOp or AllocaOp depending on `options`.
+        -:   43:/// Take an optional alignment.
+        -:   44:static Value allocBuffer(ImplicitLocOpBuilder &b,
+        -:   45:                         const LinalgPromotionOptions &options,
+        -:   46:                         Type elementType, Value allocSize, DataLayout &layout,
+        -:   47:                         Optional<unsigned> alignment = None) {
+        -:   48:  auto width = layout.getTypeSize(elementType);
+        -:   49:
+        -:   50:  IntegerAttr alignmentAttr;
+        -:   51:  if (alignment.has_value())
+        -:   52:    alignmentAttr = b.getI64IntegerAttr(alignment.value());
+        -:   53:
+        -:   54:  // Static buffer.
+        -:   55:  if (auto cst = allocSize.getDefiningOp<arith::ConstantIndexOp>()) {
+        -:   56:    auto staticBufferType =
+        -:   57:        MemRefType::get(width * cst.value(), b.getIntegerType(8));
+        -:   58:    if (options.useAlloca) {
+        -:   59:      return b.createOrFold<memref::AllocaOp>(staticBufferType, ValueRange{},
+        -:   60:                                              alignmentAttr);
+        -:   61:    }
+        -:   62:    return b.createOrFold<memref::AllocOp>(staticBufferType, ValueRange{},
+        -:   63:                                           alignmentAttr);
+        -:   64:  }
+        -:   65:
+        -:   66:  // Fallback dynamic buffer.
+        -:   67:  auto dynamicBufferType =
+        -:   68:      MemRefType::get(ShapedType::kDynamicSize, b.getIntegerType(8));
+        -:   69:  Value mul = b.createOrFold<arith::MulIOp>(
+        -:   70:      b.create<arith::ConstantIndexOp>(width), allocSize);
+        -:   71:  if (options.useAlloca)
+        -:   72:    return b.create<memref::AllocaOp>(dynamicBufferType, mul, alignmentAttr);
+        -:   73:  return b.create<memref::AllocOp>(dynamicBufferType, mul, alignmentAttr);
+        -:   74:}
+        -:   75:
+        -:   76:/// Default allocation callback function. This allocates a promoted buffer when
+        -:   77:/// no call back to do so is provided. The default is to allocate a
+        -:   78:/// memref<..xi8> and return a view to get a memref type of shape
+        -:   79:/// boundingSubViewSize.
+        -:   80:static Optional<Value>
+        -:   81:defaultAllocBufferCallBack(const LinalgPromotionOptions &options,
+        -:   82:                           OpBuilder &builder, memref::SubViewOp subView,
+        -:   83:                           ArrayRef<Value> boundingSubViewSize,
+        -:   84:                           Optional<unsigned> alignment, DataLayout &layout) {
+        -:   85:  ShapedType viewType = subView.getType();
+        -:   86:  ImplicitLocOpBuilder b(subView.getLoc(), builder);
+        -:   87:  auto zero = b.createOrFold<arith::ConstantIndexOp>(0);
+        -:   88:  auto one = b.createOrFold<arith::ConstantIndexOp>(1);
+        -:   89:
+        -:   90:  Value allocSize = one;
+        -:   91:  for (const auto &size : llvm::enumerate(boundingSubViewSize))
+        -:   92:    allocSize = b.createOrFold<arith::MulIOp>(allocSize, size.value());
+        -:   93:  Value buffer = allocBuffer(b, options, viewType.getElementType(), allocSize,
+        -:   94:                             layout, alignment);
+        -:   95:  SmallVector<int64_t, 4> dynSizes(boundingSubViewSize.size(),
+        -:   96:                                   ShapedType::kDynamicSize);
+        -:   97:  Value view = b.createOrFold<memref::ViewOp>(
+        -:   98:      MemRefType::get(dynSizes, viewType.getElementType()), buffer, zero,
+        -:   99:      boundingSubViewSize);
+        -:  100:  return view;
+        -:  101:}
+        -:  102:
+        -:  103:/// Default implementation of deallocation of the buffer use for promotion. It
+        -:  104:/// expects to get the same value that the default allocation method returned,
+        -:  105:/// i.e. result of a ViewOp.
+        -:  106:static LogicalResult
+        -:  107:defaultDeallocBufferCallBack(const LinalgPromotionOptions &options,
+        -:  108:                             OpBuilder &b, Value fullLocalView) {
+        -:  109:  if (!options.useAlloca) {
+        -:  110:    auto viewOp = cast<memref::ViewOp>(fullLocalView.getDefiningOp());
+        -:  111:    b.create<memref::DeallocOp>(viewOp.getSource().getLoc(),
+        -:  112:                                viewOp.getSource());
+        -:  113:  }
+        -:  114:  return success();
+        -:  115:}
+        -:  116:
+        -:  117:namespace {
+        -:  118:
+        -:  119:/// Helper struct that captures the information required to apply the
+        -:  120:/// transformation on each op. This bridges the abstraction gap with the
+        -:  121:/// user-facing API which exposes positional arguments to control which operands
+        -:  122:/// are promoted.
+        -:  123:struct LinalgOpInstancePromotionOptions {
+        -:  124:  LinalgOpInstancePromotionOptions(LinalgOp op,
+        -:  125:                                   const LinalgPromotionOptions &options);
+        -:  126:  /// SubViews to promote.
+        -:  127:  MapVector<int64_t, Value> subViews;
+        -:  128:  /// True if the full view should be used for the promoted buffer.
+        -:  129:  DenseMap<Value, bool> useFullTileBuffers;
+        -:  130:
+        -:  131:  /// Callback functions for allocation and deallocation of promoted buffers, as
+        -:  132:  /// well as to copy the data into and out of these buffers.
+        -:  133:  AllocBufferCallbackFn allocationFn;
+        -:  134:  DeallocBufferCallbackFn deallocationFn;
+        -:  135:  CopyCallbackFn copyInFn;
+        -:  136:  CopyCallbackFn copyOutFn;
+        -:  137:
+        -:  138:  /// Alignment of promoted buffer.
+        -:  139:  Optional<unsigned> alignment;
+        -:  140:};
+        -:  141:} // namespace
+        -:  142:
+        -:  143:LinalgOpInstancePromotionOptions::LinalgOpInstancePromotionOptions(
+        -:  144:    LinalgOp linalgOp, const LinalgPromotionOptions &options)
+        -:  145:    : subViews(), alignment(options.alignment) {
+        -:  146:  assert(linalgOp.hasBufferSemantics() && "revisit usage of shaped operand");
+        -:  147:  auto vUseFullTileBuffers =
+        -:  148:      options.useFullTileBuffers.value_or(llvm::SmallBitVector());
+        -:  149:  vUseFullTileBuffers.resize(linalgOp->getNumOperands(),
+        -:  150:                             options.useFullTileBuffersDefault);
+        -:  151:
+        -:  152:  for (OpOperand &opOperand : linalgOp->getOpOperands()) {
+        -:  153:    int64_t operandNumber = opOperand.getOperandNumber();
+        -:  154:    if (options.operandsToPromote &&
+        -:  155:        !options.operandsToPromote->count(operandNumber))
+        -:  156:      continue;
+        -:  157:    Operation *op = opOperand.get().getDefiningOp();
+        -:  158:    if (auto sv = dyn_cast_or_null<memref::SubViewOp>(op)) {
+        -:  159:      subViews[operandNumber] = sv;
+        -:  160:      useFullTileBuffers[sv] = vUseFullTileBuffers[operandNumber];
+        -:  161:    }
+        -:  162:  }
+        -:  163:
+        -:  164:  if (options.allocationFn) {
+        -:  165:    allocationFn = *options.allocationFn;
+        -:  166:  } else {
+    #####:  167:    allocationFn = [&](OpBuilder &b, memref::SubViewOp subViewOp,
+        -:  168:                       ArrayRef<Value> boundingSubViewSize,
+        -:  169:                       DataLayout &layout) -> Optional<Value> {
+    #####:  170:      return defaultAllocBufferCallBack(options, b, subViewOp,
+    #####:  171:                                        boundingSubViewSize, alignment, layout);
+call    0 never executed
+        -:  172:    };
+        -:  173:  }
+        -:  174:
+        -:  175:  if (options.deallocationFn) {
+        -:  176:    deallocationFn = *options.deallocationFn;
+        -:  177:  } else {
+    #####:  178:    deallocationFn = [&](OpBuilder &b, Value buffer) {
+    #####:  179:      return defaultDeallocBufferCallBack(options, b, buffer);
+call    0 never executed
+        -:  180:    };
+        -:  181:  }
+        -:  182:
+        -:  183:  // Save the loc because `linalgOp` goes out of scope.
+        -:  184:  Location loc = linalgOp.getLoc();
+    #####:  185:  auto defaultCopyCallBack = [loc](OpBuilder &b, Value src,
+        -:  186:                                   Value dst) -> LogicalResult {
+    #####:  187:    b.create<memref::CopyOp>(loc, src, dst);
+call    0 never executed
+    #####:  188:    return success();
+        -:  189:  };
+        -:  190:  copyInFn = (options.copyInFn ? *(options.copyInFn) : defaultCopyCallBack);
+        -:  191:  copyOutFn = (options.copyOutFn ? *(options.copyOutFn) : defaultCopyCallBack);
+        -:  192:}
+        -:  193:
+        -:  194:// Performs promotion of a `subView` into a local buffer of the size of the
+        -:  195:// *ranges* of the `subView`. This produces a buffer whose size may be bigger
+        -:  196:// than the actual size of the `subView` at the boundaries.
+        -:  197:// This is related to the full/partial tile problem.
+        -:  198:// Returns a PromotionInfo containing a `buffer`, `fullLocalView` and
+        -:  199:// `partialLocalView` such that:
+        -:  200://   * `buffer` is always the size of the full tile.
+        -:  201://   * `fullLocalView` is a dense contiguous view into that buffer.
+        -:  202://   * `partialLocalView` is a dense non-contiguous slice of `fullLocalView`
+        -:  203://     that corresponds to the size of `subView` and accounting for boundary
+        -:  204://     effects.
+        -:  205:// The point of the full tile buffer is that constant static tile sizes are
+        -:  206:// folded and result in a buffer type with statically known size and alignment
+        -:  207:// properties.
+        -:  208:// To account for general boundary effects, padding must be performed on the
+        -:  209:// boundary tiles. For now this is done with an unconditional `fill` op followed
+        -:  210:// by a partial `copy` op.
+function _ZN4mlir6linalg25promoteSubviewAsNewBufferERNS_9OpBuilderENS_8LocationENS_6memref9SubViewOpERKSt8functionIFN4llvm8OptionalINS_5ValueEEES2_S5_NS7_8ArrayRefIS9_EERNS_10DataLayoutEEESE_ called 0 returned 0% blocks executed 0%
+    #####:  211:FailureOr<PromotionInfo> mlir::linalg::promoteSubviewAsNewBuffer(
+        -:  212:    OpBuilder &b, Location loc, memref::SubViewOp subView,
+        -:  213:    const AllocBufferCallbackFn &allocationFn, DataLayout &layout) {
+    #####:  214:  auto viewType = subView.getType();
+call    0 never executed
+    #####:  215:  auto rank = viewType.getRank();
+call    0 never executed
+    #####:  216:  SmallVector<Value, 4> fullSizes;
+branch  0 never executed
+branch  1 never executed
+    #####:  217:  SmallVector<OpFoldResult> partialSizes;
+branch  0 never executed
+branch  1 never executed
+    #####:  218:  fullSizes.reserve(rank);
+branch  0 never executed
+branch  1 never executed
+    #####:  219:  partialSizes.reserve(rank);
+branch  0 never executed
+branch  1 never executed
+    #####:  220:  llvm::SmallBitVector droppedDims = subView.getDroppedDims();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  221:  int64_t resultDimIdx = 0;
+    #####:  222:  for (const auto &en : llvm::enumerate(subView.getOrCreateRanges(b, loc))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+    #####:  223:    if (droppedDims[en.index()])
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  224:      continue;
+    #####:  225:    auto rangeValue = en.value();
+branch  0 never executed
+branch  1 never executed
+        -:  226:    // Try to extract a tight constant. If the size is known statically, no need
+        -:  227:    // to look for the bound.
+    #####:  228:    LLVM_DEBUG(llvm::dbgs() << "Extract tightest: " << rangeValue.size << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  229:    Value size;
+    #####:  230:    if (auto attr = rangeValue.size.dyn_cast<Attribute>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  231:      size = getValueOrCreateConstantIndexOp(b, loc, rangeValue.size);
+call    0 never executed
+        -:  232:    } else {
+    #####:  233:      Value materializedSize =
+    #####:  234:          getValueOrCreateConstantIndexOp(b, loc, rangeValue.size);
+call    0 never executed
+    #####:  235:      FailureOr<int64_t> upperBound =
+    #####:  236:          getConstantUpperBoundForIndex(materializedSize);
+call    0 never executed
+    #####:  237:      size = failed(upperBound)
+branch  0 never executed
+branch  1 never executed
+        -:  238:                 ? materializedSize
+    #####:  239:                 : b.create<arith::ConstantIndexOp>(loc, upperBound.value());
+call    0 never executed
+        -:  240:    }
+    #####:  241:    LLVM_DEBUG(llvm::dbgs() << "Extracted tightest: " << size << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  242:    fullSizes.push_back(size);
+call    0 never executed
+    #####:  243:    partialSizes.push_back(
+call    0 never executed
+call    1 never executed
+    #####:  244:        b.createOrFold<memref::DimOp>(loc, subView, resultDimIdx++));
+call    0 never executed
+        -:  245:  }
+    #####:  246:  SmallVector<int64_t, 4> dynSizes(fullSizes.size(), ShapedType::kDynamicSize);
+call    0 never executed
+call    1 never executed
+        -:  247:  // If a callback is not specified, then use the default implementation for
+        -:  248:  // allocating the promoted buffer.
+    #####:  249:  Optional<Value> fullLocalView = allocationFn(b, subView, fullSizes, layout);
+branch  0 never executed
+branch  1 never executed
+    #####:  250:  if (!fullLocalView)
+branch  0 never executed
+branch  1 never executed
+    #####:  251:    return failure();
+    #####:  252:  SmallVector<OpFoldResult, 4> zeros(fullSizes.size(), b.getIndexAttr(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  253:  SmallVector<OpFoldResult, 4> ones(fullSizes.size(), b.getIndexAttr(1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  254:  auto partialLocalView = b.createOrFold<memref::SubViewOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  255:      loc, *fullLocalView, zeros, partialSizes, ones);
+call    0 never executed
+    #####:  256:  return PromotionInfo{*fullLocalView, partialLocalView};
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  257:}
+        -:  258:
+        -:  259:static FailureOr<MapVector<int64_t, PromotionInfo>>
+function _ZL15promoteSubViewsRN4mlir20ImplicitLocOpBuilderEN12_GLOBAL__N_132LinalgOpInstancePromotionOptionsERNS_10DataLayoutE called 0 returned 0% blocks executed 0%
+    #####:  260:promoteSubViews(ImplicitLocOpBuilder &b,
+        -:  261:                LinalgOpInstancePromotionOptions options, DataLayout &layout) {
+    #####:  262:  if (options.subViews.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  263:    return failure();
+        -:  264:
+    #####:  265:  MapVector<int64_t, PromotionInfo> promotionInfoMap;
+call    0 never executed
+        -:  266:
+    #####:  267:  for (auto v : options.subViews) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  268:    memref::SubViewOp subView =
+    #####:  269:        cast<memref::SubViewOp>(v.second.getDefiningOp());
+call    0 never executed
+call    1 never executed
+    #####:  270:    auto promotionInfo = promoteSubviewAsNewBuffer(
+    #####:  271:        b, b.getLoc(), subView, options.allocationFn, layout);
+call    0 never executed
+    #####:  272:    if (failed(promotionInfo))
+branch  0 never executed
+branch  1 never executed
+    #####:  273:      return failure();
+    #####:  274:    promotionInfoMap[v.first] = *promotionInfo;
+call    0 never executed
+        -:  275:
+        -:  276:    // Only fill the buffer if the full local view is used
+    #####:  277:    if (!options.useFullTileBuffers[v.second])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  278:      continue;
+    #####:  279:    Type subviewEltType = subView.getType().getElementType();
+call    0 never executed
+call    1 never executed
+    #####:  280:    Value fillVal =
+call    0 never executed
+    #####:  281:        llvm::TypeSwitch<Type, Value>(subviewEltType)
+function _ZZL15promoteSubViewsRN4mlir20ImplicitLocOpBuilderEN12_GLOBAL__N_132LinalgOpInstancePromotionOptionsERNS_10DataLayoutEENKUlNS_9FloatTypeEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  282:            .Case([&](FloatType t) {
+    #####:  283:              return b.create<arith::ConstantOp>(FloatAttr::get(t, 0.0));
+call    0 never executed
+call    1 never executed
+    #####:  284:            })
+call    0 never executed
+function _ZZL15promoteSubViewsRN4mlir20ImplicitLocOpBuilderEN12_GLOBAL__N_132LinalgOpInstancePromotionOptionsERNS_10DataLayoutEENKUlNS_11IntegerTypeEE0_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  285:            .Case([&](IntegerType t) {
+    #####:  286:              return b.create<arith::ConstantOp>(IntegerAttr::get(t, 0));
+call    0 never executed
+call    1 never executed
+    #####:  287:            })
+call    0 never executed
+function _ZZL15promoteSubViewsRN4mlir20ImplicitLocOpBuilderEN12_GLOBAL__N_132LinalgOpInstancePromotionOptionsERNS_10DataLayoutEENKUlNS_11ComplexTypeEE1_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  288:            .Case([&](ComplexType t) {
+    #####:  289:              Value tmp;
+    #####:  290:              if (auto et = t.getElementType().dyn_cast<FloatType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  291:                tmp = b.create<arith::ConstantOp>(FloatAttr::get(et, 0.0));
+call    0 never executed
+call    1 never executed
+    #####:  292:              else if (auto et = t.getElementType().cast<IntegerType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  293:                tmp = b.create<arith::ConstantOp>(IntegerAttr::get(et, 0));
+call    0 never executed
+call    1 never executed
+    #####:  294:              return b.create<complex::CreateOp>(t, tmp, tmp);
+call    0 never executed
+    #####:  295:            })
+call    0 never executed
+    #####:  296:            .Default([](auto) { return Value(); });
+branch  0 never executed
+branch  1 never executed
+    #####:  297:    if (!fillVal)
+branch  0 never executed
+branch  1 never executed
+    #####:  298:      return failure();
+    #####:  299:    b.create<linalg::FillOp>(fillVal, promotionInfo->fullLocalView);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  300:  }
+        -:  301:
+        -:  302:  // Copy data into the promoted buffers. Use callback if provided.
+    #####:  303:  for (auto v : options.subViews) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  304:    auto info = promotionInfoMap.find(v.first);
+call    0 never executed
+    #####:  305:    if (info == promotionInfoMap.end())
+branch  0 never executed
+branch  1 never executed
+    #####:  306:      continue;
+    #####:  307:    if (failed(options.copyInFn(
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  308:            b, cast<memref::SubViewOp>(v.second.getDefiningOp()),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  309:            info->second.partialLocalView)))
+call    0 never executed
+    #####:  310:      return failure();
+        -:  311:  }
+    #####:  312:  return promotionInfoMap;
+call    0 never executed
+        -:  313:}
+        -:  314:
+        -:  315:static FailureOr<LinalgOp>
+function _ZL15promoteSubViewsRN4mlir20ImplicitLocOpBuilderENS_6linalg8LinalgOpEN12_GLOBAL__N_132LinalgOpInstancePromotionOptionsERNS_10DataLayoutE called 0 returned 0% blocks executed 0%
+    #####:  316:promoteSubViews(ImplicitLocOpBuilder &b, LinalgOp op,
+        -:  317:                LinalgOpInstancePromotionOptions options, DataLayout &layout) {
+    #####:  318:  assert(op.hasBufferSemantics() && "expected linalg op with buffer semantics");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  319:
+        -:  320:  // 1. Promote the specified views and use them in the new op.
+    #####:  321:  auto promotedBuffersAndViews = promoteSubViews(b, options, layout);
+call    0 never executed
+call    1 never executed
+    #####:  322:  if (failed(promotedBuffersAndViews) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  323:      promotedBuffersAndViews->size() != options.subViews.size())
+branch  0 never executed
+branch  1 never executed
+    #####:  324:    return failure();
+        -:  325:
+        -:  326:  // 2. Append all other operands as they appear, this enforces that such
+        -:  327:  // operands are not views. This is to support cases such as FillOp taking
+        -:  328:  // extra scalars etc.  Keep a reference to output buffers;
+    #####:  329:  SmallVector<Value, 8> opViews;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  330:  opViews.reserve(op->getNumOperands());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  331:  SmallVector<std::pair<Value, Value>, 8> writebackViews;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  332:  writebackViews.reserve(promotedBuffersAndViews->size());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  333:  for (OpOperand &opOperand : op->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  334:    int64_t operandNumber = opOperand.getOperandNumber();
+call    0 never executed
+    #####:  335:    if (options.subViews.count(operandNumber) != 0) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  336:      if (options.useFullTileBuffers[opOperand.get()])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  337:        opViews.push_back(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  338:            (*promotedBuffersAndViews)[operandNumber].fullLocalView);
+call    0 never executed
+        -:  339:      else
+    #####:  340:        opViews.push_back(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  341:            (*promotedBuffersAndViews)[operandNumber].partialLocalView);
+call    0 never executed
+    #####:  342:      if (operandNumber >= op.getNumDpsInputs())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  343:        writebackViews.emplace_back(std::make_pair(
+branch  0 never executed
+branch  1 never executed
+    #####:  344:            opOperand.get(),
+    #####:  345:            (*promotedBuffersAndViews)[operandNumber].partialLocalView));
+call    0 never executed
+call    1 never executed
+        -:  346:    } else {
+    #####:  347:      opViews.push_back(opOperand.get());
+call    0 never executed
+        -:  348:    }
+        -:  349:  }
+    #####:  350:  op->setOperands(0, opViews.size(), opViews);
+call    0 never executed
+call    1 never executed
+        -:  351:
+    #####:  352:  OpBuilder::InsertionGuard guard(b);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  353:  b.setInsertionPointAfter(op);
+call    0 never executed
+        -:  354:  // 3. Emit write-back for the promoted output views: copy the partial view.
+    #####:  355:  for (auto viewAndPartialLocalView : writebackViews) {
+branch  0 never executed
+branch  1 never executed
+    #####:  356:    if (failed(options.copyOutFn(b, viewAndPartialLocalView.second,
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  357:                                 viewAndPartialLocalView.first)))
+    #####:  358:      return failure();
+        -:  359:  }
+        -:  360:
+        -:  361:  // 4. Dealloc all local buffers.
+    #####:  362:  for (const auto &pi : *promotedBuffersAndViews)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  363:    (void)options.deallocationFn(b, pi.second.fullLocalView);
+branch  0 never executed
+branch  1 never executed
+    #####:  364:  return op;
+branch  0 never executed
+branch  1 never executed
+        -:  365:}
+        -:  366:
+        -:  367:LogicalResult
+function _ZN4mlir6linalg27promoteSubviewsPreconditionEPNS_9OperationENS0_22LinalgPromotionOptionsE called 0 returned 0% blocks executed 0%
+    #####:  368:mlir::linalg::promoteSubviewsPrecondition(Operation *op,
+        -:  369:                                          LinalgPromotionOptions options) {
+    #####:  370:  LinalgOp linalgOp = dyn_cast<LinalgOp>(op);
+call    0 never executed
+        -:  371:  // Transformation applies to buffers only.
+    #####:  372:  if (!linalgOp || !linalgOp.hasBufferSemantics())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  373:    return failure();
+        -:  374:  // Check that at least one of the requested operands is indeed a subview.
+    #####:  375:  for (OpOperand &opOperand : linalgOp->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  376:    auto sv =
+    #####:  377:        isa_and_nonnull<memref::SubViewOp>(opOperand.get().getDefiningOp());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  378:    if (sv) {
+branch  0 never executed
+branch  1 never executed
+    #####:  379:      if (!options.operandsToPromote ||
+branch  0 never executed
+branch  1 never executed
+    #####:  380:          options.operandsToPromote->count(opOperand.getOperandNumber()))
+call    0 never executed
+call    1 never executed
+    #####:  381:        return success();
+        -:  382:    }
+        -:  383:  }
+        -:  384:  // TODO: Check all subviews requested are bound by a static constant.
+        -:  385:  // TODO: Check that the total footprint fits within a given size.
+    #####:  386:  return failure();
+        -:  387:}
+        -:  388:
+        -:  389:FailureOr<LinalgOp>
+function _ZN4mlir6linalg15promoteSubViewsERNS_9OpBuilderENS0_8LinalgOpERKNS0_22LinalgPromotionOptionsE called 0 returned 0% blocks executed 0%
+    #####:  390:mlir::linalg::promoteSubViews(OpBuilder &builder, LinalgOp linalgOp,
+        -:  391:                              const LinalgPromotionOptions &options) {
+    #####:  392:  LinalgOpInstancePromotionOptions linalgOptions(linalgOp, options);
+call    0 never executed
+call    1 never executed
+    #####:  393:  auto layout = DataLayout::closest(linalgOp);
+call    0 never executed
+call    1 never executed
+    #####:  394:  ImplicitLocOpBuilder b(linalgOp.getLoc(), builder);
+call    0 never executed
+    #####:  395:  auto res = ::promoteSubViews(b, linalgOp, linalgOptions, layout);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  396:  if (failed(res))
+branch  0 never executed
+branch  1 never executed
+    #####:  397:    return failure();
+    #####:  398:  return res;
+        -:  399:}

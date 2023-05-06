@@ -1,0 +1,1942 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Bufferization/Transforms/OneShotAnalysis.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/OneShotAnalysis.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/OneShotAnalysis.cpp.gcda
+        -:    0:Runs:325546
+        -:    1://===- OneShotAnalysis.cpp - One-Shot (Single Pass) Analysis --------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// One-Shot Analysis analyzes function bodies. Function boundaries (FuncOp
+        -:   10:// bbArgs, CallOps, ReturnOps) are treated as "unknown" ops.
+        -:   11:// ModuleBufferization.cpp is an extension of One-Shot Analysis for simple
+        -:   12:// call graphs.
+        -:   13://
+        -:   14:// One-Shot Bufferize consists of two phases.
+        -:   15://
+        -:   16:// 1. Analyze ops to decide which OpResults can bufferize inplace, i.e., without
+        -:   17://    inserting buffer copies. The analysis queries op bufferization semantics
+        -:   18://    via `BufferizableOpInterface`.
+        -:   19:// 2. Bufferize ops by calling `BufferizableOpInterface::bufferize`. This
+        -:   20://    function does not generate buffer copies for OpResults that were decided
+        -:   21://    to bufferize inplace during the analysis phase.
+        -:   22://
+        -:   23:// This file contains only the analysis. The actual bufferization is implemented
+        -:   24:// via `bufferizeOp` (Bufferize.h). For convenience, this file also contains a
+        -:   25:// helper function `runOneShotBufferize` that analyzes an op (and its nested
+        -:   26:// ops) and then bufferizes it.
+        -:   27://
+        -:   28:// Inplace bufferization decisions are passed from the analysis to the
+        -:   29:// bufferization phase via `AnalysisState` and `BufferizationAliasInfo`.
+        -:   30:// They can be printed for debugging purposes with `testAnalysisOnly`.
+        -:   31://
+        -:   32:// Ops that do not implement `BufferizableOpInterface` can be analyzed but are
+        -:   33:// treated conservatively. E.g., the analysis has to assume that their tensor
+        -:   34:// OpOperands bufferize to memory writes. While such ops can be analyzed, they
+        -:   35:// are not bufferized and remain in the IR. to_tensor and to_memref ops are
+        -:   36:// inserted at the bufferization boundary.
+        -:   37://
+        -:   38:// This analysis caters to high-performance codegen where buffer reuse is deemed
+        -:   39:// critical: the analysis should fail if the bufferized form of the function
+        -:   40:// needs to return a buffer, unless `allowReturnAllocs` is enabled.
+        -:   41:
+        -:   42:#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+        -:   43:
+        -:   44:#include <random>
+        -:   45:
+        -:   46:#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
+        -:   47:#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+        -:   48:#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+        -:   49:#include "mlir/Dialect/Bufferization/Transforms/TensorCopyInsertion.h"
+        -:   50:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   51:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   52:#include "mlir/IR/AsmState.h"
+        -:   53:#include "mlir/IR/Dominance.h"
+        -:   54:#include "mlir/IR/Operation.h"
+        -:   55:#include "mlir/IR/TypeUtilities.h"
+        -:   56:#include "mlir/Interfaces/ControlFlowInterfaces.h"
+        -:   57:#include "llvm/ADT/DenseSet.h"
+        -:   58:#include "llvm/ADT/SetVector.h"
+        -:   59:
+        -:   60:// Run mlir-opt with `-debug-only="one-shot-analysis"` for detailed debug
+        -:   61:// output.
+        -:   62:#define DEBUG_TYPE "one-shot-analysis"
+        -:   63:
+        -:   64:using namespace mlir;
+        -:   65:using namespace mlir::bufferization;
+        -:   66:
+function _ZL9isaTensorN4mlir4TypeE called 49395 returned 100% blocks executed 100%
+    49395:   67:static bool isaTensor(Type t) { return t.isa<TensorType>(); }
+call    0 returned 100%
+        -:   68:
+        -:   69://===----------------------------------------------------------------------===//
+        -:   70:// Bufferization-specific attribute manipulation.
+        -:   71:// These are for testing and debugging only. Bufferization information is
+        -:   72:// stored in BufferizationAliasInfo. When run with `testAnalysisOnly`, the IR
+        -:   73:// is annotated with the results of the analysis (copied from
+        -:   74:// BufferizationAliasInfo), so that they can be checked in tests.
+        -:   75://===----------------------------------------------------------------------===//
+        -:   76:
+        -:   77:/// Attribute marker to specify op results that can be bufferized inPlace.
+        -:   78:constexpr StringLiteral kInPlaceResultsAttrName = "__inplace_operands_attr__";
+        -:   79:
+        -:   80:/// Mark whether OpOperand will be bufferized inplace.
+function _ZL19setInPlaceOpOperandRN4mlir9OpOperandEb called 0 returned 0% blocks executed 0%
+    #####:   81:static void setInPlaceOpOperand(OpOperand &opOperand, bool inPlace) {
+    #####:   82:  Operation *op = opOperand.getOwner();
+call    0 never executed
+    #####:   83:  auto attr =
+call    0 never executed
+    #####:   84:      op->getAttr(kInPlaceResultsAttrName).dyn_cast_or_null<ArrayAttr>();
+branch  0 never executed
+branch  1 never executed
+    #####:   85:  SmallVector<StringRef> inPlaceVector;
+branch  0 never executed
+branch  1 never executed
+    #####:   86:  if (attr) {
+branch  0 never executed
+branch  1 never executed
+    #####:   87:    inPlaceVector = SmallVector<StringRef>(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   88:        llvm::to_vector<4>(attr.getAsValueRange<StringAttr>()));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:   89:  } else {
+    #####:   90:    inPlaceVector = SmallVector<StringRef>(op->getNumOperands(), "none");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:   91:    for (OpOperand &opOperand : op->getOpOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   92:      if (opOperand.get().getType().isa<TensorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   93:        inPlaceVector[opOperand.getOperandNumber()] = "false";
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   94:  }
+        -:   95:
+    #####:   96:  inPlaceVector[opOperand.getOperandNumber()] = inPlace ? "true" : "false";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   97:  op->setAttr(kInPlaceResultsAttrName,
+call    0 never executed
+    #####:   98:              OpBuilder(op).getStrArrayAttr(inPlaceVector));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   99:}
+        -:  100:
+        -:  101://===----------------------------------------------------------------------===//
+        -:  102:// BufferizationAliasInfo
+        -:  103://===----------------------------------------------------------------------===//
+        -:  104:
+function _ZN4mlir13bufferization22BufferizationAliasInfoC2EPNS_9OperationE called 2642 returned 100% blocks executed 100%
+     2642:  105:BufferizationAliasInfo::BufferizationAliasInfo(Operation *rootOp) {
+call    0 returned 100%
+call    1 returned 100%
+function _ZZN4mlir13bufferization22BufferizationAliasInfoC4EPNS_9OperationEENKUlS3_E_clES3_.isra.0 called 35185 returned 100% blocks executed 96%
+     2642:  106:  rootOp->walk([&](Operation *op) {
+call    0 returned 100%
+    89193:  107:    for (Value v : op->getResults())
+branch  0 taken 77% (fallthrough)
+branch  1 taken 23%
+branch  2 taken 57% (fallthrough)
+branch  3 taken 43%
+call    4 returned 100%
+    27004:  108:      if (v.getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+    26923:  109:        createAliasInfoEntry(v);
+call    0 returned 100%
+    54190:  110:    for (Region &r : op->getRegions())
+branch  0 taken 38%
+branch  1 taken 62%
+branch  2 taken 14% (fallthrough)
+branch  3 taken 86%
+    10838:  111:      for (Block &b : r.getBlocks())
+branch  0 taken 49% (fallthrough)
+branch  1 taken 51%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    10632:  112:        for (auto bbArg : b.getArguments())
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+     5312:  113:          if (bbArg.getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 99% (fallthrough)
+branch  2 taken 1%
+     5255:  114:            createAliasInfoEntry(bbArg);
+call    0 returned 100%
+    35185:  115:  });
+     2642:  116:}
+        -:  117:
+        -:  118:/// Add a new entry for `v` in the `aliasInfo` and `equivalentInfo`. In the
+        -:  119:/// beginning the alias and equivalence sets only contain `v` itself.
+function _ZN4mlir13bufferization22BufferizationAliasInfo20createAliasInfoEntryENS_5ValueE called 32178 returned 100% blocks executed 100%
+    32178:  120:void BufferizationAliasInfo::createAliasInfoEntry(Value v) {
+    32178:  121:  aliasInfo.insert(v);
+call    0 returned 100%
+    32178:  122:  equivalentInfo.insert(v);
+call    0 returned 100%
+    32178:  123:}
+        -:  124:
+        -:  125:/// Insert an info entry for `newValue` and merge its alias set with that of
+        -:  126:/// `alias`.
+function _ZN4mlir13bufferization22BufferizationAliasInfo20insertNewBufferAliasENS_5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  127:void BufferizationAliasInfo::insertNewBufferAlias(Value newValue, Value alias) {
+    #####:  128:  createAliasInfoEntry(newValue);
+call    0 never executed
+    #####:  129:  aliasInfo.unionSets(newValue, alias);
+call    0 never executed
+call    1 never executed
+    #####:  130:}
+        -:  131:
+        -:  132:/// Insert an info entry for `newValue` and merge its alias set with that of
+        -:  133:/// `alias`. Additionally, merge their equivalence classes.
+function _ZN4mlir13bufferization22BufferizationAliasInfo26insertNewBufferEquivalenceENS_5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  134:void BufferizationAliasInfo::insertNewBufferEquivalence(Value newValue,
+        -:  135:                                                        Value alias) {
+    #####:  136:  insertNewBufferAlias(newValue, alias);
+call    0 never executed
+    #####:  137:  equivalentInfo.unionSets(newValue, alias);
+call    0 never executed
+    #####:  138:}
+        -:  139:
+        -:  140:/// Return `true` if a value was marked as in-place bufferized.
+function _ZNK4mlir13bufferization22BufferizationAliasInfo9isInPlaceERNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    5137*:  141:bool BufferizationAliasInfo::isInPlace(OpOperand &operand) const {
+    #####:  142:  return inplaceBufferized.contains(&operand);
+call    0 never executed
+        -:  143:}
+        -:  144:
+        -:  145:/// Set the inPlace bufferization spec to true.
+function _ZN4mlir13bufferization22BufferizationAliasInfo16bufferizeInPlaceERNS_9OpOperandERNS0_13AnalysisStateE called 2016 returned 100% blocks executed 67%
+     2016:  146:void BufferizationAliasInfo::bufferizeInPlace(OpOperand &operand,
+        -:  147:                                              AnalysisState &state) {
+     2016:  148:  markInPlace(operand);
+call    0 returned 100%
+    2016*:  149:  for (OpResult result : state.getAliasingOpResult(operand))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  150:    aliasInfo.unionSets(result, operand.get());
+call    0 never executed
+     2016:  151:}
+        -:  152:
+        -:  153:/// Set the inPlace bufferization spec to false.
+function _ZN4mlir13bufferization22BufferizationAliasInfo19bufferizeOutOfPlaceERNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  154:void BufferizationAliasInfo::bufferizeOutOfPlace(OpOperand &operand) {
+    #####:  155:  assert(!inplaceBufferized.contains(&operand) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  156:         "OpOperand was already decided to bufferize inplace");
+    #####:  157:}
+        -:  158:
+        -:  159:/// Apply `fun` to all the members of the equivalence class of `v`.
+function _ZNK4mlir13bufferization22BufferizationAliasInfo23applyOnEquivalenceClassENS_5ValueEN4llvm12function_refIFvS2_EEE called 0 returned 0% blocks executed 0%
+    #####:  160:void BufferizationAliasInfo::applyOnEquivalenceClass(
+        -:  161:    Value v, function_ref<void(Value)> fun) const {
+    #####:  162:  auto leaderIt = equivalentInfo.findLeader(v);
+call    0 never executed
+    #####:  163:  for (auto mit = leaderIt, meit = equivalentInfo.member_end(); mit != meit;
+branch  0 never executed
+branch  1 never executed
+    #####:  164:       ++mit) {
+    #####:  165:    fun(*mit);
+call    0 never executed
+call    1 never executed
+        -:  166:  }
+    #####:  167:}
+        -:  168:
+        -:  169:/// Apply `fun` to all aliases of `v`.
+function _ZNK4mlir13bufferization22BufferizationAliasInfo14applyOnAliasesENS_5ValueEN4llvm12function_refIFvS2_EEE called 13811 returned 100% blocks executed 100%
+    13811:  170:void BufferizationAliasInfo::applyOnAliases(
+        -:  171:    Value v, function_ref<void(Value)> fun) const {
+    13811:  172:  auto leaderIt = aliasInfo.findLeader(v);
+call    0 returned 100%
+    27622:  173:  for (auto mit = leaderIt, meit = aliasInfo.member_end(); mit != meit; ++mit) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    13811:  174:    fun(*mit);
+call    0 returned 100%
+call    1 returned 100%
+        -:  175:  }
+    13811:  176:}
+        -:  177:
+        -:  178:BufferizationAliasInfo::EquivalenceClassRangeType
+function _ZNK4mlir13bufferization22BufferizationAliasInfo10getAliasesENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  179:BufferizationAliasInfo::getAliases(Value v) const {
+    #####:  180:  DenseSet<Value> res;
+call    0 never executed
+    #####:  181:  auto it = aliasInfo.findValue(aliasInfo.getLeaderValue(v));
+call    0 never executed
+    #####:  182:  for (auto mit = aliasInfo.member_begin(it), meit = aliasInfo.member_end();
+branch  0 never executed
+branch  1 never executed
+    #####:  183:       mit != meit; ++mit) {
+branch  0 never executed
+branch  1 never executed
+    #####:  184:    res.insert(static_cast<Value>(*mit));
+call    0 never executed
+call    1 never executed
+        -:  185:  }
+    #####:  186:  return BufferizationAliasInfo::EquivalenceClassRangeType(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  187:      aliasInfo.member_begin(it), aliasInfo.member_end());
+call    0 never executed
+        -:  188:}
+        -:  189:
+        -:  190://===----------------------------------------------------------------------===//
+        -:  191:// OneShotAnalysisState
+        -:  192://===----------------------------------------------------------------------===//
+        -:  193:
+function _ZN4mlir13bufferization20OneShotAnalysisStateC2EPNS_9OperationERKNS0_27OneShotBufferizationOptionsE called 2642 returned 100% blocks executed 100%
+     2642:  194:OneShotAnalysisState::OneShotAnalysisState(
+     2642:  195:    Operation *op, const OneShotBufferizationOptions &options)
+     2642:  196:    : AnalysisState(options), aliasInfo(op) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  197:  // Set up alias sets for OpResults that must bufferize in-place. This should
+        -:  198:  // be done before making any other bufferization decisions.
+function _ZZN4mlir13bufferization20OneShotAnalysisStateC4EPNS_9OperationERKNS0_27OneShotBufferizationOptionsEENKUlNS0_23BufferizableOpInterfaceEE_clES7_.isra.0 called 5627 returned 100% blocks executed 86%
+     8269:  199:  op->walk([&](BufferizableOpInterface bufferizableOp) {
+     5627:  200:    if (!options.isOpAllowed(bufferizableOp))
+call    0 returned 100%
+branch  1 taken 65% (fallthrough)
+branch  2 taken 35%
+     3684:  201:      return WalkResult::skip();
+     4070:  202:    for (OpOperand &opOperand : bufferizableOp->getOpOperands()) {
+call    0 returned 100%
+branch  1 taken 52% (fallthrough)
+branch  2 taken 48%
+     2127:  203:      if (opOperand.get().getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 97% (fallthrough)
+branch  2 taken 3%
+    2067*:  204:        if (bufferizableOp.mustBufferizeInPlace(opOperand, *this)) {
+call    0 returned 100%
+branch  1 taken 2% (fallthrough)
+branch  2 taken 98%
+      51*:  205:          for (OpResult opResult :
+       51:  206:               bufferizableOp.getAliasingOpResult(opOperand, *this))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  207:            aliasInfo.unionAliasSets(opOperand.get(), opResult);
+call    0 never executed
+     2178:  208:          aliasInfo.markInPlace(opOperand);
+call    0 returned 100%
+        -:  209:        }
+        -:  210:    }
+     1943:  211:    return WalkResult::advance();
+     2642:  212:  });
+call    0 returned 100%
+     2642:  213:}
+        -:  214:
+function _ZNK4mlir13bufferization20OneShotAnalysisState9isInPlaceERNS_9OpOperandE called 4423 returned 100% blocks executed 100%
+     4423:  215:bool OneShotAnalysisState::isInPlace(OpOperand &opOperand) const {
+     4423:  216:  return aliasInfo.isInPlace(opOperand);
+call    0 returned 100%
+        -:  217:}
+        -:  218:
+function _ZNK4mlir13bufferization20OneShotAnalysisState29areEquivalentBufferizedValuesENS_5ValueES2_ called 4059 returned 100% blocks executed 100%
+     4059:  219:bool OneShotAnalysisState::areEquivalentBufferizedValues(Value v1,
+        -:  220:                                                         Value v2) const {
+     4059:  221:  return aliasInfo.areEquivalentBufferizedValues(v1, v2);
+call    0 returned 100%
+        -:  222:}
+        -:  223:
+function _ZNK4mlir13bufferization20OneShotAnalysisState27areAliasingBufferizedValuesENS_5ValueES2_ called 4059 returned 100% blocks executed 100%
+     4059:  224:bool OneShotAnalysisState::areAliasingBufferizedValues(Value v1,
+        -:  225:                                                       Value v2) const {
+     4059:  226:  return aliasInfo.areAliasingBufferizedValues(v1, v2);
+call    0 returned 100%
+        -:  227:}
+        -:  228:
+        -:  229:// Gather yielded tensors in `yieldedTensors` by querying all aliases. This is
+        -:  230:// to ensure that such information is available during bufferization time.
+        -:  231:// Alias information can no longer be queried through BufferizationAliasInfo
+        -:  232:// once we have started modifying the IR.
+function _ZN4mlir13bufferization20OneShotAnalysisState20gatherYieldedTensorsEPNS_9OperationE called 0 returned 0% blocks executed 0%
+    1738*:  233:void OneShotAnalysisState::gatherYieldedTensors(Operation *op) {
+function _ZZN4mlir13bufferization20OneShotAnalysisState20gatherYieldedTensorsEPNS_9OperationEENKUlS3_E_clES3_.isra.0 called 22052 returned 100% blocks executed 94%
+   23790*:  234:  op->walk([&](Operation *returnOp) {
+    22052:  235:    if (!isRegionReturnLike(returnOp) || !getOptions().isOpAllowed(returnOp))
+call    0 returned 100%
+branch  1 taken 8% (fallthrough)
+branch  2 taken 92%
+call    3 returned 100%
+branch  4 taken 51% (fallthrough)
+branch  5 taken 49%
+    21197:  236:      return WalkResult::advance();
+        -:  237:
+     2871:  238:    for (OpOperand &returnValOperand : returnOp->getOpOperands()) {
+call    0 returned 100%
+branch  1 taken 70% (fallthrough)
+branch  2 taken 30%
+     2016:  239:      Value returnVal = returnValOperand.get();
+call    0 returned 100%
+        -:  240:      // Skip non-tensor values.
+    2016*:  241:      if (!returnVal.getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  242:        continue;
+        -:  243:
+        -:  244:      // Add all aliases of the returned value. But only the ones that are in
+        -:  245:      // the same block.
+function _ZZZN4mlir13bufferization20OneShotAnalysisState20gatherYieldedTensorsEPNS_9OperationEENKUlS3_E_clES3_ENKUlNS_5ValueEE_clES5_.isra.0 called 2016 returned 100% blocks executed 61%
+     2016:  246:      aliasInfo.applyOnAliases(returnVal, [&](Value v) {
+call    0 returned 100%
+     2016:  247:        if (auto bbArg = v.dyn_cast<BlockArgument>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  248:          if (bbArg.getOwner()->getParentOp() == returnOp->getParentOp())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  249:            yieldedTensors.insert(bbArg);
+call    0 never executed
+    #####:  250:          return;
+        -:  251:        }
+     2016:  252:        Operation *definingOp = v.getDefiningOp();
+call    0 returned 100%
+     6048:  253:        if (definingOp->getParentOp() == returnOp->getParentOp())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 taken 100% (fallthrough)
+branch  5 taken 0%
+     2016:  254:          yieldedTensors.insert(v);
+call    0 returned 100%
+        -:  255:      });
+        -:  256:    }
+        -:  257:
+      855:  258:    return WalkResult::advance();
+    #####:  259:  });
+call    0 never executed
+    #####:  260:}
+        -:  261:
+function _ZN4mlir13bufferization20OneShotAnalysisState25gatherUndefinedTensorUsesEPNS_9OperationE called 0 returned 0% blocks executed 0%
+    1738*:  262:void OneShotAnalysisState::gatherUndefinedTensorUses(Operation *op) {
+function _ZZN4mlir13bufferization20OneShotAnalysisState25gatherUndefinedTensorUsesEPNS_9OperationEENKUlS3_E_clES3_.isra.0 called 22052 returned 100% blocks executed 83%
+   23790*:  263:  op->walk([&](Operation *op) {
+        -:  264:    // Skip unknown ops.
+   22052*:  265:    auto bufferizableOp = getOptions().dynCastBufferizableOp(op);
+call    0 returned 100%
+    22052:  266:    if (!bufferizableOp)
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+    20313:  267:      return WalkResult::skip();
+        -:  268:
+        -:  269:    // Check all tensor OpResults.
+     1797:  270:    for (OpResult opResult : op->getOpResults()) {
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+branch  2 taken 98% (fallthrough)
+branch  3 taken 2%
+call    4 returned 100%
+       29:  271:      if (!opResult.getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 45% (fallthrough)
+branch  2 taken 55%
+       13:  272:        continue;
+        -:  273:
+        -:  274:      // If there is no preceding memory write, the tensor contents are
+        -:  275:      // undefined.
+        -:  276:      // Note: If `findLastPrecedingWrite` reaches the end of the reverse SSA
+        -:  277:      // use-def chain, it returns that value, regardless of whether it is a
+        -:  278:      // memory write or not.
+       32:  279:      SetVector<Value> lastWrites = findLastPrecedingWrite(opResult);
+call    0 returned 100%
+call    1 returned 100%
+function _ZZZN4mlir13bufferization20OneShotAnalysisState25gatherUndefinedTensorUsesEPNS_9OperationEENKUlS3_E_clES3_ENKUlNS_5ValueEE_clES5_.isra.0 called 16 returned 100% blocks executed 88%
+       32:  280:      bool isUndefined = llvm::none_of(lastWrites, [&](Value lastWrite) {
+call    0 returned 100%
+       16:  281:        if (auto bufferizableOp = getOptions().dynCastBufferizableOp(lastWrite))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+       16:  282:          return bufferizableOp.isMemoryWrite(lastWrite.cast<OpResult>(),
+call    0 returned 100%
+call    1 returned 100%
+       16:  283:                                              *this);
+    #####:  284:        return true;
+        -:  285:      });
+       16:  286:      if (isUndefined)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  287:        for (OpOperand &use : opResult.getUses())
+branch  0 never executed
+branch  1 never executed
+    #####:  288:          undefinedTensorUses.insert(&use);
+call    0 never executed
+        -:  289:    }
+        -:  290:
+     1739:  291:    return WalkResult::advance();
+    #####:  292:  });
+call    0 never executed
+    #####:  293:}
+        -:  294:
+function _ZNK4mlir13bufferization20OneShotAnalysisState20hasUndefinedContentsEPNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  295:bool OneShotAnalysisState::hasUndefinedContents(OpOperand *opOperand) const {
+    #####:  296:  return undefinedTensorUses.contains(opOperand);
+call    0 never executed
+        -:  297:}
+        -:  298:
+function _ZNK4mlir13bufferization20OneShotAnalysisState15isTensorYieldedENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  299:bool OneShotAnalysisState::isTensorYielded(Value tensor) const {
+    #####:  300:  return yieldedTensors.contains(tensor);
+call    0 never executed
+        -:  301:}
+        -:  302:
+function _ZNK4mlir13bufferization20OneShotAnalysisState14isValueWrittenENS_5ValueE called 1715 returned 100% blocks executed 100%
+     1715:  303:bool OneShotAnalysisState::isValueWritten(Value value) const {
+     1715:  304:  bool isWritten = false;
+function _ZZNK4mlir13bufferization20OneShotAnalysisState14isValueWrittenENS_5ValueEENKUlS2_E_clES2_.isra.0 called 1715 returned 100% blocks executed 70%
+     3430:  305:  aliasInfo.applyOnAliases(value, [&](Value val) {
+call    0 returned 100%
+     4122:  306:    for (OpOperand &use : val.getUses())
+branch  0 taken 58% (fallthrough)
+branch  1 taken 42%
+    2407*:  307:      if (isInPlace(use) && bufferizesToMemoryWrite(use))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  308:        isWritten = true;
+     1715:  309:  });
+     1715:  310:  return isWritten;
+        -:  311:}
+        -:  312:
+function _ZNK4mlir13bufferization20OneShotAnalysisState10isWritableENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  313:bool OneShotAnalysisState::isWritable(Value value) const {
+        -:  314:  // TODO: Out-of-place bufferized value could be considered writable.
+    #####:  315:  if (auto bufferizableOp = getOptions().dynCastBufferizableOp(value))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  316:    return bufferizableOp.isWritable(value, *this);
+call    0 never executed
+        -:  317:
+        -:  318:  // Query BufferizableOpInterface to see if the BlockArgument is writable.
+    #####:  319:  if (auto bbArg = value.dyn_cast<BlockArgument>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  320:    if (auto bufferizableOp =
+branch  0 never executed
+branch  1 never executed
+    #####:  321:            getOptions().dynCastBufferizableOp(bbArg.getOwner()->getParentOp()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  322:      return bufferizableOp.isWritable(bbArg, *this);
+call    0 never executed
+        -:  323:
+        -:  324:  // Not a bufferizable op: The conservative answer is "not writable".
+        -:  325:  return false;
+        -:  326:}
+        -:  327:
+        -:  328://===----------------------------------------------------------------------===//
+        -:  329:// Bufferization-specific alias analysis.
+        -:  330://===----------------------------------------------------------------------===//
+        -:  331:
+        -:  332:/// Return true if opOperand has been decided to bufferize in-place.
+function _ZL20isInplaceMemoryWriteRN4mlir9OpOperandERKNS_13bufferization22BufferizationAliasInfoERKNS2_13AnalysisStateE called 6762 returned 100% blocks executed 100%
+     6762:  333:static bool isInplaceMemoryWrite(OpOperand &opOperand,
+        -:  334:                                 const BufferizationAliasInfo &aliasInfo,
+        -:  335:                                 const AnalysisState &state) {
+        -:  336:  // OpOperands that do not bufferize to a memory write do not write in-place.
+     6762:  337:  if (!state.bufferizesToMemoryWrite(opOperand))
+call    0 returned 100%
+branch  1 taken 11% (fallthrough)
+branch  2 taken 89%
+        -:  338:    return false;
+        -:  339:  // Check current bufferization decisions.
+      714:  340:  return aliasInfo.isInPlace(opOperand);
+call    0 returned 100%
+        -:  341:}
+        -:  342:
+        -:  343:/// Return true if `a` happens before `b`, i.e., `a` or one of its ancestors
+        -:  344:/// properly dominates `b` and `b` is not inside `a`.
+function _ZL13happensBeforePN4mlir9OperationES1_RKNS_13DominanceInfoE called 0 returned 0% blocks executed 0%
+    #####:  345:static bool happensBefore(Operation *a, Operation *b,
+        -:  346:                          const DominanceInfo &domInfo) {
+    #####:  347:  do {
+        -:  348:    // TODO: Instead of isProperAncestor + properlyDominates, we should use
+        -:  349:    // properlyDominatesImpl(a, b, /*enclosingOpOk=*/false)
+    #####:  350:    if (a->isProperAncestor(b))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  351:      return false;
+    #####:  352:    if (domInfo.properlyDominates(a, b))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  353:      return true;
+    #####:  354:  } while ((a = a->getParentOp()));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  355:  return false;
+        -:  356:}
+        -:  357:
+        -:  358:static Region *
+function _ZL28getEnclosingRepetitiveRegionPN4mlir9OperationERKNS_13bufferization20BufferizationOptionsE called 0 returned 0% blocks executed 0%
+    #####:  359:getEnclosingRepetitiveRegion(Operation *op,
+        -:  360:                             const BufferizationOptions &options) {
+    #####:  361:  while (Region *region = op->getParentRegion()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  362:    op = region->getParentOp();
+call    0 never executed
+    #####:  363:    if (auto bufferizableOp = options.dynCastBufferizableOp(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  364:      if (bufferizableOp.isRepetitiveRegion(region->getRegionNumber()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  365:        return region;
+    #####:  366:  }
+        -:  367:  return nullptr;
+        -:  368:}
+        -:  369:
+        -:  370:static Region *
+function _ZL28getEnclosingRepetitiveRegionN4mlir5ValueERKNS_13bufferization20BufferizationOptionsE called 4508 returned 100% blocks executed 92%
+     4508:  371:getEnclosingRepetitiveRegion(Value value, const BufferizationOptions &options) {
+     4508:  372:  Region *region = value.getParentRegion();
+call    0 returned 100%
+     9016:  373:  while (region) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     9016:  374:    Operation *op = region->getParentOp();
+call    0 returned 100%
+     9016:  375:    if (auto bufferizableOp = options.dynCastBufferizableOp(op))
+call    0 returned 100%
+branch  1 taken 50% (fallthrough)
+branch  2 taken 50%
+     4508:  376:      if (bufferizableOp.isRepetitiveRegion(region->getRegionNumber()))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  377:        return region;
+     9016:  378:    region = op->getParentRegion();
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+        -:  379:  }
+        -:  380:  return nullptr;
+        -:  381:}
+        -:  382:
+        -:  383:/// Return `true` if the given tensor value is a memory write. Most values are
+        -:  384:/// tensor writes, but ops that define a tensor SSA value without specifying its
+        -:  385:/// contents (e.g., alloc_tensor) are not.
+function _ZL13isMemoryWriteN4mlir5ValueERKNS_13bufferization13AnalysisStateE called 4508 returned 100% blocks executed 83%
+     4508:  386:static bool isMemoryWrite(Value value, const AnalysisState &state) {
+     4508:  387:  auto opResult = value.dyn_cast<OpResult>();
+call    0 returned 100%
+     4508:  388:  if (!opResult)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  389:    return true;
+     4508:  390:  auto bufferizableOp = state.getOptions().dynCastBufferizableOp(value);
+call    0 returned 100%
+     4508:  391:  if (!bufferizableOp)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  392:    return true;
+    #####:  393:  return bufferizableOp.isMemoryWrite(opResult, state);
+call    0 never executed
+        -:  394:}
+        -:  395:
+        -:  396:/// Return `true` if op dominance can be used to rule out read-after-write
+        -:  397:/// conflicts wrt. the given reads and writes.
+        -:  398:///
+        -:  399:/// Op dominance can often be used to rule out potential conflicts such as
+        -:  400:/// "read" happens before "write". E.g., the following IR is not a RaW conflict
+        -:  401:/// because the the read happens *before* the write.
+        -:  402:///
+        -:  403:/// %0 = ... : tensor<?xf32>
+        -:  404:/// "reading_op"(%0) : tensor<?xf32>
+        -:  405:/// %1 = "writing_op"(%0) : tensor<?xf32> -> tensor<?xf32>
+        -:  406:///
+        -:  407:/// This is no longer true inside loops (or repetitive regions). In such cases,
+        -:  408:/// there may not be a meaningful `happensBefore` relationship because ops
+        -:  409:/// could be executed multiple times. E.g.:
+        -:  410:///
+        -:  411:/// %0 = ... : tensor<?xf32>
+        -:  412:/// scf.for ... {
+        -:  413:///   "reading_op"(%0) : tensor<?xf32>
+        -:  414:///   %1 = "writing_op"(%0) : tensor<?xf32> -> tensor<?xf32>
+        -:  415:///   ...
+        -:  416:/// }
+        -:  417:///
+        -:  418:/// In the above example, reading_op happens before writing_op according to
+        -:  419:/// op dominance. However, both ops may happen multiple times; in
+        -:  420:/// particular, the second execution of reading_op happens after the first
+        -:  421:/// execution of writing_op. This is problematic because the tensor %0 they
+        -:  422:/// operate on (i.e., the "definition") is defined outside of the loop.
+        -:  423:///
+        -:  424:/// Counter example:
+        -:  425:///
+        -:  426:/// scf.for ... {
+        -:  427:///   %0 = ... : tensor<?xf32>
+        -:  428:///   "reading_op"(%0) : tensor<?xf32>
+        -:  429:///   %1 = "writing_op"(%0) : tensor<?xf32> -> tensor<?xf32>
+        -:  430:///   ...
+        -:  431:/// }
+        -:  432:///
+        -:  433:/// In this example, the definition %0 is in the same repetitive region as
+        -:  434:/// "writing_op", so op dominance can be used to compute the `happensBefore`
+        -:  435:/// relationship.
+        -:  436:///
+        -:  437:/// Whether op dominance can be used or not is decided as follows: Find the
+        -:  438:/// closest enclosing repetitive region of all buffer writes wrt. the given
+        -:  439:/// tensor reads and writes. (The given sets of reads and writes contain the
+        -:  440:/// entire alias set.) In case of a read, we look at the op that defines the
+        -:  441:/// read value. In case of a write, we look at the op that is writing. If all of
+        -:  442:/// those ops are in the same closest enclosing repetitive region (nullptr in
+        -:  443:/// case of "no repetitive region" found at all), then op dominance can be used.
+        -:  444:/// Otherwise, it cannot be used.
+        -:  445:///
+        -:  446:/// Example: The common enclosing repetitive region is the scf.for loop.
+        -:  447:///          Op dominance can be used.
+        -:  448:/// scf.for ... {
+        -:  449:///   %0 = tensor.generate
+        -:  450:///   "read"(%0)
+        -:  451:/// }
+        -:  452:///
+        -:  453:/// Example: The common enclosing repetitive region is nullptr: There is no
+        -:  454:///          repetitive region around the tensor.generate. Op dominance can be
+        -:  455:///          used.
+        -:  456:/// %0 = tensor.generate
+        -:  457:/// scf.for ... { "read"(%0) }
+        -:  458:///
+        -:  459:/// Example: The common enclosing repetitive regions of tensor.generate and
+        -:  460:///          "write" differ. Op dominance cannot be used.
+        -:  461:/// %0 = tensor.generate
+        -:  462:/// scf.for ... {
+        -:  463:///   "read"(%0)
+        -:  464:///   "write"(%0)
+        -:  465:/// }
+        -:  466:///
+        -:  467:/// Example: The common enclosing repetitive regions of tensor.generate and
+        -:  468:///          "write" differ, but there is no read of %0, so op dominance can be
+        -:  469:///          used.
+        -:  470:/// %0 = tensor.generate
+        -:  471:/// scf.for ... {
+        -:  472:///   "write"(%0)
+        -:  473:/// }
+        -:  474:///
+        -:  475:/// Note: iter_args of loops are not aliases of their respective block
+        -:  476:/// arguments, so op domanice can be used when analyzing ops that operate
+        -:  477:/// on them.
+function _Z17canUseOpDominanceRKN4llvm8DenseSetIPN4mlir9OpOperandENS_12DenseMapInfoIS3_vEEEES8_RKNS1_13bufferization13AnalysisStateE called 4032 returned 100% blocks executed 67%
+     4032:  478:bool canUseOpDominance(const DenseSet<OpOperand *> &usesRead,
+        -:  479:                       const DenseSet<OpOperand *> &usesWrite,
+        -:  480:                       const AnalysisState &state) {
+     4032:  481:  const BufferizationOptions &options = state.getOptions();
+call    0 returned 100%
+     4032:  482:  Optional<Region *> commonEnclosingRegion = None;
+        -:  483:
+        -:  484:  // In case of a write, take the region in which the write takes place.
+    4032*:  485:  for (OpOperand *uWrite : usesWrite) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 never executed
+    #####:  486:    Region *r = getEnclosingRepetitiveRegion(uWrite->getOwner(), options);
+call    0 never executed
+    #####:  487:    if (!commonEnclosingRegion.has_value()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  488:      commonEnclosingRegion = r;
+    #####:  489:      continue;
+        -:  490:    }
+    #####:  491:    if (*commonEnclosingRegion != r)
+branch  0 never executed
+branch  1 never executed
+    #####:  492:      return false;
+        -:  493:  }
+        -:  494:
+        -:  495:  // In case of a read, take the region which the read value is defined.
+     8540:  496:  for (OpOperand *uRead : usesRead) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 53% (fallthrough)
+branch  4 taken 47%
+call    5 returned 100%
+        -:  497:    // Optimization: Skip reads of values that have no defined contents.
+    4508*:  498:    if (!isMemoryWrite(uRead->get(), state))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  499:      continue;
+     4508:  500:    Region *r = getEnclosingRepetitiveRegion(uRead->get(), options);
+call    0 returned 100%
+     4508:  501:    if (!commonEnclosingRegion.has_value()) {
+branch  0 taken 89% (fallthrough)
+branch  1 taken 11%
+     4032:  502:      commonEnclosingRegion = r;
+     4032:  503:      continue;
+        -:  504:    }
+      476:  505:    if (*commonEnclosingRegion != r)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  506:      return false;
+        -:  507:  }
+        -:  508:
+     4032:  509:  return commonEnclosingRegion.has_value();
+        -:  510:}
+        -:  511:
+        -:  512:/// Annotate IR with details about the detected RaW conflict.
+function _ZL16annotateConflictPN4mlir9OpOperandES1_NS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  513:static void annotateConflict(OpOperand *uRead, OpOperand *uConflictingWrite,
+        -:  514:                             Value lastWrite) {
+    #####:  515:  static uint64_t counter = 0;
+    #####:  516:  Operation *readingOp = uRead->getOwner();
+call    0 never executed
+    #####:  517:  Operation *conflictingWritingOp = uConflictingWrite->getOwner();
+        -:  518:
+    #####:  519:  OpBuilder b(conflictingWritingOp->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  520:  std::string id = "C_" + std::to_string(counter++);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  521:
+    #####:  522:  std::string conflictingWriteAttr =
+    #####:  523:      id +
+branch  0 never executed
+branch  1 never executed
+    #####:  524:      "[CONFL-WRITE: " + std::to_string(uConflictingWrite->getOperandNumber()) +
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  525:      "]";
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  526:  conflictingWritingOp->setAttr(conflictingWriteAttr, b.getUnitAttr());
+call    0 never executed
+call    1 never executed
+        -:  527:
+    #####:  528:  std::string readAttr =
+    #####:  529:      id + "[READ: " + std::to_string(uRead->getOperandNumber()) + "]";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+    #####:  530:  readingOp->setAttr(readAttr, b.getUnitAttr());
+call    0 never executed
+call    1 never executed
+        -:  531:
+    #####:  532:  if (auto opResult = lastWrite.dyn_cast<OpResult>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  533:    std::string lastWriteAttr = id + "[LAST-WRITE: result " +
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  534:                                std::to_string(opResult.getResultNumber()) +
+call    0 never executed
+call    1 never executed
+    #####:  535:                                "]";
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  536:    opResult.getDefiningOp()->setAttr(lastWriteAttr, b.getUnitAttr());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  537:  } else {
+    #####:  538:    auto bbArg = lastWrite.cast<BlockArgument>();
+call    0 never executed
+    #####:  539:    std::string lastWriteAttr =
+call    0 never executed
+    #####:  540:        id + "[LAST-WRITE: bbArg " + std::to_string(bbArg.getArgNumber()) + "]";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+    #####:  541:    bbArg.getOwner()->getParentOp()->setAttr(lastWriteAttr, b.getUnitAttr());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  542:  }
+    #####:  543:}
+        -:  544:
+        -:  545:/// Given sets of uses and writes, return true if there is a RaW conflict under
+        -:  546:/// the assumption that all given reads/writes alias the same buffer and that
+        -:  547:/// all given writes bufferize inplace.
+        -:  548:///
+        -:  549:/// A conflict is: According to SSA use-def chains, a read R is supposed to read
+        -:  550:/// the result of a write W1. But because of bufferization decisions, R actually
+        -:  551:/// reads another write W2.
+        -:  552:static bool hasReadAfterWriteInterference(
+        -:  553:    const DenseSet<OpOperand *> &usesRead,
+        -:  554:    const DenseSet<OpOperand *> &usesWrite, const DominanceInfo &domInfo,
+        -:  555:    AnalysisState &state, const BufferizationAliasInfo &aliasInfo) {
+        -:  556:  const BufferizationOptions &options = state.getOptions();
+        -:  557:
+        -:  558:  // Check if op dominance can be used to rule out read-after-write conflicts.
+        -:  559:  bool useDominance = canUseOpDominance(usesRead, usesWrite, state);
+        -:  560:  LLVM_DEBUG(llvm::dbgs() << "\n- useDominance = " << useDominance << "\n");
+        -:  561:
+        -:  562:  for (OpOperand *uRead : usesRead) {
+        -:  563:    Operation *readingOp = uRead->getOwner();
+        -:  564:
+        -:  565:    // Find most recent writes of uRead by following the SSA use-def chain.
+        -:  566:    // E.g.:
+        -:  567:    //
+        -:  568:    // %0 = "writing_op"(%t) : tensor<?x32> -> tensor<?xf32>
+        -:  569:    // %1 = "aliasing_op"(%0) : tensor<?x32> -> tensor<?xf32>
+        -:  570:    // %2 = "reading_op"(%1) : : tensor<?x32> -> not_a_tensor_type
+        -:  571:    //
+        -:  572:    // In the above example, if uRead is the OpOperand of reading_op, lastWrite
+        -:  573:    // is %0. Note that operations that create an alias but do not write (such
+        -:  574:    // as ExtractSliceOp) are skipped.
+        -:  575:    SetVector<Value> lastWrites = state.findLastPrecedingWrite(uRead->get());
+        -:  576:
+        -:  577:    // Look for conflicting memory writes. Potential conflicts are writes to an
+        -:  578:    // alias that have been decided to bufferize inplace.
+        -:  579:    for (OpOperand *uConflictingWrite : usesWrite) {
+        -:  580:      LLVM_DEBUG(llvm::dbgs() << "\n- check conflict:\n");
+        -:  581:      LLVM_DEBUG(llvm::dbgs()
+        -:  582:                 << "  uRead = operand " << uRead->getOperandNumber() << " of "
+        -:  583:                 << *uRead->getOwner() << "\n");
+        -:  584:      LLVM_DEBUG(llvm::dbgs() << "  unConflictingWrite = operand "
+        -:  585:                              << uConflictingWrite->getOperandNumber() << " of "
+        -:  586:                              << *uConflictingWrite->getOwner() << "\n");
+        -:  587:
+        -:  588:      // Throughout this loop, check for multiple requirements that have to be
+        -:  589:      // met for uConflictingWrite to be an actual conflict.
+        -:  590:      Operation *conflictingWritingOp = uConflictingWrite->getOwner();
+        -:  591:
+        -:  592:      // Inside of repetitive regions, ops may be executed multiple times and op
+        -:  593:      // dominance cannot be used to rule out conflicts.
+        -:  594:      if (useDominance) {
+        -:  595:        // No conflict if the readingOp dominates conflictingWritingOp, i.e.,
+        -:  596:        // the write is not visible when reading.
+        -:  597:        //
+        -:  598:        // Note: If ops are executed multiple times (e.g., because they are
+        -:  599:        //       inside a loop), there may be no meaningful `happensBefore`
+        -:  600:        //       relationship.
+        -:  601:        if (happensBefore(readingOp, conflictingWritingOp, domInfo)) {
+        -:  602:          LLVM_DEBUG(llvm::dbgs()
+        -:  603:                     << "  no conflict: read happens before write\n");
+        -:  604:          continue;
+        -:  605:        }
+        -:  606:
+        -:  607:        // No conflict if the reading use equals the use of the conflicting
+        -:  608:        // write. A use cannot conflict with itself.
+        -:  609:        //
+        -:  610:        // Note: Just being the same op is not enough. It has to be the same
+        -:  611:        //       use.
+        -:  612:        // Note: If the op is executed multiple times (e.g., because it is
+        -:  613:        //       inside a loop), it may be conflicting with itself.
+        -:  614:        if (uConflictingWrite == uRead) {
+        -:  615:          LLVM_DEBUG(llvm::dbgs()
+        -:  616:                     << "  no conflict: read and write are same use\n");
+        -:  617:          continue;
+        -:  618:        }
+        -:  619:
+        -:  620:        // Ops are not conflicting if they are in mutually exclusive regions.
+        -:  621:        //
+        -:  622:        // Note: If ops are executed multiple times (e.g., because they are
+        -:  623:        //       inside a loop), mutually exclusive regions may be executed
+        -:  624:        //       multiple times.
+        -:  625:        if (insideMutuallyExclusiveRegions(readingOp, conflictingWritingOp)) {
+        -:  626:          LLVM_DEBUG(llvm::dbgs() << "  no conflict: read and write are in "
+        -:  627:                                     "mutually exclusive regions\n");
+        -:  628:          continue;
+        -:  629:        }
+        -:  630:      }
+        -:  631:
+        -:  632:      // No conflict if the op interface says so.
+        -:  633:      if (auto bufferizableOp = options.dynCastBufferizableOp(readingOp)) {
+        -:  634:        if (bufferizableOp.isNotConflicting(uRead, uConflictingWrite, state)) {
+        -:  635:          LLVM_DEBUG(llvm::dbgs()
+        -:  636:                     << "  no conflict: op interace of reading op says 'no'\n");
+        -:  637:          continue;
+        -:  638:        }
+        -:  639:      }
+        -:  640:
+        -:  641:      if (conflictingWritingOp != readingOp) {
+        -:  642:        if (auto bufferizableOp =
+        -:  643:                options.dynCastBufferizableOp(conflictingWritingOp)) {
+        -:  644:          if (bufferizableOp.isNotConflicting(uRead, uConflictingWrite,
+        -:  645:                                              state)) {
+        -:  646:            LLVM_DEBUG(
+        -:  647:                llvm::dbgs()
+        -:  648:                << "  no conflict: op interace of writing op says 'no'\n");
+        -:  649:            continue;
+        -:  650:          }
+        -:  651:        }
+        -:  652:      }
+        -:  653:
+        -:  654:      // Check all possible last writes.
+        -:  655:      for (Value lastWrite : lastWrites) {
+        -:  656:        LLVM_DEBUG(llvm::dbgs() << "  * lastWrite = " << lastWrite << "\n");
+        -:  657:
+        -:  658:        // No conflict if the conflicting write happens before the last
+        -:  659:        // write.
+        -:  660:        if (Operation *writingOp = lastWrite.getDefiningOp()) {
+        -:  661:          if (happensBefore(conflictingWritingOp, writingOp, domInfo)) {
+        -:  662:            // conflictingWritingOp happens before writingOp. No conflict.
+        -:  663:            LLVM_DEBUG(llvm::dbgs()
+        -:  664:                       << "    no conflict: write happens before last write\n");
+        -:  665:            continue;
+        -:  666:          }
+        -:  667:          // No conflict if conflictingWritingOp is contained in writingOp.
+        -:  668:          if (writingOp->isProperAncestor(conflictingWritingOp)) {
+        -:  669:            LLVM_DEBUG(
+        -:  670:                llvm::dbgs()
+        -:  671:                << "    no conflict: write is contained in last write\n");
+        -:  672:            continue;
+        -:  673:          }
+        -:  674:        } else {
+        -:  675:          auto bbArg = lastWrite.cast<BlockArgument>();
+        -:  676:          Block *block = bbArg.getOwner();
+        -:  677:          if (!block->findAncestorOpInBlock(*conflictingWritingOp)) {
+        -:  678:            LLVM_DEBUG(llvm::dbgs() << "    no conflict: last write is bbArg "
+        -:  679:                                       "and write happens outside of block\n");
+        -:  680:            // conflictingWritingOp happens outside of the block. No
+        -:  681:            // conflict.
+        -:  682:            continue;
+        -:  683:          }
+        -:  684:        }
+        -:  685:
+        -:  686:        // No conflict if the conflicting write and the last write are the same
+        -:  687:        // use.
+        -:  688:        SmallVector<OpResult> aliasingOpResult =
+        -:  689:            state.getAliasingOpResult(*uConflictingWrite);
+        -:  690:        if (aliasingOpResult.size() == 1 && aliasingOpResult[0] == lastWrite) {
+        -:  691:          LLVM_DEBUG(llvm::dbgs()
+        -:  692:                     << "    no conflict: last write and write are same\n");
+        -:  693:          continue;
+        -:  694:        }
+        -:  695:
+        -:  696:        // All requirements are met. Conflict found!
+        -:  697:
+        -:  698:        if (options.printConflicts)
+        -:  699:          annotateConflict(uRead, uConflictingWrite, lastWrite);
+        -:  700:        LLVM_DEBUG(llvm::dbgs() << "  => RaW CONFLICT FOUND\n");
+        -:  701:        return true;
+        -:  702:      }
+        -:  703:    }
+        -:  704:  }
+        -:  705:
+        -:  706:  return false;
+        -:  707:}
+        -:  708:
+        -:  709:// Helper function to iterate on aliases of `root` and capture the writes.
+    6048*:  710:static void getAliasingInplaceWrites(DenseSet<OpOperand *> &res, Value root,
+        -:  711:                                     const BufferizationAliasInfo &aliasInfo,
+        -:  712:                                     const AnalysisState &state) {
+function _ZZL24getAliasingInplaceWritesRN4llvm8DenseSetIPN4mlir9OpOperandENS_12DenseMapInfoIS3_vEEEENS1_5ValueERKNS1_13bufferization22BufferizationAliasInfoERKNS9_13AnalysisStateEENKUlS8_E_clES8_ called 6048 returned 100% blocks executed 75%
+    6048*:  713:  aliasInfo.applyOnAliases(root, [&](Value alias) {
+call    0 returned 100%
+call    1 returned 100%
+    12810:  714:    for (auto &use : alias.getUses())
+branch  0 taken 53% (fallthrough)
+branch  1 taken 47%
+        -:  715:      // Inplace write to a value that aliases root.
+     6762:  716:      if (isInplaceMemoryWrite(use, aliasInfo, state))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  717:        res.insert(&use);
+call    0 never executed
+     6048:  718:  });
+        -:  719:}
+        -:  720:
+        -:  721:// Helper function to iterate on aliases of `root` and capture the reads.
+    4032*:  722:static void getAliasingReads(DenseSet<OpOperand *> &res, Value root,
+        -:  723:                             const BufferizationAliasInfo &aliasInfo,
+        -:  724:                             const AnalysisState &state) {
+function _ZZL16getAliasingReadsRN4llvm8DenseSetIPN4mlir9OpOperandENS_12DenseMapInfoIS3_vEEEENS1_5ValueERKNS1_13bufferization22BufferizationAliasInfoERKNS9_13AnalysisStateEENKUlS8_E_clES8_.isra.0 called 4032 returned 100% blocks executed 47%
+    8064*:  725:  aliasInfo.applyOnAliases(root, [&](Value alias) {
+call    0 returned 100%
+     8540:  726:    for (auto &use : alias.getUses()) {
+branch  0 taken 53% (fallthrough)
+branch  1 taken 47%
+        -:  727:      // Read of a value that aliases root.
+    4508*:  728:      if (state.bufferizesToMemoryRead(use)) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+    4508*:  729:        res.insert(&use);
+call    0 returned 100%
+     4508:  730:        continue;
+        -:  731:      }
+        -:  732:
+        -:  733:      // Read of a dependent value in the SSA use-def chain. E.g.:
+        -:  734:      //
+        -:  735:      // %0 = ...
+        -:  736:      // %1 = tensor.extract_slice %0 {not_analyzed_yet}
+        -:  737:      // "read"(%1)
+        -:  738:      //
+        -:  739:      // In the above example, getAliasingReads(%0) includes the first OpOperand
+        -:  740:      // of the tensor.extract_slice op. The extract_slice itself does not read
+        -:  741:      // but its aliasing result is eventually fed into an op that does.
+        -:  742:      //
+        -:  743:      // Note: This is considered a "read" only if the use does not bufferize to
+        -:  744:      // a memory write. (We already ruled out memory reads. In case of a memory
+        -:  745:      // write, the buffer would be entirely overwritten; in the above example
+        -:  746:      // there would then be no flow of data from the extract_slice operand to
+        -:  747:      // its result's uses.)
+    #####:  748:      if (!state.bufferizesToMemoryWrite(use)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  749:        SmallVector<OpResult> opResults = state.getAliasingOpResult(use);
+call    0 never executed
+    #####:  750:        if (llvm::any_of(opResults,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  751:                         [&](OpResult r) { return state.isValueRead(r); }))
+    #####:  752:          res.insert(&use);
+call    0 never executed
+        -:  753:      }
+        -:  754:    }
+     4032:  755:  });
+        -:  756:}
+        -:  757:
+        -:  758:/// Return true if bufferizing `operand` inplace would create a conflict. A read
+        -:  759:/// R and a write W of the same alias set is a conflict if inplace bufferization
+        -:  760:/// of W changes the value read by R to a value different from the one that
+        -:  761:/// would be expected by tracing back R's origin through SSA use-def chains.
+        -:  762:/// A conflict can only be introduced by a new alias and/or an inplace
+        -:  763:/// bufferization decision.
+        -:  764:///
+        -:  765:/// Example:
+        -:  766:/// %0 = tensor.extract_slice %t[...][...][1, 1] {inplace?}
+        -:  767:/// %1 = vector.transfer_write %v1, %t {inplace} : vector<5xf32>, tensor<?xf32>
+        -:  768:/// %e = tensor.extract_slice %1
+        -:  769:/// %2 = vector.transfer_write %v2, %0 {inplace} : vector<6xf32>, tensor<?xf32>
+        -:  770:/// %3 = vector.transfer_read %e, %cst : tensor<?xf32>, vector<7xf32>
+        -:  771:///
+        -:  772:/// In the above example, the two TransferWriteOps have already been decided to
+        -:  773:/// bufferize inplace. Bufferizing the ExtractSliceOp inplace would create a
+        -:  774:/// conflict because:
+        -:  775:/// * According to SSA use-def chains, we expect to read the result of %1.
+        -:  776:/// * However, adding an alias {%0, %t} would mean that the second
+        -:  777:///   TransferWriteOp overwrites the first one. Therefore, the TransferReadOp
+        -:  778:///   would no longer be reading the result of %1.
+        -:  779:///
+        -:  780:/// If `checkConsistencyOnly` is true, this function checks if there is a
+        -:  781:/// read-after-write conflict without bufferizing `operand` inplace. This would
+        -:  782:/// indicate a problem with the current inplace bufferization decisions.
+        -:  783:///
+        -:  784:/// Note: If `checkConsistencyOnly`, this function may be called with a null
+        -:  785:/// OpResult. In that case, only the consistency of bufferization decisions
+        -:  786:/// involving aliases of the given OpOperand are checked.
+function _ZL37wouldCreateReadAfterWriteInterferenceRN4mlir9OpOperandERKNS_13DominanceInfoERNS_13bufferization13AnalysisStateERKNS5_22BufferizationAliasInfoEb called 4032 returned 100% blocks executed 71%
+     4032:  787:static bool wouldCreateReadAfterWriteInterference(
+        -:  788:    OpOperand &operand, const DominanceInfo &domInfo, AnalysisState &state,
+        -:  789:    const BufferizationAliasInfo &aliasInfo,
+        -:  790:    bool checkConsistencyOnly = false) {
+        -:  791:  // Collect reads and writes of all aliases of OpOperand and OpResult.
+     8064:  792:  DenseSet<OpOperand *> usesRead, usesWrite;
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     4032:  793:  getAliasingReads(usesRead, operand.get(), aliasInfo, state);
+call    0 returned 100%
+     4032:  794:  getAliasingInplaceWrites(usesWrite, operand.get(), aliasInfo, state);
+call    0 returned 100%
+    4032*:  795:  for (OpResult result : state.getAliasingOpResult(operand)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  796:    getAliasingReads(usesRead, result, aliasInfo, state);
+call    0 never executed
+    #####:  797:    getAliasingInplaceWrites(usesWrite, result, aliasInfo, state);
+call    0 never executed
+        -:  798:  }
+     4032:  799:  if (!checkConsistencyOnly && state.bufferizesToMemoryWrite(operand))
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  800:    usesWrite.insert(&operand);
+call    0 never executed
+        -:  801:
+     4032:  802:  return hasReadAfterWriteInterference(usesRead, usesWrite, domInfo, state,
+call    0 returned 100%
+call    1 returned 100%
+     4032:  803:                                       aliasInfo);
+        -:  804:}
+        -:  805:
+        -:  806:/// Check the reverse SSA use-def chain (following aliasing OpOperands) for
+        -:  807:/// non-writable tensor values. Stop searching when an out-of-place bufferized
+        -:  808:/// OpOperand was found (or when the OpOperand was not bufferized yet).
+        -:  809:/// `currentOpOperand` is assumed to be in-place, even if that decision was not
+        -:  810:/// materialized in `aliasInfo` yet.
+        -:  811:static bool
+function _ZL37hasPrecedingAliasingNonWritableTensorN4mlir5ValueEPNS_9OpOperandERKNS_13bufferization22BufferizationAliasInfoERKNS3_20OneShotAnalysisStateE called 0 returned 0% blocks executed 0%
+    #####:  812:hasPrecedingAliasingNonWritableTensor(Value value, OpOperand *currentOpOperand,
+        -:  813:                                      const BufferizationAliasInfo &aliasInfo,
+        -:  814:                                      const OneShotAnalysisState &state) {
+    #####:  815:  SmallVector<Value> worklist;
+call    0 never executed
+    #####:  816:  worklist.push_back(value);
+call    0 never executed
+    #####:  817:  while (!worklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  818:    Value nextVal = worklist.pop_back_val();
+call    0 never executed
+    #####:  819:    if (!state.isWritable(nextVal))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  820:      return true;
+        -:  821:
+        -:  822:    // If `nextVal` is not a BlockArgument: End of use-def chain reached.
+    #####:  823:    auto opResult = nextVal.dyn_cast<OpResult>();
+call    0 never executed
+    #####:  824:    if (!opResult)
+branch  0 never executed
+branch  1 never executed
+    #####:  825:      continue;
+        -:  826:
+        -:  827:    // Follow reverse SSA use-def chain.
+    #####:  828:    SmallVector<OpOperand *> aliasingOpOperands =
+    #####:  829:        state.getAliasingOpOperand(opResult);
+call    0 never executed
+    #####:  830:    for (OpOperand *opOperand : aliasingOpOperands)
+branch  0 never executed
+branch  1 never executed
+    #####:  831:      if (aliasInfo.isInPlace(*opOperand) || currentOpOperand == opOperand)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  832:        worklist.push_back(opOperand->get());
+call    0 never executed
+        -:  833:  }
+        -:  834:  return false;
+        -:  835:}
+        -:  836:
+        -:  837:/// Return true if bufferizing `operand` inplace would create a write to a
+        -:  838:/// non-writable buffer.
+function _ZL35wouldCreateWriteToNonWritableBufferRN4mlir9OpOperandERKNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateEb called 2016 returned 100% blocks executed 52%
+     2016:  839:static bool wouldCreateWriteToNonWritableBuffer(
+        -:  840:    OpOperand &operand, const BufferizationAliasInfo &aliasInfo,
+        -:  841:    OneShotAnalysisState &state, bool checkConsistencyOnly = false) {
+        -:  842:  // Collect writes of all aliases of OpOperand and OpResult.
+     2016:  843:  DenseSet<OpOperand *> usesWrite;
+call    0 returned 100%
+     2016:  844:  getAliasingInplaceWrites(usesWrite, operand.get(), aliasInfo, state);
+call    0 returned 100%
+    2016*:  845:  for (OpResult result : state.getAliasingOpResult(operand)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  846:    getAliasingInplaceWrites(usesWrite, result, aliasInfo, state);
+call    0 never executed
+        -:  847:  }
+     2016:  848:  if (!checkConsistencyOnly && state.bufferizesToMemoryWrite(operand))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  849:    usesWrite.insert(&operand);
+call    0 never executed
+        -:  850:
+        -:  851:  // Assuming that `operand` bufferizes in-place: For each write (to each
+        -:  852:  // alias), check if there is a non-writable tensor in the reverse SSA use-def
+        -:  853:  // chain.
+    2016*:  854:  for (OpOperand *uWrite : usesWrite) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 never executed
+    #####:  855:    if (hasPrecedingAliasingNonWritableTensor(uWrite->get(), &operand,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  856:                                              aliasInfo, state)) {
+    #####:  857:      LLVM_DEBUG(llvm::dbgs() << "=> NOT WRITABLE\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  858:      return true;
+        -:  859:    }
+        -:  860:  }
+        -:  861:
+     2016:  862:  return false;
+        -:  863:}
+        -:  864:
+        -:  865://===----------------------------------------------------------------------===//
+        -:  866:// Bufferization analyses.
+        -:  867://===----------------------------------------------------------------------===//
+        -:  868:
+        -:  869:/// Determine if `operand` can be bufferized in-place.
+function _ZL31bufferizableInPlaceAnalysisImplRN4mlir9OpOperandERNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateERKNS_13DominanceInfoE called 2016 returned 100% blocks executed 35%
+     2016:  870:static LogicalResult bufferizableInPlaceAnalysisImpl(
+        -:  871:    OpOperand &operand, BufferizationAliasInfo &aliasInfo,
+        -:  872:    OneShotAnalysisState &state, const DominanceInfo &domInfo) {
+    2016*:  873:  LLVM_DEBUG(
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  874:      llvm::dbgs() << "//===-------------------------------------------===//\n"
+        -:  875:                   << "Analyzing operand #" << operand.getOperandNumber()
+        -:  876:                   << " of " << *operand.getOwner() << "\n");
+        -:  877:
+     2016:  878:  bool foundInterference =
+     4032:  879:      wouldCreateWriteToNonWritableBuffer(operand, aliasInfo, state) ||
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+    2016*:  880:      wouldCreateReadAfterWriteInterference(operand, domInfo, state, aliasInfo);
+call    0 returned 100%
+        -:  881:
+    2016*:  882:  if (foundInterference)
+    #####:  883:    aliasInfo.bufferizeOutOfPlace(operand);
+call    0 never executed
+        -:  884:  else
+     2016:  885:    aliasInfo.bufferizeInPlace(operand, state);
+call    0 returned 100%
+        -:  886:
+    2016*:  887:  LLVM_DEBUG(llvm::dbgs()
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  888:             << "//===-------------------------------------------===//\n");
+     2016:  889:  return success();
+        -:  890:}
+        -:  891:
+        -:  892:/// Analyze the `ops` to determine which OpOperands are inplaceable. Walk ops in
+        -:  893:/// reverse and bufferize ops greedily. This is a good starter heuristic.
+        -:  894:///
+        -:  895:/// Even if an op does not read or write, it may still create an alias when
+        -:  896:/// bufferized in-place. An example of such ops is tensor.extract_slice.
+        -:  897:///
+        -:  898:/// Rationale for bufferizing `%1 = tensor.extract_slice %0[...]` inplace:
+        -:  899:///
+        -:  900:/// When bufferized out of place, an ExtractSliceOp lowers to alloc + copy. This
+        -:  901:/// cannot change the flow of information for either the source or the
+        -:  902:/// result buffers.
+        -:  903:///
+        -:  904:/// When bufferized inplace, an ExtractSliceOp does not by itself create any
+        -:  905:/// read or write from memory. Instead, it has the effect of merging the alias
+        -:  906:/// sets of the source and the result buffers.
+        -:  907:///
+        -:  908:/// An analysis is required to ensure inplace bufferization would not result in
+        -:  909:/// RaW dependence violations.
+function _ZL15inPlaceAnalysisRN4llvm11SmallVectorIPN4mlir9OperationELj6EEERNS1_13bufferization22BufferizationAliasInfoERNS6_20OneShotAnalysisStateERKNS1_13DominanceInfoEj called 1738 returned 100% blocks executed 42%
+     1738:  910:static LogicalResult inPlaceAnalysis(SmallVector<Operation *> &ops,
+        -:  911:                                     BufferizationAliasInfo &aliasInfo,
+        -:  912:                                     OneShotAnalysisState &state,
+        -:  913:                                     const DominanceInfo &domInfo,
+        -:  914:                                     unsigned analysisFuzzerSeed = 0) {
+     1738:  915:  if (analysisFuzzerSeed) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  916:    // This is a fuzzer. For testing purposes only. Randomize the order in which
+        -:  917:    // operations are analyzed. The bufferization quality is likely worse, but
+        -:  918:    // we want to make sure that no assertions are triggered anywhere.
+    #####:  919:    std::mt19937 g(analysisFuzzerSeed);
+    #####:  920:    llvm::shuffle(ops.begin(), ops.end(), g);
+call    0 never executed
+        -:  921:  }
+        -:  922:
+        -:  923:  // Analyze a single op.
+function _ZZL15inPlaceAnalysisRN4llvm11SmallVectorIPN4mlir9OperationELj6EEERNS1_13bufferization22BufferizationAliasInfoERNS6_20OneShotAnalysisStateERKNS1_13DominanceInfoEjENKUlS3_E_clES3_ called 19336 returned 100% blocks executed 93%
+    21074:  924:  auto analyzeOp = [&](Operation *op) {
+    43791:  925:    for (OpOperand &opOperand : op->getOpOperands())
+call    0 returned 100%
+branch  1 taken 56% (fallthrough)
+branch  2 taken 44%
+    24455:  926:      if (opOperand.get().getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+    24455:  927:        if (auto bufferizableOp = state.getOptions().dynCastBufferizableOp(op))
+call    0 returned 100%
+branch  1 taken 8% (fallthrough)
+branch  2 taken 92%
+     2016:  928:          if (failed(bufferizableInPlaceAnalysisImpl(opOperand, aliasInfo,
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     2016:  929:                                                     state, domInfo)))
+call    0 returned 100%
+    #####:  930:            return failure();
+    19336:  931:    return success();
+     1738:  932:  };
+        -:  933:
+     1738:  934:  OneShotBufferizationOptions::AnalysisHeuristic heuristic =
+     1738:  935:      static_cast<const OneShotBufferizationOptions &>(state.getOptions())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     1738:  936:          .analysisHeuristic;
+     1738:  937:  if (heuristic == OneShotBufferizationOptions::AnalysisHeuristic::BottomUp) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  938:    // Default: Walk ops in reverse for better interference analysis.
+    21074:  939:    for (Operation *op : reverse(ops))
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+call    2 returned 100%
+    19336:  940:      if (failed(analyzeOp(op)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  941:        return failure();
+    #####:  942:  } else if (heuristic ==
+branch  0 never executed
+branch  1 never executed
+        -:  943:             OneShotBufferizationOptions::AnalysisHeuristic::TopDown) {
+    #####:  944:    for (Operation *op : ops)
+branch  0 never executed
+branch  1 never executed
+    #####:  945:      if (failed(analyzeOp(op)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  946:        return failure();
+        -:  947:  } else {
+    #####:  948:    llvm_unreachable("unsupported heuristic");
+call    0 never executed
+        -:  949:  }
+        -:  950:
+     1738:  951:  return success();
+        -:  952:}
+        -:  953:
+        -:  954:/// Return true if the given op has a tensor result or a tensor operand.
+function _ZL18hasTensorSemanticsPN4mlir9OperationE called 22052 returned 100% blocks executed 100%
+    22052:  955:static bool hasTensorSemantics(Operation *op) {
+    44104:  956:  bool hasTensorResult = any_of(op->getResultTypes(), isaTensor);
+branch  0 taken 80% (fallthrough)
+branch  1 taken 20%
+call    2 returned 100%
+    22052:  957:  bool hasTensorOperand = any_of(op->getOperandTypes(), isaTensor);
+call    0 returned 100%
+call    1 returned 100%
+    22052:  958:  return hasTensorResult || hasTensorOperand;
+        -:  959:}
+        -:  960:
+        -:  961:/// Analyze all ops that are contained in `op`.
+function _ZL15inPlaceAnalysisPN4mlir9OperationERNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateERKNS_13DominanceInfoEj called 1738 returned 100% blocks executed 100%
+     1738:  962:static LogicalResult inPlaceAnalysis(Operation *op,
+        -:  963:                                     BufferizationAliasInfo &aliasInfo,
+        -:  964:                                     OneShotAnalysisState &state,
+        -:  965:                                     const DominanceInfo &domInfo,
+        -:  966:                                     unsigned analysisFuzzerSeed = 0) {
+        -:  967:  // Collect ops so we can build our own reverse traversal.
+     1738:  968:  SmallVector<Operation *> ops;
+call    0 returned 100%
+function _ZZL15inPlaceAnalysisPN4mlir9OperationERNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateERKNS_13DominanceInfoEjENKUlS1_E_clES1_.isra.0 called 22052 returned 100% blocks executed 100%
+     1738:  969:  op->walk([&](Operation *op) {
+call    0 returned 100%
+        -:  970:    // No tensors => no buffers.
+    22052:  971:    if (!hasTensorSemantics(op))
+call    0 returned 100%
+branch  1 taken 88% (fallthrough)
+branch  2 taken 12%
+        -:  972:      return;
+    19336:  973:    ops.push_back(op);
+call    0 returned 100%
+        -:  974:  });
+        -:  975:
+     1738:  976:  return inPlaceAnalysis(ops, aliasInfo, state, domInfo, analysisFuzzerSeed);
+call    0 returned 100%
+branch  1 taken 29% (fallthrough)
+branch  2 taken 71%
+        -:  977:}
+        -:  978:
+        -:  979:/// Analyze equivalence of tied OpResult/OpOperand pairs of the given ops.
+function _ZL19equivalenceAnalysisRN4llvm11SmallVectorIPN4mlir9OperationELj6EEERNS1_13bufferization22BufferizationAliasInfoERNS6_13AnalysisStateE called 1738 returned 100% blocks executed 70%
+     1738:  980:static void equivalenceAnalysis(SmallVector<Operation *> &ops,
+        -:  981:                                BufferizationAliasInfo &aliasInfo,
+        -:  982:                                AnalysisState &state) {
+    19336:  983:  for (Operation *op : ops)
+branch  0 taken 91% (fallthrough)
+branch  1 taken 9%
+    17598:  984:    if (auto bufferizableOp = state.getOptions().dynCastBufferizableOp(op))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+    17630:  985:      for (OpResult opResult : op->getOpResults())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+call    4 returned 100%
+       16:  986:        if (opResult.getType().isa<TensorType>())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+    #####:  987:          for (OpOperand *opOperand :
+       32:  988:               bufferizableOp.getAliasingOpOperand(opResult, state))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  989:            if (state.isInPlace(*opOperand))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  990:              if (bufferizableOp.bufferRelation(opResult, state) ==
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  991:                  BufferRelation::Equivalent)
+    #####:  992:                aliasInfo.unionEquivalenceClasses(opResult, opOperand->get());
+call    0 never executed
+     1738:  993:}
+        -:  994:
+        -:  995:/// Analyze equivalence of tied OpResult/OpOperand pairs of all ops contained
+        -:  996:/// in `op`.
+function _ZL19equivalenceAnalysisPN4mlir9OperationERNS_13bufferization22BufferizationAliasInfoERNS2_13AnalysisStateE called 1738 returned 100% blocks executed 100%
+     1738:  997:static void equivalenceAnalysis(Operation *op,
+        -:  998:                                BufferizationAliasInfo &aliasInfo,
+        -:  999:                                AnalysisState &state) {
+        -: 1000:  // Traverse ops in PostOrder: Nested ops first, then enclosing ops.
+     1738: 1001:  SmallVector<Operation *> ops;
+call    0 returned 100%
+function _ZZL19equivalenceAnalysisPN4mlir9OperationERNS_13bufferization22BufferizationAliasInfoERNS2_13AnalysisStateEENKUlS1_E_clES1_.isra.0 called 22052 returned 100% blocks executed 100%
+     1738: 1002:  op->walk<WalkOrder::PostOrder>([&](Operation *op) {
+call    0 returned 100%
+        -: 1003:    // No tensors => no buffers.
+    44104: 1004:    if (none_of(op->getResultTypes(), isaTensor))
+branch  0 taken 80% (fallthrough)
+branch  1 taken 20%
+call    2 returned 100%
+branch  3 taken 80% (fallthrough)
+branch  4 taken 20%
+        -: 1005:      return;
+    17598: 1006:    ops.push_back(op);
+call    0 returned 100%
+        -: 1007:  });
+        -: 1008:
+     1738: 1009:  equivalenceAnalysis(ops, aliasInfo, state);
+call    0 returned 100%
+branch  1 taken 28% (fallthrough)
+branch  2 taken 72%
+     1738: 1010:}
+        -: 1011:
+        -: 1012:/// Assert that the current bufferization decisions are consistent.
+        -: 1013:static LogicalResult
+function _ZL25checkAliasInfoConsistencyPN4mlir9OperationERKNS_13DominanceInfoERNS_13bufferization13AnalysisStateERKNS5_22BufferizationAliasInfoE called 1754 returned 100% blocks executed 100%
+     1754: 1014:checkAliasInfoConsistency(Operation *op, const DominanceInfo &domInfo,
+        -: 1015:                          AnalysisState &state,
+        -: 1016:                          const BufferizationAliasInfo &aliasInfo) {
+     1754: 1017:  const BufferizationOptions &options = state.getOptions();
+call    0 returned 100%
+        -: 1018:
+function _ZZL25checkAliasInfoConsistencyPN4mlir9OperationERKNS_13DominanceInfoERNS_13bufferization13AnalysisStateERKNS5_22BufferizationAliasInfoEENKUlNS5_23BufferizableOpInterfaceEE_clESB_.isra.0 called 3615 returned 100% blocks executed 83%
+     5369: 1019:  WalkResult walkResult = op->walk([&](BufferizableOpInterface op) {
+        -: 1020:    // Skip ops that are not in the filter.
+     3615: 1021:    if (!options.isOpAllowed(op.getOperation()))
+call    0 returned 100%
+branch  1 taken 51% (fallthrough)
+branch  2 taken 49%
+     1832: 1022:      return WalkResult::advance();
+        -: 1023:
+        -: 1024:    // Input IR may not contain any ToMemrefOps. These are not supported because
+        -: 1025:    // the analysis cannot follow the data flow through memrefs.
+     1783: 1026:    if (isa<ToMemrefOp>(op.getOperation())) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+       16: 1027:      op->emitError("to_memref ops not supported during One-Shot Analysis");
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       16: 1028:      return WalkResult::interrupt();
+        -: 1029:    }
+        -: 1030:
+     3810: 1031:    for (OpOperand &opOperand : op->getOpOperands()) {
+call    0 returned 100%
+branch  1 taken 54% (fallthrough)
+branch  2 taken 46%
+     2043: 1032:      if (opOperand.get().getType().isa<TensorType>()) {
+call    0 returned 100%
+branch  1 taken 99% (fallthrough)
+branch  2 taken 1%
+     2016: 1033:        if (wouldCreateReadAfterWriteInterference(
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     2016: 1034:                opOperand, domInfo, state, aliasInfo,
+call    0 returned 100%
+        -: 1035:                /*checkConsistencyOnly=*/true)) {
+        -: 1036:          // This error can happen if certain "mustBufferizeInPlace" interface
+        -: 1037:          // methods are implemented incorrectly, such that the IR already has
+        -: 1038:          // a RaW conflict before making any bufferization decisions.
+    #####: 1039:          op->emitError("input IR has RaW conflict");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1040:          return WalkResult::interrupt();
+        -: 1041:        }
+        -: 1042:      }
+        -: 1043:    }
+        -: 1044:
+     1767: 1045:    return WalkResult::advance();
+     1754: 1046:  });
+call    0 returned 100%
+        -: 1047:
+     1754: 1048:  return success(!walkResult.wasInterrupted());
+        -: 1049:}
+        -: 1050:
+        -: 1051:/// Annotate the IR with the result of the analysis. For testing/debugging only.
+        -: 1052:static void
+    #####: 1053:annotateOpsWithBufferizationMarkers(Operation *op,
+        -: 1054:                                    const BufferizationAliasInfo &aliasInfo,
+        -: 1055:                                    AnalysisState &state) {
+function _ZZL35annotateOpsWithBufferizationMarkersPN4mlir9OperationERKNS_13bufferization22BufferizationAliasInfoERNS2_13AnalysisStateEENKUlS1_E_clES1_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1056:  op->walk([&](Operation *op) {
+    #####: 1057:    if (auto bufferizableOp = state.getOptions().dynCastBufferizableOp(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1058:      for (OpOperand &opOperand : op->getOpOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1059:        if (opOperand.get().getType().isa<TensorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1060:          setInPlaceOpOperand(opOperand, aliasInfo.isInPlace(opOperand));
+call    0 never executed
+call    1 never executed
+    #####: 1061:  });
+    #####: 1062:}
+        -: 1063:
+        -: 1064:/// Assert that IR is in destination-passing style. I.e., every value that is
+        -: 1065:/// returned or yielded from a block is:
+        -: 1066:/// * aliasing a bbArg of that block or a parent block, or
+        -: 1067:/// * aliasing an OpResult of a op in a parent block.
+        -: 1068:///
+        -: 1069:/// Example:
+        -: 1070:/// ```
+        -: 1071:/// %0 = "some_op" : tensor<?xf32>
+        -: 1072:/// %1 = scf.if %c -> (tensor<?xf32>) {
+        -: 1073:///   scf.yield %0 : tensor<?xf32>
+        -: 1074:/// } else {
+        -: 1075:///   %t = linalg.alloc_tensor : tensor<?xf32>
+        -: 1076:///   scf.yield %t : tensor<?xf32>
+        -: 1077:/// }
+        -: 1078:/// ```
+        -: 1079:/// In the above example, the first scf.yield op satifies destination-passing
+        -: 1080:/// style because the yielded value %0 is defined in the parent block. The
+        -: 1081:/// second scf.yield op does not satisfy destination-passing style because the
+        -: 1082:/// yielded value %t is defined in the same block as the scf.yield op.
+        -: 1083:// TODO: The current implementation checks for equivalent values instead of
+        -: 1084:// aliasing values, which is stricter than needed. We can currently not check
+        -: 1085:// for aliasing values because the analysis is a maybe-alias analysis and we
+        -: 1086:// need a must-alias analysis here.
+        -: 1087:static LogicalResult
+        -: 1088:assertDestinationPassingStyle(Operation *op, AnalysisState &state,
+        -: 1089:                              BufferizationAliasInfo &aliasInfo,
+        -: 1090:                              SmallVector<Operation *> &newOps) {
+        -: 1091:  LogicalResult status = success();
+        -: 1092:  DominanceInfo domInfo(op);
+function _ZZL29assertDestinationPassingStylePN4mlir9OperationERNS_13bufferization13AnalysisStateERNS2_22BufferizationAliasInfoERN4llvm11SmallVectorIS1_Lj6EEEENKUlS1_E_clES1_ called 11754 returned 100% blocks executed 23%
+    11754: 1093:  op->walk([&](Operation *returnOp) {
+    12637: 1094:    if (!isRegionReturnLike(returnOp) ||
+call    0 returned 100%
+branch  1 taken 8% (fallthrough)
+branch  2 taken 92%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+      883: 1095:        !state.getOptions().isOpAllowed(returnOp))
+call    0 returned 100%
+    11754: 1096:      return WalkResult::advance();
+        -: 1097:
+    #####: 1098:    for (OpOperand &returnValOperand : returnOp->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1099:      Value returnVal = returnValOperand.get();
+call    0 never executed
+        -: 1100:      // Skip non-tensor values.
+    #####: 1101:      if (!returnVal.getType().isa<TensorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1102:        continue;
+        -: 1103:
+    #####: 1104:      bool foundEquivValue = false;
+function _ZZZL29assertDestinationPassingStylePN4mlir9OperationERNS_13bufferization13AnalysisStateERNS2_22BufferizationAliasInfoERN4llvm11SmallVectorIS1_Lj6EEEENKUlS1_E_clES1_ENKUlNS_5ValueEE_clESC_ called 0 returned 0% blocks executed 0%
+    #####: 1105:      aliasInfo.applyOnEquivalenceClass(returnVal, [&](Value equivVal) {
+    #####: 1106:        if (auto bbArg = equivVal.dyn_cast<BlockArgument>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1107:          Operation *definingOp = bbArg.getOwner()->getParentOp();
+call    0 never executed
+    #####: 1108:          if (definingOp->isProperAncestor(returnOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1109:            foundEquivValue = true;
+    #####: 1110:          return;
+        -: 1111:        }
+        -: 1112:
+    #####: 1113:        Operation *definingOp = equivVal.getDefiningOp();
+call    0 never executed
+    #####: 1114:        if (definingOp->getBlock()->findAncestorOpInBlock(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1115:                *returnOp->getParentOp()))
+branch  0 never executed
+branch  1 never executed
+        -: 1116:          // Skip ops that happen after `returnOp` and parent ops.
+    #####: 1117:          if (happensBefore(definingOp, returnOp, domInfo))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1118:            foundEquivValue = true;
+        -: 1119:      });
+        -: 1120:
+    #####: 1121:      if (!foundEquivValue)
+branch  0 never executed
+branch  1 never executed
+    #####: 1122:        status =
+    #####: 1123:            returnOp->emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1124:            << "operand #" << returnValOperand.getOperandNumber()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1125:            << " of ReturnLike op does not satisfy destination passing style";
+call    0 never executed
+        -: 1126:    }
+        -: 1127:
+    #####: 1128:    return WalkResult::advance();
+        -: 1129:  });
+        -: 1130:
+        -: 1131:  return status;
+        -: 1132:}
+        -: 1133:
+function _ZN4mlir13bufferization9analyzeOpEPNS_9OperationERNS0_20OneShotAnalysisStateE called 1754 returned 100% blocks executed 83%
+     1754: 1134:LogicalResult bufferization::analyzeOp(Operation *op,
+        -: 1135:                                       OneShotAnalysisState &state) {
+     1754: 1136:  DominanceInfo domInfo(op);
+call    0 returned 100%
+     1754: 1137:  BufferizationAliasInfo &aliasInfo = state.getAliasInfo();
+call    0 returned 100%
+     1754: 1138:  const auto &options =
+     1754: 1139:      static_cast<const OneShotBufferizationOptions &>(state.getOptions());
+call    0 returned 100%
+        -: 1140:
+        -: 1141:  // Catch incorrect API usage.
+    1754*: 1142:  assert((state.hasDialectState(func::FuncDialect::getDialectNamespace()) ||
+call    0 returned 100%
+branch  1 taken 51% (fallthrough)
+branch  2 taken 49%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 never executed
+        -: 1143:          !options.bufferizeFunctionBoundaries) &&
+        -: 1144:         "must use ModuleBufferize to bufferize function boundaries");
+        -: 1145:
+     1754: 1146:  if (failed(checkAliasInfoConsistency(op, domInfo, state, aliasInfo)))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+       16: 1147:    return failure();
+        -: 1148:
+        -: 1149:  // If the analysis fails, just return.
+     1738: 1150:  if (failed(inPlaceAnalysis(op, aliasInfo, state, domInfo,
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     1738: 1151:                             options.analysisFuzzerSeed)))
+call    0 returned 100%
+    #####: 1152:    return failure();
+     1738: 1153:  equivalenceAnalysis(op, aliasInfo, state);
+call    0 returned 100%
+        -: 1154:
+     1738: 1155:  bool failedAnalysis = false;
+     1738: 1156:  if (!options.allowReturnAllocs) {
+branch  0 taken 51% (fallthrough)
+branch  1 taken 49%
+      883: 1157:    SmallVector<Operation *> newOps;
+call    0 returned 100%
+     1766: 1158:    failedAnalysis |=
+      883: 1159:        failed(assertDestinationPassingStyle(op, state, aliasInfo, newOps));
+call    0 returned 100%
+        -: 1160:  }
+        -: 1161:
+        -: 1162:  // Gather some extra analysis data.
+     1738: 1163:  state.gatherYieldedTensors(op);
+call    0 returned 100%
+     1738: 1164:  state.gatherUndefinedTensorUses(op);
+call    0 returned 100%
+        -: 1165:
+        -: 1166:  // Analysis verification: After setting up alias/equivalence sets, each op
+        -: 1167:  // can check for expected invariants/limitations and fail the analysis if
+        -: 1168:  // necessary.
+function _ZZN4mlir13bufferization9analyzeOpEPNS_9OperationERNS0_20OneShotAnalysisStateEENKUlS2_E_clES2_ called 22052 returned 100% blocks executed 100%
+     1738: 1169:  op->walk([&](Operation *op) {
+call    0 returned 100%
+    22052: 1170:    if (BufferizableOpInterface bufferizableOp =
+branch  0 taken 8% (fallthrough)
+branch  1 taken 92%
+    22052: 1171:            options.dynCastBufferizableOp(op))
+call    0 returned 100%
+branch  1 taken 8% (fallthrough)
+branch  2 taken 92%
+     1739: 1172:      failedAnalysis |= failed(bufferizableOp.verifyAnalysis(state));
+call    0 returned 100%
+    22052: 1173:  });
+        -: 1174:
+        -: 1175:  // Annotate operations if we only want to report the analysis.
+     1738: 1176:  if (options.testAnalysisOnly)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####: 1177:    annotateOpsWithBufferizationMarkers(op, aliasInfo, state);
+call    0 never executed
+        -: 1178:
+     1754: 1179:  return success(!failedAnalysis);
+call    0 returned 100%
+        -: 1180:}
+        -: 1181:
+        -: 1182:LogicalResult
+function _ZN4mlir13bufferization19runOneShotBufferizeEPNS_9OperationERKNS0_27OneShotBufferizationOptionsE called 888 returned 100% blocks executed 80%
+      888: 1183:bufferization::runOneShotBufferize(Operation *op,
+        -: 1184:                                   const OneShotBufferizationOptions &options) {
+     888*: 1185:  assert(!(options.copyBeforeWrite && options.testAnalysisOnly) &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1186:         "invalid combination of bufferization flags");
+      888: 1187:  if (!options.copyBeforeWrite) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -: 1188:    // If a buffer is copied before every write, no analysis is needed.
+     1771: 1189:    OneShotAnalysisState state(op, options);
+call    0 returned 100%
+call    1 returned 100%
+      888: 1190:    if (failed(insertTensorCopies(op, options)))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+        5: 1191:      return failure();
+call    0 returned 100%
+        -: 1192:  }
+      883: 1193:  if (options.testAnalysisOnly)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####: 1194:    return success();
+      883: 1195:  return bufferizeOp(op, options, /*copyBeforeWrite=*/options.copyBeforeWrite);
+call    0 returned 100%
+        -: 1196:}

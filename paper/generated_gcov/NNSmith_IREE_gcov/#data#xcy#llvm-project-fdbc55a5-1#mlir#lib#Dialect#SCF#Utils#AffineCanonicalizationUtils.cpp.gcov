@@ -1,0 +1,593 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/SCF/Utils/AffineCanonicalizationUtils.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/SCF/Utils/CMakeFiles/obj.MLIRSCFUtils.dir/AffineCanonicalizationUtils.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SCF/Utils/CMakeFiles/obj.MLIRSCFUtils.dir/AffineCanonicalizationUtils.cpp.gcda
+        -:    0:Runs:325550
+        -:    1://===- AffineCanonicalizationUtils.cpp - Affine Canonicalization in SCF ---===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// Utility functions to canonicalize affine ops within SCF op regions.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/SCF/Utils/AffineCanonicalizationUtils.h"
+        -:   14:#include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
+        -:   15:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   16:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   17:#include "mlir/Dialect/Utils/StaticValueUtils.h"
+        -:   18:#include "mlir/IR/AffineMap.h"
+        -:   19:#include "mlir/IR/Matchers.h"
+        -:   20:#include "mlir/IR/PatternMatch.h"
+        -:   21:#include "llvm/Support/Debug.h"
+        -:   22:
+        -:   23:#define DEBUG_TYPE "mlir-scf-affine-utils"
+        -:   24:
+        -:   25:using namespace mlir;
+        -:   26:using namespace presburger;
+        -:   27:
+function _ZL20unpackOptionalValuesN4llvm8ArrayRefINS_8OptionalIN4mlir5ValueEEEEERNS_11SmallVectorIS3_Lj6EEE called 0 returned 0% blocks executed 0%
+    #####:   28:static void unpackOptionalValues(ArrayRef<Optional<Value>> source,
+        -:   29:                                 SmallVector<Value> &target) {
+    #####:   30:  target = llvm::to_vector<4>(llvm::map_range(source, [](Optional<Value> val) {
+call    0 never executed
+        -:   31:    return val.has_value() ? *val : Value();
+    #####:   32:  }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   33:}
+        -:   34:
+        -:   35:/// Bound an identifier `pos` in a given FlatAffineValueConstraints with
+        -:   36:/// constraints drawn from an affine map. Before adding the constraint, the
+        -:   37:/// dimensions/symbols of the affine map are aligned with `constraints`.
+        -:   38:/// `operands` are the SSA Value operands used with the affine map.
+        -:   39:/// Note: This function adds a new symbol column to the `constraints` for each
+        -:   40:/// dimension/symbol that exists in the affine map but not in `constraints`.
+function _ZL16alignAndAddBoundRN4mlir26FlatAffineValueConstraintsENS_10presburger15IntegerRelation9BoundTypeEjNS_9AffineMapENS_10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####:   41:static LogicalResult alignAndAddBound(FlatAffineValueConstraints &constraints,
+        -:   42:                                      IntegerPolyhedron::BoundType type,
+        -:   43:                                      unsigned pos, AffineMap map,
+        -:   44:                                      ValueRange operands) {
+    #####:   45:  SmallVector<Value> dims, syms, newSyms;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   46:  unpackOptionalValues(constraints.getMaybeValues(VarKind::SetDim), dims);
+call    0 never executed
+call    1 never executed
+    #####:   47:  unpackOptionalValues(constraints.getMaybeValues(VarKind::Symbol), syms);
+call    0 never executed
+call    1 never executed
+        -:   48:
+    #####:   49:  AffineMap alignedMap =
+call    0 never executed
+    #####:   50:      alignAffineMapWithValues(map, operands, dims, syms, &newSyms);
+call    0 never executed
+call    1 never executed
+    #####:   51:  for (unsigned i = syms.size(); i < newSyms.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:   52:    constraints.appendSymbolVar(newSyms[i]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   53:  return constraints.addBound(type, pos, alignedMap);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   54:}
+        -:   55:
+        -:   56:/// Add `val` to each result of `map`.
+function _ZL17addConstToResultsN4mlir9AffineMapEl called 0 returned 0% blocks executed 0%
+    #####:   57:static AffineMap addConstToResults(AffineMap map, int64_t val) {
+    #####:   58:  SmallVector<AffineExpr> newResults;
+call    0 never executed
+    #####:   59:  for (AffineExpr r : map.getResults())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   60:    newResults.push_back(r + val);
+call    0 never executed
+call    1 never executed
+    #####:   61:  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), newResults,
+    #####:   62:                        map.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:   63:}
+        -:   64:
+        -:   65:/// This function tries to canonicalize min/max operations by proving that their
+        -:   66:/// value is bounded by the same lower and upper bound. In that case, the
+        -:   67:/// operation can be folded away.
+        -:   68:///
+        -:   69:/// Bounds are computed by FlatAffineValueConstraints. Invariants required for
+        -:   70:/// finding/proving bounds should be supplied via `constraints`.
+        -:   71:///
+        -:   72:/// 1. Add dimensions for `op` and `opBound` (lower or upper bound of `op`).
+        -:   73:/// 2. Compute an upper bound of `op` (in case of `isMin`) or a lower bound (in
+        -:   74:///    case of `!isMin`) and bind it to `opBound`. SSA values that are used in
+        -:   75:///    `op` but are not part of `constraints`, are added as extra symbols.
+        -:   76:/// 3. For each result of `op`: Add result as a dimension `r_i`. Prove that:
+        -:   77:///    * If `isMin`: r_i >= opBound
+        -:   78:///    * If `isMax`: r_i <= opBound
+        -:   79:///    If this is the case, ub(op) == lb(op).
+        -:   80:/// 4. Replace `op` with `opBound`.
+        -:   81:///
+        -:   82:/// In summary, the following constraints are added throughout this function.
+        -:   83:/// Note: `invar` are dimensions added by the caller to express the invariants.
+        -:   84:/// (Showing only the case where `isMin`.)
+        -:   85:///
+        -:   86:///  invar |    op | opBound | r_i | extra syms... | const |           eq/ineq
+        -:   87:///  ------+-------+---------+-----+---------------+-------+-------------------
+        -:   88:///   (various eq./ineq. constraining `invar`, added by the caller)
+        -:   89:///    ... |     0 |       0 |   0 |             0 |   ... |               ...
+        -:   90:///  ------+-------+---------+-----+---------------+-------+-------------------
+        -:   91:///   (various ineq. constraining `op` in terms of `op` operands (`invar` and
+        -:   92:///    extra `op` operands "extra syms" that are not in `invar`)).
+        -:   93:///    ... |    -1 |       0 |   0 |           ... |   ... |              >= 0
+        -:   94:///  ------+-------+---------+-----+---------------+-------+-------------------
+        -:   95:///   (set `opBound` to `op` upper bound in terms of `invar` and "extra syms")
+        -:   96:///    ... |     0 |      -1 |   0 |           ... |   ... |               = 0
+        -:   97:///  ------+-------+---------+-----+---------------+-------+-------------------
+        -:   98:///   (for each `op` map result r_i: set r_i to corresponding map result,
+        -:   99:///    prove that r_i >= minOpUb via contradiction)
+        -:  100:///    ... |     0 |       0 |  -1 |           ... |   ... |               = 0
+        -:  101:///      0 |     0 |       1 |  -1 |             0 |    -1 |              >= 0
+        -:  102:///
+        -:  103:static LogicalResult
+function _ZL20canonicalizeMinMaxOpRN4mlir12RewriterBaseEPNS_9OperationENS_9AffineMapENS_10ValueRangeEbNS_26FlatAffineValueConstraintsE called 0 returned 0% blocks executed 0%
+    #####:  104:canonicalizeMinMaxOp(RewriterBase &rewriter, Operation *op, AffineMap map,
+        -:  105:                     ValueRange operands, bool isMin,
+        -:  106:                     FlatAffineValueConstraints constraints) {
+    #####:  107:  RewriterBase::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  108:  unsigned numResults = map.getNumResults();
+call    0 never executed
+        -:  109:
+        -:  110:  // Add a few extra dimensions.
+    #####:  111:  unsigned dimOp = constraints.appendDimVar();      // `op`
+call    0 never executed
+    #####:  112:  unsigned dimOpBound = constraints.appendDimVar(); // `op` lower/upper bound
+call    0 never executed
+    #####:  113:  unsigned resultDimStart = constraints.appendDimVar(/*num=*/numResults);
+call    0 never executed
+        -:  114:
+        -:  115:  // Add an inequality for each result expr_i of map:
+        -:  116:  // isMin: op <= expr_i, !isMin: op >= expr_i
+    #####:  117:  auto boundType = isMin ? IntegerPolyhedron::UB : IntegerPolyhedron::LB;
+branch  0 never executed
+branch  1 never executed
+        -:  118:  // Upper bounds are exclusive, so add 1. (`affine.min` ops are inclusive.)
+    #####:  119:  AffineMap mapLbUb = isMin ? addConstToResults(map, 1) : map;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  120:  if (failed(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  121:          alignAndAddBound(constraints, boundType, dimOp, mapLbUb, operands)))
+    #####:  122:    return failure();
+        -:  123:
+        -:  124:  // Try to compute a lower/upper bound for op, expressed in terms of the other
+        -:  125:  // `dims` and extra symbols.
+    #####:  126:  SmallVector<AffineMap> opLb(1), opUb(1);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  127:  constraints.getSliceBounds(dimOp, 1, rewriter.getContext(), &opLb, &opUb);
+call    0 never executed
+    #####:  128:  AffineMap sliceBound = isMin ? opUb[0] : opLb[0];
+branch  0 never executed
+branch  1 never executed
+        -:  129:  // TODO: `getSliceBounds` may return multiple bounds at the moment. This is
+        -:  130:  // a TODO of `getSliceBounds` and not handled here.
+    #####:  131:  if (!sliceBound || sliceBound.getNumResults() != 1)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  132:    return failure(); // No or multiple bounds found.
+        -:  133:  // Recover the inclusive UB in the case of an `affine.min`.
+    #####:  134:  AffineMap boundMap = isMin ? addConstToResults(sliceBound, -1) : sliceBound;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  135:
+        -:  136:  // Add an equality: Set dimOpBound to computed bound.
+        -:  137:  // Add back dimension for op. (Was removed by `getSliceBounds`.)
+    #####:  138:  AffineMap alignedBoundMap = boundMap.shiftDims(/*shift=*/1, /*offset=*/dimOp);
+call    0 never executed
+    #####:  139:  if (failed(constraints.addBound(IntegerPolyhedron::EQ, dimOpBound,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  140:                                  alignedBoundMap)))
+    #####:  141:    return failure();
+        -:  142:
+        -:  143:  // If the constraint system is empty, there is an inconsistency. (E.g., this
+        -:  144:  // can happen if loop lb > ub.)
+    #####:  145:  if (constraints.isEmpty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  146:    return failure();
+        -:  147:
+        -:  148:  // In the case of `isMin` (`!isMin` is inversed):
+        -:  149:  // Prove that each result of `map` has a lower bound that is equal to (or
+        -:  150:  // greater than) the upper bound of `op` (`dimOpBound`). In that case, `op`
+        -:  151:  // can be replaced with the bound. I.e., prove that for each result
+        -:  152:  // expr_i (represented by dimension r_i):
+        -:  153:  //
+        -:  154:  // r_i >= opBound
+        -:  155:  //
+        -:  156:  // To prove this inequality, add its negation to the constraint set and prove
+        -:  157:  // that the constraint set is empty.
+    #####:  158:  for (unsigned i = resultDimStart; i < resultDimStart + numResults; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  159:    FlatAffineValueConstraints newConstr(constraints);
+call    0 never executed
+        -:  160:
+        -:  161:    // Add an equality: r_i = expr_i
+        -:  162:    // Note: These equalities could have been added earlier and used to express
+        -:  163:    // minOp <= expr_i. However, then we run the risk that `getSliceBounds`
+        -:  164:    // computes minOpUb in terms of r_i dims, which is not desired.
+    #####:  165:    if (failed(alignAndAddBound(newConstr, IntegerPolyhedron::EQ, i,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  166:                                map.getSubMap({i - resultDimStart}), operands)))
+call    0 never executed
+    #####:  167:      return failure();
+        -:  168:
+        -:  169:    // If `isMin`:  Add inequality: r_i < opBound
+        -:  170:    //              equiv.: opBound - r_i - 1 >= 0
+        -:  171:    // If `!isMin`: Add inequality: r_i > opBound
+        -:  172:    //              equiv.: -opBound + r_i - 1 >= 0
+    #####:  173:    SmallVector<int64_t> ineq(newConstr.getNumCols(), 0);
+call    0 never executed
+call    1 never executed
+    #####:  174:    ineq[dimOpBound] = isMin ? 1 : -1;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  175:    ineq[i] = isMin ? -1 : 1;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  176:    ineq[newConstr.getNumCols() - 1] = -1;
+branch  0 never executed
+branch  1 never executed
+    #####:  177:    newConstr.addInequality(ineq);
+call    0 never executed
+    #####:  178:    if (!newConstr.isEmpty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  179:      return failure();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  180:  }
+        -:  181:
+        -:  182:  // Lower and upper bound of `op` are equal. Replace `minOp` with its bound.
+    #####:  183:  AffineMap newMap = alignedBoundMap;
+    #####:  184:  SmallVector<Value> newOperands;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  185:  unpackOptionalValues(constraints.getMaybeValues(), newOperands);
+call    0 never executed
+        -:  186:  // If dims/symbols have known constant values, use those in order to simplify
+        -:  187:  // the affine map further.
+    #####:  188:  for (int64_t i = 0, e = constraints.getNumVars(); i < e; ++i) {
+branch  0 never executed
+branch  1 never executed
+        -:  189:    // Skip unused operands and operands that are already constants.
+    #####:  190:    if (!newOperands[i] || getConstantIntValue(newOperands[i]))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  191:      continue;
+    #####:  192:    if (auto bound = constraints.getConstantBound64(IntegerPolyhedron::EQ, i))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  193:      newOperands[i] =
+branch  0 never executed
+branch  1 never executed
+    #####:  194:          rewriter.create<arith::ConstantIndexOp>(op->getLoc(), *bound);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  195:  }
+    #####:  196:  mlir::canonicalizeMapAndOperands(&newMap, &newOperands);
+call    0 never executed
+    #####:  197:  rewriter.setInsertionPoint(op);
+call    0 never executed
+    #####:  198:  rewriter.replaceOpWithNewOp<AffineApplyOp>(op, newMap, newOperands);
+call    0 never executed
+    #####:  199:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  200:}
+        -:  201:
+        -:  202:static LogicalResult
+function _ZL23addLoopRangeConstraintsRN4mlir26FlatAffineValueConstraintsENS_5ValueENS_12OpFoldResultES3_S3_RNS_12RewriterBaseE called 0 returned 0% blocks executed 0%
+    #####:  203:addLoopRangeConstraints(FlatAffineValueConstraints &constraints, Value iv,
+        -:  204:                        OpFoldResult lb, OpFoldResult ub, OpFoldResult step,
+        -:  205:                        RewriterBase &rewriter) {
+        -:  206:  // IntegerPolyhedron does not support semi-affine expressions.
+        -:  207:  // Therefore, only constant step values are supported.
+    #####:  208:  auto stepInt = getConstantIntValue(step);
+call    0 never executed
+    #####:  209:  if (!stepInt)
+branch  0 never executed
+branch  1 never executed
+    #####:  210:    return failure();
+        -:  211:
+    #####:  212:  unsigned dimIv = constraints.appendDimVar(iv);
+call    0 never executed
+call    1 never executed
+    #####:  213:  auto lbv = lb.dyn_cast<Value>();
+branch  0 never executed
+branch  1 never executed
+    #####:  214:  unsigned symLb = lbv ? constraints.appendSymbolVar(lbv)
+call    0 never executed
+    #####:  215:                       : constraints.appendSymbolVar(/*num=*/1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  216:  auto ubv = ub.dyn_cast<Value>();
+branch  0 never executed
+branch  1 never executed
+    #####:  217:  unsigned symUb = ubv ? constraints.appendSymbolVar(ubv)
+call    0 never executed
+    #####:  218:                       : constraints.appendSymbolVar(/*num=*/1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  219:
+        -:  220:  // If loop lower/upper bounds are constant: Add EQ constraint.
+    #####:  221:  Optional<int64_t> lbInt = getConstantIntValue(lb);
+call    0 never executed
+    #####:  222:  Optional<int64_t> ubInt = getConstantIntValue(ub);
+call    0 never executed
+    #####:  223:  if (lbInt)
+branch  0 never executed
+branch  1 never executed
+    #####:  224:    constraints.addBound(IntegerPolyhedron::EQ, symLb, *lbInt);
+call    0 never executed
+    #####:  225:  if (ubInt)
+branch  0 never executed
+branch  1 never executed
+    #####:  226:    constraints.addBound(IntegerPolyhedron::EQ, symUb, *ubInt);
+call    0 never executed
+        -:  227:
+        -:  228:  // Lower bound: iv >= lb (equiv.: iv - lb >= 0)
+    #####:  229:  SmallVector<int64_t> ineqLb(constraints.getNumCols(), 0);
+call    0 never executed
+    #####:  230:  ineqLb[dimIv] = 1;
+branch  0 never executed
+branch  1 never executed
+    #####:  231:  ineqLb[symLb] = -1;
+branch  0 never executed
+branch  1 never executed
+    #####:  232:  constraints.addInequality(ineqLb);
+call    0 never executed
+        -:  233:
+        -:  234:  // Upper bound
+    #####:  235:  AffineExpr ivUb;
+    #####:  236:  if (lbInt && ubInt && (*lbInt + *stepInt >= *ubInt)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  237:    // The loop has at most one iteration.
+        -:  238:    // iv < lb + 1
+        -:  239:    // TODO: Try to derive this constraint by simplifying the expression in
+        -:  240:    // the else-branch.
+    #####:  241:    ivUb =
+    #####:  242:        rewriter.getAffineSymbolExpr(symLb - constraints.getNumDimVars()) + 1;
+call    0 never executed
+call    1 never executed
+        -:  243:  } else {
+        -:  244:    // The loop may have more than one iteration.
+        -:  245:    // iv < lb + step * ((ub - lb - 1) floorDiv step) + 1
+    #####:  246:    AffineExpr exprLb =
+branch  0 never executed
+branch  1 never executed
+        -:  247:        lbInt
+    #####:  248:            ? rewriter.getAffineConstantExpr(*lbInt)
+call    0 never executed
+    #####:  249:            : rewriter.getAffineSymbolExpr(symLb - constraints.getNumDimVars());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  250:    AffineExpr exprUb =
+branch  0 never executed
+branch  1 never executed
+        -:  251:        ubInt
+    #####:  252:            ? rewriter.getAffineConstantExpr(*ubInt)
+call    0 never executed
+    #####:  253:            : rewriter.getAffineSymbolExpr(symUb - constraints.getNumDimVars());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  254:    ivUb = exprLb + 1 + (*stepInt * ((exprUb - exprLb - 1).floorDiv(*stepInt)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  255:  }
+    #####:  256:  auto map = AffineMap::get(
+        -:  257:      /*dimCount=*/constraints.getNumDimVars(),
+    #####:  258:      /*symbolCount=*/constraints.getNumSymbolVars(), /*result=*/ivUb);
+call    0 never executed
+        -:  259:
+    #####:  260:  return constraints.addBound(IntegerPolyhedron::UB, dimIv, map);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  261:}
+        -:  262:
+        -:  263:/// Canonicalize min/max operations in the context of for loops with a known
+        -:  264:/// range. Call `canonicalizeMinMaxOp` and add the following constraints to
+        -:  265:/// the constraint system (along with the missing dimensions):
+        -:  266:///
+        -:  267:/// * iv >= lb
+        -:  268:/// * iv < lb + step * ((ub - lb - 1) floorDiv step) + 1
+        -:  269:///
+        -:  270:/// Note: Due to limitations of IntegerPolyhedron, only constant step sizes
+        -:  271:/// are currently supported.
+function _ZN4mlir3scf26canonicalizeMinMaxOpInLoopERNS_12RewriterBaseEPNS_9OperationENS_9AffineMapENS_10ValueRangeEbN4llvm12function_refIFNS_13LogicalResultENS_5ValueERNS_12OpFoldResultESC_SC_EEE called 0 returned 0% blocks executed 0%
+    #####:  272:LogicalResult scf::canonicalizeMinMaxOpInLoop(RewriterBase &rewriter,
+        -:  273:                                              Operation *op, AffineMap map,
+        -:  274:                                              ValueRange operands, bool isMin,
+        -:  275:                                              LoopMatcherFn loopMatcher) {
+    #####:  276:  FlatAffineValueConstraints constraints;
+call    0 never executed
+    #####:  277:  DenseSet<Value> allIvs;
+call    0 never executed
+call    1 never executed
+        -:  278:
+        -:  279:  // Find all iteration variables among `minOp`'s operands add constrain them.
+    #####:  280:  for (Value operand : operands) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  281:    // Skip duplicate ivs.
+    #####:  282:    if (llvm::is_contained(allIvs, operand))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  283:      continue;
+        -:  284:
+        -:  285:    // If `operand` is an iteration variable: Find corresponding loop
+        -:  286:    // bounds and step.
+    #####:  287:    Value iv = operand;
+    #####:  288:    OpFoldResult lb, ub, step;
+    #####:  289:    if (failed(loopMatcher(operand, lb, ub, step)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  290:      continue;
+    #####:  291:    allIvs.insert(iv);
+call    0 never executed
+        -:  292:
+    #####:  293:    if (failed(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  294:            addLoopRangeConstraints(constraints, iv, lb, ub, step, rewriter)))
+    #####:  295:      return failure();
+        -:  296:  }
+        -:  297:
+    #####:  298:  return canonicalizeMinMaxOp(rewriter, op, map, operands, isMin, constraints);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  299:}
+        -:  300:
+        -:  301:/// Try to simplify a min/max operation `op` after loop peeling. This function
+        -:  302:/// can simplify min/max operations such as (ub is the previous upper bound of
+        -:  303:/// the unpeeled loop):
+        -:  304:/// ```
+        -:  305:/// #map = affine_map<(d0)[s0, s1] -> (s0, -d0 + s1)>
+        -:  306:/// %r = affine.min #affine.min #map(%iv)[%step, %ub]
+        -:  307:/// ```
+        -:  308:/// and rewrites them into (in the case the peeled loop):
+        -:  309:/// ```
+        -:  310:/// %r = %step
+        -:  311:/// ```
+        -:  312:/// min/max operations inside the partial iteration are rewritten in a similar
+        -:  313:/// way.
+        -:  314:///
+        -:  315:/// This function builds up a set of constraints, capable of proving that:
+        -:  316:/// * Inside the peeled loop: min(step, ub - iv) == step
+        -:  317:/// * Inside the partial iteration: min(step, ub - iv) == ub - iv
+        -:  318:///
+        -:  319:/// Returns `success` if the given operation was replaced by a new operation;
+        -:  320:/// `failure` otherwise.
+        -:  321:///
+        -:  322:/// Note: `ub` is the previous upper bound of the loop (before peeling).
+        -:  323:/// `insideLoop` must be true for min/max ops inside the loop and false for
+        -:  324:/// affine.min ops inside the partial iteration. For an explanation of the other
+        -:  325:/// parameters, see comment of `canonicalizeMinMaxOpInLoop`.
+function _ZN4mlir3scf21rewritePeeledMinMaxOpERNS_12RewriterBaseEPNS_9OperationENS_9AffineMapENS_10ValueRangeEbNS_5ValueES7_S7_b called 0 returned 0% blocks executed 0%
+    #####:  326:LogicalResult scf::rewritePeeledMinMaxOp(RewriterBase &rewriter, Operation *op,
+        -:  327:                                         AffineMap map, ValueRange operands,
+        -:  328:                                         bool isMin, Value iv, Value ub,
+        -:  329:                                         Value step, bool insideLoop) {
+    #####:  330:  FlatAffineValueConstraints constraints;
+call    0 never executed
+    #####:  331:  constraints.appendDimVar({iv, ub, step});
+call    0 never executed
+call    1 never executed
+    #####:  332:  if (auto constUb = getConstantIntValue(ub))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  333:    constraints.addBound(IntegerPolyhedron::EQ, 1, *constUb);
+call    0 never executed
+    #####:  334:  if (auto constStep = getConstantIntValue(step))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  335:    constraints.addBound(IntegerPolyhedron::EQ, 2, *constStep);
+call    0 never executed
+        -:  336:
+        -:  337:  // Add loop peeling invariant. This is the main piece of knowledge that
+        -:  338:  // enables AffineMinOp simplification.
+    #####:  339:  if (insideLoop) {
+branch  0 never executed
+branch  1 never executed
+        -:  340:    // ub - iv >= step (equiv.: -iv + ub - step + 0 >= 0)
+        -:  341:    // Intuitively: Inside the peeled loop, every iteration is a "full"
+        -:  342:    // iteration, i.e., step divides the iteration space `ub - lb` evenly.
+    #####:  343:    constraints.addInequality({-1, 1, -1, 0});
+call    0 never executed
+        -:  344:  } else {
+        -:  345:    // ub - iv < step (equiv.: iv + -ub + step - 1 >= 0)
+        -:  346:    // Intuitively: `iv` is the split bound here, i.e., the iteration variable
+        -:  347:    // value of the very last iteration (in the unpeeled loop). At that point,
+        -:  348:    // there are less than `step` elements remaining. (Otherwise, the peeled
+        -:  349:    // loop would run for at least one more iteration.)
+    #####:  350:    constraints.addInequality({1, -1, 1, -1});
+call    0 never executed
+        -:  351:  }
+        -:  352:
+    #####:  353:  return canonicalizeMinMaxOp(rewriter, op, map, operands, isMin, constraints);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  354:}

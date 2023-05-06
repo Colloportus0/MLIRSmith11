@@ -1,0 +1,277 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/MemRef/Transforms/ExpandOps.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/MemRef/Transforms/CMakeFiles/obj.MLIRMemRefTransforms.dir/ExpandOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/MemRef/Transforms/CMakeFiles/obj.MLIRMemRefTransforms.dir/ExpandOps.cpp.gcda
+        -:    0:Runs:325549
+        -:    1://===- StdExpandDivs.cpp - Code to prepare Std for lowering Divs to LLVM  -===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file Std transformations to expand Divs operation to help for the
+        -:   10:// lowering to LLVM. Currently implemented transformations are Ceil and Floor
+        -:   11:// for Signed Integers.
+        -:   12://
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#include "mlir/Dialect/MemRef/Transforms/Passes.h"
+        -:   16:
+        -:   17:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   18:#include "mlir/Dialect/Arith/Transforms/Passes.h"
+        -:   19:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   20:#include "mlir/IR/TypeUtilities.h"
+        -:   21:#include "mlir/Transforms/DialectConversion.h"
+        -:   22:
+        -:   23:namespace mlir {
+        -:   24:namespace memref {
+        -:   25:#define GEN_PASS_DEF_EXPANDOPS
+        -:   26:#include "mlir/Dialect/MemRef/Transforms/Passes.h.inc"
+        -:   27:} // namespace memref
+        -:   28:} // namespace mlir
+        -:   29:
+        -:   30:using namespace mlir;
+        -:   31:
+        -:   32:namespace {
+        -:   33:
+        -:   34:/// Converts `atomic_rmw` that cannot be lowered to a simple atomic op with
+        -:   35:/// AtomicRMWOpLowering pattern, e.g. with "minf" or "maxf" attributes, to
+        -:   36:/// `memref.generic_atomic_rmw` with the expanded code.
+        -:   37:///
+        -:   38:/// %x = atomic_rmw "maxf" %fval, %F[%i] : (f32, memref<10xf32>) -> f32
+        -:   39:///
+        -:   40:/// will be lowered to
+        -:   41:///
+        -:   42:/// %x = memref.generic_atomic_rmw %F[%i] : memref<10xf32> {
+        -:   43:/// ^bb0(%current: f32):
+        -:   44:///   %cmp = arith.cmpf "ogt", %current, %fval : f32
+        -:   45:///   %new_value = select %cmp, %current, %fval : f32
+        -:   46:///   memref.atomic_yield %new_value : f32
+        -:   47:/// }
+        -:   48:struct AtomicRMWOpConverter : public OpRewritePattern<memref::AtomicRMWOp> {
+        -:   49:public:
+        -:   50:  using OpRewritePattern::OpRewritePattern;
+        -:   51:
+function _ZNK12_GLOBAL__N_120AtomicRMWOpConverter15matchAndRewriteEN4mlir6memref11AtomicRMWOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   52:  LogicalResult matchAndRewrite(memref::AtomicRMWOp op,
+        -:   53:                                PatternRewriter &rewriter) const final {
+    #####:   54:    arith::CmpFPredicate predicate;
+    #####:   55:    switch (op.getKind()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   56:    case arith::AtomicRMWKind::maxf:
+    #####:   57:      predicate = arith::CmpFPredicate::OGT;
+    #####:   58:      break;
+    #####:   59:    case arith::AtomicRMWKind::minf:
+    #####:   60:      predicate = arith::CmpFPredicate::OLT;
+    #####:   61:      break;
+    #####:   62:    default:
+    #####:   63:      return failure();
+        -:   64:    }
+        -:   65:
+    #####:   66:    auto loc = op.getLoc();
+call    0 never executed
+    #####:   67:    auto genericOp = rewriter.create<memref::GenericAtomicRMWOp>(
+    #####:   68:        loc, op.getMemref(), op.getIndices());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   69:    OpBuilder bodyBuilder =
+    #####:   70:        OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
+call    0 never executed
+call    1 never executed
+        -:   71:
+    #####:   72:    Value lhs = genericOp.getCurrentValue();
+call    0 never executed
+    #####:   73:    Value rhs = op.getValue();
+call    0 never executed
+    #####:   74:    Value cmp = bodyBuilder.create<arith::CmpFOp>(loc, predicate, lhs, rhs);
+call    0 never executed
+call    1 never executed
+    #####:   75:    Value select = bodyBuilder.create<arith::SelectOp>(loc, cmp, lhs, rhs);
+call    0 never executed
+call    1 never executed
+    #####:   76:    bodyBuilder.create<memref::AtomicYieldOp>(loc, select);
+call    0 never executed
+        -:   77:
+    #####:   78:    rewriter.replaceOp(op, genericOp.getResult());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   79:    return success();
+        -:   80:  }
+        -:   81:};
+        -:   82:
+        -:   83:/// Converts `memref.reshape` that has a target shape of a statically-known
+        -:   84:/// size to `memref.reinterpret_cast`.
+        -:   85:struct MemRefReshapeOpConverter : public OpRewritePattern<memref::ReshapeOp> {
+        -:   86:public:
+        -:   87:  using OpRewritePattern::OpRewritePattern;
+        -:   88:
+function _ZNK12_GLOBAL__N_124MemRefReshapeOpConverter15matchAndRewriteEN4mlir6memref9ReshapeOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   89:  LogicalResult matchAndRewrite(memref::ReshapeOp op,
+        -:   90:                                PatternRewriter &rewriter) const final {
+    #####:   91:    auto shapeType = op.getShape().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   92:    if (!shapeType.hasStaticShape())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   93:      return failure();
+        -:   94:
+    #####:   95:    int64_t rank = shapeType.cast<MemRefType>().getDimSize(0);
+call    0 never executed
+call    1 never executed
+    #####:   96:    SmallVector<OpFoldResult, 4> sizes, strides;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   97:    sizes.resize(rank);
+call    0 never executed
+    #####:   98:    strides.resize(rank);
+call    0 never executed
+        -:   99:
+    #####:  100:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  101:    Value stride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+call    0 never executed
+    #####:  102:    for (int i = rank - 1; i >= 0; --i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  103:      Value size;
+        -:  104:      // Load dynamic sizes from the shape input, use constants for static dims.
+    #####:  105:      if (op.getType().isDynamicDim(i)) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  106:        Value index = rewriter.create<arith::ConstantIndexOp>(loc, i);
+call    0 never executed
+call    1 never executed
+    #####:  107:        size = rewriter.create<memref::LoadOp>(loc, op.getShape(), index);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  108:        if (!size.getType().isa<IndexType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  109:          size = rewriter.create<arith::IndexCastOp>(
+    #####:  110:              loc, rewriter.getIndexType(), size);
+call    0 never executed
+call    1 never executed
+    #####:  111:        sizes[i] = size;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  112:      } else {
+    #####:  113:        sizes[i] = rewriter.getIndexAttr(op.getType().getDimSize(i));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  114:        size =
+    #####:  115:            rewriter.create<arith::ConstantOp>(loc, sizes[i].get<Attribute>());
+call    0 never executed
+call    1 never executed
+        -:  116:      }
+    #####:  117:      strides[i] = stride;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  118:      if (i > 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  119:        stride = rewriter.create<arith::MulIOp>(loc, stride, size);
+call    0 never executed
+        -:  120:    }
+    #####:  121:    rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+    #####:  122:        op, op.getType(), op.getSource(), /*offset=*/rewriter.getIndexAttr(0),
+call    0 never executed
+call    1 never executed
+    #####:  123:        sizes, strides);
+call    0 never executed
+call    1 never executed
+    #####:  124:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  125:  }
+        -:  126:};
+        -:  127:
+  326623*:  128:struct ExpandOpsPass : public memref::impl::ExpandOpsBase<ExpandOpsPass> {
+call    0 never executed
+call    1 returned 100%
+function _ZN12_GLOBAL__N_113ExpandOpsPass14runOnOperationEv called 858 returned 100% blocks executed 88%
+      858:  129:  void runOnOperation() override {
+      858:  130:    MLIRContext &ctx = getContext();
+call    0 returned 100%
+        -:  131:
+      858:  132:    RewritePatternSet patterns(&ctx);
+call    0 returned 100%
+     1716:  133:    memref::populateExpandOpsPatterns(patterns);
+      858:  134:    ConversionTarget target(ctx);
+call    0 returned 100%
+call    1 returned 100%
+        -:  135:
+      858:  136:    target.addLegalDialect<arith::ArithDialect, memref::MemRefDialect>();
+call    0 returned 100%
+      858:  137:    target.addDynamicallyLegalOp<memref::AtomicRMWOp>(
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_113ExpandOpsPass14runOnOperationEvENKUlN4mlir6memref11AtomicRMWOpEE_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  138:        [](memref::AtomicRMWOp op) {
+    #####:  139:          return op.getKind() != arith::AtomicRMWKind::maxf &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  140:                 op.getKind() != arith::AtomicRMWKind::minf;
+call    0 never executed
+        -:  141:        });
+function _ZZN12_GLOBAL__N_113ExpandOpsPass14runOnOperationEvENKUlN4mlir6memref9ReshapeOpEE0_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+     858*:  142:    target.addDynamicallyLegalOp<memref::ReshapeOp>([](memref::ReshapeOp op) {
+call    0 returned 100%
+    #####:  143:      return !op.getShape().getType().cast<MemRefType>().hasStaticShape();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  144:    });
+      858:  145:    if (failed(applyPartialConversion(getOperation(), target,
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 0% (fallthrough)
+branch  6 taken 100%
+      858:  146:                                      std::move(patterns))))
+call    0 returned 100%
+    #####:  147:      signalPassFailure();
+call    0 never executed
+      858:  148:  }
+        -:  149:};
+        -:  150:
+        -:  151:} // namespace
+        -:  152:
+function _ZN4mlir6memref25populateExpandOpsPatternsERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+     858*:  153:void mlir::memref::populateExpandOpsPatterns(RewritePatternSet &patterns) {
+     858*:  154:  patterns.add<AtomicRMWOpConverter, MemRefReshapeOpConverter>(
+     858*:  155:      patterns.getContext());
+call    0 never executed
+call    1 returned 100%
+call    2 returned 100%
+    #####:  156:}
+        -:  157:
+function _ZN4mlir6memref19createExpandOpsPassEv called 326623 returned 100% blocks executed 100%
+   326623:  158:std::unique_ptr<Pass> mlir::memref::createExpandOpsPass() {
+   326623:  159:  return std::make_unique<ExpandOpsPass>();
+call    0 returned 100%
+        -:  160:}

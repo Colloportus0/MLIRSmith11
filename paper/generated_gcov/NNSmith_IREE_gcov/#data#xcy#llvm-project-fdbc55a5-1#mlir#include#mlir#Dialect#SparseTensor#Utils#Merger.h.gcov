@@ -1,0 +1,546 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/Dialect/SparseTensor/Utils/Merger.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/Sparsification.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/Sparsification.cpp.gcda
+        -:    0:Runs:325552
+        -:    1://===- Merger.h - Utilities for defining lattices ---------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This header file defines utilities for dealing with iteration lattices.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef MLIR_DIALECT_SPARSETENSOR_UTILS_MERGER_H_
+        -:   14:#define MLIR_DIALECT_SPARSETENSOR_UTILS_MERGER_H_
+        -:   15:
+        -:   16:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   17:#include "mlir/Dialect/SparseTensor/IR/Enums.h"
+        -:   18:#include "mlir/IR/Value.h"
+        -:   19:#include "llvm/ADT/BitVector.h"
+        -:   20:
+        -:   21:namespace mlir {
+        -:   22:namespace sparse_tensor {
+        -:   23:
+        -:   24:/// Tensor expression kind.
+        -:   25:enum Kind {
+        -:   26:  // Leaf.
+        -:   27:  kTensor = 0,
+        -:   28:  kInvariant,
+        -:   29:  kIndex,
+        -:   30:  // Unary operations.
+        -:   31:  kAbsF,
+        -:   32:  kAbsC,
+        -:   33:  kAbsI,
+        -:   34:  kCeilF,
+        -:   35:  kFloorF,
+        -:   36:  kSqrtF,
+        -:   37:  kSqrtC,
+        -:   38:  kExpm1F,
+        -:   39:  kExpm1C,
+        -:   40:  kLog1pF,
+        -:   41:  kLog1pC,
+        -:   42:  kSinF,
+        -:   43:  kSinC,
+        -:   44:  kTanhF,
+        -:   45:  kTanhC,
+        -:   46:  kNegF,
+        -:   47:  kNegC,
+        -:   48:  kNegI,
+        -:   49:  kTruncF,
+        -:   50:  kExtF,
+        -:   51:  kCastFS, // signed
+        -:   52:  kCastFU, // unsigned
+        -:   53:  kCastSF, // signed
+        -:   54:  kCastUF, // unsigned
+        -:   55:  kCastS,  // signed
+        -:   56:  kCastU,  // unsigned
+        -:   57:  kCastIdx,
+        -:   58:  kTruncI,
+        -:   59:  kCIm, // complex.im
+        -:   60:  kCRe, // complex.re
+        -:   61:  kBitCast,
+        -:   62:  kBinaryBranch, // semiring unary branch created from a binary op
+        -:   63:  kUnary,        // semiring unary op
+        -:   64:  kSelect,       // custom selection criteria
+        -:   65:  // Binary operations.
+        -:   66:  kMulF,
+        -:   67:  kMulC,
+        -:   68:  kMulI,
+        -:   69:  kDivF,
+        -:   70:  kDivC, // complex
+        -:   71:  kDivS, // signed
+        -:   72:  kDivU, // unsigned
+        -:   73:  kAddF,
+        -:   74:  kAddC,
+        -:   75:  kAddI,
+        -:   76:  kSubF,
+        -:   77:  kSubC,
+        -:   78:  kSubI,
+        -:   79:  kAndI,
+        -:   80:  kOrI,
+        -:   81:  kXorI,
+        -:   82:  kShrS, // signed
+        -:   83:  kShrU, // unsigned
+        -:   84:  kShlI,
+        -:   85:  kBinary, // semiring binary op
+        -:   86:  kReduce, // semiring reduction op
+        -:   87:};
+        -:   88:
+        -:   89:/// Children subexpressions of tensor operations.
+        -:   90:struct Children {
+        -:   91:  unsigned e0;
+        -:   92:  unsigned e1;
+        -:   93:};
+        -:   94:
+        -:   95:/// Tensor expression. Represents a MLIR expression in tensor index notation.
+        -:   96:struct TensorExp {
+        -:   97:  TensorExp(Kind k, unsigned x, unsigned y, Value v, Operation *operation);
+        -:   98:
+        -:   99:  /// Tensor expression kind.
+        -:  100:  Kind kind;
+        -:  101:
+        -:  102:  union {
+        -:  103:    /// Expressions representing tensors simply have a tensor number.
+        -:  104:    unsigned tensor;
+        -:  105:
+        -:  106:    /// Indices hold the index number.
+        -:  107:    unsigned index;
+        -:  108:
+        -:  109:    /// Tensor operations hold the indices of their children.
+        -:  110:    Children children;
+        -:  111:  };
+        -:  112:
+        -:  113:  /// Direct link to IR for an invariant or the destination value (to
+        -:  114:  /// infer destination type) of a cast operation During code generation,
+        -:  115:  /// this field may be used to cache "hoisted" loop invariant tensor loads.
+        -:  116:  Value val;
+        -:  117:
+        -:  118:  /// Code blocks used by semirings. For the case of kUnary, kBinary, kReduce,
+        -:  119:  /// and kSelect, this holds the original operation with all regions. For
+        -:  120:  /// kBinaryBranch, this holds the YieldOp for the left or right half
+        -:  121:  /// to be merged into a nested scf loop.
+        -:  122:  Operation *op;
+        -:  123:};
+        -:  124:
+        -:  125:/// Lattice point. Each lattice point consists of a conjunction of tensor
+        -:  126:/// loop indices (encoded in a bitvector) and the index of the corresponding
+        -:  127:/// tensor expression.
+        -:  128:struct LatPoint {
+        -:  129:  LatPoint(unsigned n, unsigned e, unsigned b);
+        -:  130:  LatPoint(const BitVector &b, unsigned e);
+        -:  131:
+        -:  132:  /// Conjunction of tensor loop indices as bitvector. This represents
+        -:  133:  /// all indices involved in the tensor expression
+        -:  134:  BitVector bits;
+        -:  135:
+        -:  136:  /// Simplified conjunction of tensor loop indices as bitvector. This
+        -:  137:  /// represents a simplified condition under which this tensor expression
+        -:  138:  /// must execute. Pre-computed during codegen to avoid repeated eval.
+        -:  139:  BitVector simple;
+        -:  140:
+        -:  141:  /// Index of the tensor expression.
+        -:  142:  unsigned exp;
+        -:  143:};
+        -:  144:
+        -:  145:/// A class to handle all iteration lattice operations. This class abstracts
+        -:  146:/// away from some implementation details of storing iteration lattices and
+        -:  147:/// tensor expressions. This allows for fine-tuning performance characteristics
+        -:  148:/// independently from the basic algorithm if bottlenecks are identified.
+        -:  149:class Merger {
+        -:  150:public:
+        -:  151:  /// Constructs a merger for the given number of tensors and loops. The
+        -:  152:  /// user supplies the number of tensors involved in the kernel, with the
+        -:  153:  /// last tensor in this set denoting the output tensor. The merger adds an
+        -:  154:  /// additional synthetic tensor at the end of this set to represent all
+        -:  155:  /// invariant expressions in the kernel.
+function _ZN4mlir13sparse_tensor6MergerC2Ejj called 0 returned 0% blocks executed 0%
+    #####:  156:  Merger(unsigned t, unsigned l)
+    #####:  157:      : outTensor(t - 1), syntheticTensor(t), numTensors(t + 1), numLoops(l),
+        -:  158:        hasSparseOut(false),
+    #####:  159:        dimTypes(t + 1, std::vector<DimLevelType>(l, DimLevelType::Undef)),
+call    0 never executed
+    #####:  160:        loopIdxToDim(t + 1, std::vector<Optional<unsigned>>(l, llvm::None)) {}
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+        -:  161:
+        -:  162:  /// Adds a tensor expression. Returns its index.
+        -:  163:  unsigned addExp(Kind k, unsigned e0, unsigned e1 = -1u, Value v = Value(),
+        -:  164:                  Operation *op = nullptr);
+        -:  165:  unsigned addExp(Kind k, unsigned e, Value v, Operation *op = nullptr) {
+        -:  166:    return addExp(k, e, -1u, v, op);
+        -:  167:  }
+        -:  168:  unsigned addExp(Kind k, Value v, Operation *op = nullptr) {
+        -:  169:    return addExp(k, -1u, -1u, v, op);
+        -:  170:  }
+        -:  171:
+        -:  172:  /// Adds an iteration lattice point. Returns its index.
+        -:  173:  unsigned addLat(unsigned t, unsigned i, unsigned e);
+        -:  174:
+        -:  175:  /// Adds a new, initially empty, set. Returns its index.
+        -:  176:  unsigned addSet();
+        -:  177:
+        -:  178:  /// Computes a single conjunction of two lattice points by taking the "union"
+        -:  179:  /// of loop indices (effectively constructing a larger "intersection" of those
+        -:  180:  /// indices) with a newly constructed tensor (sub)expression of given kind.
+        -:  181:  /// Returns the index of the new lattice point.
+        -:  182:  unsigned conjLatPoint(Kind kind, unsigned p0, unsigned p1,
+        -:  183:                        Operation *op = nullptr);
+        -:  184:
+        -:  185:  /// Conjunctive merge of two lattice sets L0 and L1 is conjunction of
+        -:  186:  /// cartesian product. Returns the index of the new set.
+        -:  187:  unsigned takeConj(Kind kind, unsigned s0, unsigned s1,
+        -:  188:                    Operation *op = nullptr);
+        -:  189:
+        -:  190:  /// Disjunctive merge of two lattice sets L0 and L1 is (L0 /\_op L1, L0, L1).
+        -:  191:  /// Returns the index of the new set.
+        -:  192:  unsigned takeDisj(Kind kind, unsigned s0, unsigned s1,
+        -:  193:                    Operation *op = nullptr);
+        -:  194:
+        -:  195:  /// Disjunctive merge of two lattice sets L0 and L1 with custom handling of
+        -:  196:  /// the overlap, left, and right regions. Any region may be left missing in
+        -:  197:  /// the output. Returns the index of the new set.
+        -:  198:  unsigned takeCombi(Kind kind, unsigned s0, unsigned s1, Operation *orig,
+        -:  199:                     bool includeLeft, Kind ltrans, Operation *opleft,
+        -:  200:                     bool includeRight, Kind rtrans, Operation *opright);
+        -:  201:
+        -:  202:  /// Maps the unary operator over the lattice set of the operand, i.e. each
+        -:  203:  /// lattice point on an expression E is simply copied over, but with OP E
+        -:  204:  /// as new expression. Returns the index of the new set.
+        -:  205:  unsigned mapSet(Kind kind, unsigned s0, Value v = Value(),
+        -:  206:                  Operation *op = nullptr);
+        -:  207:
+        -:  208:  /// Optimizes the iteration lattice points in the given set. This
+        -:  209:  /// method should be called right before code generation to avoid
+        -:  210:  /// generating redundant loops and conditions.
+        -:  211:  unsigned optimizeSet(unsigned s0);
+        -:  212:
+        -:  213:  /// Simplifies the conditions in a conjunction of a given lattice point
+        -:  214:  /// within the given set using just two basic rules:
+        -:  215:  /// (1) multiple dense conditions are reduced to single dense, and
+        -:  216:  /// (2) a *singleton* sparse/dense is reduced to sparse/random access.
+        -:  217:  BitVector simplifyCond(unsigned s0, unsigned p0);
+        -:  218:
+        -:  219:  /// Returns true if Li > Lj.
+        -:  220:  bool latGT(unsigned i, unsigned j) const;
+        -:  221:
+        -:  222:  /// Returns true if Li and Lj only differ in dense.
+        -:  223:  bool onlyDenseDiff(unsigned i, unsigned j);
+        -:  224:
+        -:  225:  /// Bit translation (get tensor ID).
+    #####:  226:  unsigned tensor(unsigned b) const { return b % numTensors; }
+branch  0 never executed
+branch  1 never executed
+        -:  227:  /// Bit translation (get loop index).
+    #####:  228:  unsigned index(unsigned b) const { return b / numTensors; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  229:
+        -:  230:  /// Returns true if bit corresponds to index of output tensor.
+        -:  231:  bool isOutTensor(unsigned b, unsigned i) const {
+        -:  232:    return tensor(b) == outTensor && index(b) == i;
+        -:  233:  }
+        -:  234:
+        -:  235:  /// Gets tensor ID for the output tensor.
+    #####:  236:  unsigned getOutTensorID() const { return outTensor; }
+call    0 never executed
+        -:  237:  /// Gets tensor ID for the synthetic tensor (used for all invariant tensor
+        -:  238:  /// expressions).
+        -:  239:  unsigned getSynTensorID() const { return syntheticTensor; }
+        -:  240:
+        -:  241:  /// Returns true if given tensor iterates *only* in the given tensor
+        -:  242:  /// expression. For the output tensor, this defines a "simply dynamic"
+        -:  243:  /// operation [Bik96]. For instance: a(i) *= 2.0 or a(i) += a(i) for
+        -:  244:  /// sparse vector a.
+        -:  245:  bool isSingleCondition(unsigned t, unsigned e) const;
+        -:  246:
+        -:  247:  /// Returns true if any set bit corresponds to sparse dimension level type.
+        -:  248:  bool hasAnySparse(const BitVector &bits) const;
+        -:  249:
+        -:  250:  /// Gets the dimension level type of the `t`th tensor on `i`th loop.
+function _ZNK4mlir13sparse_tensor6Merger15getDimLevelTypeEjj called 0 returned 0% blocks executed 0%
+    #####:  251:  DimLevelType getDimLevelType(unsigned t, unsigned i) const {
+    #####:  252:    assert(t < numTensors && i < numLoops);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  253:    return dimTypes[t][i];
+        -:  254:  }
+        -:  255:
+        -:  256:  /// Gets the dimension level type of `b`.
+    #####:  257:  DimLevelType getDimLevelType(unsigned b) const {
+    #####:  258:    return getDimLevelType(tensor(b), index(b));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  259:  }
+        -:  260:
+        -:  261:  /// Gets the dimension number of the the `t`th tensor on `i`th loop.
+function _ZNK4mlir13sparse_tensor6Merger9getDimNumEjj called 0 returned 0% blocks executed 0%
+    #####:  262:  Optional<unsigned> getDimNum(unsigned t, unsigned i) const {
+    #####:  263:    assert(t < numTensors && i < numLoops);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  264:    return loopIdxToDim[t][i];
+        -:  265:  }
+        -:  266:
+        -:  267:  /// Gets the dimension number of `b`.
+    #####:  268:  Optional<unsigned> getDimNum(unsigned b) const {
+    #####:  269:    return getDimNum(tensor(b), index(b));
+        -:  270:  }
+        -:  271:
+        -:  272:  /// Sets the dimension and dimension level type of the `t`th tensor on `i`th
+        -:  273:  /// loop.
+function _ZN4mlir13sparse_tensor6Merger21setDimAndDimLevelTypeEjjjNS0_12DimLevelTypeE called 0 returned 0% blocks executed 0%
+    #####:  274:  void setDimAndDimLevelType(unsigned t, unsigned i, unsigned dim,
+        -:  275:                             DimLevelType dlt) {
+    #####:  276:    assert(isValidDLT(dlt));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  277:    dimTypes[t][i] = dlt;
+branch  0 never executed
+branch  1 never executed
+    #####:  278:    loopIdxToDim[t][i] = dim;
+branch  0 never executed
+branch  1 never executed
+    #####:  279:  }
+        -:  280:
+        -:  281:  // Iterates the bits of a lattice, for each set bit, converts it into the
+        -:  282:  // corresponding tensor dimension and invokes the callback.
+function _ZN4mlir13sparse_tensor6Merger23foreachTidDimPairInBitsERKN4llvm9BitVectorENS2_12function_refIFvjjNS2_8OptionalIjEENS0_12DimLevelTypeEEEE called 0 returned 0% blocks executed 0%
+    #####:  283:  void foreachTidDimPairInBits(
+        -:  284:      const BitVector &bits,
+        -:  285:      function_ref<void(unsigned b, unsigned tid, Optional<unsigned> dim,
+        -:  286:                        DimLevelType dlt)>
+        -:  287:          cb) {
+    #####:  288:    for (unsigned b : bits.set_bits())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  289:      cb(b, tensor(b), getDimNum(b), getDimLevelType(b));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  290:  }
+        -:  291:
+        -:  292:  // Has sparse output tensor setter.
+    #####:  293:  void setHasSparseOut(bool s) { hasSparseOut = s; }
+call    0 never executed
+        -:  294:
+        -:  295:  /// Convenience getters to immediately access the stored nodes.
+        -:  296:  /// Typically it is inadvisible to keep the reference around, as in
+        -:  297:  /// "TensorExpr &te = merger.exp(e))", since insertions into the merger
+        -:  298:  /// may cause data movement and invalidate the underlying memory address.
+    #####:  299:  TensorExp &exp(unsigned e) { return tensorExps[e]; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+call   11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+branch 20 never executed
+branch 21 never executed
+call   22 never executed
+branch 23 never executed
+branch 24 never executed
+branch 25 never executed
+branch 26 never executed
+branch 27 never executed
+branch 28 never executed
+branch 29 never executed
+branch 30 never executed
+branch 31 never executed
+branch 32 never executed
+call   33 never executed
+branch 34 never executed
+branch 35 never executed
+branch 36 never executed
+branch 37 never executed
+branch 38 never executed
+branch 39 never executed
+call   40 never executed
+branch 41 never executed
+branch 42 never executed
+call   43 never executed
+branch 44 never executed
+branch 45 never executed
+branch 46 never executed
+branch 47 never executed
+branch 48 never executed
+branch 49 never executed
+branch 50 never executed
+branch 51 never executed
+branch 52 never executed
+branch 53 never executed
+branch 54 never executed
+branch 55 never executed
+branch 56 never executed
+branch 57 never executed
+branch 58 never executed
+branch 59 never executed
+branch 60 never executed
+branch 61 never executed
+branch 62 never executed
+branch 63 never executed
+branch 64 never executed
+branch 65 never executed
+branch 66 never executed
+branch 67 never executed
+branch 68 never executed
+branch 69 never executed
+branch 70 never executed
+branch 71 never executed
+branch 72 never executed
+branch 73 never executed
+branch 74 never executed
+branch 75 never executed
+branch 76 never executed
+branch 77 never executed
+branch 78 never executed
+branch 79 never executed
+call   80 never executed
+branch 81 never executed
+branch 82 never executed
+call   83 never executed
+branch 84 never executed
+branch 85 never executed
+branch 86 never executed
+branch 87 never executed
+branch 88 never executed
+branch 89 never executed
+call   90 never executed
+branch 91 never executed
+branch 92 never executed
+call   93 never executed
+branch 94 never executed
+branch 95 never executed
+    #####:  300:  LatPoint &lat(unsigned l) { return latPoints[l]; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+call   12 never executed
+branch 13 never executed
+branch 14 never executed
+call   15 never executed
+    #####:  301:  SmallVector<unsigned, 16> &set(unsigned s) { return latSets[s]; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+        -:  302:
+        -:  303:#ifndef NDEBUG
+        -:  304:  /// Print methods (for debugging).
+        -:  305:  void dumpExp(unsigned e) const;
+        -:  306:  void dumpLat(unsigned p) const;
+        -:  307:  void dumpSet(unsigned s) const;
+        -:  308:  void dumpBits(const BitVector &bits) const;
+        -:  309:#endif
+        -:  310:
+        -:  311:  /// Builds the iteration lattices in a bottom-up traversal given the remaining
+        -:  312:  /// tensor (sub)expression and the next loop index in the iteration graph.
+        -:  313:  /// Returns index of the root expression.
+        -:  314:  unsigned buildLattices(unsigned e, unsigned i);
+        -:  315:
+        -:  316:  /// Builds a tensor expression from the given Linalg operation.
+        -:  317:  /// Returns index of the root expression on success.
+        -:  318:  Optional<unsigned> buildTensorExpFromLinalg(linalg::GenericOp op);
+        -:  319:
+        -:  320:  /// Rebuilds SSA format from a tensor expression.
+        -:  321:  Value buildExp(RewriterBase &rewriter, Location loc, unsigned e, Value v0,
+        -:  322:                 Value v1);
+        -:  323:
+        -:  324:private:
+        -:  325:  /// Private helpers.
+        -:  326:  bool maybeZero(unsigned e) const;
+        -:  327:  bool isInvariant(unsigned e) const;
+        -:  328:  Type inferType(unsigned e, Value src);
+        -:  329:
+        -:  330:  /// Traverses the SSA tree (possibly a DAG) to build a tensor expression.
+        -:  331:  Optional<unsigned> buildTensorExp(linalg::GenericOp op, Value v);
+        -:  332:
+        -:  333:  /// Merger data structures.
+        -:  334:  const unsigned outTensor;
+        -:  335:  const unsigned syntheticTensor;
+        -:  336:  const unsigned numTensors;
+        -:  337:  const unsigned numLoops;
+        -:  338:  bool hasSparseOut;
+        -:  339:  // Map that converts pair<tensor id, loop id> to the corresponding dimension
+        -:  340:  // level type.
+        -:  341:  std::vector<std::vector<DimLevelType>> dimTypes;
+        -:  342:  // Map that converts pair<tensor id, loop id> to the corresponding dimension.
+        -:  343:  std::vector<std::vector<Optional<unsigned>>> loopIdxToDim;
+        -:  344:  llvm::SmallVector<TensorExp, 32> tensorExps;
+        -:  345:  llvm::SmallVector<LatPoint, 16> latPoints;
+        -:  346:  llvm::SmallVector<SmallVector<unsigned, 16>, 8> latSets;
+        -:  347:};
+        -:  348:
+        -:  349:} // namespace sparse_tensor
+        -:  350:} // namespace mlir
+        -:  351:
+        -:  352:#endif // MLIR_DIALECT_SPARSETENSOR_UTILS_MERGER_H_

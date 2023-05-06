@@ -1,0 +1,1198 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Conversion/SCFToGPU/SCFToGPU.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/SCFToGPU/CMakeFiles/obj.MLIRSCFToGPU.dir/SCFToGPU.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/SCFToGPU/CMakeFiles/obj.MLIRSCFToGPU.dir/SCFToGPU.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- SCFToGPU.cpp - Convert an affine loop nest to a GPU kernel -------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This implements a straightforward conversion of an loop nest into a GPU
+        -:   10:// kernel.  The caller is expected to guarantee that the conversion is correct
+        -:   11:// or to further transform the kernel to ensure correctness.
+        -:   12://
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#include "mlir/Conversion/SCFToGPU/SCFToGPU.h"
+        -:   16:
+        -:   17:#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+        -:   18:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   19:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   20:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   21:#include "mlir/Dialect/GPU/Transforms/ParallelLoopMapper.h"
+        -:   22:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   23:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   24:#include "mlir/IR/AffineExpr.h"
+        -:   25:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   26:#include "mlir/IR/Builders.h"
+        -:   27:#include "mlir/Pass/Pass.h"
+        -:   28:#include "mlir/Transforms/DialectConversion.h"
+        -:   29:#include "mlir/Transforms/Passes.h"
+        -:   30:#include "mlir/Transforms/RegionUtils.h"
+        -:   31:#include "llvm/ADT/Sequence.h"
+        -:   32:#include "llvm/Support/Debug.h"
+        -:   33:
+        -:   34:#define DEBUG_TYPE "loops-to-gpu"
+        -:   35:
+        -:   36:using namespace mlir;
+        -:   37:using namespace mlir::scf;
+        -:   38:
+        -:   39:// Name of internal attribute to mark visited operations during conversion.
+        -:   40://
+        -:   41:// NOTE: The conversion originally used the following legality criteria:
+        -:   42://   `!parallelOp->hasAttr(gpu::getMappingAttrName())`
+        -:   43:// But the provided pattern might reject some cases based on more detailed
+        -:   44:// analysis of the `mapping` attribute.
+        -:   45:// To avoid dialect conversion failure due to non-converted illegal operation
+        -:   46:// we use this extra Unit attribute as a marker, that the operation was checked
+        -:   47:// by the pattern and is should be considered as legal in the following legality
+        -:   48:// checks. The `finalizeParallelLoopToGPUConversion` function performs clean up
+        -:   49:// of this extra attributes ans is supposed to be called after the dialect
+        -:   50:// conversion.
+        -:   51://
+        -:   52:// TODO: Implement a cleaner solution, factoring out the "matching" logic
+        -:   53:// from the pattern and its callees into a separate function that can be called
+        -:   54:// from both the pattern and the op legality check.
+        -:   55:static constexpr StringLiteral kVisitedAttrName = "SCFToGPU_visited";
+        -:   56:
+        -:   57:// Extract an indexed value from KernelDim3.
+function _ZL12getDim3ValueRKN4mlir3gpu10KernelDim3Ej called 0 returned 0% blocks executed 0%
+    #####:   58:static Value getDim3Value(const gpu::KernelDim3 &dim3, unsigned pos) {
+    #####:   59:  switch (pos) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   60:  case 0:
+    #####:   61:    return dim3.x;
+    #####:   62:  case 1:
+    #####:   63:    return dim3.y;
+    #####:   64:  case 2:
+    #####:   65:    return dim3.z;
+    #####:   66:  default:
+    #####:   67:    llvm_unreachable("dim3 position out of bounds");
+call    0 never executed
+        -:   68:  }
+        -:   69:  return nullptr;
+        -:   70:}
+        -:   71:
+        -:   72:// Get the lower bound-related operands of a loop operation.
+    #####:   73:static Operation::operand_range getLowerBoundOperands(AffineForOp forOp) {
+    #####:   74:  return forOp.getLowerBoundOperands();
+        -:   75:}
+        -:   76:
+        -:   77:// Get the upper bound-related operands of a loop operation.
+    #####:   78:static Operation::operand_range getUpperBoundOperands(AffineForOp forOp) {
+    #####:   79:  return forOp.getUpperBoundOperands();
+call    0 never executed
+        -:   80:}
+        -:   81:
+        -:   82:// Get a Value that corresponds to the loop step.  If the step is an attribute,
+        -:   83:// materialize a corresponding constant using builder.
+function _ZL15getOrCreateStepN4mlir11AffineForOpERNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:   84:static Value getOrCreateStep(AffineForOp forOp, OpBuilder &builder) {
+    #####:   85:  return builder.create<arith::ConstantIndexOp>(forOp.getLoc(),
+    #####:   86:                                                forOp.getStep());
+call    0 never executed
+call    1 never executed
+        -:   87:}
+        -:   88:
+        -:   89:// Get a Value for the loop lower bound.  If the value requires computation,
+        -:   90:// materialize the instructions using builder.
+    #####:   91:static Value getOrEmitLowerBound(AffineForOp forOp, OpBuilder &builder) {
+    #####:   92:  return lowerAffineLowerBound(forOp, builder);
+        -:   93:}
+        -:   94:
+        -:   95:// Get a Value for the loop upper bound.  If the value requires computation,
+        -:   96:// materialize the instructions using builder.
+    #####:   97:static Value getOrEmitUpperBound(AffineForOp forOp, OpBuilder &builder) {
+    #####:   98:  return lowerAffineUpperBound(forOp, builder);
+        -:   99:}
+        -:  100:
+        -:  101:// Check the structure of the loop nest:
+        -:  102://   - there are enough loops to map to numDims;
+        -:  103://   - the loops are perfectly nested;
+        -:  104://   - the loop bounds can be computed above the outermost loop.
+        -:  105:// This roughly corresponds to the "matcher" part of the pattern-based
+        -:  106:// rewriting infrastructure.
+function _ZL31checkAffineLoopNestMappableImplN4mlir11AffineForOpEj called 0 returned 0% blocks executed 0%
+    #####:  107:static LogicalResult checkAffineLoopNestMappableImpl(AffineForOp forOp,
+        -:  108:                                                     unsigned numDims) {
+    #####:  109:  Region &limit = forOp.getRegion();
+    #####:  110:  for (unsigned i = 0, e = numDims; i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  111:    Operation *nested = &forOp.getBody()->front();
+call    0 never executed
+call    1 never executed
+    #####:  112:    if (!areValuesDefinedAbove(getLowerBoundOperands(forOp), limit) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  113:        !areValuesDefinedAbove(getUpperBoundOperands(forOp), limit))
+call    0 never executed
+    #####:  114:      return forOp.emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  115:          "loops with bounds depending on other mapped loops "
+    #####:  116:          "are not supported");
+call    0 never executed
+        -:  117:
+        -:  118:    // The innermost loop can have an arbitrary body, skip the perfect nesting
+        -:  119:    // check for it.
+    #####:  120:    if (i == e - 1)
+branch  0 never executed
+branch  1 never executed
+        -:  121:      break;
+        -:  122:
+    #####:  123:    auto begin = forOp.getBody()->begin(), end = forOp.getBody()->end();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  124:    if (forOp.getBody()->empty() || std::next(begin, 2) != end)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  125:      return forOp.emitError("expected perfectly nested loops in the body");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  126:
+    #####:  127:    if (!(forOp = dyn_cast<AffineForOp>(nested)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  128:      return nested->emitError("expected a nested loop");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  129:  }
+    #####:  130:  return success();
+        -:  131:}
+        -:  132:
+function _ZL27checkAffineLoopNestMappableN4mlir11AffineForOpEjj called 0 returned 0% blocks executed 0%
+    #####:  133:static LogicalResult checkAffineLoopNestMappable(AffineForOp forOp,
+        -:  134:                                                 unsigned numBlockDims,
+        -:  135:                                                 unsigned numThreadDims) {
+    #####:  136:  if (numBlockDims < 1 || numThreadDims < 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  137:    LLVM_DEBUG(llvm::dbgs() << "nothing to map");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  138:    return success();
+        -:  139:  }
+        -:  140:
+    #####:  141:  if (numBlockDims > 3) {
+branch  0 never executed
+branch  1 never executed
+    #####:  142:    return forOp.emitError("cannot map to more than 3 block dimensions");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  143:  }
+    #####:  144:  if (numThreadDims > 3) {
+branch  0 never executed
+branch  1 never executed
+    #####:  145:    return forOp.emitError("cannot map to more than 3 thread dimensions");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  146:  }
+    #####:  147:  return checkAffineLoopNestMappableImpl(forOp, numBlockDims + numThreadDims);
+call    0 never executed
+        -:  148:}
+        -:  149:
+        -:  150:namespace {
+        -:  151:// Helper structure that holds common state of the loop to GPU kernel
+        -:  152:// conversion.
+    #####:  153:struct AffineLoopToGpuConverter {
+        -:  154:  Optional<AffineForOp> collectBounds(AffineForOp forOp, unsigned numLoops);
+        -:  155:
+        -:  156:  void createLaunch(AffineForOp rootForOp, AffineForOp innermostForOp,
+        -:  157:                    unsigned numBlockDims, unsigned numThreadDims);
+        -:  158:
+        -:  159:  // Ranges of the loops mapped to blocks or threads.
+        -:  160:  SmallVector<Value, 6> dims;
+        -:  161:  // Lower bounds of the loops mapped to blocks or threads.
+        -:  162:  SmallVector<Value, 6> lbs;
+        -:  163:  // Induction variables of the loops mapped to blocks or threads.
+        -:  164:  SmallVector<Value, 6> ivs;
+        -:  165:  // Steps of the loops mapped to blocks or threads.
+        -:  166:  SmallVector<Value, 6> steps;
+        -:  167:};
+        -:  168:} // namespace
+        -:  169:
+        -:  170:// Return true if the value is obviously a constant "one".
+function _ZL13isConstantOneN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  171:static bool isConstantOne(Value value) {
+    #####:  172:  if (auto def = value.getDefiningOp<arith::ConstantIndexOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  173:    return def.value() == 1;
+call    0 never executed
+    #####:  174:  return false;
+        -:  175:}
+        -:  176:
+        -:  177:// Collect ranges, bounds, steps and induction variables in preparation for
+        -:  178:// mapping a loop nest of depth "numLoops" rooted at "forOp" to a GPU kernel.
+        -:  179:// This may fail if the IR for computing loop bounds cannot be constructed, for
+        -:  180:// example if an affine loop uses semi-affine maps. Return the last loop to be
+        -:  181:// mapped on success, llvm::None on failure.
+        -:  182:Optional<AffineForOp>
+function _ZN12_GLOBAL__N_124AffineLoopToGpuConverter13collectBoundsEN4mlir11AffineForOpEj called 0 returned 0% blocks executed 0%
+    #####:  183:AffineLoopToGpuConverter::collectBounds(AffineForOp forOp, unsigned numLoops) {
+    #####:  184:  OpBuilder builder(forOp.getOperation());
+call    0 never executed
+    #####:  185:  dims.reserve(numLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  186:  lbs.reserve(numLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  187:  ivs.reserve(numLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  188:  steps.reserve(numLoops);
+branch  0 never executed
+branch  1 never executed
+    #####:  189:  AffineForOp currentLoop = forOp;
+    #####:  190:  for (unsigned i = 0; i < numLoops; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  191:    Value lowerBound = getOrEmitLowerBound(currentLoop, builder);
+call    0 never executed
+    #####:  192:    Value upperBound = getOrEmitUpperBound(currentLoop, builder);
+call    0 never executed
+    #####:  193:    if (!lowerBound || !upperBound) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  194:      return llvm::None;
+        -:  195:    }
+        -:  196:
+    #####:  197:    Value range = builder.create<arith::SubIOp>(currentLoop.getLoc(),
+    #####:  198:                                                upperBound, lowerBound);
+call    0 never executed
+call    1 never executed
+    #####:  199:    Value step = getOrCreateStep(currentLoop, builder);
+call    0 never executed
+    #####:  200:    if (!isConstantOne(step))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  201:      range = builder.create<arith::DivSIOp>(currentLoop.getLoc(), range, step);
+call    0 never executed
+    #####:  202:    dims.push_back(range);
+call    0 never executed
+        -:  203:
+    #####:  204:    lbs.push_back(lowerBound);
+call    0 never executed
+    #####:  205:    ivs.push_back(currentLoop.getInductionVar());
+call    0 never executed
+call    1 never executed
+    #####:  206:    steps.push_back(step);
+call    0 never executed
+        -:  207:
+    #####:  208:    if (i != numLoops - 1)
+branch  0 never executed
+branch  1 never executed
+    #####:  209:      currentLoop = cast<AffineForOp>(&currentLoop.getBody()->front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  210:  }
+    #####:  211:  return currentLoop;
+        -:  212:}
+        -:  213:
+        -:  214:// Replace the rooted at "rootForOp" with a GPU launch operation.  This expects
+        -:  215:// "innermostForOp" to point to the last loop to be transformed to the kernel,
+        -:  216:// and to have (numBlockDims + numThreadDims) perfectly nested loops between
+        -:  217:// "rootForOp" and "innermostForOp".
+function _ZN12_GLOBAL__N_124AffineLoopToGpuConverter12createLaunchEN4mlir11AffineForOpES2_jj called 0 returned 0% blocks executed 0%
+    #####:  218:void AffineLoopToGpuConverter::createLaunch(AffineForOp rootForOp,
+        -:  219:                                            AffineForOp innermostForOp,
+        -:  220:                                            unsigned numBlockDims,
+        -:  221:                                            unsigned numThreadDims) {
+    #####:  222:  OpBuilder builder(rootForOp.getOperation());
+call    0 never executed
+        -:  223:  // Prepare the grid and block sizes for the launch operation.  If there is
+        -:  224:  // no loop mapped to a specific dimension, use constant "1" as its size.
+    #####:  225:  Value constOne =
+    #####:  226:      (numBlockDims < 3 || numThreadDims < 3)
+    #####:  227:          ? builder.create<arith::ConstantIndexOp>(rootForOp.getLoc(), 1)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  228:          : nullptr;
+    #####:  229:  Value gridSizeX = numBlockDims > 0 ? dims[0] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  230:  Value gridSizeY = numBlockDims > 1 ? dims[1] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  231:  Value gridSizeZ = numBlockDims > 2 ? dims[2] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  232:  Value blockSizeX = numThreadDims > 0 ? dims[numBlockDims] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  233:  Value blockSizeY = numThreadDims > 1 ? dims[numBlockDims + 1] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  234:  Value blockSizeZ = numThreadDims > 2 ? dims[numBlockDims + 2] : constOne;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  235:
+        -:  236:  // Create a launch op and move the body region of the innermost loop to the
+        -:  237:  // launch op.
+    #####:  238:  auto launchOp = builder.create<gpu::LaunchOp>(
+        -:  239:      rootForOp.getLoc(), gridSizeX, gridSizeY, gridSizeZ, blockSizeX,
+    #####:  240:      blockSizeY, blockSizeZ);
+call    0 never executed
+        -:  241:
+        -:  242:  // Replace the loop terminator (loops contain only a single block) with the
+        -:  243:  // gpu terminator and move the operations from the loop body block to the gpu
+        -:  244:  // launch body block.  Do not move the entire block because of the difference
+        -:  245:  // in block arguments.
+    #####:  246:  Operation &terminator = innermostForOp.getBody()->back();
+call    0 never executed
+call    1 never executed
+    #####:  247:  Location terminatorLoc = terminator.getLoc();
+call    0 never executed
+    #####:  248:  terminator.erase();
+call    0 never executed
+    #####:  249:  builder.setInsertionPointToEnd(innermostForOp.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  250:  builder.create<gpu::TerminatorOp>(terminatorLoc, llvm::None);
+call    0 never executed
+    #####:  251:  launchOp.getBody().front().getOperations().splice(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  252:      launchOp.getBody().front().begin(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  253:      innermostForOp.getBody()->getOperations());
+call    0 never executed
+call    1 never executed
+        -:  254:
+        -:  255:  // Remap the loop iterators to use block/thread identifiers instead.  Loops
+        -:  256:  // may iterate from LB with step S whereas GPU thread/block ids always iterate
+        -:  257:  // from 0 to N with step 1.  Therefore, loop induction variables are replaced
+        -:  258:  // with (gpu-thread/block-id * S) + LB.
+    #####:  259:  builder.setInsertionPointToStart(&launchOp.getBody().front());
+call    0 never executed
+call    1 never executed
+    #####:  260:  auto *lbArgumentIt = lbs.begin();
+    #####:  261:  auto *stepArgumentIt = steps.begin();
+    #####:  262:  for (const auto &en : llvm::enumerate(ivs)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  263:    Value id =
+    #####:  264:        en.index() < numBlockDims
+branch  0 never executed
+branch  1 never executed
+    #####:  265:            ? getDim3Value(launchOp.getBlockIds(), en.index())
+call    0 never executed
+call    1 never executed
+    #####:  266:            : getDim3Value(launchOp.getThreadIds(), en.index() - numBlockDims);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  267:    Value step = steps[en.index()];
+branch  0 never executed
+branch  1 never executed
+    #####:  268:    if (!isConstantOne(step))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  269:      id = builder.create<arith::MulIOp>(rootForOp.getLoc(), step, id);
+call    0 never executed
+        -:  270:
+    #####:  271:    Value ivReplacement =
+    #####:  272:        builder.create<arith::AddIOp>(rootForOp.getLoc(), *lbArgumentIt, id);
+call    0 never executed
+call    1 never executed
+    #####:  273:    en.value().replaceAllUsesWith(ivReplacement);
+call    0 never executed
+    #####:  274:    std::advance(lbArgumentIt, 1);
+call    0 never executed
+    #####:  275:    std::advance(stepArgumentIt, 1);
+call    0 never executed
+        -:  276:  }
+        -:  277:
+        -:  278:  // We are done and can erase the original outermost loop.
+    #####:  279:  rootForOp.erase();
+call    0 never executed
+    #####:  280:}
+        -:  281:
+        -:  282:// Generic loop to GPU kernel conversion function.
+function _ZL32convertAffineLoopNestToGPULaunchN4mlir11AffineForOpEjj called 0 returned 0% blocks executed 0%
+    #####:  283:static LogicalResult convertAffineLoopNestToGPULaunch(AffineForOp forOp,
+        -:  284:                                                      unsigned numBlockDims,
+        -:  285:                                                      unsigned numThreadDims) {
+    #####:  286:  if (failed(checkAffineLoopNestMappable(forOp, numBlockDims, numThreadDims)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  287:    return failure();
+        -:  288:
+    #####:  289:  AffineLoopToGpuConverter converter;
+call    0 never executed
+    #####:  290:  auto maybeInnerLoop =
+    #####:  291:      converter.collectBounds(forOp, numBlockDims + numThreadDims);
+call    0 never executed
+    #####:  292:  if (!maybeInnerLoop)
+branch  0 never executed
+branch  1 never executed
+    #####:  293:    return failure();
+    #####:  294:  converter.createLaunch(forOp, *maybeInnerLoop, numBlockDims, numThreadDims);
+call    0 never executed
+        -:  295:
+    #####:  296:  return success();
+call    0 never executed
+        -:  297:}
+        -:  298:
+function _ZN4mlir32convertAffineLoopNestToGPULaunchENS_11AffineForOpEjj called 0 returned 0% blocks executed 0%
+    #####:  299:LogicalResult mlir::convertAffineLoopNestToGPULaunch(AffineForOp forOp,
+        -:  300:                                                     unsigned numBlockDims,
+        -:  301:                                                     unsigned numThreadDims) {
+    #####:  302:  return ::convertAffineLoopNestToGPULaunch(forOp, numBlockDims, numThreadDims);
+call    0 never executed
+        -:  303:}
+        -:  304:
+        -:  305:namespace {
+        -:  306:struct ParallelToGpuLaunchLowering : public OpRewritePattern<ParallelOp> {
+        -:  307:  using OpRewritePattern<ParallelOp>::OpRewritePattern;
+        -:  308:
+        -:  309:  LogicalResult matchAndRewrite(ParallelOp parallelOp,
+        -:  310:                                PatternRewriter &rewriter) const override;
+        -:  311:};
+        -:  312:} // namespace
+        -:  313:
+        -:  314:/// Tries to derive a static upper bound from the defining operation of
+        -:  315:/// `upperBound`.
+function _ZL22deriveStaticUpperBoundN4mlir5ValueERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  316:static Value deriveStaticUpperBound(Value upperBound,
+        -:  317:                                    PatternRewriter &rewriter) {
+    #####:  318:  if (auto op = upperBound.getDefiningOp<arith::ConstantIndexOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  319:    return op;
+        -:  320:  }
+        -:  321:
+    #####:  322:  if (auto minOp = upperBound.getDefiningOp<AffineMinOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  323:    for (const AffineExpr &result : minOp.getMap().getResults()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  324:      if (auto constExpr = result.dyn_cast<AffineConstantExpr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  325:        return rewriter.create<arith::ConstantIndexOp>(minOp.getLoc(),
+    #####:  326:                                                       constExpr.getValue());
+call    0 never executed
+call    1 never executed
+        -:  327:      }
+        -:  328:    }
+        -:  329:  }
+        -:  330:
+    #####:  331:  if (auto minOp = upperBound.getDefiningOp<arith::MinSIOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  332:    for (Value operand : {minOp.getLhs(), minOp.getRhs()}) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  333:      if (auto staticBound = deriveStaticUpperBound(operand, rewriter))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  334:        return staticBound;
+        -:  335:    }
+        -:  336:  }
+        -:  337:
+    #####:  338:  if (auto multiplyOp = upperBound.getDefiningOp<arith::MulIOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  339:    if (auto lhs = dyn_cast_or_null<arith::ConstantIndexOp>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  340:            deriveStaticUpperBound(multiplyOp.getOperand(0), rewriter)
+call    0 never executed
+    #####:  341:                .getDefiningOp()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  342:      if (auto rhs = dyn_cast_or_null<arith::ConstantIndexOp>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  343:              deriveStaticUpperBound(multiplyOp.getOperand(1), rewriter)
+call    0 never executed
+    #####:  344:                  .getDefiningOp())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  345:        // Assumptions about the upper bound of minimum computations no longer
+        -:  346:        // work if multiplied by mixed signs, so abort in this case.
+    #####:  347:        if ((lhs.value() < 0) != (rhs.value() < 0))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  348:          return {};
+        -:  349:
+    #####:  350:        return rewriter.create<arith::ConstantIndexOp>(
+    #####:  351:            multiplyOp.getLoc(), lhs.value() * rhs.value());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  352:      }
+        -:  353:  }
+        -:  354:
+    #####:  355:  return {};
+        -:  356:}
+        -:  357:
+        1:  358:static bool isMappedToProcessor(gpu::Processor processor) {
+        1:  359:  return processor != gpu::Processor::Sequential;
+        -:  360:}
+        -:  361:
+        2:  362:static unsigned getLaunchOpArgumentNum(gpu::Processor processor) {
+        1:  363:  switch (processor) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  364:  case gpu::Processor::BlockX:
+        -:  365:    return 0;
+        -:  366:  case gpu::Processor::BlockY:
+        -:  367:    return 1;
+        -:  368:  case gpu::Processor::BlockZ:
+        -:  369:    return 2;
+        -:  370:  case gpu::Processor::ThreadX:
+        -:  371:    return 3;
+        -:  372:  case gpu::Processor::ThreadY:
+        -:  373:    return 4;
+        -:  374:  case gpu::Processor::ThreadZ:
+        -:  375:    return 5;
+    #####:  376:  default:;
+        -:  377:  }
+    #####:  378:  llvm_unreachable(
+call    0 never executed
+call    1 never executed
+        -:  379:      "invalid processor type while retrieving launch op argument number");
+        -:  380:}
+        -:  381:
+        -:  382:/// Modifies the current transformation state to capture the effect of the given
+        -:  383:/// `scf.parallel` operation on index substitutions and the operations to be
+        -:  384:/// inserted.
+        -:  385:/// Specifically, if a dimension of a parallel loop is mapped to a hardware id,
+        -:  386:/// this function will
+        -:  387:/// - compute the loop index based on the hardware id and affine map from the
+        -:  388:///   mapping and update `cloningMap` to substitute all uses.
+        -:  389:/// - derive a new upper bound for the hardware id and augment the provided
+        -:  390:///   `gpu.launch operation` accordingly.
+        -:  391:/// - if the upper bound is imprecise, insert a conditional in the `gpu.launch`
+        -:  392:///   and update the rewriter to insert into the conditional's body.
+        -:  393:/// If the dimension is mapped to sequential,
+        -:  394:/// - insert a for loop into the body and update the rewriter to insert into
+        -:  395:///   the for loop's body.
+        -:  396:/// - update the `cloningMap` to replace uses of the index with the index of
+        -:  397:///   the new for loop.
+        -:  398:/// In either case,
+        -:  399:/// - append the instructions from the loops body to worklist, in reverse order.
+        -:  400:/// To note the end of the current scope in case a loop or conditional was
+        -:  401:/// inserted, a sentinel (the `gpu.launch` operation) is inserted into the
+        -:  402:/// worklist. This signals the processor of the worklist to pop the rewriter
+        -:  403:/// one scope-level up.
+function _ZL19processParallelLoopN4mlir3scf10ParallelOpENS_3gpu8LaunchOpERNS_20BlockAndValueMappingERN4llvm15SmallVectorImplIPNS_9OperationEEERNS6_8DenseMapINS2_9ProcessorENS_5ValueENS6_12DenseMapInfoISD_vEENS6_6detail12DenseMapPairISD_SE_EEEERNS_15PatternRewriterE called 2 returned 100% blocks executed 64%
+        2:  404:static LogicalResult processParallelLoop(
+        -:  405:    ParallelOp parallelOp, gpu::LaunchOp launchOp,
+        -:  406:    BlockAndValueMapping &cloningMap, SmallVectorImpl<Operation *> &worklist,
+        -:  407:    DenseMap<gpu::Processor, Value> &bounds, PatternRewriter &rewriter) {
+        -:  408:  // TODO: Verify that this is a valid GPU mapping.
+        -:  409:  // processor ids: 0-2 block [x/y/z], 3-5 -> thread [x/y/z], 6-> sequential
+        2:  410:  ArrayAttr mapping =
+        2:  411:      parallelOp->getAttrOfType<ArrayAttr>(gpu::getMappingAttrName());
+call    0 returned 100%
+call    1 returned 100%
+        -:  412:
+        -:  413:  // TODO: Support reductions.
+        2:  414:  if (!mapping || parallelOp.getNumResults() != 0)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+        1:  415:    return failure();
+        -:  416:
+        1:  417:  Location loc = parallelOp.getLoc();
+call    0 returned 100%
+        -:  418:
+function _ZZL19processParallelLoopN4mlir3scf10ParallelOpENS_3gpu8LaunchOpERNS_20BlockAndValueMappingERN4llvm15SmallVectorImplIPNS_9OperationEEERNS6_8DenseMapINS2_9ProcessorENS_5ValueENS6_12DenseMapInfoISD_vEENS6_6detail12DenseMapPairISD_SE_EEEERNS_15PatternRewriterEENKUlSE_E_clESE_.isra.0 called 6 returned 100% blocks executed 67%
+        6:  419:  auto launchIndependent = [&launchOp](Value val) {
+       12:  420:    return val.getParentRegion()->isAncestor(launchOp->getParentRegion());
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+        1:  421:  };
+        -:  422:
+function _ZZL19processParallelLoopN4mlir3scf10ParallelOpENS_3gpu8LaunchOpERNS_20BlockAndValueMappingERN4llvm15SmallVectorImplIPNS_9OperationEEERNS6_8DenseMapINS2_9ProcessorENS_5ValueENS6_12DenseMapInfoISD_vEENS6_6detail12DenseMapPairISD_SE_EEEERNS_15PatternRewriterEENKUlSE_E0_clESE_ called 3 returned 100% blocks executed 40%
+        4:  423:  auto ensureLaunchIndependent = [&rewriter,
+    #####:  424:                                  launchIndependent](Value val) -> Value {
+        3:  425:    if (launchIndependent(val))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        3:  426:      return val;
+    #####:  427:    if (auto constOp = val.getDefiningOp<arith::ConstantOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  428:      return rewriter.create<arith::ConstantOp>(constOp.getLoc(),
+    #####:  429:                                                constOp.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  430:    return {};
+        1:  431:  };
+        -:  432:
+        2:  433:  for (auto config : llvm::zip(
+        1:  434:           mapping, parallelOp.getInductionVars(), parallelOp.getLowerBound(),
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        3:  435:           parallelOp.getUpperBound(), parallelOp.getStep())) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 50% (fallthrough)
+branch  5 taken 50%
+        1:  436:    Attribute mappingAttribute;
+        1:  437:    Value iv, lowerBound, upperBound, step;
+        1:  438:    std::tie(mappingAttribute, iv, lowerBound, upperBound, step) = config;
+call    0 returned 100%
+        1:  439:    auto annotation =
+call    0 returned 100%
+        1:  440:        mappingAttribute.dyn_cast<gpu::ParallelLoopDimMappingAttr>();
+        1:  441:    if (!annotation)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  442:      return parallelOp.emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  443:             << "expected mapping attribute for lowering to GPU";
+call    0 never executed
+        1:  444:    Value newIndex;
+        1:  445:    gpu::Processor processor = annotation.getProcessor();
+call    0 returned 100%
+        -:  446:
+        1:  447:    if (isMappedToProcessor(processor)) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  448:      // Use the corresponding thread/grid index as replacement for the loop iv.
+        1:  449:      Value operand =
+        1:  450:          launchOp.getBody().getArgument(getLaunchOpArgumentNum(processor));
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+call    3 returned 100%
+        -:  451:      // Take the indexmap and add the lower bound and step computations in.
+        -:  452:      // This computes operand * step + lowerBound.
+        -:  453:      // Use an affine map here so that it composes nicely with the provided
+        -:  454:      // annotation.
+        1:  455:      AffineMap lowerAndStep = AffineMap::get(
+        -:  456:          1, 2,
+        1:  457:          rewriter.getAffineDimExpr(0) * rewriter.getAffineSymbolExpr(0) +
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        2:  458:              rewriter.getAffineSymbolExpr(1));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        2:  459:      newIndex = rewriter.create<AffineApplyOp>(
+        1:  460:          loc, annotation.getMap().compose(lowerAndStep),
+call    0 returned 100%
+        2:  461:          ValueRange{operand, step, lowerBound});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  462:      // If there was also a bound, insert that, too.
+        -:  463:      // TODO: Check that we do not assign bounds twice.
+        1:  464:      if (annotation.getBound()) {
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0%
+        -:  465:        // We pass as the single operand to the bound-map the number of
+        -:  466:        // iterations, which is (upperBound - lowerBound) ceilDiv step. To
+        -:  467:        // support inner loops with dynamic upper bounds (as generated by e.g.
+        -:  468:        // tiling), try to derive a max for the bounds. If the used bound for
+        -:  469:        // the hardware id is imprecise, wrap the contained code into a
+        -:  470:        // conditional. If the lower-bound is constant or defined before the
+        -:  471:        // launch, we can use it in the launch bounds. Otherwise fail.
+       1*:  472:        if (!launchIndependent(lowerBound) &&
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+branch  3 never executed
+branch  4 never executed
+    #####:  473:            !isa_and_nonnull<arith::ConstantOp>(lowerBound.getDefiningOp()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  474:          return failure();
+        -:  475:        // The step must also be constant or defined outside of the loop nest.
+       1*:  476:        if (!launchIndependent(step) &&
+call    0 returned 100%
+branch  1 taken 0%
+branch  2 taken 100%
+branch  3 never executed
+branch  4 never executed
+    #####:  477:            !isa_and_nonnull<arith::ConstantOp>(step.getDefiningOp()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  478:          return failure();
+        -:  479:        // If the upper-bound is constant or defined before the launch, we can
+        -:  480:        // use it in the launch bounds directly. Otherwise try derive a bound.
+        1:  481:        bool boundIsPrecise =
+       1*:  482:            launchIndependent(upperBound) ||
+call    0 returned 100%
+branch  1 taken 0%
+branch  2 taken 100%
+branch  3 never executed
+branch  4 never executed
+    #####:  483:            isa_and_nonnull<arith::ConstantOp>(upperBound.getDefiningOp());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        1:  484:        {
+        1:  485:          PatternRewriter::InsertionGuard guard(rewriter);
+call    0 returned 100%
+        1:  486:          rewriter.setInsertionPoint(launchOp);
+call    0 returned 100%
+        1:  487:          if (!boundIsPrecise) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  488:            upperBound = deriveStaticUpperBound(upperBound, rewriter);
+call    0 never executed
+    #####:  489:            if (!upperBound) {
+branch  0 never executed
+branch  1 never executed
+    #####:  490:              return rewriter.notifyMatchFailure(
+        -:  491:                  parallelOp,
+        -:  492:                  "cannot derive loop-invariant upper bound for number of"
+    #####:  493:                  "iterations");
+call    0 never executed
+        -:  494:            }
+        -:  495:          }
+        -:  496:          // Compute the number of iterations needed. We compute this as an
+        -:  497:          // affine expression ceilDiv (upperBound - lowerBound) step. We use
+        -:  498:          // affine.apply here so that it composes nicely with the provided map.
+        1:  499:          AffineMap stepMap = AffineMap::get(
+        -:  500:              1, 2,
+        1:  501:              ((rewriter.getAffineDimExpr(0) - rewriter.getAffineSymbolExpr(0))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        1:  502:                   .ceilDiv(rewriter.getAffineSymbolExpr(1))));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        2:  503:          Value launchBound = rewriter.create<AffineApplyOp>(
+        1:  504:              loc, annotation.getBound().compose(stepMap),
+call    0 returned 100%
+        1:  505:              ValueRange{
+call    0 returned 100%
+call    1 returned 100%
+        -:  506:                  ensureLaunchIndependent(
+        1:  507:                      cloningMap.lookupOrDefault(upperBound)),
+call    0 returned 100%
+call    1 returned 100%
+        -:  508:                  ensureLaunchIndependent(
+        1:  509:                      cloningMap.lookupOrDefault(lowerBound)),
+call    0 returned 100%
+call    1 returned 100%
+        3:  510:                  ensureLaunchIndependent(cloningMap.lookupOrDefault(step))});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  511:          // todo(herhut,ravishankarm): Update the behavior of setMappingAttr
+        -:  512:          // when this condition is relaxed.
+        1:  513:          if (bounds.find(processor) != bounds.end()) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  514:            return rewriter.notifyMatchFailure(
+    #####:  515:                parallelOp, "cannot redefine the bound for processor " +
+    #####:  516:                                Twine(static_cast<int64_t>(processor)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  517:          }
+        1:  518:          bounds[processor] = launchBound;
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  519:        }
+        1:  520:        if (!boundIsPrecise) {
+branch  0 taken 0%
+branch  1 taken 100%
+        -:  521:          // We are using an approximation, create a surrounding conditional.
+    #####:  522:          Value originalBound = std::get<3>(config);
+call    0 never executed
+    #####:  523:          arith::CmpIOp pred = rewriter.create<arith::CmpIOp>(
+    #####:  524:              loc, arith::CmpIPredicate::slt, newIndex,
+    #####:  525:              cloningMap.lookupOrDefault(originalBound));
+call    0 never executed
+call    1 never executed
+    #####:  526:          scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, pred, false);
+call    0 never executed
+    #####:  527:          rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  528:          // Put a sentinel into the worklist so we know when to pop out of the
+        -:  529:          // if body again. We use the launchOp here, as that cannot be part of
+        -:  530:          // the bodies instruction.
+    #####:  531:          worklist.push_back(launchOp.getOperation());
+call    0 never executed
+        -:  532:        }
+        -:  533:      }
+        -:  534:    } else {
+        -:  535:      // Create a sequential for loop.
+    #####:  536:      auto loopOp = rewriter.create<scf::ForOp>(
+    #####:  537:          loc, cloningMap.lookupOrDefault(lowerBound),
+    #####:  538:          cloningMap.lookupOrDefault(upperBound),
+call    0 never executed
+    #####:  539:          cloningMap.lookupOrDefault(step));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  540:      newIndex = loopOp.getInductionVar();
+call    0 never executed
+    #####:  541:      rewriter.setInsertionPointToStart(loopOp.getBody());
+call    0 never executed
+call    1 never executed
+        -:  542:      // Put a sentinel into the worklist so we know when to pop out of the loop
+        -:  543:      // body again. We use the launchOp here, as that cannot be part of the
+        -:  544:      // bodies instruction.
+    #####:  545:      worklist.push_back(launchOp.getOperation());
+call    0 never executed
+        -:  546:    }
+        1:  547:    cloningMap.map(iv, newIndex);
+call    0 returned 100%
+        -:  548:  }
+        -:  549:
+        -:  550:  // Propagate custom user defined optional attributes, that can be used at
+        -:  551:  // later stage, such as extension data for GPU kernel dispatch
+        4:  552:  for (const auto &namedAttr : parallelOp->getAttrs()) {
+call    0 returned 100%
+branch  1 taken 75% (fallthrough)
+branch  2 taken 25%
+        5:  553:    if (namedAttr.getName() == gpu::getMappingAttrName() ||
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 67% (fallthrough)
+branch  4 taken 33%
+branch  5 taken 50% (fallthrough)
+branch  6 taken 50%
+        2:  554:        namedAttr.getName() == ParallelOp::getOperandSegmentSizeAttr())
+call    0 returned 100%
+call    1 returned 100%
+        2:  555:      continue;
+        1:  556:    launchOp->setAttr(namedAttr.getName(), namedAttr.getValue());
+call    0 returned 100%
+call    1 returned 100%
+        -:  557:  }
+        -:  558:
+        1:  559:  Block *body = parallelOp.getBody();
+call    0 returned 100%
+        2:  560:  worklist.reserve(worklist.size() + body->getOperations().size());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        3:  561:  for (Operation &op : llvm::reverse(body->without_terminator()))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+        1:  562:    worklist.push_back(&op);
+call    0 returned 100%
+        1:  563:  return success();
+        -:  564:}
+        -:  565:
+        -:  566:/// Lower a `scf.parallel` operation into a corresponding `gpu.launch`
+        -:  567:/// operation.
+        -:  568:///
+        -:  569:/// This essentially transforms a loop nest into a corresponding SIMT function.
+        -:  570:/// The conversion is driven by mapping annotations on the `scf.parallel`
+        -:  571:/// operations. The mapping is provided via a `DictionaryAttribute` named
+        -:  572:/// `mapping`, which has three entries:
+        -:  573:///  - processor: the hardware id to map to. 0-2 are block dimensions, 3-5 are
+        -:  574:///               thread dimensions and 6 is sequential.
+        -:  575:///  - map : An affine map that is used to pre-process hardware ids before
+        -:  576:///          substitution.
+        -:  577:///  - bound : An affine map that is used to compute the bound of the hardware
+        -:  578:///            id based on an upper bound of the number of iterations.
+        -:  579:/// If the `scf.parallel` contains nested `scf.parallel` operations, those
+        -:  580:/// need to be annotated, as well. Structurally, the transformation works by
+        -:  581:/// splicing all operations from nested `scf.parallel` operations into a single
+        -:  582:/// sequence. Indices mapped to hardware ids are substituted with those ids,
+        -:  583:/// wheras sequential mappings result in a sequential for-loop. To have more
+        -:  584:/// flexibility when mapping code to hardware ids, the transform supports two
+        -:  585:/// affine maps. The first `map` is used to compute the actual index for
+        -:  586:/// substitution from the hardware id. The second `bound` is used to compute the
+        -:  587:/// launch dimension for the hardware id from the number of iterations the
+        -:  588:/// mapped loop is performing. Note that the number of iterations might be
+        -:  589:/// imprecise if the corresponding loop-bounds are loop-dependent. In such case,
+        -:  590:/// the hardware id might iterate over additional indices. The transformation
+        -:  591:/// caters for this by predicating the created sequence of instructions on
+        -:  592:/// the actual loop bound. This only works if an static upper bound for the
+        -:  593:/// dynamic loop bound can be derived, currently via analyzing `affine.min`
+        -:  594:/// operations.
+        -:  595:LogicalResult
+function _ZNK12_GLOBAL__N_127ParallelToGpuLaunchLowering15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterE called 2 returned 100% blocks executed 77%
+        2:  596:ParallelToGpuLaunchLowering::matchAndRewrite(ParallelOp parallelOp,
+        -:  597:                                             PatternRewriter &rewriter) const {
+        -:  598:  // Mark the operation as visited for recursive legality check.
+        2:  599:  parallelOp->setAttr(kVisitedAttrName, rewriter.getUnitAttr());
+call    0 returned 100%
+call    1 returned 100%
+        -:  600:
+        -:  601:  // We can only transform starting at the outer-most loop. Launches inside of
+        -:  602:  // parallel loops are not supported.
+        2:  603:  if (auto parentLoop = parallelOp->getParentOfType<ParallelOp>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  604:    return failure();
+        -:  605:  // Create a launch operation. We start with bound one for all grid/block
+        -:  606:  // sizes. Those will be refined later as we discover them from mappings.
+        2:  607:  Location loc = parallelOp.getLoc();
+call    0 returned 100%
+        2:  608:  Value constantOne =
+        2:  609:      rewriter.create<arith::ConstantIndexOp>(parallelOp.getLoc(), 1);
+call    0 returned 100%
+call    1 returned 100%
+        2:  610:  gpu::LaunchOp launchOp = rewriter.create<gpu::LaunchOp>(
+        -:  611:      parallelOp.getLoc(), constantOne, constantOne, constantOne, constantOne,
+        2:  612:      constantOne, constantOne);
+call    0 returned 100%
+        2:  613:  rewriter.setInsertionPointToEnd(&launchOp.getBody().front());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        2:  614:  rewriter.create<gpu::TerminatorOp>(loc);
+call    0 returned 100%
+        2:  615:  rewriter.setInsertionPointToStart(&launchOp.getBody().front());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  616:
+        2:  617:  BlockAndValueMapping cloningMap;
+call    0 returned 100%
+        4:  618:  llvm::DenseMap<gpu::Processor, Value> launchBounds;
+call    0 returned 100%
+call    1 returned 100%
+        4:  619:  SmallVector<Operation *, 16> worklist;
+call    0 returned 100%
+call    1 returned 100%
+        2:  620:  if (failed(processParallelLoop(parallelOp, launchOp, cloningMap, worklist,
+call    0 returned 100%
+branch  1 taken 50% (fallthrough)
+branch  2 taken 50%
+        -:  621:                                 launchBounds, rewriter)))
+        1:  622:    return failure();
+        -:  623:
+        -:  624:  // Whether we have seen any side-effects. Reset when leaving an inner scope.
+        -:  625:  bool seenSideeffects = false;
+        -:  626:  // Whether we have left a nesting scope (and hence are no longer innermost).
+        -:  627:  bool leftNestingScope = false;
+        2:  628:  while (!worklist.empty()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+        1:  629:    Operation *op = worklist.pop_back_val();
+call    0 returned 100%
+        -:  630:    // Now walk over the body and clone it.
+        -:  631:    // TODO: This is only correct if there either is no further scf.parallel
+        -:  632:    //       nested or this code is side-effect free. Otherwise we might need
+        -:  633:    //       predication. We are overly conservative for now and only allow
+        -:  634:    //       side-effects in the innermost scope.
+        1:  635:    if (auto nestedParallel = dyn_cast<ParallelOp>(op)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  636:      // Before entering a nested scope, make sure there have been no
+        -:  637:      // sideeffects until now.
+    #####:  638:      if (seenSideeffects)
+branch  0 never executed
+branch  1 never executed
+    #####:  639:        return failure();
+        -:  640:      // A nested scf.parallel needs insertion of code to compute indices.
+        -:  641:      // Insert that now. This will also update the worklist with the loops
+        -:  642:      // body.
+    #####:  643:      if (failed(processParallelLoop(nestedParallel, launchOp, cloningMap,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  644:                                     worklist, launchBounds, rewriter)))
+    #####:  645:        return failure();
+        1:  646:    } else if (op == launchOp.getOperation()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  647:      // Found our sentinel value. We have finished the operations from one
+        -:  648:      // nesting level, pop one level back up.
+    #####:  649:      auto *parent = rewriter.getInsertionPoint()->getParentOp();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  650:      rewriter.setInsertionPointAfter(parent);
+call    0 never executed
+    #####:  651:      leftNestingScope = true;
+    #####:  652:      seenSideeffects = false;
+        -:  653:    } else {
+        -:  654:      // Otherwise we copy it over.
+        1:  655:      Operation *clone = rewriter.clone(*op, cloningMap);
+call    0 returned 100%
+        3:  656:      cloningMap.map(op->getResults(), clone->getResults());
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+call    4 returned 100%
+        -:  657:      // Check for side effects.
+        -:  658:      // TODO: Handle region side effects properly.
+        1:  659:      seenSideeffects |= !MemoryEffectOpInterface::hasNoEffect(clone) ||
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        1:  660:                         clone->getNumRegions() != 0;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  661:      // If we are no longer in the innermost scope, sideeffects are disallowed.
+        1:  662:      if (seenSideeffects && leftNestingScope)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  663:        return failure();
+        -:  664:    }
+        -:  665:  }
+        -:  666:
+        -:  667:  // Now that we succeeded creating the launch operation, also update the
+        -:  668:  // bounds.
+        3:  669:  for (auto bound : launchBounds)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 50% (fallthrough)
+branch  4 taken 50%
+call    5 returned 100%
+        1:  670:    launchOp.setOperand(getLaunchOpArgumentNum(std::get<0>(bound)),
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+call    3 returned 100%
+        1:  671:                        std::get<1>(bound));
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  672:
+        1:  673:  rewriter.eraseOp(parallelOp);
+call    0 returned 100%
+        2:  674:  return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  675:}
+        -:  676:
+function _ZN4mlir33populateParallelLoopToGPUPatternsERNS_17RewritePatternSetE called 432 returned 100% blocks executed 100%
+      432:  677:void mlir::populateParallelLoopToGPUPatterns(RewritePatternSet &patterns) {
+      432:  678:  patterns.add<ParallelToGpuLaunchLowering>(patterns.getContext());
+call    0 returned 100%
+      432:  679:}
+        -:  680:
+function _ZN4mlir34configureParallelLoopToGPULegalityERNS_16ConversionTargetE called 432 returned 100% blocks executed 100%
+      432:  681:void mlir::configureParallelLoopToGPULegality(ConversionTarget &target) {
+      432:  682:  target.addLegalDialect<memref::MemRefDialect>();
+call    0 returned 100%
+function _ZZN4mlir34configureParallelLoopToGPULegalityERNS_16ConversionTargetEENKUlNS_3scf10ParallelOpEE_clES3_.isra.0 called 1699 returned 100% blocks executed 100%
+     2131:  683:  target.addDynamicallyLegalOp<scf::ParallelOp>([](scf::ParallelOp parallelOp) {
+call    0 returned 100%
+     1699:  684:    return !parallelOp->hasAttr(gpu::getMappingAttrName()) ||
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+        5:  685:           parallelOp->hasAttr(kVisitedAttrName);
+call    0 returned 100%
+branch  1 taken 20% (fallthrough)
+branch  2 taken 80%
+        -:  686:  });
+      432:  687:}
+        -:  688:
+function _ZN4mlir35finalizeParallelLoopToGPUConversionEPNS_9OperationE called 432 returned 100% blocks executed 100%
+      432:  689:void mlir::finalizeParallelLoopToGPUConversion(Operation *op) {
+      432:  690:  op->walk([](scf::ParallelOp parallelOp) {
+call    0 returned 100%
+      848:  691:    parallelOp->removeAttr(kVisitedAttrName);
+call    0 returned 100%
+        -:  692:  });
+      432:  693:}

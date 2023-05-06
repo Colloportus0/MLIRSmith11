@@ -1,0 +1,470 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/LLVMIR/IR/TypeDetail.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMDialect.dir/IR/LLVMTypes.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMDialect.dir/IR/LLVMTypes.cpp.gcda
+        -:    0:Runs:325549
+        -:    1://===- TypeDetail.h - Details of MLIR LLVM dialect types --------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file contains implementation details, such as storage structures, of
+        -:   10:// MLIR LLVM dialect types.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef DIALECT_LLVMIR_IR_TYPEDETAIL_H
+        -:   15:#define DIALECT_LLVMIR_IR_TYPEDETAIL_H
+        -:   16:
+        -:   17:#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+        -:   18:#include "mlir/IR/TypeSupport.h"
+        -:   19:#include "mlir/IR/Types.h"
+        -:   20:
+        -:   21:#include "llvm/ADT/Bitfields.h"
+        -:   22:#include "llvm/ADT/PointerIntPair.h"
+        -:   23:
+        -:   24:namespace mlir {
+        -:   25:namespace LLVM {
+        -:   26:namespace detail {
+        -:   27:
+        -:   28://===----------------------------------------------------------------------===//
+        -:   29:// LLVMStructTypeStorage.
+        -:   30://===----------------------------------------------------------------------===//
+        -:   31:
+        -:   32:/// Type storage for LLVM structure types.
+        -:   33:///
+        -:   34:/// Structures are uniqued using:
+        -:   35:/// - a bit indicating whether a struct is literal or identified;
+        -:   36:/// - for identified structs, in addition to the bit:
+        -:   37:///   - a string identifier;
+        -:   38:/// - for literal structs, in addition to the bit:
+        -:   39:///   - a list of contained types;
+        -:   40:///   - a bit indicating whether the literal struct is packed.
+        -:   41:///
+        -:   42:/// Identified structures only have a mutable component consisting of:
+        -:   43:///   - a list of contained types;
+        -:   44:///   - a bit indicating whether the identified struct is packed;
+        -:   45:///   - a bit indicating whether the identified struct is intentionally opaque;
+        -:   46:///   - a bit indicating whether the identified struct has been initialized.
+        -:   47:/// Uninitialized structs are considered opaque by the user, and can be mutated.
+        -:   48:/// Initialized and still opaque structs cannot be mutated.
+        -:   49:///
+        -:   50:/// The struct storage consists of:
+        -:   51:///   - immutable part:
+        -:   52:///     - a pointer to the first element of the key (character for identified
+        -:   53:///       structs, type for literal structs);
+        -:   54:///     - the number of elements in the key packed together with bits indicating
+        -:   55:///       whether a type is literal or identified, and the packedness bit for
+        -:   56:///       literal structs only;
+        -:   57:///   - mutable part:
+        -:   58:///     - a pointer to the first contained type for identified structs only;
+        -:   59:///     - the number of contained types packed together with bits of the mutable
+        -:   60:///       component, for identified structs only.
+        -:   61:struct LLVMStructTypeStorage : public TypeStorage {
+        -:   62:public:
+        -:   63:  /// Construction/uniquing key class for LLVM dialect structure storage. Note
+        -:   64:  /// that this is a transient helper data structure that is NOT stored.
+        -:   65:  /// Therefore, it intentionally avoids bit manipulation and type erasure in
+        -:   66:  /// pointers to make manipulation more straightforward. Not all elements of
+        -:   67:  /// the key participate in uniquing, but all elements participate in
+        -:   68:  /// construction.
+        -:   69:  class Key {
+        -:   70:  public:
+        -:   71:    /// Constructs a key for an identified struct.
+    #####:   72:    Key(StringRef name, bool opaque)
+    #####:   73:        : name(name), identified(true), packed(false), opaque(opaque) {}
+        -:   74:    /// Constructs a key for a literal struct.
+      116:   75:    Key(ArrayRef<Type> types, bool packed)
+      116:   76:        : types(types), identified(false), packed(packed), opaque(false) {}
+        -:   77:
+        -:   78:    /// Checks a specific property of the struct.
+     788*:   79:    bool isIdentified() const { return identified; }
+      224:   80:    bool isPacked() const {
+      224:   81:      assert(!isIdentified() &&
+        -:   82:             "'packed' bit is not part of the key for identified structs");
+      224:   83:      return packed;
+        -:   84:    }
+    #####:   85:    bool isOpaque() const {
+    #####:   86:      assert(isIdentified() &&
+        -:   87:             "'opaque' bit is meaningless on literal structs");
+    #####:   88:      return opaque;
+        -:   89:    }
+        -:   90:
+        -:   91:    /// Returns the identifier of a key for identified structs.
+    #####:   92:    StringRef getIdentifier() const {
+    #####:   93:      assert(isIdentified() &&
+        -:   94:             "non-identified struct key cannot have an identifier");
+    #####:   95:      return name;
+        -:   96:    }
+        -:   97:
+        -:   98:    /// Returns the list of type contained in the key of a literal struct.
+      224:   99:    ArrayRef<Type> getTypeList() const {
+      224:  100:      assert(!isIdentified() &&
+        -:  101:             "identified struct key cannot have a type list");
+      224:  102:      return types;
+        -:  103:    }
+        -:  104:
+        -:  105:    /// Returns the hash value of the key. This combines various flags into a
+        -:  106:    /// single value: the identified flag sets the first bit, and the packedness
+        -:  107:    /// flag sets the second bit. Opacity bit is only used for construction and
+        -:  108:    /// does not participate in uniquing.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage3Key9hashValueEv called 108 returned 100% blocks executed 62%
+      108:  109:    llvm::hash_code hashValue() const {
+      108:  110:      constexpr static unsigned kIdentifiedHashFlag = 1;
+      108:  111:      constexpr static unsigned kPackedHashFlag = 2;
+        -:  112:
+      108:  113:      unsigned flags = 0;
+      108:  114:      if (isIdentified()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  115:        flags |= kIdentifiedHashFlag;
+    #####:  116:        return llvm::hash_combine(flags, getIdentifier());
+call    0 never executed
+        -:  117:      }
+      108:  118:      if (isPacked())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  119:        flags |= kPackedHashFlag;
+      108:  120:      return llvm::hash_combine(flags, getTypeList());
+call    0 returned 100%
+        -:  121:    }
+        -:  122:
+        -:  123:    /// Compares two keys.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage3KeyeqERKS3_ called 47 returned 100% blocks executed 69%
+       47:  124:    bool operator==(const Key &other) const {
+       47:  125:      if (isIdentified())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  126:        return other.isIdentified() &&
+branch  0 never executed
+branch  1 never executed
+    #####:  127:               other.getIdentifier().equals(getIdentifier());
+branch  0 never executed
+branch  1 never executed
+        -:  128:
+       47:  129:      return !other.isIdentified() && other.isPacked() == isPacked() &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+       89:  130:             other.getTypeList() == getTypeList();
+branch  0 taken 89% (fallthrough)
+branch  1 taken 11%
+branch  2 taken 7% (fallthrough)
+branch  3 taken 93%
+        -:  131:    }
+        -:  132:
+        -:  133:    /// Copies dynamically-sized components of the key into the given allocator.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage3Key17copyIntoAllocatorERNS_14StorageUniquer16StorageAllocatorE called 69 returned 100% blocks executed 67%
+       69:  134:    Key copyIntoAllocator(TypeStorageAllocator &allocator) const {
+       69:  135:      if (isIdentified())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  136:        return Key(allocator.copyInto(name), opaque);
+call    0 never executed
+       69:  137:      return Key(allocator.copyInto(types), packed);
+call    0 returned 100%
+        -:  138:    }
+        -:  139:
+        -:  140:  private:
+        -:  141:    ArrayRef<Type> types;
+        -:  142:    StringRef name;
+        -:  143:    bool identified;
+        -:  144:    bool packed;
+        -:  145:    bool opaque;
+        -:  146:  };
+        -:  147:  using KeyTy = Key;
+        -:  148:
+        -:  149:  /// Returns the string identifier of an identified struct.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage13getIdentifierEv called 0 returned 0% blocks executed 0%
+    #####:  150:  StringRef getIdentifier() const {
+    #####:  151:    assert(isIdentified() && "requested identifier on a non-identified struct");
+call    0 never executed
+    #####:  152:    return StringRef(static_cast<const char *>(keyPtr), keySize());
+        -:  153:  }
+        -:  154:
+        -:  155:  /// Returns the list of types (partially) identifying a literal struct.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage11getTypeListEv called 8062 returned 100% blocks executed 67%
+     8062:  156:  ArrayRef<Type> getTypeList() const {
+        -:  157:    // If this triggers, use getIdentifiedStructBody() instead.
+    #####:  158:    assert(!isIdentified() && "requested typelist on an identified struct");
+call    0 never executed
+     8062:  159:    return ArrayRef<Type>(static_cast<const Type *>(keyPtr), keySize());
+        -:  160:  }
+        -:  161:
+        -:  162:  /// Returns the list of types contained in an identified struct.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage23getIdentifiedStructBodyEv called 0 returned 0% blocks executed 0%
+    #####:  163:  ArrayRef<Type> getIdentifiedStructBody() const {
+        -:  164:    // If this triggers, use getTypeList() instead.
+    #####:  165:    assert(isIdentified() &&
+call    0 never executed
+        -:  166:           "requested struct body on a non-identified struct");
+    #####:  167:    return ArrayRef<Type>(identifiedBodyArray, identifiedBodySize());
+        -:  168:  }
+        -:  169:
+        -:  170:  /// Checks whether the struct is identified.
+   22864*:  171:  bool isIdentified() const {
+   16150*:  172:    return llvm::Bitfield::get<KeyFlagIdentified>(keySizeAndFlags);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+branch  6 taken 0% (fallthrough)
+branch  7 taken 100%
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 taken 0% (fallthrough)
+branch 13 taken 100%
+branch 14 never executed
+branch 15 never executed
+        -:  173:  }
+        -:  174:
+        -:  175:  /// Checks whether the struct is packed (both literal and identified structs).
+    1371*:  176:  bool isPacked() const {
+    1324*:  177:    return isIdentified() ? llvm::Bitfield::get<MutableFlagPacked>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 taken 0% (fallthrough)
+branch  6 taken 100%
+branch  7 never executed
+branch  8 never executed
+    #####:  178:                                identifiedBodySizeAndFlags)
+    1371*:  179:                          : llvm::Bitfield::get<KeyFlagPacked>(keySizeAndFlags);
+call    0 never executed
+call    1 returned 100%
+        -:  180:  }
+        -:  181:
+        -:  182:  /// Checks whether a struct is marked as intentionally opaque (an
+        -:  183:  /// uninitialized struct is also considered opaque by the user, call
+        -:  184:  /// isInitialized to check that).
+    #####:  185:  bool isOpaque() const {
+    #####:  186:    return llvm::Bitfield::get<MutableFlagOpaque>(identifiedBodySizeAndFlags);
+branch  0 never executed
+branch  1 never executed
+        -:  187:  }
+        -:  188:
+        -:  189:  /// Checks whether an identified struct has been explicitly initialized either
+        -:  190:  /// by setting its body or by marking it as intentionally opaque.
+    #####:  191:  bool isInitialized() const {
+    #####:  192:    return llvm::Bitfield::get<MutableFlagInitialized>(
+    #####:  193:        identifiedBodySizeAndFlags);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  194:  }
+        -:  195:
+        -:  196:  /// Constructs the storage from the given key. This sets up the uniquing key
+        -:  197:  /// components and optionally the mutable component if they construction key
+        -:  198:  /// has the relevant information. In the latter case, the struct is considered
+        -:  199:  /// as initialized and can no longer be mutated.
+function _ZN4mlir4LLVM6detail21LLVMStructTypeStorageC2ERKNS2_3KeyE called 69 returned 100% blocks executed 50%
+       69:  200:  LLVMStructTypeStorage(const KeyTy &key) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       69:  201:    if (!key.isIdentified()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       69:  202:      ArrayRef<Type> types = key.getTypeList();
+       69:  203:      keyPtr = static_cast<const void *>(types.data());
+call    0 returned 100%
+       69:  204:      setKeySize(types.size());
+call    0 returned 100%
+      138:  205:      llvm::Bitfield::set<KeyFlagPacked>(keySizeAndFlags, key.isPacked());
+       69:  206:      return;
+        -:  207:    }
+        -:  208:
+    #####:  209:    StringRef name = key.getIdentifier();
+    #####:  210:    keyPtr = static_cast<const void *>(name.data());
+call    0 never executed
+    #####:  211:    setKeySize(name.size());
+call    0 never executed
+    #####:  212:    llvm::Bitfield::set<KeyFlagIdentified>(keySizeAndFlags, true);
+        -:  213:
+        -:  214:    // If the struct is being constructed directly as opaque, mark it as
+        -:  215:    // initialized.
+    #####:  216:    llvm::Bitfield::set<MutableFlagInitialized>(identifiedBodySizeAndFlags,
+    #####:  217:                                                key.isOpaque());
+call    0 never executed
+    #####:  218:    llvm::Bitfield::set<MutableFlagOpaque>(identifiedBodySizeAndFlags,
+    #####:  219:                                           key.isOpaque());
+call    0 never executed
+        -:  220:  }
+        -:  221:
+        -:  222:  /// Hook into the type uniquing infrastructure.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorageeqERKNS2_3KeyE called 47 returned 100% blocks executed 100%
+       47:  223:  bool operator==(const KeyTy &other) const { return getKey() == other; };
+call    0 returned 100%
+call    1 returned 100%
+        -:  224:  static llvm::hash_code hashKey(const KeyTy &key) { return key.hashValue(); }
+function _ZN4mlir4LLVM6detail21LLVMStructTypeStorage9constructERNS_14StorageUniquer16StorageAllocatorERKNS2_3KeyE called 69 returned 100% blocks executed 100%
+       69:  225:  static LLVMStructTypeStorage *construct(TypeStorageAllocator &allocator,
+        -:  226:                                          const KeyTy &key) {
+      138:  227:    return new (allocator.allocate<LLVMStructTypeStorage>())
+       69:  228:        LLVMStructTypeStorage(key.copyIntoAllocator(allocator));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  229:  }
+        -:  230:
+        -:  231:  /// Sets the body of an identified struct. If the struct is already
+        -:  232:  /// initialized, succeeds only if the body is equal to the current body. Fails
+        -:  233:  /// if the struct is marked as intentionally opaque. The struct will be marked
+        -:  234:  /// as initialized as a result of this operation and can no longer be changed.
+function _ZN4mlir4LLVM6detail21LLVMStructTypeStorage6mutateERNS_14StorageUniquer16StorageAllocatorEN4llvm8ArrayRefINS_4TypeEEEb called 0 returned 0% blocks executed 0%
+    #####:  235:  LogicalResult mutate(TypeStorageAllocator &allocator, ArrayRef<Type> body,
+        -:  236:                       bool packed) {
+    #####:  237:    if (!isIdentified())
+branch  0 never executed
+branch  1 never executed
+    #####:  238:      return failure();
+    #####:  239:    if (isInitialized())
+branch  0 never executed
+branch  1 never executed
+    #####:  240:      return success(!isOpaque() && body == getIdentifiedStructBody() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  241:                     packed == isPacked());
+branch  0 never executed
+branch  1 never executed
+        -:  242:
+    #####:  243:    llvm::Bitfield::set<MutableFlagInitialized>(identifiedBodySizeAndFlags,
+call    0 never executed
+        -:  244:                                                true);
+    #####:  245:    llvm::Bitfield::set<MutableFlagPacked>(identifiedBodySizeAndFlags, packed);
+call    0 never executed
+        -:  246:
+    #####:  247:    ArrayRef<Type> typesInAllocator = allocator.copyInto(body);
+call    0 never executed
+    #####:  248:    identifiedBodyArray = typesInAllocator.data();
+call    0 never executed
+    #####:  249:    setIdentifiedBodySize(typesInAllocator.size());
+call    0 never executed
+        -:  250:
+    #####:  251:    return success();
+        -:  252:  }
+        -:  253:
+        -:  254:private:
+        -:  255:  /// Returns the number of elements in the key.
+    8062*:  256:  unsigned keySize() const {
+    8062*:  257:    return llvm::Bitfield::get<KeySize>(keySizeAndFlags);
+        -:  258:  }
+        -:  259:
+        -:  260:  /// Sets the number of elements in the key.
+      69*:  261:  void setKeySize(unsigned value) {
+      69*:  262:    llvm::Bitfield::set<KeySize>(keySizeAndFlags, value);
+call    0 returned 100%
+call    1 returned 100%
+call    2 never executed
+call    3 never executed
+        -:  263:  }
+        -:  264:
+        -:  265:  /// Returns the number of types contained in an identified struct.
+    #####:  266:  unsigned identifiedBodySize() const {
+    #####:  267:    return llvm::Bitfield::get<MutableSize>(identifiedBodySizeAndFlags);
+        -:  268:  }
+        -:  269:  /// Sets the number of types contained in an identified struct.
+    #####:  270:  void setIdentifiedBodySize(unsigned value) {
+    #####:  271:    llvm::Bitfield::set<MutableSize>(identifiedBodySizeAndFlags, value);
+call    0 never executed
+        -:  272:  }
+        -:  273:
+        -:  274:  /// Returns the key for the current storage.
+function _ZNK4mlir4LLVM6detail21LLVMStructTypeStorage6getKeyEv called 47 returned 100% blocks executed 67%
+       47:  275:  Key getKey() const {
+       47:  276:    if (isIdentified())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  277:      return Key(getIdentifier(), isOpaque());
+call    0 never executed
+       47:  278:    return Key(getTypeList(), isPacked());
+call    0 returned 100%
+        -:  279:  }
+        -:  280:
+        -:  281:  /// Bitfield elements for `keyAndSizeFlags`:
+        -:  282:  ///   - bit 0: identified key flag;
+        -:  283:  ///   - bit 1: packed key flag;
+        -:  284:  ///   - bits 2..bitwidth(unsigned): size of the key.
+        -:  285:  using KeyFlagIdentified =
+        -:  286:      llvm::Bitfield::Element<bool, /*Offset=*/0, /*Size=*/1>;
+        -:  287:  using KeyFlagPacked = llvm::Bitfield::Element<bool, /*Offset=*/1, /*Size=*/1>;
+        -:  288:  using KeySize =
+        -:  289:      llvm::Bitfield::Element<unsigned, /*Offset=*/2,
+        -:  290:                              std::numeric_limits<unsigned>::digits - 2>;
+        -:  291:
+        -:  292:  /// Bitfield elements for `identifiedBodySizeAndFlags`:
+        -:  293:  ///   - bit 0: opaque flag;
+        -:  294:  ///   - bit 1: packed mutable flag;
+        -:  295:  ///   - bit 2: initialized flag;
+        -:  296:  ///   - bits 3..bitwidth(unsigned): size of the identified body.
+        -:  297:  using MutableFlagOpaque =
+        -:  298:      llvm::Bitfield::Element<bool, /*Offset=*/0, /*Size=*/1>;
+        -:  299:  using MutableFlagPacked =
+        -:  300:      llvm::Bitfield::Element<bool, /*Offset=*/1, /*Size=*/1>;
+        -:  301:  using MutableFlagInitialized =
+        -:  302:      llvm::Bitfield::Element<bool, /*Offset=*/2, /*Size=*/1>;
+        -:  303:  using MutableSize =
+        -:  304:      llvm::Bitfield::Element<unsigned, /*Offset=*/3,
+        -:  305:                              std::numeric_limits<unsigned>::digits - 3>;
+        -:  306:
+        -:  307:  /// Pointer to the first element of the uniquing key.
+        -:  308:  // Note: cannot use PointerUnion because bump-ptr allocator does not guarantee
+        -:  309:  // address alignment.
+        -:  310:  const void *keyPtr = nullptr;
+        -:  311:
+        -:  312:  /// Pointer to the first type contained in an identified struct.
+        -:  313:  const Type *identifiedBodyArray = nullptr;
+        -:  314:
+        -:  315:  /// Size of the uniquing key combined with identified/literal and
+        -:  316:  /// packedness bits. Must only be used through the Key* bitfields.
+        -:  317:  unsigned keySizeAndFlags = 0;
+        -:  318:
+        -:  319:  /// Number of the types contained in an identified struct combined with
+        -:  320:  /// mutable flags. Must only be used through the Mutable* bitfields.
+        -:  321:  unsigned identifiedBodySizeAndFlags = 0;
+        -:  322:};
+        -:  323:
+        -:  324://===----------------------------------------------------------------------===//
+        -:  325:// LLVMTypeAndSizeStorage.
+        -:  326://===----------------------------------------------------------------------===//
+        -:  327:
+        -:  328:/// Common storage used for LLVM dialect types that need an element type and a
+        -:  329:/// number: arrays, fixed and scalable vectors. The actual semantics of the
+        -:  330:/// type is defined by its kind.
+        -:  331:struct LLVMTypeAndSizeStorage : public TypeStorage {
+        -:  332:  using KeyTy = std::tuple<Type, unsigned>;
+        -:  333:
+        -:  334:  LLVMTypeAndSizeStorage(const KeyTy &key)
+        -:  335:      : elementType(std::get<0>(key)), numElements(std::get<1>(key)) {}
+        -:  336:
+        -:  337:  static LLVMTypeAndSizeStorage *construct(TypeStorageAllocator &allocator,
+        -:  338:                                           const KeyTy &key) {
+        -:  339:    return new (allocator.allocate<LLVMTypeAndSizeStorage>())
+        -:  340:        LLVMTypeAndSizeStorage(key);
+        -:  341:  }
+        -:  342:
+        -:  343:  bool operator==(const KeyTy &key) const {
+        -:  344:    return std::make_tuple(elementType, numElements) == key;
+        -:  345:  }
+        -:  346:
+        -:  347:  Type elementType;
+        -:  348:  unsigned numElements;
+        -:  349:};
+        -:  350:
+        -:  351:} // namespace detail
+        -:  352:} // namespace LLVM
+        -:  353:} // namespace mlir
+        -:  354:
+        -:  355:#endif // DIALECT_LLVMIR_IR_TYPEDETAIL_H

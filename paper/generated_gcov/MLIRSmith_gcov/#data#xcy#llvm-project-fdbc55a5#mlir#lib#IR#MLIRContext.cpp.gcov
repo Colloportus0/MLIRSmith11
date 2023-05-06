@@ -1,0 +1,1770 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/IR/MLIRContext.cpp
+        -:    0:Graph:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/MLIRContext.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/MLIRContext.cpp.gcda
+        -:    0:Runs:116164
+        -:    1://===- MLIRContext.cpp - MLIR Type Classes --------------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/IR/MLIRContext.h"
+        -:   10:#include "AffineExprDetail.h"
+        -:   11:#include "AffineMapDetail.h"
+        -:   12:#include "AttributeDetail.h"
+        -:   13:#include "IntegerSetDetail.h"
+        -:   14:#include "TypeDetail.h"
+        -:   15:#include "mlir/IR/AffineExpr.h"
+        -:   16:#include "mlir/IR/AffineMap.h"
+        -:   17:#include "mlir/IR/Attributes.h"
+        -:   18:#include "mlir/IR/BuiltinDialect.h"
+        -:   19:#include "mlir/IR/Diagnostics.h"
+        -:   20:#include "mlir/IR/Dialect.h"
+        -:   21:#include "mlir/IR/ExtensibleDialect.h"
+        -:   22:#include "mlir/IR/IntegerSet.h"
+        -:   23:#include "mlir/IR/Location.h"
+        -:   24:#include "mlir/IR/OpImplementation.h"
+        -:   25:#include "mlir/IR/Types.h"
+        -:   26:#include "mlir/Support/DebugAction.h"
+        -:   27:#include "llvm/ADT/DenseMap.h"
+        -:   28:#include "llvm/ADT/DenseSet.h"
+        -:   29:#include "llvm/ADT/SmallString.h"
+        -:   30:#include "llvm/ADT/StringSet.h"
+        -:   31:#include "llvm/ADT/Twine.h"
+        -:   32:#include "llvm/Support/Allocator.h"
+        -:   33:#include "llvm/Support/CommandLine.h"
+        -:   34:#include "llvm/Support/Debug.h"
+        -:   35:#include "llvm/Support/Mutex.h"
+        -:   36:#include "llvm/Support/RWMutex.h"
+        -:   37:#include "llvm/Support/ThreadPool.h"
+        -:   38:#include "llvm/Support/raw_ostream.h"
+        -:   39:#include <memory>
+        -:   40:
+        -:   41:#define DEBUG_TYPE "mlircontext"
+        -:   42:
+        -:   43:using namespace mlir;
+        -:   44:using namespace mlir::detail;
+        -:   45:
+        -:   46://===----------------------------------------------------------------------===//
+        -:   47:// MLIRContext CommandLine Options
+        -:   48://===----------------------------------------------------------------------===//
+        -:   49:
+        -:   50:namespace {
+        -:   51:/// This struct contains command line options that can be used to initialize
+        -:   52:/// various bits of an MLIRContext. This uses a struct wrapper to avoid the need
+        -:   53:/// for global command line options.
+        -:   54:struct MLIRContextOptions {
+        -:   55:  llvm::cl::opt<bool> disableThreading{
+        -:   56:      "mlir-disable-threading",
+        -:   57:      llvm::cl::desc("Disable multi-threading within MLIR, overrides any "
+        -:   58:                     "further call to MLIRContext::enableMultiThreading()")};
+        -:   59:
+        -:   60:  llvm::cl::opt<bool> printOpOnDiagnostic{
+        -:   61:      "mlir-print-op-on-diagnostic",
+        -:   62:      llvm::cl::desc("When a diagnostic is emitted on an operation, also print "
+        -:   63:                     "the operation as an attached note"),
+        -:   64:      llvm::cl::init(true)};
+        -:   65:
+        -:   66:  llvm::cl::opt<bool> printStackTraceOnDiagnostic{
+        -:   67:      "mlir-print-stacktrace-on-diagnostic",
+        -:   68:      llvm::cl::desc("When a diagnostic is emitted, also print the stack trace "
+        -:   69:                     "as an attached note")};
+        -:   70:};
+        -:   71:} // namespace
+        -:   72:
+        -:   73:static llvm::ManagedStatic<MLIRContextOptions> clOptions;
+        -:   74:
+function _ZL27isThreadingGloballyDisabledv called 377726 returned 100% blocks executed 100%
+   377726:   75:static bool isThreadingGloballyDisabled() {
+        -:   76:#if LLVM_ENABLE_THREADS != 0
+   755452:   77:  return clOptions.isConstructed() && clOptions->disableThreading;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 1%
+        -:   78:#else
+        -:   79:  return true;
+        -:   80:#endif
+        -:   81:}
+        -:   82:
+        -:   83:/// Register a set of useful command-line options that can be used to configure
+        -:   84:/// various flags within the MLIRContext. These flags are used when constructing
+        -:   85:/// an MLIR context for initialization.
+function _ZN4mlir28registerMLIRContextCLOptionsEv called 116164 returned 100% blocks executed 100%
+   116164:   86:void mlir::registerMLIRContextCLOptions() {
+        -:   87:  // Make sure that the options struct has been initialized.
+   116164:   88:  *clOptions;
+call    0 returned 100%
+   116164:   89:}
+        -:   90:
+        -:   91://===----------------------------------------------------------------------===//
+        -:   92:// Locking Utilities
+        -:   93://===----------------------------------------------------------------------===//
+        -:   94:
+        -:   95:namespace {
+        -:   96:/// Utility writer lock that takes a runtime flag that specifies if we really
+        -:   97:/// need to lock.
+        -:   98:struct ScopedWriterLock {
+  8264634:   99:  ScopedWriterLock(llvm::sys::SmartRWMutex<true> &mutexParam, bool shouldLock)
+  8430420:  100:      : mutex(shouldLock ? &mutexParam : nullptr) {
+   165786:  101:    if (mutex)
+   165786:  102:      mutex->lock();
+call    0 returned 100%
+        -:  103:  }
+ 16529278:  104:  ~ScopedWriterLock() {
+  8264639:  105:    if (mutex)
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+   165791:  106:      mutex->unlock();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  107:  }
+        -:  108:  llvm::sys::SmartRWMutex<true> *mutex;
+        -:  109:};
+        -:  110:} // namespace
+        -:  111:
+        -:  112://===----------------------------------------------------------------------===//
+        -:  113:// MLIRContextImpl
+        -:  114://===----------------------------------------------------------------------===//
+        -:  115:
+        -:  116:namespace mlir {
+        -:  117:/// This is the implementation of the MLIRContext class, using the pImpl idiom.
+        -:  118:/// This class is completely private to this file, so everything is public.
+        -:  119:class MLIRContextImpl {
+        -:  120:public:
+        -:  121:  //===--------------------------------------------------------------------===//
+        -:  122:  // Debugging
+        -:  123:  //===--------------------------------------------------------------------===//
+        -:  124:
+        -:  125:  /// An action manager for use within the context.
+        -:  126:  DebugActionManager debugActionManager;
+        -:  127:
+        -:  128:  //===--------------------------------------------------------------------===//
+        -:  129:  // Diagnostics
+        -:  130:  //===--------------------------------------------------------------------===//
+        -:  131:  DiagnosticEngine diagEngine;
+        -:  132:
+        -:  133:  //===--------------------------------------------------------------------===//
+        -:  134:  // Options
+        -:  135:  //===--------------------------------------------------------------------===//
+        -:  136:
+        -:  137:  /// In most cases, creating operation in unregistered dialect is not desired
+        -:  138:  /// and indicate a misconfiguration of the compiler. This option enables to
+        -:  139:  /// detect such use cases
+        -:  140:  bool allowUnregisteredDialects = false;
+        -:  141:
+        -:  142:  /// Enable support for multi-threading within MLIR.
+        -:  143:  bool threadingIsEnabled = true;
+        -:  144:
+        -:  145:  /// Track if we are currently executing in a threaded execution environment
+        -:  146:  /// (like the pass-manager): this is only a debugging feature to help reducing
+        -:  147:  /// the chances of data races one some context APIs.
+        -:  148:#ifndef NDEBUG
+        -:  149:  std::atomic<int> multiThreadedExecutionContext{0};
+        -:  150:#endif
+        -:  151:
+        -:  152:  /// If the operation should be attached to diagnostics printed via the
+        -:  153:  /// Operation::emit methods.
+        -:  154:  bool printOpOnDiagnostic = true;
+        -:  155:
+        -:  156:  /// If the current stack trace should be attached when emitting diagnostics.
+        -:  157:  bool printStackTraceOnDiagnostic = false;
+        -:  158:
+        -:  159:  //===--------------------------------------------------------------------===//
+        -:  160:  // Other
+        -:  161:  //===--------------------------------------------------------------------===//
+        -:  162:
+        -:  163:  /// This points to the ThreadPool used when processing MLIR tasks in parallel.
+        -:  164:  /// It can't be nullptr when multi-threading is enabled. Otherwise if
+        -:  165:  /// multi-threading is disabled, and the threadpool wasn't externally provided
+        -:  166:  /// using `setThreadPool`, this will be nullptr.
+        -:  167:  llvm::ThreadPool *threadPool = nullptr;
+        -:  168:
+        -:  169:  /// In case where the thread pool is owned by the context, this ensures
+        -:  170:  /// destruction with the context.
+        -:  171:  std::unique_ptr<llvm::ThreadPool> ownedThreadPool;
+        -:  172:
+        -:  173:  /// This is a list of dialects that are created referring to this context.
+        -:  174:  /// The MLIRContext owns the objects.
+        -:  175:  DenseMap<StringRef, std::unique_ptr<Dialect>> loadedDialects;
+        -:  176:  DialectRegistry dialectsRegistry;
+        -:  177:
+        -:  178:  /// An allocator used for AbstractAttribute and AbstractType objects.
+        -:  179:  llvm::BumpPtrAllocator abstractDialectSymbolAllocator;
+        -:  180:
+        -:  181:  /// This is a mapping from operation name to the operation info describing it.
+        -:  182:  llvm::StringMap<OperationName::Impl> operations;
+        -:  183:
+        -:  184:  /// A vector of operation info specifically for registered operations.
+        -:  185:  llvm::StringMap<RegisteredOperationName> registeredOperations;
+        -:  186:
+        -:  187:  /// This is a sorted container of registered operations for a deterministic
+        -:  188:  /// and efficient `getRegisteredOperations` implementation.
+        -:  189:  SmallVector<RegisteredOperationName, 0> sortedRegisteredOperations;
+        -:  190:
+        -:  191:  /// A mutex used when accessing operation information.
+        -:  192:  llvm::sys::SmartRWMutex<true> operationInfoMutex;
+        -:  193:
+        -:  194:  //===--------------------------------------------------------------------===//
+        -:  195:  // Affine uniquing
+        -:  196:  //===--------------------------------------------------------------------===//
+        -:  197:
+        -:  198:  // Affine expression, map and integer set uniquing.
+        -:  199:  StorageUniquer affineUniquer;
+        -:  200:
+        -:  201:  //===--------------------------------------------------------------------===//
+        -:  202:  // Type uniquing
+        -:  203:  //===--------------------------------------------------------------------===//
+        -:  204:
+        -:  205:  DenseMap<TypeID, AbstractType *> registeredTypes;
+        -:  206:  StorageUniquer typeUniquer;
+        -:  207:
+        -:  208:  /// Cached Type Instances.
+        -:  209:  Float8E5M2Type f8E5M2Ty;
+        -:  210:  BFloat16Type bf16Ty;
+        -:  211:  Float16Type f16Ty;
+        -:  212:  Float32Type f32Ty;
+        -:  213:  Float64Type f64Ty;
+        -:  214:  Float80Type f80Ty;
+        -:  215:  Float128Type f128Ty;
+        -:  216:  IndexType indexTy;
+        -:  217:  IntegerType int1Ty, int8Ty, int16Ty, int32Ty, int64Ty, int128Ty;
+        -:  218:  NoneType noneType;
+        -:  219:
+        -:  220:  //===--------------------------------------------------------------------===//
+        -:  221:  // Attribute uniquing
+        -:  222:  //===--------------------------------------------------------------------===//
+        -:  223:
+        -:  224:  DenseMap<TypeID, AbstractAttribute *> registeredAttributes;
+        -:  225:  StorageUniquer attributeUniquer;
+        -:  226:
+        -:  227:  /// Cached Attribute Instances.
+        -:  228:  BoolAttr falseAttr, trueAttr;
+        -:  229:  UnitAttr unitAttr;
+        -:  230:  UnknownLoc unknownLocAttr;
+        -:  231:  DictionaryAttr emptyDictionaryAttr;
+        -:  232:  StringAttr emptyStringAttr;
+        -:  233:
+        -:  234:  /// Map of string attributes that may reference a dialect, that are awaiting
+        -:  235:  /// that dialect to be loaded.
+        -:  236:  llvm::sys::SmartMutex<true> dialectRefStrAttrMutex;
+        -:  237:  DenseMap<StringRef, SmallVector<StringAttrStorage *>>
+        -:  238:      dialectReferencingStrAttrs;
+        -:  239:
+        -:  240:public:
+function _ZN4mlir15MLIRContextImplC2Eb called 189146 returned 100% blocks executed 88%
+   189146:  241:  MLIRContextImpl(bool threadingIsEnabled)
+   189146:  242:      : threadingIsEnabled(threadingIsEnabled) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+   189146:  243:    if (threadingIsEnabled) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    94007:  244:      ownedThreadPool = std::make_unique<llvm::ThreadPool>();
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    94007:  245:      threadPool = ownedThreadPool.get();
+        -:  246:    }
+   189146:  247:  }
+function _ZN4mlir15MLIRContextImplD2Ev called 188632 returned 100% blocks executed 100%
+   659650:  248:  ~MLIRContextImpl() {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+branch  6 taken 100% (fallthrough)
+branch  7 taken 0%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+branch 13 taken 50% (fallthrough)
+branch 14 taken 50%
+call   15 returned 100%
+call   16 returned 100%
+  4278681:  249:    for (auto typeMapping : registeredTypes)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 95% (fallthrough)
+branch  4 taken 5%
+call    5 returned 100%
+  7802834:  250:      typeMapping.second->~AbstractType();
+call    0 returned 100%
+call    1 returned 100%
+  5900602:  251:    for (auto attrMapping : registeredAttributes)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 97% (fallthrough)
+branch  4 taken 3%
+call    5 returned 100%
+ 11046676:  252:      attrMapping.second->~AbstractAttribute();
+call    0 returned 100%
+call    1 returned 100%
+   188632:  253:  }
+        -:  254:};
+        -:  255:} // namespace mlir
+        -:  256:
+function _ZN4mlir11MLIRContextC2ENS0_9ThreadingE called 94573 returned 100% blocks executed 100%
+    94573:  257:MLIRContext::MLIRContext(Threading setting)
+    94573:  258:    : MLIRContext(DialectRegistry(), setting) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  259:
+function _ZN4mlir11MLIRContextC2ERKNS_15DialectRegistryENS0_9ThreadingE called 189146 returned 100% blocks executed 100%
+   189146:  260:MLIRContext::MLIRContext(const DialectRegistry &registry, Threading setting)
+    94573:  261:    : impl(new MLIRContextImpl(setting == Threading::ENABLED &&
+branch  0 taken 1% (fallthrough)
+branch  1 taken 99%
+   283719:  262:                               !isThreadingGloballyDisabled())) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 100% (fallthrough)
+branch  6 taken 0%
+        -:  263:  // Initialize values based on the command line flags if they were provided.
+   189146:  264:  if (clOptions.isConstructed()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+   189146:  265:    printOpOnDiagnostic(clOptions->printOpOnDiagnostic);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  266:    printStackTraceOnDiagnostic(clOptions->printStackTraceOnDiagnostic);
+call    0 returned 100%
+call    1 returned 100%
+        -:  267:  }
+        -:  268:
+        -:  269:  // Pre-populate the registry.
+   189146:  270:  registry.appendTo(impl->dialectsRegistry);
+call    0 returned 100%
+        -:  271:
+        -:  272:  // Ensure the builtin dialect is always pre-loaded.
+   189146:  273:  getOrLoadDialect<BuiltinDialect>();
+call    0 returned 100%
+        -:  274:
+        -:  275:  // Initialize several common attributes and types to avoid the need to lock
+        -:  276:  // the context when accessing them.
+        -:  277:
+        -:  278:  //// Types.
+        -:  279:  /// Floating-point Types.
+   189146:  280:  impl->f8E5M2Ty = TypeUniquer::get<Float8E5M2Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  281:  impl->bf16Ty = TypeUniquer::get<BFloat16Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  282:  impl->f16Ty = TypeUniquer::get<Float16Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  283:  impl->f32Ty = TypeUniquer::get<Float32Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  284:  impl->f64Ty = TypeUniquer::get<Float64Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  285:  impl->f80Ty = TypeUniquer::get<Float80Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  286:  impl->f128Ty = TypeUniquer::get<Float128Type>(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  287:  /// Index Type.
+   189146:  288:  impl->indexTy = TypeUniquer::get<IndexType>(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  289:  /// Integer Types.
+   189146:  290:  impl->int1Ty = TypeUniquer::get<IntegerType>(this, 1, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  291:  impl->int8Ty = TypeUniquer::get<IntegerType>(this, 8, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+   378292:  292:  impl->int16Ty =
+   189146:  293:      TypeUniquer::get<IntegerType>(this, 16, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+   378292:  294:  impl->int32Ty =
+   189146:  295:      TypeUniquer::get<IntegerType>(this, 32, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+   378292:  296:  impl->int64Ty =
+   189146:  297:      TypeUniquer::get<IntegerType>(this, 64, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+   378292:  298:  impl->int128Ty =
+   189146:  299:      TypeUniquer::get<IntegerType>(this, 128, IntegerType::Signless);
+call    0 returned 100%
+call    1 returned 100%
+        -:  300:  /// None Type.
+   189146:  301:  impl->noneType = TypeUniquer::get<NoneType>(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  302:
+        -:  303:  //// Attributes.
+        -:  304:  //// Note: These must be registered after the types as they may generate one
+        -:  305:  //// of the above types internally.
+        -:  306:  /// Unknown Location Attribute.
+   189146:  307:  impl->unknownLocAttr = AttributeUniquer::get<UnknownLoc>(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  308:  /// Bool Attributes.
+   189146:  309:  impl->falseAttr = IntegerAttr::getBoolAttrUnchecked(impl->int1Ty, false);
+call    0 returned 100%
+call    1 returned 100%
+   189146:  310:  impl->trueAttr = IntegerAttr::getBoolAttrUnchecked(impl->int1Ty, true);
+call    0 returned 100%
+call    1 returned 100%
+        -:  311:  /// Unit Attribute.
+   189146:  312:  impl->unitAttr = AttributeUniquer::get<UnitAttr>(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  313:  /// The empty dictionary attribute.
+   189146:  314:  impl->emptyDictionaryAttr = DictionaryAttr::getEmptyUnchecked(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  315:  /// The empty string attribute.
+   189146:  316:  impl->emptyStringAttr = StringAttr::getEmptyStringAttrUnchecked(this);
+call    0 returned 100%
+call    1 returned 100%
+        -:  317:
+        -:  318:  // Register the affine storage objects with the uniquer.
+   189146:  319:  impl->affineUniquer
+   189146:  320:      .registerParametricStorageType<AffineBinaryOpExprStorage>();
+call    0 returned 100%
+   189146:  321:  impl->affineUniquer
+call    0 returned 100%
+   189146:  322:      .registerParametricStorageType<AffineConstantExprStorage>();
+call    0 returned 100%
+   189146:  323:  impl->affineUniquer.registerParametricStorageType<AffineDimExprStorage>();
+call    0 returned 100%
+   189146:  324:  impl->affineUniquer.registerParametricStorageType<AffineMapStorage>();
+call    0 returned 100%
+   189146:  325:  impl->affineUniquer.registerParametricStorageType<IntegerSetStorage>();
+call    0 returned 100%
+   189146:  326:}
+        -:  327:
+        -:  328:MLIRContext::~MLIRContext() = default;
+        -:  329:
+        -:  330:/// Copy the specified array of elements into memory managed by the provided
+        -:  331:/// bump pointer allocator.  This assumes the elements are all PODs.
+        -:  332:template <typename T>
+        -:  333:static ArrayRef<T> copyArrayRefInto(llvm::BumpPtrAllocator &allocator,
+        -:  334:                                    ArrayRef<T> elements) {
+        -:  335:  auto result = allocator.Allocate<T>(elements.size());
+        -:  336:  std::uninitialized_copy(elements.begin(), elements.end(), result);
+        -:  337:  return ArrayRef<T>(result, elements.size());
+        -:  338:}
+        -:  339:
+        -:  340://===----------------------------------------------------------------------===//
+        -:  341:// Debugging
+        -:  342://===----------------------------------------------------------------------===//
+        -:  343:
+function _ZN4mlir11MLIRContext21getDebugActionManagerEv called 94573 returned 100% blocks executed 100%
+    94573:  344:DebugActionManager &MLIRContext::getDebugActionManager() {
+    94573:  345:  return getImpl().debugActionManager;
+        -:  346:}
+        -:  347:
+        -:  348://===----------------------------------------------------------------------===//
+        -:  349:// Diagnostic Handlers
+        -:  350://===----------------------------------------------------------------------===//
+        -:  351:
+        -:  352:/// Returns the diagnostic engine for this context.
+function _ZN4mlir11MLIRContext13getDiagEngineEv called 22387192 returned 100% blocks executed 100%
+ 22387192:  353:DiagnosticEngine &MLIRContext::getDiagEngine() { return getImpl().diagEngine; }
+        -:  354:
+        -:  355://===----------------------------------------------------------------------===//
+        -:  356:// Dialect and Operation Registration
+        -:  357://===----------------------------------------------------------------------===//
+        -:  358:
+function _ZN4mlir11MLIRContext21appendDialectRegistryERKNS_15DialectRegistryE called 91752 returned 100% blocks executed 86%
+    91752:  359:void MLIRContext::appendDialectRegistry(const DialectRegistry &registry) {
+    91752:  360:  if (registry.isSubsetOf(impl->dialectsRegistry))
+call    0 returned 100%
+branch  1 taken 4% (fallthrough)
+branch  2 taken 96%
+        -:  361:    return;
+        -:  362:
+    4004*:  363:  assert(impl->multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  364:         "appending to the MLIRContext dialect registry while in a "
+        -:  365:         "multi-threaded execution context");
+     4004:  366:  registry.appendTo(impl->dialectsRegistry);
+call    0 returned 100%
+        -:  367:
+        -:  368:  // For the already loaded dialects, apply any possible extensions immediately.
+     4004:  369:  registry.applyExtensions(this);
+call    0 returned 100%
+        -:  370:}
+        -:  371:
+function _ZN4mlir11MLIRContext18getDialectRegistryEv called 0 returned 0% blocks executed 0%
+    #####:  372:const DialectRegistry &MLIRContext::getDialectRegistry() {
+    #####:  373:  return impl->dialectsRegistry;
+        -:  374:}
+        -:  375:
+        -:  376:/// Return information about all registered IR dialects.
+function _ZN4mlir11MLIRContext17getLoadedDialectsEv called 138121631 returned 100% blocks executed 100%
+138121631:  377:std::vector<Dialect *> MLIRContext::getLoadedDialects() {
+138121631:  378:  std::vector<Dialect *> result;
+call    0 returned 100%
+138121631:  379:  result.reserve(impl->loadedDialects.size());
+call    0 returned 100%
+2262089072:  380:  for (auto &dialect : impl->loadedDialects)
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 93% (fallthrough)
+branch  4 taken 7%
+call    5 returned 100%
+1985845916:  381:    result.push_back(dialect.second.get());
+call    0 returned 100%
+call    1 returned 100%
+138121406:  382:  llvm::array_pod_sort(result.begin(), result.end(),
+branch  0 taken 100% (fallthrough)
+branch  1 taken -0%
+        -:  383:                       [](Dialect *const *lhs, Dialect *const *rhs) -> int {
+        -:  384:                         return (*lhs)->getNamespace() < (*rhs)->getNamespace();
+        -:  385:                       });
+138121754:  386:  return result;
+        -:  387:}
+function _ZN4mlir11MLIRContext20getAvailableDialectsEv called 0 returned 0% blocks executed 0%
+    #####:  388:std::vector<StringRef> MLIRContext::getAvailableDialects() {
+    #####:  389:  std::vector<StringRef> result;
+    #####:  390:  for (auto dialect : impl->dialectsRegistry.getDialectNames())
+branch  0 never executed
+branch  1 never executed
+    #####:  391:    result.push_back(dialect);
+call    0 never executed
+    #####:  392:  return result;
+        -:  393:}
+        -:  394:
+        -:  395:/// Get a registered IR dialect with the given namespace. If none is found,
+        -:  396:/// then return nullptr.
+function _ZN4mlir11MLIRContext16getLoadedDialectEN4llvm9StringRefE called 143011877 returned 100% blocks executed 100%
+143011877:  397:Dialect *MLIRContext::getLoadedDialect(StringRef name) {
+        -:  398:  // Dialects are sorted by name, so we can use binary search for lookup.
+143011877:  399:  auto it = impl->loadedDialects.find(name);
+call    0 returned 100%
+143011875:  400:  return (it != impl->loadedDialects.end()) ? it->second.get() : nullptr;
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 99% (fallthrough)
+branch  3 taken 1%
+call    4 returned 100%
+        -:  401:}
+        -:  402:
+function _ZN4mlir11MLIRContext16getOrLoadDialectEN4llvm9StringRefE called 3450750 returned 100% blocks executed 100%
+  3450750:  403:Dialect *MLIRContext::getOrLoadDialect(StringRef name) {
+  3450750:  404:  Dialect *dialect = getLoadedDialect(name);
+call    0 returned 100%
+  3450750:  405:  if (dialect)
+branch  0 taken 17% (fallthrough)
+branch  1 taken 83%
+        -:  406:    return dialect;
+   585730:  407:  DialectAllocatorFunctionRef allocator =
+   585730:  408:      impl->dialectsRegistry.getDialectAllocator(name);
+call    0 returned 100%
+   585730:  409:  return allocator ? allocator(this) : nullptr;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+        -:  410:}
+        -:  411:
+        -:  412:/// Get a dialect for the provided namespace and TypeID: abort the program if a
+        -:  413:/// dialect exist for this namespace with different TypeID. Returns a pointer to
+        -:  414:/// the dialect owned by the context.
+        -:  415:Dialect *
+function _ZN4mlir11MLIRContext16getOrLoadDialectEN4llvm9StringRefENS_6TypeIDENS1_12function_refIFSt10unique_ptrINS_7DialectESt14default_deleteIS6_EEvEEE called 2628709 returned 100% blocks executed 53%
+  2628709:  416:MLIRContext::getOrLoadDialect(StringRef dialectNamespace, TypeID dialectID,
+        -:  417:                              function_ref<std::unique_ptr<Dialect>()> ctor) {
+  2628709:  418:  auto &impl = getImpl();
+call    0 returned 100%
+        -:  419:  // Get the correct insertion position sorted by namespace.
+  2628709:  420:  auto dialectIt = impl.loadedDialects.find(dialectNamespace);
+call    0 returned 100%
+        -:  421:
+  2628709:  422:  if (dialectIt == impl.loadedDialects.end()) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 54% (fallthrough)
+branch  3 taken 46%
+ 1421188*:  423:    LLVM_DEBUG(llvm::dbgs()
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  424:               << "Load new dialect in Context " << dialectNamespace << "\n");
+        -:  425:#ifndef NDEBUG
+  1421188:  426:    if (impl.multiThreadedExecutionContext != 0)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  427:      llvm::report_fatal_error(
+    #####:  428:          "Loading a dialect (" + dialectNamespace +
+call    0 never executed
+        -:  429:          ") while in a multi-threaded execution context (maybe "
+        -:  430:          "the PassManager): this can indicate a "
+    #####:  431:          "missing `dependentDialects` in a pass for example.");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  432:#endif // NDEBUG
+        -:  433:    // loadedDialects entry is initialized to nullptr, indicating that the
+        -:  434:    // dialect is currently being loaded.
+  1421188:  435:    std::unique_ptr<Dialect> &dialect = impl.loadedDialects[dialectNamespace];
+call    0 returned 100%
+  1421188:  436:    dialect = ctor();
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+ 1421188*:  437:    assert(dialect && "dialect ctor failed");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  438:
+        -:  439:    // Refresh all the identifiers dialect field, this catches cases where a
+        -:  440:    // dialect may be loaded after identifier prefixed with this dialect name
+        -:  441:    // were already created.
+  1421188:  442:    auto stringAttrsIt = impl.dialectReferencingStrAttrs.find(dialectNamespace);
+call    0 returned 100%
+  1421188:  443:    if (stringAttrsIt != impl.dialectReferencingStrAttrs.end()) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 1%
+ 34638344:  444:      for (StringAttrStorage *storage : stringAttrsIt->second)
+call    0 returned 100%
+branch  1 taken 96% (fallthrough)
+branch  2 taken 4%
+ 33220165:  445:        storage->referencedDialect = dialect.get();
+  1418179:  446:      impl.dialectReferencingStrAttrs.erase(stringAttrsIt);
+call    0 returned 100%
+        -:  447:    }
+        -:  448:
+        -:  449:    // Apply any extensions to this newly loaded dialect.
+  1421188:  450:    impl.dialectsRegistry.applyExtensions(dialect.get());
+call    0 returned 100%
+  1421188:  451:    return dialect.get();
+        -:  452:  }
+        -:  453:
+        -:  454:#ifndef NDEBUG
+  1207521:  455:  if (dialectIt->second == nullptr)
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  456:    llvm::report_fatal_error(
+    #####:  457:        "Loading (and getting) a dialect (" + dialectNamespace +
+call    0 never executed
+        -:  458:        ") while the same dialect is still loading: use loadDialect instead "
+    #####:  459:        "of getOrLoadDialect.");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  460:#endif // NDEBUG
+        -:  461:
+        -:  462:  // Abort if dialect with namespace has already been registered.
+  1207521:  463:  std::unique_ptr<Dialect> &dialect = dialectIt->second;
+  1207521:  464:  if (dialect->getTypeID() != dialectID)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  465:    llvm::report_fatal_error("a dialect with namespace '" + dialectNamespace +
+call    0 never executed
+    #####:  466:                             "' has already been registered");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  467:
+  2628709:  468:  return dialect.get();
+        -:  469:}
+        -:  470:
+function _ZN4mlir11MLIRContext16isDialectLoadingEN4llvm9StringRefE called 1846238 returned 100% blocks executed 100%
+  1846238:  471:bool MLIRContext::isDialectLoading(StringRef dialectNamespace) {
+  1846238:  472:  auto it = getImpl().loadedDialects.find(dialectNamespace);
+call    0 returned 100%
+        -:  473:  // nullptr indicates that the dialect is currently being loaded.
+  1846238:  474:  return it != getImpl().loadedDialects.end() && it->second == nullptr;
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 65% (fallthrough)
+branch  3 taken 35%
+call    4 returned 100%
+branch  5 taken 100% (fallthrough)
+branch  6 taken 0%
+        -:  475:}
+        -:  476:
+function _ZN4mlir11MLIRContext23getOrLoadDynamicDialectEN4llvm9StringRefENS1_12function_refIFvPNS_14DynamicDialectEEEE called 0 returned 0% blocks executed 0%
+    #####:  477:DynamicDialect *MLIRContext::getOrLoadDynamicDialect(
+        -:  478:    StringRef dialectNamespace, function_ref<void(DynamicDialect *)> ctor) {
+    #####:  479:  auto &impl = getImpl();
+call    0 never executed
+        -:  480:  // Get the correct insertion position sorted by namespace.
+    #####:  481:  auto dialectIt = impl.loadedDialects.find(dialectNamespace);
+call    0 never executed
+        -:  482:
+    #####:  483:  if (dialectIt != impl.loadedDialects.end()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  484:    if (auto dynDialect = dyn_cast<DynamicDialect>(dialectIt->second.get()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  485:      return dynDialect;
+    #####:  486:    llvm::report_fatal_error("a dialect with namespace '" + dialectNamespace +
+call    0 never executed
+    #####:  487:                             "' has already been registered");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  488:  }
+        -:  489:
+    #####:  490:  LLVM_DEBUG(llvm::dbgs() << "Load new dynamic dialect in Context "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  491:                          << dialectNamespace << "\n");
+        -:  492:#ifndef NDEBUG
+    #####:  493:  if (impl.multiThreadedExecutionContext != 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  494:    llvm::report_fatal_error(
+    #####:  495:        "Loading a dynamic dialect (" + dialectNamespace +
+call    0 never executed
+        -:  496:        ") while in a multi-threaded execution context (maybe "
+        -:  497:        "the PassManager): this can indicate a "
+    #####:  498:        "missing `dependentDialects` in a pass for example.");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  499:#endif
+        -:  500:
+    #####:  501:  auto name = StringAttr::get(this, dialectNamespace);
+call    0 never executed
+call    1 never executed
+    #####:  502:  auto *dialect = new DynamicDialect(name, this);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  503:  (void)getOrLoadDialect(name, dialect->getTypeID(), [dialect, ctor]() {
+call    0 never executed
+call    1 never executed
+    #####:  504:    ctor(dialect);
+call    0 never executed
+    #####:  505:    return std::unique_ptr<DynamicDialect>(dialect);
+        -:  506:  });
+        -:  507:  // This is the same result as `getOrLoadDialect` (if it didn't failed),
+        -:  508:  // since it has the same TypeID, and TypeIDs are unique.
+    #####:  509:  return dialect;
+        -:  510:}
+        -:  511:
+function _ZN4mlir11MLIRContext24loadAllAvailableDialectsEv called 0 returned 0% blocks executed 0%
+    #####:  512:void MLIRContext::loadAllAvailableDialects() {
+    #####:  513:  for (StringRef name : getAvailableDialects())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  514:    getOrLoadDialect(name);
+call    0 never executed
+    #####:  515:}
+        -:  516:
+function _ZN4mlir11MLIRContext15getRegistryHashEv called 87285 returned 100% blocks executed 100%
+    87285:  517:llvm::hash_code MLIRContext::getRegistryHash() {
+    87285:  518:  llvm::hash_code hash(0);
+call    0 returned 100%
+        -:  519:  // Factor in number of loaded dialects, attributes, operations, types.
+    87285:  520:  hash = llvm::hash_combine(hash, impl->loadedDialects.size());
+call    0 returned 100%
+    87285:  521:  hash = llvm::hash_combine(hash, impl->registeredAttributes.size());
+call    0 returned 100%
+    87285:  522:  hash = llvm::hash_combine(hash, impl->registeredOperations.size());
+call    0 returned 100%
+    87285:  523:  hash = llvm::hash_combine(hash, impl->registeredTypes.size());
+call    0 returned 100%
+    87285:  524:  return hash;
+        -:  525:}
+        -:  526:
+function _ZN4mlir11MLIRContext26allowsUnregisteredDialectsEv called 0 returned 0% blocks executed 0%
+    #####:  527:bool MLIRContext::allowsUnregisteredDialects() {
+    #####:  528:  return impl->allowUnregisteredDialects;
+        -:  529:}
+        -:  530:
+function _ZN4mlir11MLIRContext25allowUnregisteredDialectsEb called 94573 returned 100% blocks executed 67%
+    94573:  531:void MLIRContext::allowUnregisteredDialects(bool allowing) {
+   94573*:  532:  assert(impl->multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  533:         "changing MLIRContext `allow-unregistered-dialects` configuration "
+        -:  534:         "while in a multi-threaded execution context");
+    94573:  535:  impl->allowUnregisteredDialects = allowing;
+    94573:  536:}
+        -:  537:
+        -:  538:/// Return true if multi-threading is enabled by the context.
+function _ZN4mlir11MLIRContext23isMultithreadingEnabledEv called 575223 returned 100% blocks executed 100%
+123809054:  539:bool MLIRContext::isMultithreadingEnabled() {
+   575223:  540:  return impl->threadingIsEnabled && llvm::llvm_is_multithreaded();
+branch  0 taken 32% (fallthrough)
+branch  1 taken 68%
+        -:  541:}
+        -:  542:
+        -:  543:/// Set the flag specifying if multi-threading is disabled by the context.
+function _ZN4mlir11MLIRContext21disableMultithreadingEb called 283153 returned 100% blocks executed 43%
+   283153:  544:void MLIRContext::disableMultithreading(bool disable) {
+        -:  545:  // This API can be overridden by the global debugging flag
+        -:  546:  // --mlir-disable-threading
+   283153:  547:  if (isThreadingGloballyDisabled())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+        -:  548:    return;
+  282021*:  549:  assert(impl->multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  550:         "changing MLIRContext `disable-threading` configuration while "
+        -:  551:         "in a multi-threaded execution context");
+        -:  552:
+   282021:  553:  impl->threadingIsEnabled = !disable;
+call    0 returned 100%
+        -:  554:
+        -:  555:  // Update the threading mode for each of the uniquers.
+   282021:  556:  impl->affineUniquer.disableMultithreading(disable);
+call    0 returned 100%
+   282021:  557:  impl->attributeUniquer.disableMultithreading(disable);
+call    0 returned 100%
+   282021:  558:  impl->typeUniquer.disableMultithreading(disable);
+call    0 returned 100%
+        -:  559:
+        -:  560:  // Destroy thread pool (stop all threads) if it is no longer needed, or create
+        -:  561:  // a new one if multithreading was re-enabled.
+   282021:  562:  if (disable) {
+branch  0 taken 33% (fallthrough)
+branch  1 taken 67%
+        -:  563:    // If the thread pool is owned, explicitly set it to nullptr to avoid
+        -:  564:    // keeping a dangling pointer around. If the thread pool is externally
+        -:  565:    // owned, we don't do anything.
+    94007:  566:    if (impl->ownedThreadPool) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  567:      assert(impl->threadPool);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  568:      impl->threadPool = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  569:      impl->ownedThreadPool.reset();
+branch  0 never executed
+branch  1 never executed
+        -:  570:    }
+   188014:  571:  } else if (!impl->threadPool) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  572:    // The thread pool isn't externally provided.
+    #####:  573:    assert(!impl->ownedThreadPool);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  574:    impl->ownedThreadPool = std::make_unique<llvm::ThreadPool>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  575:    impl->threadPool = impl->ownedThreadPool.get();
+        -:  576:  }
+        -:  577:}
+        -:  578:
+function _ZN4mlir11MLIRContext13setThreadPoolERN4llvm10ThreadPoolE called 94007 returned 100% blocks executed 67%
+    94007:  579:void MLIRContext::setThreadPool(llvm::ThreadPool &pool) {
+   94007*:  580:  assert(!isMultithreadingEnabled() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  581:         "expected multi-threading to be disabled when setting a ThreadPool");
+    94007:  582:  impl->threadPool = &pool;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    94007:  583:  impl->ownedThreadPool.reset();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    94007:  584:  enableMultithreading();
+call    0 returned 100%
+    94007:  585:}
+        -:  586:
+function _ZN4mlir11MLIRContext13getNumThreadsEv called 468 returned 100% blocks executed 80%
+      468:  587:unsigned MLIRContext::getNumThreads() {
+      468:  588:  if (isMultithreadingEnabled()) {
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+     465*:  589:    assert(impl->threadPool &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  590:           "multi-threading is enabled but threadpool not set");
+      465:  591:    return impl->threadPool->getThreadCount();
+        -:  592:  }
+        -:  593:  // No multithreading or active thread pool. Return 1 thread.
+        -:  594:  return 1;
+        -:  595:}
+        -:  596:
+function _ZN4mlir11MLIRContext13getThreadPoolEv called 133662 returned 100% blocks executed 60%
+   133662:  597:llvm::ThreadPool &MLIRContext::getThreadPool() {
+  133662*:  598:  assert(isMultithreadingEnabled() &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 never executed
+        -:  599:         "expected multi-threading to be enabled within the context");
+  133662*:  600:  assert(impl->threadPool &&
+branch  0 taken 0%
+branch  1 taken 100%
+call    2 never executed
+        -:  601:         "multi-threading is enabled but threadpool not set");
+   133662:  602:  return *impl->threadPool;
+        -:  603:}
+        -:  604:
+function _ZN4mlir11MLIRContext27enterMultiThreadedExecutionEv called 87285 returned 100% blocks executed 100%
+    87285:  605:void MLIRContext::enterMultiThreadedExecution() {
+        -:  606:#ifndef NDEBUG
+    87285:  607:  ++impl->multiThreadedExecutionContext;
+        -:  608:#endif
+    87285:  609:}
+function _ZN4mlir11MLIRContext26exitMultiThreadedExecutionEv called 87285 returned 100% blocks executed 100%
+    87285:  610:void MLIRContext::exitMultiThreadedExecution() {
+        -:  611:#ifndef NDEBUG
+    87285:  612:  --impl->multiThreadedExecutionContext;
+        -:  613:#endif
+    87285:  614:}
+        -:  615:
+        -:  616:/// Return true if we should attach the operation to diagnostics emitted via
+        -:  617:/// Operation::emit.
+function _ZN4mlir11MLIRContext25shouldPrintOpOnDiagnosticEv called 6312128 returned 100% blocks executed 100%
+  6312128:  618:bool MLIRContext::shouldPrintOpOnDiagnostic() {
+  6312128:  619:  return impl->printOpOnDiagnostic;
+        -:  620:}
+        -:  621:
+        -:  622:/// Set the flag specifying if we should attach the operation to diagnostics
+        -:  623:/// emitted via Operation::emit.
+function _ZN4mlir11MLIRContext19printOpOnDiagnosticEb called 189639 returned 100% blocks executed 67%
+   189639:  624:void MLIRContext::printOpOnDiagnostic(bool enable) {
+  189639*:  625:  assert(impl->multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  626:         "changing MLIRContext `print-op-on-diagnostic` configuration while in "
+        -:  627:         "a multi-threaded execution context");
+   189639:  628:  impl->printOpOnDiagnostic = enable;
+   189639:  629:}
+        -:  630:
+        -:  631:/// Return true if we should attach the current stacktrace to diagnostics when
+        -:  632:/// emitted.
+function _ZN4mlir11MLIRContext33shouldPrintStackTraceOnDiagnosticEv called 6319962 returned 100% blocks executed 100%
+  6319962:  633:bool MLIRContext::shouldPrintStackTraceOnDiagnostic() {
+  6319962:  634:  return impl->printStackTraceOnDiagnostic;
+        -:  635:}
+        -:  636:
+        -:  637:/// Set the flag specifying if we should attach the current stacktrace when
+        -:  638:/// emitting diagnostics.
+function _ZN4mlir11MLIRContext27printStackTraceOnDiagnosticEb called 189146 returned 100% blocks executed 67%
+   189146:  639:void MLIRContext::printStackTraceOnDiagnostic(bool enable) {
+  189146*:  640:  assert(impl->multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  641:         "changing MLIRContext `print-stacktrace-on-diagnostic` configuration "
+        -:  642:         "while in a multi-threaded execution context");
+   189146:  643:  impl->printStackTraceOnDiagnostic = enable;
+   189146:  644:}
+        -:  645:
+        -:  646:/// Return information about all registered operations.
+function _ZN4mlir11MLIRContext23getRegisteredOperationsEv called 4856 returned 100% blocks executed 100%
+     4856:  647:ArrayRef<RegisteredOperationName> MLIRContext::getRegisteredOperations() {
+     4856:  648:  return impl->sortedRegisteredOperations;
+        -:  649:}
+        -:  650:
+function _ZN4mlir11MLIRContext21isOperationRegisteredEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  651:bool MLIRContext::isOperationRegistered(StringRef name) {
+    #####:  652:  return RegisteredOperationName::lookup(name, this).has_value();
+call    0 never executed
+        -:  653:}
+        -:  654:
+function _ZN4mlir7Dialect7addTypeENS_6TypeIDEONS_12AbstractTypeE called 3912876 returned 100% blocks executed 75%
+  3912876:  655:void Dialect::addType(TypeID typeID, AbstractType &&typeInfo) {
+  3912876:  656:  auto &impl = context->getImpl();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 3912876*:  657:  assert(impl.multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  658:         "Registering a new type kind while in a multi-threaded execution "
+        -:  659:         "context");
+  3912876:  660:  auto *newInfo =
+call    0 returned 100%
+  7825752:  661:      new (impl.abstractDialectSymbolAllocator.Allocate<AbstractType>())
+  3912876:  662:          AbstractType(std::move(typeInfo));
+call    0 returned 100%
+call    1 returned 100%
+  3912876:  663:  if (!impl.registeredTypes.insert({typeID, newInfo}).second)
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  664:    llvm::report_fatal_error("Dialect Type already registered.");
+call    0 never executed
+  3912876:  665:}
+        -:  666:
+function _ZN4mlir7Dialect12addAttributeENS_6TypeIDEONS_17AbstractAttributeE called 5539815 returned 100% blocks executed 75%
+  5539815:  667:void Dialect::addAttribute(TypeID typeID, AbstractAttribute &&attrInfo) {
+  5539815:  668:  auto &impl = context->getImpl();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 5539815*:  669:  assert(impl.multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  670:         "Registering a new attribute kind while in a multi-threaded execution "
+        -:  671:         "context");
+  5539815:  672:  auto *newInfo =
+call    0 returned 100%
+ 11079630:  673:      new (impl.abstractDialectSymbolAllocator.Allocate<AbstractAttribute>())
+  5539815:  674:          AbstractAttribute(std::move(attrInfo));
+call    0 returned 100%
+call    1 returned 100%
+  5539815:  675:  if (!impl.registeredAttributes.insert({typeID, newInfo}).second)
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  676:    llvm::report_fatal_error("Dialect Attribute already registered.");
+call    0 never executed
+  5539815:  677:}
+        -:  678:
+        -:  679://===----------------------------------------------------------------------===//
+        -:  680:// AbstractAttribute
+        -:  681://===----------------------------------------------------------------------===//
+        -:  682:
+        -:  683:/// Get the dialect that registered the attribute with the provided typeid.
+function _ZN4mlir17AbstractAttribute6lookupENS_6TypeIDEPNS_11MLIRContextE called 311512946 returned 100% blocks executed 75%
+311512946:  684:const AbstractAttribute &AbstractAttribute::lookup(TypeID typeID,
+        -:  685:                                                   MLIRContext *context) {
+311512946:  686:  const AbstractAttribute *abstract = lookupMutable(typeID, context);
+call    0 returned 100%
+311512946:  687:  if (!abstract)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  688:    llvm::report_fatal_error("Trying to create an Attribute that was not "
+call    0 never executed
+        -:  689:                             "registered in this MLIRContext.");
+311512946:  690:  return *abstract;
+        -:  691:}
+        -:  692:
+function _ZN4mlir17AbstractAttribute13lookupMutableENS_6TypeIDEPNS_11MLIRContextE called 311512946 returned 100% blocks executed 100%
+311512946:  693:AbstractAttribute *AbstractAttribute::lookupMutable(TypeID typeID,
+        -:  694:                                                    MLIRContext *context) {
+311512946:  695:  auto &impl = context->getImpl();
+call    0 returned 100%
+311512946:  696:  auto it = impl.registeredAttributes.find(typeID);
+call    0 returned 100%
+311512947:  697:  if (it == impl.registeredAttributes.end())
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+        -:  698:    return nullptr;
+311512946:  699:  return it->second;
+call    0 returned 100%
+        -:  700:}
+        -:  701:
+        -:  702://===----------------------------------------------------------------------===//
+        -:  703:// OperationName
+        -:  704://===----------------------------------------------------------------------===//
+        -:  705:
+function _ZN4mlir13OperationNameC2EN4llvm9StringRefEPNS_11MLIRContextE called 123005694 returned 100% blocks executed 100%
+123005694:  706:OperationName::OperationName(StringRef name, MLIRContext *context) {
+123005694:  707:  MLIRContextImpl &ctxImpl = context->getImpl();
+branch  0 taken 93% (fallthrough)
+branch  1 taken 7%
+        -:  708:
+        -:  709:  // Check for an existing name in read-only mode.
+123005694:  710:  bool isMultithreadingEnabled = context->isMultithreadingEnabled();
+branch  0 taken 93% (fallthrough)
+branch  1 taken 7%
+114906846:  711:  if (isMultithreadingEnabled) {
+        -:  712:    // Check the registered info map first. In the overwhelmingly common case,
+        -:  713:    // the entry will be in here and it also removes the need to acquire any
+        -:  714:    // locks.
+114906846:  715:    auto registeredIt = ctxImpl.registeredOperations.find(name);
+call    0 returned 100%
+114906864:  716:    if (LLVM_LIKELY(registeredIt != ctxImpl.registeredOperations.end())) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+114661066:  717:      impl = registeredIt->second.impl;
+114661066:  718:      return;
+        -:  719:    }
+        -:  720:
+   411584:  721:    llvm::sys::SmartScopedReader<true> contextLock(ctxImpl.operationInfoMutex);
+call    0 returned 100%
+   246140:  722:    auto it = ctxImpl.operations.find(name);
+call    0 returned 100%
+   245900:  723:    if (it != ctxImpl.operations.end()) {
+branch  0 taken 33% (fallthrough)
+branch  1 taken 67%
+    80131:  724:      impl = &it->second;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+114821815:  725:      return;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  726:    }
+        -:  727:  }
+        -:  728:
+        -:  729:  // Acquire a writer-lock so that we can safely create the new instance.
+ 16529273:  730:  ScopedWriterLock lock(ctxImpl.operationInfoMutex, isMultithreadingEnabled);
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+        -:  731:
+  8264639:  732:  auto it = ctxImpl.operations.insert({name, OperationName::Impl(nullptr)});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+  8264639:  733:  if (it.second)
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+   169573:  734:    it.first->second.name = StringAttr::get(context, name);
+call    0 returned 100%
+call    1 returned 100%
+  8264639:  735:  impl = &it.first->second;
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+        -:  736:}
+        -:  737:
+function _ZNK4mlir13OperationName19getDialectNamespaceEv called 195167580 returned 100% blocks executed 100%
+195167580:  738:StringRef OperationName::getDialectNamespace() const {
+195318910:  739:  if (Dialect *dialect = getDialect())
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 1%
+195016334:  740:    return dialect->getNamespace();
+   151247:  741:  return getStringRef().split('.').first;
+call    0 returned 100%
+call    1 returned 100%
+        -:  742:}
+        -:  743:
+        -:  744://===----------------------------------------------------------------------===//
+        -:  745:// RegisteredOperationName
+        -:  746://===----------------------------------------------------------------------===//
+        -:  747:
+        -:  748:Optional<RegisteredOperationName>
+function _ZN4mlir23RegisteredOperationName6lookupEN4llvm9StringRefEPNS_11MLIRContextE called 258874516 returned 100% blocks executed 100%
+258874516:  749:RegisteredOperationName::lookup(StringRef name, MLIRContext *ctx) {
+258874516:  750:  auto &impl = ctx->getImpl();
+call    0 returned 100%
+258874516:  751:  auto it = impl.registeredOperations.find(name);
+call    0 returned 100%
+258874518:  752:  if (it != impl.registeredOperations.end())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+258136745:  753:    return it->getValue();
+   737773:  754:  return llvm::None;
+        -:  755:}
+        -:  756:
+        -:  757:ParseResult
+function _ZNK4mlir23RegisteredOperationName13parseAssemblyERNS_11OpAsmParserERNS_14OperationStateE called 0 returned 0% blocks executed 0%
+    #####:  758:RegisteredOperationName::parseAssembly(OpAsmParser &parser,
+        -:  759:                                       OperationState &result) const {
+    #####:  760:  return impl->parseAssemblyFn(parser, result);
+call    0 never executed
+        -:  761:}
+        -:  762:
+function _ZNK4mlir23RegisteredOperationName20populateDefaultAttrsERNS_13NamedAttrListE called 257986703 returned 100% blocks executed 100%
+257986703:  763:void RegisteredOperationName::populateDefaultAttrs(NamedAttrList &attrs) const {
+257986703:  764:  impl->populateDefaultAttrsFn(*this, attrs);
+call    0 returned 100%
+257986700:  765:}
+        -:  766:
+function _ZN4mlir23RegisteredOperationName6insertEN4llvm9StringRefERNS_7DialectENS_6TypeIDEONS1_15unique_functionIKFNS_11ParseResultERNS_11OpAsmParserERNS_14OperationStateEEEEONS6_IKFvPNS_9OperationERNS_12OpAsmPrinterES2_EEEONS6_IKFNS_13LogicalResultESG_EEESP_ONS6_IKFSM_SG_NS1_8ArrayRefINS_9AttributeEEERNS1_15SmallVectorImplINS_12OpFoldResultEEEEEEONS6_IKFvRNS_17RewritePatternSetEPNS_11MLIRContextEEEEONS_6detail12InterfaceMapEONS6_IKFbS5_EEENSQ_IS2_EEONS6_IKFvRKS0_RNS_13NamedAttrListEEEE called 33220165 returned 100% blocks executed 87%
+ 33220165:  767:void RegisteredOperationName::insert(
+        -:  768:    StringRef name, Dialect &dialect, TypeID typeID,
+        -:  769:    ParseAssemblyFn &&parseAssembly, PrintAssemblyFn &&printAssembly,
+        -:  770:    VerifyInvariantsFn &&verifyInvariants,
+        -:  771:    VerifyRegionInvariantsFn &&verifyRegionInvariants, FoldHookFn &&foldHook,
+        -:  772:    GetCanonicalizationPatternsFn &&getCanonicalizationPatterns,
+        -:  773:    detail::InterfaceMap &&interfaceMap, HasTraitFn &&hasTrait,
+        -:  774:    ArrayRef<StringRef> attrNames,
+        -:  775:    PopulateDefaultAttrsFn &&populateDefaultAttrs) {
+ 33220165:  776:  MLIRContext *ctx = dialect.getContext();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 33220165:  777:  auto &ctxImpl = ctx->getImpl();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+33220165*:  778:  assert(ctxImpl.multiThreadedExecutionContext == 0 &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  779:         "registering a new operation kind while in a multi-threaded execution "
+        -:  780:         "context");
+        -:  781:
+        -:  782:  // Register the attribute names of this operation.
+ 33220165:  783:  MutableArrayRef<StringAttr> cachedAttrNames;
+ 33220165:  784:  if (!attrNames.empty()) {
+branch  0 taken 38% (fallthrough)
+branch  1 taken 62%
+ 12498731:  785:    cachedAttrNames = MutableArrayRef<StringAttr>(
+call    0 returned 100%
+call    1 returned 100%
+ 12498731:  786:        ctxImpl.abstractDialectSymbolAllocator.Allocate<StringAttr>(
+call    0 returned 100%
+        -:  787:            attrNames.size()),
+        -:  788:        attrNames.size());
+ 37626486:  789:    for (unsigned i : llvm::seq<unsigned>(0, attrNames.size()))
+call    0 returned 100%
+branch  1 taken 67% (fallthrough)
+branch  2 taken 33%
+ 25127755:  790:      new (&cachedAttrNames[i]) StringAttr(StringAttr::get(ctx, attrNames[i]));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+        -:  791:  }
+        -:  792:
+        -:  793:  // Insert the operation info if it doesn't exist yet.
+ 33220165:  794:  auto it = ctxImpl.operations.insert({name, OperationName::Impl(nullptr)});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+ 33220165:  795:  if (it.second)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  796:    it.first->second.name = StringAttr::get(ctx, name);
+call    0 returned 100%
+call    1 returned 100%
+ 33220165:  797:  OperationName::Impl &impl = it.first->second;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  798:
+ 33220165:  799:  if (impl.isRegistered()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  800:    llvm::errs() << "error: operation named '" << name
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  801:                 << "' is already registered.\n";
+call    0 never executed
+    #####:  802:    abort();
+call    0 never executed
+        -:  803:  }
+ 33220165:  804:  auto emplaced = ctxImpl.registeredOperations.try_emplace(
+ 33220165:  805:      name, RegisteredOperationName(&impl));
+call    0 returned 100%
+33220165*:  806:  assert(emplaced.second && "operation name registration must be successful");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  807:
+        -:  808:  // Add emplaced operation name to the sorted operations container.
+ 33220165:  809:  RegisteredOperationName &value = emplaced.first->getValue();
+call    0 returned 100%
+ 33220165:  810:  ctxImpl.sortedRegisteredOperations.insert(
+call    0 returned 100%
+ 33220165:  811:      llvm::upper_bound(ctxImpl.sortedRegisteredOperations, value,
+call    0 returned 100%
+        -:  812:                        [](auto &lhs, auto &rhs) {
+        -:  813:                          return lhs.getIdentifier().compare(
+        -:  814:                              rhs.getIdentifier());
+        -:  815:                        }),
+        -:  816:      value);
+        -:  817:
+        -:  818:  // Update the registered info for this operation.
+ 33220165:  819:  impl.dialect = &dialect;
+ 33220165:  820:  impl.typeID = typeID;
+ 33220165:  821:  impl.interfaceMap = std::move(interfaceMap);
+call    0 returned 100%
+ 33220165:  822:  impl.foldHookFn = std::move(foldHook);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  823:  impl.getCanonicalizationPatternsFn = std::move(getCanonicalizationPatterns);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  824:  impl.hasTraitFn = std::move(hasTrait);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  825:  impl.parseAssemblyFn = std::move(parseAssembly);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  826:  impl.printAssemblyFn = std::move(printAssembly);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  827:  impl.verifyInvariantsFn = std::move(verifyInvariants);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  828:  impl.verifyRegionInvariantsFn = std::move(verifyRegionInvariants);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  829:  impl.attributeNames = cachedAttrNames;
+ 33220165:  830:  impl.populateDefaultAttrsFn = std::move(populateDefaultAttrs);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+ 33220165:  831:}
+        -:  832:
+        -:  833://===----------------------------------------------------------------------===//
+        -:  834:// AbstractType
+        -:  835://===----------------------------------------------------------------------===//
+        -:  836:
+function _ZN4mlir12AbstractType6lookupENS_6TypeIDEPNS_11MLIRContextE called 19598108 returned 100% blocks executed 75%
+ 19598108:  837:const AbstractType &AbstractType::lookup(TypeID typeID, MLIRContext *context) {
+ 19598108:  838:  const AbstractType *type = lookupMutable(typeID, context);
+call    0 returned 100%
+ 19598108:  839:  if (!type)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  840:    llvm::report_fatal_error(
+call    0 never executed
+        -:  841:        "Trying to create a Type that was not registered in this MLIRContext.");
+ 19598108:  842:  return *type;
+        -:  843:}
+        -:  844:
+function _ZN4mlir12AbstractType13lookupMutableENS_6TypeIDEPNS_11MLIRContextE called 19601711 returned 100% blocks executed 100%
+ 19601711:  845:AbstractType *AbstractType::lookupMutable(TypeID typeID, MLIRContext *context) {
+ 19601711:  846:  auto &impl = context->getImpl();
+call    0 returned 100%
+ 19601711:  847:  auto it = impl.registeredTypes.find(typeID);
+call    0 returned 100%
+ 19601711:  848:  if (it == impl.registeredTypes.end())
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+        -:  849:    return nullptr;
+ 19601711:  850:  return it->second;
+call    0 returned 100%
+        -:  851:}
+        -:  852:
+        -:  853://===----------------------------------------------------------------------===//
+        -:  854:// Type uniquing
+        -:  855://===----------------------------------------------------------------------===//
+        -:  856:
+        -:  857:/// Returns the storage uniquer used for constructing type storage instances.
+        -:  858:/// This should not be used directly.
+function _ZN4mlir11MLIRContext14getTypeUniquerEv called 1486306557 returned 100% blocks executed 100%
+  7211570:  859:StorageUniquer &MLIRContext::getTypeUniquer() { return getImpl().typeUniquer; }
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+        -:  860:
+function _ZN4mlir14Float8E5M2Type3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  861:Float8E5M2Type Float8E5M2Type::get(MLIRContext *context) {
+    #####:  862:  return context->getImpl().f8E5M2Ty;
+        -:  863:}
+function _ZN4mlir12BFloat16Type3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  864:BFloat16Type BFloat16Type::get(MLIRContext *context) {
+    #####:  865:  return context->getImpl().bf16Ty;
+        -:  866:}
+function _ZN4mlir11Float16Type3getEPNS_11MLIRContextE called 45024722 returned 100% blocks executed 100%
+ 45024722:  867:Float16Type Float16Type::get(MLIRContext *context) {
+ 45024722:  868:  return context->getImpl().f16Ty;
+        -:  869:}
+function _ZN4mlir11Float32Type3getEPNS_11MLIRContextE called 49783703 returned 100% blocks executed 100%
+ 49783703:  870:Float32Type Float32Type::get(MLIRContext *context) {
+ 49783703:  871:  return context->getImpl().f32Ty;
+        -:  872:}
+function _ZN4mlir11Float64Type3getEPNS_11MLIRContextE called 61 returned 100% blocks executed 100%
+       61:  873:Float64Type Float64Type::get(MLIRContext *context) {
+       61:  874:  return context->getImpl().f64Ty;
+        -:  875:}
+function _ZN4mlir11Float80Type3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  876:Float80Type Float80Type::get(MLIRContext *context) {
+    #####:  877:  return context->getImpl().f80Ty;
+        -:  878:}
+function _ZN4mlir12Float128Type3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  879:Float128Type Float128Type::get(MLIRContext *context) {
+    #####:  880:  return context->getImpl().f128Ty;
+        -:  881:}
+        -:  882:
+        -:  883:/// Get an instance of the IndexType.
+function _ZN4mlir9IndexType3getEPNS_11MLIRContextE called 629298261 returned 100% blocks executed 100%
+629298261:  884:IndexType IndexType::get(MLIRContext *context) {
+629298261:  885:  return context->getImpl().indexTy;
+        -:  886:}
+        -:  887:
+        -:  888:/// Return an existing integer type instance if one is cached within the
+        -:  889:/// context.
+        -:  890:static IntegerType
+function _ZL20getCachedIntegerTypejN4mlir11IntegerType19SignednessSemanticsEPNS_11MLIRContextE called 512523266 returned 100% blocks executed 82%
+512523266:  891:getCachedIntegerType(unsigned width,
+        -:  892:                     IntegerType::SignednessSemantics signedness,
+        -:  893:                     MLIRContext *context) {
+512523266:  894:  if (signedness != IntegerType::Signless)
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+    12011:  895:    return IntegerType();
+        -:  896:
+512511255:  897:  switch (width) {
+branch  0 taken 68%
+branch  1 taken 1%
+branch  2 taken 6%
+branch  3 taken 11%
+branch  4 taken 15%
+branch  5 taken 0%
+branch  6 taken 0%
+347093377:  898:  case 1:
+347093377:  899:    return context->getImpl().int1Ty;
+   248815:  900:  case 8:
+   248815:  901:    return context->getImpl().int8Ty;
+ 30364069:  902:  case 16:
+ 30364069:  903:    return context->getImpl().int16Ty;
+ 58094437:  904:  case 32:
+ 58094437:  905:    return context->getImpl().int32Ty;
+ 76710557:  906:  case 64:
+ 76710557:  907:    return context->getImpl().int64Ty;
+    #####:  908:  case 128:
+    #####:  909:    return context->getImpl().int128Ty;
+    #####:  910:  default:
+    #####:  911:    return IntegerType();
+        -:  912:  }
+        -:  913:}
+        -:  914:
+function _ZN4mlir11IntegerType3getEPNS_11MLIRContextEjNS0_19SignednessSemanticsE called 512523262 returned 100% blocks executed 100%
+512523262:  915:IntegerType IntegerType::get(MLIRContext *context, unsigned width,
+        -:  916:                             IntegerType::SignednessSemantics signedness) {
+512523262:  917:  if (auto cached = getCachedIntegerType(width, signedness, context))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+512511257:  918:    return cached;
+    12011:  919:  return Base::get(context, width, signedness);
+call    0 returned 100%
+        -:  920:}
+        -:  921:
+        -:  922:IntegerType
+function _ZN4mlir11IntegerType10getCheckedEN4llvm12function_refIFNS_18InFlightDiagnosticEvEEEPNS_11MLIRContextEjNS0_19SignednessSemanticsE called 0 returned 0% blocks executed 0%
+    #####:  923:IntegerType::getChecked(function_ref<InFlightDiagnostic()> emitError,
+        -:  924:                        MLIRContext *context, unsigned width,
+        -:  925:                        SignednessSemantics signedness) {
+    #####:  926:  if (auto cached = getCachedIntegerType(width, signedness, context))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  927:    return cached;
+    #####:  928:  return Base::getChecked(emitError, context, width, signedness);
+call    0 never executed
+        -:  929:}
+        -:  930:
+        -:  931:/// Get an instance of the NoneType.
+function _ZN4mlir8NoneType3getEPNS_11MLIRContextE called 375971909 returned 100% blocks executed 100%
+375971909:  932:NoneType NoneType::get(MLIRContext *context) {
+375971909:  933:  if (NoneType cachedInst = context->getImpl().noneType)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+375215325:  934:    return cachedInst;
+        -:  935:  // Note: May happen when initializing the singleton attributes of the builtin
+        -:  936:  // dialect.
+   756584:  937:  return Base::get(context);
+call    0 returned 100%
+        -:  938:}
+        -:  939:
+        -:  940://===----------------------------------------------------------------------===//
+        -:  941:// Attribute uniquing
+        -:  942://===----------------------------------------------------------------------===//
+        -:  943:
+        -:  944:/// Returns the storage uniquer used for constructing attribute storage
+        -:  945:/// instances. This should not be used directly.
+function _ZN4mlir11MLIRContext19getAttributeUniquerEv called 4379177774 returned 100% blocks executed 100%
+4379934358:  946:StorageUniquer &MLIRContext::getAttributeUniquer() {
+   756584:  947:  return getImpl().attributeUniquer;
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  948:}
+        -:  949:
+        -:  950:/// Initialize the given attribute storage instance.
+function _ZN4mlir6detail16AttributeUniquer26initializeAttributeStorageEPNS_16AttributeStorageEPNS_11MLIRContextENS_6TypeIDE called 311512946 returned 100% blocks executed 100%
+311512946:  951:void AttributeUniquer::initializeAttributeStorage(AttributeStorage *storage,
+        -:  952:                                                  MLIRContext *ctx,
+        -:  953:                                                  TypeID attrID) {
+311512946:  954:  storage->initializeAbstractAttribute(AbstractAttribute::lookup(attrID, ctx));
+call    0 returned 100%
+311512946:  955:}
+        -:  956:
+function _ZN4mlir8BoolAttr3getEPNS_11MLIRContextEb called 4819086 returned 100% blocks executed 100%
+  4819086:  957:BoolAttr BoolAttr::get(MLIRContext *context, bool value) {
+  4819086:  958:  return value ? context->getImpl().trueAttr : context->getImpl().falseAttr;
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+        -:  959:}
+        -:  960:
+function _ZN4mlir8UnitAttr3getEPNS_11MLIRContextE called 1451 returned 100% blocks executed 100%
+     1451:  961:UnitAttr UnitAttr::get(MLIRContext *context) {
+     1451:  962:  return context->getImpl().unitAttr;
+        -:  963:}
+        -:  964:
+function _ZN4mlir10UnknownLoc3getEPNS_11MLIRContextE called 8361677 returned 100% blocks executed 100%
+ 8361677*:  965:UnknownLoc UnknownLoc::get(MLIRContext *context) {
+ 8361677*:  966:  return context->getImpl().unknownLocAttr;
+        -:  967:}
+        -:  968:
+        -:  969:/// Return empty dictionary.
+function _ZN4mlir14DictionaryAttr8getEmptyEPNS_11MLIRContextE called 174568739 returned 100% blocks executed 100%
+174568739:  970:DictionaryAttr DictionaryAttr::getEmpty(MLIRContext *context) {
+174568739:  971:  return context->getImpl().emptyDictionaryAttr;
+        -:  972:}
+        -:  973:
+function _ZN4mlir6detail17StringAttrStorage10initializeEPNS_11MLIRContextE called 42221833 returned 100% blocks executed 100%
+ 42221833:  974:void StringAttrStorage::initialize(MLIRContext *context) {
+        -:  975:  // Check for a dialect namespace prefix, if there isn't one we don't need to
+        -:  976:  // do any additional initialization.
+ 42221833:  977:  auto dialectNamePair = value.split('.');
+call    0 returned 100%
+ 42221833:  978:  if (dialectNamePair.first.empty() || dialectNamePair.second.empty())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+branch  2 taken 80% (fallthrough)
+branch  3 taken 20%
+  8739340:  979:    return;
+        -:  980:
+        -:  981:  // If one exists, we check to see if this dialect is loaded. If it is, we set
+        -:  982:  // the dialect now, if it isn't we record this storage for initialization
+        -:  983:  // later if the dialect ever gets loaded.
+ 33579690:  984:  if ((referencedDialect = context->getLoadedDialect(dialectNamePair.first)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+        -:  985:    return;
+        -:  986:
+ 33482493:  987:  MLIRContextImpl &impl = context->getImpl();
+call    0 returned 100%
+ 66964986:  988:  llvm::sys::SmartScopedLock<true> lock(impl.dialectRefStrAttrMutex);
+call    0 returned 100%
+ 33482493:  989:  impl.dialectReferencingStrAttrs[dialectNamePair.first].push_back(this);
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+        -:  990:}
+        -:  991:
+        -:  992:/// Return an empty string.
+function _ZN4mlir10StringAttr3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  993:StringAttr StringAttr::get(MLIRContext *context) {
+    #####:  994:  return context->getImpl().emptyStringAttr;
+        -:  995:}
+        -:  996:
+        -:  997://===----------------------------------------------------------------------===//
+        -:  998:// AffineMap uniquing
+        -:  999://===----------------------------------------------------------------------===//
+        -: 1000:
+function _ZN4mlir11MLIRContext16getAffineUniquerEv called 6997053746 returned 100% blocks executed 100%
+6997053746: 1001:StorageUniquer &MLIRContext::getAffineUniquer() {
+6997053746: 1002:  return getImpl().affineUniquer;
+        -: 1003:}
+        -: 1004:
+function _ZN4mlir9AffineMap7getImplEjjN4llvm8ArrayRefINS_10AffineExprEEEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+4289593162*: 1005:AffineMap AffineMap::getImpl(unsigned dimCount, unsigned symbolCount,
+        -: 1006:                             ArrayRef<AffineExpr> results,
+        -: 1007:                             MLIRContext *context) {
+47086454*: 1008:  auto &impl = context->getImpl();
+call    0 returned 100%
+call    1 returned 100%
+call    2 never executed
+call    3 never executed
+4289593162*: 1009:  auto *storage = impl.affineUniquer.get<AffineMapStorage>(
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 never executed
+call    4 never executed
+ 13509336: 1010:      [&](AffineMapStorage *storage) { storage->context = context; }, dimCount,
+        -: 1011:      symbolCount, results);
+4289594785*: 1012:  return AffineMap(storage);
+        -: 1013:}
+        -: 1014:
+        -: 1015:/// Check whether the arguments passed to the AffineMap::get() are consistent.
+        -: 1016:/// This method checks whether the highest index of dimensional identifier
+        -: 1017:/// present in result expressions is less than `dimCount` and the highest index
+        -: 1018:/// of symbolic identifier present in result expressions is less than
+        -: 1019:/// `symbolCount`.
+        -: 1020:LLVM_ATTRIBUTE_UNUSED static bool
+function _ZL20willBeValidAffineMapjjN4llvm8ArrayRefIN4mlir10AffineExprEEE called 4243599971 returned 100% blocks executed 40%
+4243599971: 1021:willBeValidAffineMap(unsigned dimCount, unsigned symbolCount,
+        -: 1022:                     ArrayRef<AffineExpr> results) {
+4243599971: 1023:  int64_t maxDimPosition = -1;
+4243599971: 1024:  int64_t maxSymbolPosition = -1;
+4243599971: 1025:  getMaxDimAndSymbol(ArrayRef<ArrayRef<AffineExpr>>(results), maxDimPosition,
+call    0 returned 100%
+        -: 1026:                     maxSymbolPosition);
+4243598322: 1027:  if ((maxDimPosition >= dimCount) || (maxSymbolPosition >= symbolCount)) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####: 1028:    LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1029:        llvm::dbgs()
+        -: 1030:        << "maximum dimensional identifier position in result expression must "
+        -: 1031:           "be less than `dimCount` and maximum symbolic identifier position "
+        -: 1032:           "in result expression must be less than `symbolCount`\n");
+    #####: 1033:    return false;
+        -: 1034:  }
+        -: 1035:  return true;
+        -: 1036:}
+        -: 1037:
+function _ZN4mlir9AffineMap3getEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####: 1038:AffineMap AffineMap::get(MLIRContext *context) {
+    #####: 1039:  return getImpl(/*dimCount=*/0, /*symbolCount=*/0, /*results=*/{}, context);
+call    0 never executed
+        -: 1040:}
+        -: 1041:
+function _ZN4mlir9AffineMap3getEjjPNS_11MLIRContextE called 45994855 returned 100% blocks executed 100%
+ 45994855: 1042:AffineMap AffineMap::get(unsigned dimCount, unsigned symbolCount,
+        -: 1043:                         MLIRContext *context) {
+ 45994855: 1044:  return getImpl(dimCount, symbolCount, /*results=*/{}, context);
+call    0 returned 100%
+        -: 1045:}
+        -: 1046:
+function _ZN4mlir9AffineMap3getEjjNS_10AffineExprE called 1091599 returned 100% blocks executed 83%
+  1091599: 1047:AffineMap AffineMap::get(unsigned dimCount, unsigned symbolCount,
+        -: 1048:                         AffineExpr result) {
+ 1091599*: 1049:  assert(willBeValidAffineMap(dimCount, symbolCount, {result}));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+  1091599: 1050:  return getImpl(dimCount, symbolCount, {result}, result.getContext());
+call    0 returned 100%
+call    1 returned 100%
+        -: 1051:}
+        -: 1052:
+function _ZN4mlir9AffineMap3getEjjN4llvm8ArrayRefINS_10AffineExprEEEPNS_11MLIRContextE called 4242508382 returned 100% blocks executed 80%
+4242508382: 1053:AffineMap AffineMap::get(unsigned dimCount, unsigned symbolCount,
+        -: 1054:                         ArrayRef<AffineExpr> results, MLIRContext *context) {
+4242508382*: 1055:  assert(willBeValidAffineMap(dimCount, symbolCount, results));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+4242506708: 1056:  return getImpl(dimCount, symbolCount, results, context);
+call    0 returned 100%
+        -: 1057:}
+        -: 1058:
+        -: 1059://===----------------------------------------------------------------------===//
+        -: 1060:// Integer Sets: these are allocated into the bump pointer, and are immutable.
+        -: 1061:// Unlike AffineMap's, these are uniqued only if they are small.
+        -: 1062://===----------------------------------------------------------------------===//
+        -: 1063:
+function _ZN4mlir10IntegerSet3getEjjN4llvm8ArrayRefINS_10AffineExprEEENS2_IbEE called 799333 returned 100% blocks executed 71%
+   799333: 1064:IntegerSet IntegerSet::get(unsigned dimCount, unsigned symbolCount,
+        -: 1065:                           ArrayRef<AffineExpr> constraints,
+        -: 1066:                           ArrayRef<bool> eqFlags) {
+        -: 1067:  // The number of constraints can't be zero.
+  799333*: 1068:  assert(!constraints.empty());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+  799333*: 1069:  assert(constraints.size() == eqFlags.size());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -: 1070:
+   799333: 1071:  auto &impl = constraints[0].getContext()->getImpl();
+call    0 returned 100%
+call    1 returned 100%
+   799333: 1072:  auto *storage = impl.affineUniquer.get<IntegerSetStorage>(
+call    0 returned 100%
+   631782: 1073:      [](IntegerSetStorage *) {}, dimCount, symbolCount, constraints, eqFlags);
+   799333: 1074:  return IntegerSet(storage);
+        -: 1075:}
+        -: 1076:
+        -: 1077://===----------------------------------------------------------------------===//
+        -: 1078:// StorageUniquerSupport
+        -: 1079://===----------------------------------------------------------------------===//
+        -: 1080:
+        -: 1081:/// Utility method to generate a callback that can be used to generate a
+        -: 1082:/// diagnostic when checking the construction invariants of a storage object.
+        -: 1083:/// This is defined out-of-line to avoid the need to include Location.h.
+        -: 1084:llvm::unique_function<InFlightDiagnostic()>
+function _ZN4mlir6detail26getDefaultDiagnosticEmitFnEPNS_11MLIRContextE called 2891751543 returned 100% blocks executed 100%
+2892520138: 1085:mlir::detail::getDefaultDiagnosticEmitFn(MLIRContext *ctx) {
+function _ZZN4mlir6detail26getDefaultDiagnosticEmitFnEPNS_11MLIRContextEENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+2892520138*: 1086:  return [ctx] { return emitError(UnknownLoc::get(ctx)); };
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+        -: 1087:}
+        -: 1088:llvm::unique_function<InFlightDiagnostic()>
+function _ZN4mlir6detail26getDefaultDiagnosticEmitFnERKNS_8LocationE called 0 returned 0% blocks executed 0%
+    #####: 1089:mlir::detail::getDefaultDiagnosticEmitFn(const Location &loc) {
+    #####: 1090:  return [=] { return emitError(loc); };
+call    0 never executed
+call    1 never executed
+        -: 1091:}

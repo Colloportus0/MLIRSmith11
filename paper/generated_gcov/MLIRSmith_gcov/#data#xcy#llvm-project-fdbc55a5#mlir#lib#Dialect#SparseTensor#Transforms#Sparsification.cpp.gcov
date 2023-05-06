@@ -1,0 +1,2597 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/SparseTensor/Transforms/Sparsification.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/Sparsification.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/Sparsification.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- Sparsification.cpp - Implementation of sparsification --------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements converting sparse tensor types to actual sparse code.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "CodegenUtils.h"
+        -:   14:
+        -:   15:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   16:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   17:#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
+        -:   18:#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+        -:   19:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   20:#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+        -:   21:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   22:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   23:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   24:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   25:#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+        -:   26:#include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
+        -:   27:#include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
+        -:   28:#include "mlir/Dialect/SparseTensor/Utils/Merger.h"
+        -:   29:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   30:#include "mlir/IR/Matchers.h"
+        -:   31:#include "mlir/IR/TensorEncoding.h"
+        -:   32:#include "llvm/ADT/SmallBitVector.h"
+        -:   33:
+        -:   34:using namespace mlir;
+        -:   35:using namespace mlir::sparse_tensor;
+        -:   36:
+        -:   37://===----------------------------------------------------------------------===//
+        -:   38:// Declarations of data structures.
+        -:   39://===----------------------------------------------------------------------===//
+        -:   40:
+        -:   41:namespace {
+        -:   42:
+        -:   43:// Iteration graph sorting.
+        -:   44:enum SortMask {
+        -:   45:  kSparseOnly = 0x0,
+        -:   46:  kIncludeDense = 0x1,
+        -:   47:  kIncludeUndef = 0x2,
+        -:   48:  kIncludeAll = 0x3
+        -:   49:};
+        -:   50:
+        -:   51:// Reduction kinds.
+        -:   52:enum Reduction { kNoReduc, kSum, kProduct, kAnd, kOr, kXor, kCustom };
+        -:   53:
+        -:   54:// Code generation.
+    #####:   55:struct CodeGen {
+call    0 never executed
+        -:   56:  CodeGen(SparsificationOptions o, ValueRange tensors, unsigned numTensors,
+        -:   57:          unsigned numLoops, OpOperand *op, unsigned nest,
+        -:   58:          std::vector<unsigned> &ts)
+        -:   59:      : options(o), loopEmitter(tensors, /*isLastOutput=*/true,
+        -:   60:                                /*isSparseOut=*/op != nullptr),
+        -:   61:        sparseOut(op), outerParNest(nest), topSort(ts) {
+        -:   62:    if (op)
+        -:   63:      insChain = op->get();
+        -:   64:  }
+        -:   65:  /// Sparsification options.
+        -:   66:  SparsificationOptions options;
+        -:   67:  /// Loop emitter helper class.
+        -:   68:  SparseTensorLoopEmitter loopEmitter;
+        -:   69:  /// Current reduction, updated during code generation. When indices of a
+        -:   70:  /// reduction are exhausted, all inner loops can use a scalarized reduction.
+        -:   71:  unsigned redExp = -1u;
+        -:   72:  Value redVal;
+        -:   73:  Reduction redKind = kNoReduc;
+        -:   74:  unsigned redCustom = -1u;
+        -:   75:  // Sparse tensor as output. Implemented either through direct injective
+        -:   76:  // insertion in lexicographic index order or through access pattern expansion
+        -:   77:  // in the innermost loop nest (`expValues` through `expCount`).
+        -:   78:  OpOperand *sparseOut;
+        -:   79:  unsigned outerParNest;
+        -:   80:  Value insChain; // bookkeeping for insertion chain
+        -:   81:  Value expValues;
+        -:   82:  Value expFilled;
+        -:   83:  Value expAdded;
+        -:   84:  Value expCount;
+        -:   85:  // Topsort (reference should remain in scope).
+        -:   86:  std::vector<unsigned> &topSort;
+        -:   87:
+function _ZNK12_GLOBAL__N_17CodeGen15getLoopIdxValueEm called 0 returned 0% blocks executed 0%
+    #####:   88:  Value getLoopIdxValue(size_t loopIdx) const {
+    #####:   89:    for (unsigned lv = 0; lv < topSort.size(); lv++)
+branch  0 never executed
+branch  1 never executed
+    #####:   90:      if (topSort[lv] == loopIdx)
+branch  0 never executed
+branch  1 never executed
+    #####:   91:        return loopEmitter.getLoopIV(lv);
+branch  0 never executed
+branch  1 never executed
+        -:   92:
+    #####:   93:    llvm_unreachable("invalid loop index");
+        -:   94:  }
+        -:   95:};
+        -:   96:
+        -:   97:} // namespace
+        -:   98:
+        -:   99://===----------------------------------------------------------------------===//
+        -:  100:// Sparse compiler analysis methods.
+        -:  101://===----------------------------------------------------------------------===//
+        -:  102:
+        -:  103:/// Helper method to construct a permuted dimension ordering
+        -:  104:/// that adheres to the given topological sort.
+function _ZL7permutePN4mlir11MLIRContextENS_9AffineMapERSt6vectorIjSaIjEE called 0 returned 0% blocks executed 0%
+    #####:  105:static AffineMap permute(MLIRContext *context, AffineMap m,
+        -:  106:                         std::vector<unsigned> &topSort) {
+    #####:  107:  unsigned sz = topSort.size();
+call    0 never executed
+    #####:  108:  assert(m.getNumResults() == sz && "TopoSort/AffineMap size mismatch");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  109:  // Construct the inverse of `m`; to avoid the asymptotic complexity
+        -:  110:  // of calling `m.getPermutedPosition` repeatedly.
+    #####:  111:  SmallVector<unsigned, 4> inv(sz);
+call    0 never executed
+    #####:  112:  for (unsigned i = 0; i < sz; i++)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  113:    inv[i] = m.getDimPosition(i);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  114:  // Construct the permutation.
+    #####:  115:  SmallVector<unsigned, 4> perm(sz);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  116:  for (unsigned i = 0; i < sz; i++)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  117:    perm[i] = inv[topSort[i]];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  118:  return AffineMap::getPermutationMap(perm, context);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  119:}
+        -:  120:
+        -:  121:/// Helper method to inspect affine expressions. Rejects cases where the
+        -:  122:/// same index is used more than once. Also rejects compound affine
+        -:  123:/// expressions in sparse dimensions.
+function _ZL10findAffineRN4mlir13sparse_tensor6MergerEjjNS_10AffineExprENS0_12DimLevelTypeEb called 1874 returned 100% blocks executed 45%
+     1874:  124:static bool findAffine(Merger &merger, unsigned tensor, unsigned dim,
+        -:  125:                       AffineExpr a, DimLevelType dlt,
+        -:  126:                       bool setLvlFormat = true) {
+     1874:  127:  switch (a.getKind()) {
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0%
+branch  3 taken 0%
+branch  4 taken 0%
+     1874:  128:  case AffineExprKind::DimId: {
+     1874:  129:    unsigned idx = a.cast<AffineDimExpr>().getPosition();
+call    0 returned 100%
+call    1 returned 100%
+     1874:  130:    if (!isUndefDLT(merger.getDimLevelType(tensor, idx)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  131:      return false; // used more than once
+        -:  132:
+     1874:  133:    if (setLvlFormat)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     1874:  134:      merger.setDimAndDimLevelType(tensor, idx, dim, dlt);
+call    0 returned 100%
+        -:  135:    return true;
+        -:  136:  }
+    #####:  137:  case AffineExprKind::Add:
+    #####:  138:  case AffineExprKind::Mul: {
+    #####:  139:    if (!isDenseDLT(dlt))
+branch  0 never executed
+branch  1 never executed
+        -:  140:      return false; // compound only in dense dim
+    #####:  141:    auto binOp = a.cast<AffineBinaryOpExpr>();
+call    0 never executed
+        -:  142:    // We do not set dim level format for affine expresssion like d0 + d1 on
+        -:  143:    // both loop index at d0 and d1,
+    #####:  144:    return findAffine(merger, tensor, dim, binOp.getLHS(), dlt, false) &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  145:           findAffine(merger, tensor, dim, binOp.getRHS(), dlt, false);
+call    0 never executed
+call    1 never executed
+        -:  146:  }
+    #####:  147:  case AffineExprKind::Constant:
+    #####:  148:    return isDenseDLT(dlt); // const only in dense dim
+        -:  149:  default:
+        -:  150:    return false;
+        -:  151:  }
+        -:  152:}
+        -:  153:
+        -:  154:/// Helper method to inspect sparse encodings in the tensor types.
+        -:  155:/// Fills the per-dimension sparsity information for all tensors.
+        -:  156:/// Returns true if the sparse annotations and affine subscript
+        -:  157:/// expressions of all tensors are admissible. Returns false if
+        -:  158:/// no annotations are found or inadmissible constructs occur.
+function _ZL21findSparseAnnotationsRN4mlir13sparse_tensor6MergerENS_6linalg9GenericOpE called 457 returned 100% blocks executed 88%
+      457:  159:static bool findSparseAnnotations(Merger &merger, linalg::GenericOp op) {
+      457:  160:  bool annotated = false;
+     1380:  161:  for (OpOperand &t : op->getOpOperands()) {
+call    0 returned 100%
+branch  1 taken 67% (fallthrough)
+branch  2 taken 33%
+      923:  162:    auto map = op.getMatchingIndexingMap(&t);
+call    0 returned 100%
+      923:  163:    auto enc = getSparseTensorEncoding(t.get().getType());
+call    0 returned 100%
+      923:  164:    if (enc)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  165:      annotated = true;
+     923*:  166:    assert(map.getNumResults() == op.getRank(&t));
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+call    4 never executed
+     2797:  167:    for (unsigned d = 0, rank = map.getNumResults(); d < rank; d++) {
+call    0 returned 100%
+branch  1 taken 67% (fallthrough)
+branch  2 taken 33%
+     1874:  168:      unsigned tensor = t.getOperandNumber();
+call    0 returned 100%
+     1874:  169:      AffineExpr a = map.getResult(toOrigDim(enc, d));
+call    0 returned 100%
+call    1 returned 100%
+     1874:  170:      if (!findAffine(merger, tensor, d, a, getDimLevelType(enc, d)))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  171:        return false; // inadmissible affine expression
+        -:  172:    }
+        -:  173:  }
+      457:  174:  return annotated;
+        -:  175:}
+        -:  176:
+        -:  177:/// A helper to compute a topological sort. O(n^2) time complexity
+        -:  178:/// as we use adj matrix for the graph.
+        -:  179:/// The sorted result will put the first Reduction iterator to the
+        -:  180:/// latest possible index.
+function _ZL14topSortOptimaljN4llvm8ArrayRefINS_9StringRefEEERSt6vectorIjSaIjEES6_RS3_IS3_IbSaIbEESaIS8_EE called 0 returned 0% blocks executed 0%
+    #####:  181:static bool topSortOptimal(unsigned n, ArrayRef<StringRef> iteratorTypes,
+        -:  182:                           std::vector<unsigned> &topSort,
+        -:  183:                           std::vector<unsigned> &inDegree,
+        -:  184:                           std::vector<std::vector<bool>> &adjM) {
+    #####:  185:  std::vector<unsigned> redIt; // reduce iterator with 0 degree
+    #####:  186:  std::vector<unsigned> parIt; // parallel iterator with 0 degree
+branch  0 never executed
+branch  1 never executed
+    #####:  187:  for (unsigned i = 0; i < n; i++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  188:    if (inDegree[i] == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  189:      if (linalg::isReductionIterator(iteratorTypes[i]))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  190:        redIt.push_back(i);
+call    0 never executed
+        -:  191:      else
+    #####:  192:        parIt.push_back(i);
+call    0 never executed
+        -:  193:    }
+        -:  194:  }
+        -:  195:
+    #####:  196:  while (!redIt.empty() || !parIt.empty()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  197:    // We always choose parallel iterator if there is any.
+    #####:  198:    auto &it = !parIt.empty() ? parIt : redIt;
+branch  0 never executed
+branch  1 never executed
+    #####:  199:    auto src = it.back();
+call    0 never executed
+    #####:  200:    topSort.push_back(src);
+call    0 never executed
+    #####:  201:    it.pop_back();
+        -:  202:    // Update in-degree, and push 0-degree node into worklist.
+    #####:  203:    for (unsigned dst = 0; dst < n; dst++)
+branch  0 never executed
+branch  1 never executed
+    #####:  204:      if (adjM[src][dst] && --inDegree[dst] == 0) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  205:        if (linalg::isReductionIterator(iteratorTypes[dst]))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  206:          redIt.push_back(dst);
+call    0 never executed
+        -:  207:        else
+    #####:  208:          parIt.push_back(dst);
+call    0 never executed
+        -:  209:      }
+        -:  210:  }
+    #####:  211:  return topSort.size() == n;
+branch  0 never executed
+branch  1 never executed
+        -:  212:}
+        -:  213:
+        -:  214:/// Helper method to add all constraints from the indices in one affine
+        -:  215:/// expression before all indices in the other affine expression. For
+        -:  216:/// example i0+i1 < i2+i3+1 yields i0<i2, i0<i3, i1<i2, and i1<i3.
+function _ZL18addAffineOrderingsRSt6vectorIS_IbSaIbEESaIS1_EERS_IjSaIjEEN4mlir10AffineExprES9_j called 0 returned 0% blocks executed 0%
+    #####:  217:static void addAffineOrderings(std::vector<std::vector<bool>> &adjM,
+        -:  218:                               std::vector<unsigned> &inDegree, AffineExpr a,
+        -:  219:                               AffineExpr b, unsigned fidx) {
+    #####:  220:  switch (a.getKind()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  221:  case AffineExprKind::DimId: {
+    #####:  222:    unsigned idx = a.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  223:    if (b)
+branch  0 never executed
+branch  1 never executed
+    #####:  224:      addAffineOrderings(adjM, inDegree, b, AffineExpr(), idx);
+call    0 never executed
+    #####:  225:    else if (!adjM[fidx][idx]) {
+branch  0 never executed
+branch  1 never executed
+    #####:  226:      adjM[fidx][idx] = true;
+    #####:  227:      inDegree[idx]++;
+        -:  228:    }
+        -:  229:    break;
+        -:  230:  }
+    #####:  231:  case AffineExprKind::Add:
+    #####:  232:  case AffineExprKind::Mul: {
+    #####:  233:    auto binOp = a.cast<AffineBinaryOpExpr>();
+call    0 never executed
+    #####:  234:    addAffineOrderings(adjM, inDegree, binOp.getLHS(), b, fidx);
+call    0 never executed
+call    1 never executed
+    #####:  235:    addAffineOrderings(adjM, inDegree, binOp.getRHS(), b, fidx);
+call    0 never executed
+call    1 never executed
+    #####:  236:    break;
+        -:  237:  }
+        -:  238:  default:
+        -:  239:    break;
+        -:  240:  }
+    #####:  241:}
+        -:  242:
+        -:  243:/// Computes a topologically sorted iteration graph for the linalg operation.
+        -:  244:/// Ensures all tensors are visited in natural index order. This is essential
+        -:  245:/// for sparse storage formats since these only support access along fixed
+        -:  246:/// dimensions. Even for dense storage formats, however, the natural index
+        -:  247:/// order yields innermost unit-stride access with better spatial locality.
+function _ZL21computeIterationGraphRN4mlir13sparse_tensor6MergerENS_6linalg9GenericOpERSt6vectorIjSaIjEEjPNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  248:static bool computeIterationGraph(Merger &merger, linalg::GenericOp op,
+        -:  249:                                  std::vector<unsigned> &topSort, unsigned mask,
+        -:  250:                                  OpOperand *skip = nullptr) {
+        -:  251:  // Set up an n x n from/to adjacency matrix of the iteration graph
+        -:  252:  // for the implicit loop indices i_0 .. i_n-1.
+    #####:  253:  unsigned n = op.getNumLoops();
+call    0 never executed
+    #####:  254:  std::vector<std::vector<bool>> adjM(n, std::vector<bool>(n, false));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  255:  std::vector<unsigned> inDegree(n, 0); // in-degree of each node.
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  256:  auto iteratorTypes = op.getIteratorTypesArray();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  257:  // Iterate over the indexing maps of every tensor in the tensor expression.
+    #####:  258:  for (OpOperand &t : op->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  259:    // Skip tensor during cycle resolution.
+    #####:  260:    if (&t == skip)
+branch  0 never executed
+branch  1 never executed
+    #####:  261:      continue;
+        -:  262:    // Get map and encoding.
+    #####:  263:    auto map = op.getMatchingIndexingMap(&t);
+call    0 never executed
+    #####:  264:    auto enc = getSparseTensorEncoding(t.get().getType());
+call    0 never executed
+    #####:  265:    assert(map.getNumDims() == n);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  266:    // Skip dense tensor constraints when not requested.
+    #####:  267:    if (!(mask & SortMask::kIncludeDense) && !enc)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  268:      continue;
+        -:  269:    // Each tensor expression and optional dimension ordering (row-major
+        -:  270:    // by default) puts an ordering constraint on the loop indices. For
+        -:  271:    // example, the tensor expresion A_ijk forces the ordering i < j < k
+        -:  272:    // on the loop indices if no explicit dimension ordering is given.
+    #####:  273:    for (unsigned d = 1, rank = map.getNumResults(); d < rank; d++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  274:      AffineExpr f = map.getResult(toOrigDim(enc, d - 1));
+call    0 never executed
+call    1 never executed
+    #####:  275:      AffineExpr t = map.getResult(toOrigDim(enc, d));
+call    0 never executed
+call    1 never executed
+    #####:  276:      addAffineOrderings(adjM, inDegree, f, t, 0);
+call    0 never executed
+        -:  277:    }
+        -:  278:    // Push unrelated loops into sparse iteration space, so these
+        -:  279:    // will be skipped more often.
+    #####:  280:    if (mask & SortMask::kIncludeUndef) {
+branch  0 never executed
+branch  1 never executed
+    #####:  281:      unsigned tensor = t.getOperandNumber();
+    #####:  282:      for (unsigned i = 0; i < n; i++)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  283:        if (isCompressedDLT(merger.getDimLevelType(tensor, i)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  284:            isSingletonDLT(merger.getDimLevelType(tensor, i))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  285:          for (unsigned j = 0; j < n; j++)
+branch  0 never executed
+branch  1 never executed
+    #####:  286:            if (isUndefDLT(merger.getDimLevelType(tensor, j))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  287:              adjM[i][j] = true;
+    #####:  288:              inDegree[j]++;
+        -:  289:            }
+        -:  290:        } else {
+    #####:  291:          assert(isDenseDLT(merger.getDimLevelType(tensor, i)) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  292:                 isUndefDLT(merger.getDimLevelType(tensor, i)));
+        -:  293:        }
+        -:  294:    }
+        -:  295:  }
+        -:  296:  // Topologically sort the iteration graph to determine loop order.
+        -:  297:  // Report failure for a cyclic iteration graph.
+    #####:  298:  topSort.clear();
+branch  0 never executed
+branch  1 never executed
+    #####:  299:  topSort.reserve(n);
+call    0 never executed
+    #####:  300:  return topSortOptimal(n, iteratorTypes, topSort, inDegree, adjM);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  301:}
+        -:  302:
+        -:  303:/// Returns true if tensor materializes uninitialized into the computation.
+function _ZL15isMaterializingN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  304:static bool isMaterializing(Value val) {
+    #####:  305:  return val.getDefiningOp<tensor::EmptyOp>() ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  306:         val.getDefiningOp<bufferization::AllocTensorOp>();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  307:}
+        -:  308:
+        -:  309:/// Returns true when the tensor expression is admissible for codegen.
+        -:  310:/// Since all sparse input tensors are admissible, we just need to check
+        -:  311:/// whether the out tensor in the tensor expression codegen is admissible.
+        -:  312:/// Sets `sparseOut` to the tensor and `outerParNest` to the outer injective
+        -:  313:/// nesting depth when a "truly dynamic" sparse tensor output occurs.
+function _ZL21isAdmissibleTensorExpRN4mlir13sparse_tensor6MergerENS_6linalg9GenericOpERSt6vectorIjSaIjEEjPPNS_9OpOperandERj called 0 returned 0% blocks executed 0%
+    #####:  314:static bool isAdmissibleTensorExp(Merger &merger, linalg::GenericOp op,
+        -:  315:                                  std::vector<unsigned> &topSort, unsigned exp,
+        -:  316:                                  OpOperand **sparseOut,
+        -:  317:                                  unsigned &outerParNest) {
+    #####:  318:  OpOperand *lhs = op.getDpsInitOperand(0);
+call    0 never executed
+    #####:  319:  unsigned tensor = lhs->getOperandNumber();
+call    0 never executed
+    #####:  320:  auto enc = getSparseTensorEncoding(lhs->get().getType());
+call    0 never executed
+        -:  321:  // An non-annotated output tensor is assumed dense, and becomes a random
+        -:  322:  // access n-dim memref. Admissible since insertions cannot occur.
+    #####:  323:  if (!enc)
+branch  0 never executed
+branch  1 never executed
+        -:  324:    return true;
+        -:  325:  // An all-dense annotated "sparse" output tensor becomes a linearized random
+        -:  326:  // access 1-dim memref. Also admissible since insertions cannot occur.
+    #####:  327:  bool allDense = true;
+    #####:  328:  auto iteratorTypes = op.getIteratorTypesArray();
+call    0 never executed
+    #####:  329:  unsigned numLoops = iteratorTypes.size();
+    #####:  330:  for (unsigned i = 0; i < numLoops; i++)
+branch  0 never executed
+branch  1 never executed
+    #####:  331:    if (isCompressedDLT(merger.getDimLevelType(tensor, i)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  332:        isSingletonDLT(merger.getDimLevelType(tensor, i))) {
+branch  0 never executed
+branch  1 never executed
+        -:  333:      allDense = false;
+        -:  334:      break;
+        -:  335:    } else {
+    #####:  336:      assert(isDenseDLT(merger.getDimLevelType(tensor, i)) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  337:             isUndefDLT(merger.getDimLevelType(tensor, i)));
+        -:  338:    }
+    #####:  339:  if (allDense)
+branch  0 never executed
+branch  1 never executed
+        -:  340:    return true;
+        -:  341:  // A tensor expression with a sparse output tensor that changes its values
+        -:  342:  // but not its nonzero structure, an operation called "simply dynamic" in
+        -:  343:  // [Bik96,Ch9], is also admissible without special codegen.
+    #####:  344:  if (merger.isSingleCondition(tensor, exp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  345:    return true;
+        -:  346:  // Accept "truly dynamic" if the output tensor materializes uninitialized
+        -:  347:  // into the computation and insertions occur in lexicographic index order.
+    #####:  348:  if (isMaterializing(lhs->get())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  349:    unsigned nest = 0;
+    #####:  350:    for (unsigned i = 0; i < numLoops; i++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  351:      if (linalg::isReductionIterator(iteratorTypes[topSort[i]]))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  352:        break; // terminate at first reduction
+    #####:  353:      nest++;
+        -:  354:    }
+        -:  355:    // Determine admissible dynamic insertion situations:
+        -:  356:    // (1) fully injective, since there are no reductions,
+        -:  357:    // (2) admissible 1-d expansion in innermost dimension.
+    #####:  358:    if (nest >= op.getRank(lhs) - 1) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  359:      *sparseOut = lhs;
+    #####:  360:      outerParNest = nest;
+    #####:  361:      return true;
+        -:  362:    }
+        -:  363:  }
+        -:  364:  return false;
+        -:  365:}
+        -:  366:
+        -:  367://===----------------------------------------------------------------------===//
+        -:  368:// Sparse compiler synthesis methods (reductions).
+        -:  369://===----------------------------------------------------------------------===//
+        -:  370:
+        -:  371:/// Maps operation to reduction.
+function _ZL12getReductionN4mlir13sparse_tensor4KindE called 0 returned 0% blocks executed 0%
+    #####:  372:static Reduction getReduction(Kind kind) {
+    #####:  373:  switch (kind) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  374:  case Kind::kAddF:
+        -:  375:  case Kind::kAddC:
+        -:  376:  case Kind::kAddI:
+        -:  377:  case Kind::kSubF:
+        -:  378:  case Kind::kSubC:
+        -:  379:  case Kind::kSubI:
+        -:  380:    return kSum;
+    #####:  381:  case Kind::kMulF:
+    #####:  382:  case Kind::kMulC:
+    #####:  383:  case Kind::kMulI:
+    #####:  384:    return kProduct;
+    #####:  385:  case Kind::kAndI:
+    #####:  386:    return kAnd;
+    #####:  387:  case Kind::kOrI:
+    #####:  388:    return kOr;
+    #####:  389:  case Kind::kXorI:
+    #####:  390:    return kXor;
+    #####:  391:  case Kind::kReduce:
+    #####:  392:    return kCustom;
+    #####:  393:  default:
+    #####:  394:    llvm_unreachable("unexpected reduction operator");
+call    0 never executed
+        -:  395:  }
+        -:  396:}
+        -:  397:
+        -:  398:/// Updates scalarized reduction value.
+function _ZL11updateReducRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  399:static void updateReduc(Merger &merger, CodeGen &codegen, Value reduc) {
+    #####:  400:  assert(codegen.redKind != kNoReduc);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  401:  codegen.redVal = merger.exp(codegen.redExp).val = reduc;
+branch  0 never executed
+branch  1 never executed
+    #####:  402:}
+        -:  403:
+        -:  404:/// Extracts identity from custom reduce.
+    #####:  405:static Value getCustomRedId(Operation *op) {
+    #####:  406:  return dyn_cast<sparse_tensor::ReduceOp>(op).getIdentity();
+call    0 never executed
+call    1 never executed
+        -:  407:}
+        -:  408:
+        -:  409://===----------------------------------------------------------------------===//
+        -:  410:// Sparse compiler synthesis methods (statements and expressions).
+        -:  411://===----------------------------------------------------------------------===//
+        -:  412:
+        -:  413:/// Local bufferization of all dense and sparse data structures.
+        -:  414:static void genBuffers(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  415:                       linalg::GenericOp op) {
+        -:  416:  Location loc = op.getLoc();
+        -:  417:  assert(op.getNumOperands() == op.getNumDpsInputs() + 1);
+        -:  418:
+        -:  419:  codegen.loopEmitter.initializeLoopEmit(
+        -:  420:      builder, loc,
+        -:  421:      /// Generates buffer for the output tensor.
+        -:  422:      /// Note that all sparse kernels assume that when all elements are written
+        -:  423:      /// to (viz. x(i) = y(i) * z(i)), the output buffer is already initialized
+        -:  424:      /// to all zeroes and only nonzeroes values are computed and written out.
+        -:  425:      /// For updates (viz. x(i) += y(i) * z(i)), only nonzeroes values are used
+        -:  426:      /// for the updates and no assumption on the original contents of the
+        -:  427:      /// output buffer is necessary.
+function _ZZL10genBuffersRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEENKUlS7_NS_8LocationENS_5ValueESB_E_clES7_SA_SB_SB_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  428:      [&op](OpBuilder &builder, Location loc, Value memref,
+    #####:  429:            Value tensor) -> Value {
+        -:  430:        // Must not be a sparse tensor.
+    #####:  431:        assert(!getSparseTensorEncoding(tensor.getType()));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  432:        OpOperand *lhs = op.getDpsInitOperand(0);
+call    0 never executed
+        -:  433:        // Two output tensors references should pointed to the same object.
+    #####:  434:        assert(lhs->get() == tensor);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  435:        bool isInit = op.isInitTensor(lhs);
+call    0 never executed
+        -:  436:        // An output tensor can simply materialize from the buffer of the tensor
+        -:  437:        // that appears in the outs() clause. For updates, this has the
+        -:  438:        // advantage that only the nonzero value are involved in the
+        -:  439:        // computation, keeping the operation O(nnz). In all other cases, we are
+        -:  440:        // forced to zero out the buffer to enforce the assumption above, which
+        -:  441:        // may negatively impact running complexity (viz. O(n^2 + nnz) vs.
+        -:  442:        // O(nnz) for matrices).
+        -:  443:        // TODO: use better analysis to avoid zeroing out the buffer?
+    #####:  444:        Value init = memref;
+    #####:  445:        if (!isInit) {
+branch  0 never executed
+branch  1 never executed
+    #####:  446:          Value zero = constantZero(builder, loc,
+    #####:  447:                                    getElementTypeOrSelf(tensor.getType()));
+call    0 never executed
+call    1 never executed
+    #####:  448:          builder.create<linalg::FillOp>(loc, ValueRange{zero},
+    #####:  449:                                         ValueRange{init});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  450:        }
+    #####:  451:        return init;
+        -:  452:      });
+        -:  453:}
+        -:  454:
+        -:  455:/// Generates an affine expression.
+        -:  456://
+        -:  457:// TODO: generalize for sparse tensor subscripts
+        -:  458://
+function _ZL9genAffineRN12_GLOBAL__N_17CodeGenERN4mlir9OpBuilderENS2_10AffineExprENS2_8LocationE called 0 returned 0% blocks executed 0%
+    #####:  459:static Value genAffine(CodeGen &codegen, OpBuilder &builder, AffineExpr a,
+        -:  460:                       Location loc) {
+    #####:  461:  switch (a.getKind()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  462:  case AffineExprKind::DimId: {
+    #####:  463:    unsigned idx = a.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  464:    return codegen.getLoopIdxValue(idx); // universal dense index
+call    0 never executed
+        -:  465:  }
+    #####:  466:  case AffineExprKind::Add: {
+    #####:  467:    auto binOp = a.cast<AffineBinaryOpExpr>();
+call    0 never executed
+    #####:  468:    return builder.create<arith::AddIOp>(
+    #####:  469:        loc, genAffine(codegen, builder, binOp.getLHS(), loc),
+call    0 never executed
+call    1 never executed
+    #####:  470:        genAffine(codegen, builder, binOp.getRHS(), loc));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  471:  }
+    #####:  472:  case AffineExprKind::Mul: {
+    #####:  473:    auto binOp = a.cast<AffineBinaryOpExpr>();
+call    0 never executed
+    #####:  474:    return builder.create<arith::MulIOp>(
+    #####:  475:        loc, genAffine(codegen, builder, binOp.getLHS(), loc),
+call    0 never executed
+call    1 never executed
+    #####:  476:        genAffine(codegen, builder, binOp.getRHS(), loc));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  477:  }
+    #####:  478:  case AffineExprKind::Constant: {
+    #####:  479:    int64_t c = a.cast<AffineConstantExpr>().getValue();
+call    0 never executed
+call    1 never executed
+    #####:  480:    return constantIndex(builder, loc, c);
+call    0 never executed
+        -:  481:  }
+    #####:  482:  default:
+    #####:  483:    llvm_unreachable("unexpected affine subscript");
+call    0 never executed
+        -:  484:  }
+        -:  485:}
+        -:  486:
+        -:  487:/// Generates index for load/store on sparse tensor.
+function _ZL8genIndexRN12_GLOBAL__N_17CodeGenEN4mlir6linalg9GenericOpEPNS2_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  488:static Value genIndex(CodeGen &codegen, linalg::GenericOp op, OpOperand *t) {
+    #####:  489:  auto map = op.getMatchingIndexingMap(t);
+call    0 never executed
+    #####:  490:  auto enc = getSparseTensorEncoding(t->get().getType());
+call    0 never executed
+    #####:  491:  AffineExpr a = map.getResult(toOrigDim(enc, map.getNumResults() - 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  492:  assert(a.getKind() == AffineExprKind::DimId);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  493:  unsigned idx = a.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  494:  return codegen.getLoopIdxValue(idx);
+call    0 never executed
+        -:  495:}
+        -:  496:
+        -:  497:/// Generates subscript for load/store on a dense or sparse tensor.
+function _ZL12genSubscriptRN12_GLOBAL__N_17CodeGenERN4mlir9OpBuilderENS2_6linalg9GenericOpEPNS2_9OpOperandERN4llvm11SmallVectorINS2_5ValueELj4EEE called 0 returned 0% blocks executed 0%
+    #####:  498:static Value genSubscript(CodeGen &codegen, OpBuilder &builder,
+        -:  499:                          linalg::GenericOp op, OpOperand *t,
+        -:  500:                          SmallVector<Value, 4> &args) {
+    #####:  501:  unsigned tensor = t->getOperandNumber();
+call    0 never executed
+    #####:  502:  auto map = op.getMatchingIndexingMap(t);
+call    0 never executed
+    #####:  503:  auto enc = getSparseTensorEncoding(t->get().getType());
+call    0 never executed
+    #####:  504:  unsigned rank = map.getNumResults();
+call    0 never executed
+    #####:  505:  if (enc) {
+branch  0 never executed
+branch  1 never executed
+        -:  506:    // Note that currently, all sparse subscripts are simple.
+        -:  507:    // TODO: accept affine too?
+    #####:  508:    assert(map.getResult(toOrigDim(enc, rank - 1)).getKind() ==
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  509:           AffineExprKind::DimId);
+    #####:  510:    Value pidx = codegen.loopEmitter.getPidxs()[tensor].back();
+branch  0 never executed
+branch  1 never executed
+    #####:  511:    assert(pidx);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  512:    args.push_back(pidx); // position index
+call    0 never executed
+        -:  513:  } else {
+    #####:  514:    for (unsigned d = 0; d < rank; d++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  515:      AffineExpr a = map.getResult(d);
+call    0 never executed
+    #####:  516:      args.push_back(genAffine(codegen, builder, a, op.getLoc()));
+call    0 never executed
+call    1 never executed
+        -:  517:    }
+        -:  518:  }
+    #####:  519:  return codegen.loopEmitter.getValBuffer()[tensor];
+        -:  520:}
+        -:  521:
+        -:  522:/// Generates insertion code to implement dynamic tensor load.
+function _ZL16genInsertionLoadRN12_GLOBAL__N_17CodeGenERN4mlir9OpBuilderENS2_6linalg9GenericOpEPNS2_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  523:static Value genInsertionLoad(CodeGen &codegen, OpBuilder &builder,
+        -:  524:                              linalg::GenericOp op, OpOperand *t) {
+    #####:  525:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+        -:  526:  // Direct lexicographic index order, tensor loads as zero.
+    #####:  527:  if (!codegen.expValues) {
+branch  0 never executed
+branch  1 never executed
+    #####:  528:    Type tp = getElementTypeOrSelf(t->get().getType());
+call    0 never executed
+    #####:  529:    return constantZero(builder, loc, tp);
+call    0 never executed
+        -:  530:  }
+        -:  531:  // Load from expanded access pattern.
+    #####:  532:  Value index = genIndex(codegen, op, t);
+call    0 never executed
+    #####:  533:  return builder.create<memref::LoadOp>(loc, codegen.expValues, index);
+call    0 never executed
+        -:  534:}
+        -:  535:
+        -:  536:/// Generates insertion code to implement dynamic tensor load for reduction.
+function _ZL22genInsertionLoadReduceRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEPNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  537:static Value genInsertionLoadReduce(Merger &merger, CodeGen &codegen,
+        -:  538:                                    OpBuilder &builder, linalg::GenericOp op,
+        -:  539:                                    OpOperand *t) {
+    #####:  540:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  541:  Value identity = getCustomRedId(merger.exp(codegen.redCustom).op);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  542:  // Direct lexicographic index order, tensor loads as identity.
+    #####:  543:  if (!codegen.expValues) {
+branch  0 never executed
+branch  1 never executed
+    #####:  544:    return identity;
+        -:  545:  }
+        -:  546:  // Load from expanded access pattern if filled, identity otherwise.
+    #####:  547:  Value index = genIndex(codegen, op, t);
+call    0 never executed
+    #####:  548:  Value isFilled =
+    #####:  549:      builder.create<memref::LoadOp>(loc, codegen.expFilled, index);
+call    0 never executed
+call    1 never executed
+    #####:  550:  Value valAtIndex =
+    #####:  551:      builder.create<memref::LoadOp>(loc, codegen.expValues, index);
+call    0 never executed
+call    1 never executed
+    #####:  552:  return builder.create<arith::SelectOp>(loc, isFilled, valAtIndex, identity);
+call    0 never executed
+        -:  553:}
+        -:  554:
+        -:  555:/// Generates insertion code to implement dynamic tensor store.
+function _ZL17genInsertionStoreRN12_GLOBAL__N_17CodeGenERN4mlir9OpBuilderENS2_6linalg9GenericOpEPNS2_9OpOperandENS2_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  556:static void genInsertionStore(CodeGen &codegen, OpBuilder &builder,
+        -:  557:                              linalg::GenericOp op, OpOperand *t, Value rhs) {
+    #####:  558:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+        -:  559:  // Direct insertion in lexicographic index order.
+    #####:  560:  if (!codegen.expValues) {
+branch  0 never executed
+branch  1 never executed
+    #####:  561:    unsigned rank = op.getRank(t);
+call    0 never executed
+    #####:  562:    SmallVector<Value, 4> indices;
+    #####:  563:    for (unsigned i = 0; i < rank; i++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  564:      assert(codegen.loopEmitter.getLoopIV(i));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  565:      indices.push_back(codegen.loopEmitter.getLoopIV(i));
+call    0 never executed
+        -:  566:    }
+    #####:  567:    codegen.insChain =
+    #####:  568:        builder.create<InsertOp>(loc, rhs, codegen.insChain, indices);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  569:    return;
+branch  0 never executed
+branch  1 never executed
+        -:  570:  }
+        -:  571:  // Generates insertion code along expanded access pattern.
+        -:  572:  //   if (!expFilled[i]) then
+        -:  573:  //     expFilled[i] = true
+        -:  574:  //     expAdded[inserts++] = i
+        -:  575:  //   endif
+        -:  576:  //   values[i] = rhs
+    #####:  577:  Value index = genIndex(codegen, op, t);
+call    0 never executed
+    #####:  578:  Value fval = constantI1(builder, loc, false);
+call    0 never executed
+    #####:  579:  Value tval = constantI1(builder, loc, true);
+call    0 never executed
+        -:  580:  // If statement.
+    #####:  581:  Value filled = builder.create<memref::LoadOp>(loc, codegen.expFilled, index);
+call    0 never executed
+call    1 never executed
+    #####:  582:  Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+    #####:  583:                                             filled, fval);
+call    0 never executed
+call    1 never executed
+    #####:  584:  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, builder.getIndexType(), cond,
+    #####:  585:                                             /*else=*/true);
+call    0 never executed
+call    1 never executed
+        -:  586:  // True branch.
+    #####:  587:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  588:  builder.create<memref::StoreOp>(loc, tval, codegen.expFilled, index);
+call    0 never executed
+    #####:  589:  builder.create<memref::StoreOp>(loc, index, codegen.expAdded,
+    #####:  590:                                  codegen.expCount);
+call    0 never executed
+    #####:  591:  Value one = constantIndex(builder, loc, 1);
+call    0 never executed
+    #####:  592:  Value add = builder.create<arith::AddIOp>(loc, codegen.expCount, one);
+call    0 never executed
+call    1 never executed
+    #####:  593:  builder.create<scf::YieldOp>(loc, add);
+call    0 never executed
+        -:  594:  // False branch.
+    #####:  595:  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  596:  builder.create<scf::YieldOp>(loc, codegen.expCount);
+call    0 never executed
+    #####:  597:  builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+        -:  598:  // Value assignment.
+    #####:  599:  codegen.expCount = ifOp.getResult(0);
+call    0 never executed
+    #####:  600:  builder.create<memref::StoreOp>(loc, rhs, codegen.expValues, index);
+call    0 never executed
+        -:  601:}
+        -:  602:
+        -:  603:/// Generates a load on a dense or sparse tensor.
+function _ZL13genTensorLoadRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEj called 0 returned 0% blocks executed 0%
+    #####:  604:static Value genTensorLoad(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  605:                           linalg::GenericOp op, unsigned exp) {
+        -:  606:  // Test if the load was hoisted to a higher loop nest.
+    #####:  607:  Value val = merger.exp(exp).val;
+branch  0 never executed
+branch  1 never executed
+    #####:  608:  if (val)
+branch  0 never executed
+branch  1 never executed
+    #####:  609:    return val;
+        -:  610:
+        -:  611:  // Load during insertion.
+    #####:  612:  OpOperand &t = op->getOpOperand(merger.exp(exp).tensor);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  613:  if (&t == codegen.sparseOut) {
+branch  0 never executed
+branch  1 never executed
+    #####:  614:    if (codegen.redCustom != -1u)
+branch  0 never executed
+branch  1 never executed
+    #####:  615:      return genInsertionLoadReduce(merger, codegen, builder, op, &t);
+call    0 never executed
+    #####:  616:    return genInsertionLoad(codegen, builder, op, &t);
+call    0 never executed
+        -:  617:  }
+        -:  618:  // Actual load.
+    #####:  619:  SmallVector<Value, 4> args;
+call    0 never executed
+    #####:  620:  Value ptr = genSubscript(codegen, builder, op, &t, args);
+call    0 never executed
+    #####:  621:  return builder.create<memref::LoadOp>(op.getLoc(), ptr, args);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  622:}
+        -:  623:
+        -:  624:/// Generates a store on a dense or sparse tensor.
+function _ZL14genTensorStoreRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjNS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  625:static void genTensorStore(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  626:                           linalg::GenericOp op, unsigned exp, Value rhs) {
+    #####:  627:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+        -:  628:  // Test if this is a scalarized reduction.
+    #####:  629:  if (codegen.redVal) {
+branch  0 never executed
+branch  1 never executed
+    #####:  630:    updateReduc(merger, codegen, rhs);
+    #####:  631:    return;
+call    0 never executed
+        -:  632:  }
+        -:  633:  // Store during insertion.
+    #####:  634:  OpOperand *t = op.getDpsInitOperand(0);
+call    0 never executed
+    #####:  635:  if (t == codegen.sparseOut) {
+branch  0 never executed
+branch  1 never executed
+    #####:  636:    if (!rhs) {
+branch  0 never executed
+branch  1 never executed
+        -:  637:      // Only unary and binary are allowed to return uninitialized rhs
+        -:  638:      // to indicate missing output.
+    #####:  639:      assert(merger.exp(exp).kind == kUnary || merger.exp(exp).kind == kBinary);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+    #####:  640:    } else if (merger.exp(exp).kind == kSelect) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  641:      // Select operation insertion.
+    #####:  642:      Value insChain = codegen.insChain;
+    #####:  643:      assert(insChain);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  644:      SmallVector<Type, 1> types;
+call    0 never executed
+    #####:  645:      types.push_back(codegen.insChain.getType());
+call    0 never executed
+    #####:  646:      scf::IfOp ifOp =
+    #####:  647:          builder.create<scf::IfOp>(loc, types, rhs, /*else=*/true);
+call    0 never executed
+    #####:  648:      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  649:      // Existing value was preserved to be used here.
+    #####:  650:      assert(merger.exp(exp).val);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  651:      Value v0 = merger.exp(exp).val;
+call    0 never executed
+    #####:  652:      genInsertionStore(codegen, builder, op, t, v0);
+call    0 never executed
+    #####:  653:      merger.exp(exp).val = Value();
+branch  0 never executed
+branch  1 never executed
+        -:  654:      // Yield modified insertion chain along true branch.
+    #####:  655:      builder.create<scf::YieldOp>(op.getLoc(), codegen.insChain);
+call    0 never executed
+        -:  656:      // Yield original insertion chain along false branch.
+    #####:  657:      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  658:      builder.create<scf::YieldOp>(loc, insChain);
+call    0 never executed
+        -:  659:      // Done with if statement.
+    #####:  660:      codegen.insChain = ifOp->getResult(0);
+call    0 never executed
+    #####:  661:      builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  662:    } else {
+    #####:  663:      genInsertionStore(codegen, builder, op, t, rhs);
+call    0 never executed
+        -:  664:    }
+    #####:  665:    return;
+        -:  666:  }
+        -:  667:  // Actual store.
+    #####:  668:  SmallVector<Value, 4> args;
+call    0 never executed
+    #####:  669:  Value ptr = genSubscript(codegen, builder, op, t, args);
+call    0 never executed
+    #####:  670:  builder.create<memref::StoreOp>(loc, rhs, ptr, args);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  671:}
+        -:  672:
+        -:  673:/// Generates an invariant value.
+        -:  674:inline static Value genInvariantValue(Merger &merger, CodeGen &codegen,
+        -:  675:                                      OpBuilder &builder, unsigned exp) {
+        -:  676:  return merger.exp(exp).val;
+        -:  677:}
+        -:  678:
+        -:  679:/// Generates an index value.
+    #####:  680:inline static Value genIndexValue(CodeGen &codegen, OpBuilder &builder,
+        -:  681:                                  unsigned idx) {
+    #####:  682:  return codegen.getLoopIdxValue(idx);
+        -:  683:}
+        -:  684:
+        -:  685:/// Semi-ring branches are simply inlined by the sparse compiler. Prior
+        -:  686:/// analysis has verified that all computations are "local" to the inlined
+        -:  687:/// branch or otherwise invariantly defined outside the loop nest, with the
+        -:  688:/// exception of index computations, which need to be relinked to actual
+        -:  689:/// inlined cloned code.
+function _ZL12relinkBranchRN12_GLOBAL__N_17CodeGenERN4mlir12RewriterBaseEPNS2_5BlockENS2_5ValueEj called 0 returned 0% blocks executed 0%
+    #####:  690:static Value relinkBranch(CodeGen &codegen, RewriterBase &rewriter,
+        -:  691:                          Block *block, Value e, unsigned ldx) {
+    #####:  692:  if (Operation *def = e.getDefiningOp()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  693:    if (auto indexOp = dyn_cast<linalg::IndexOp>(def))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  694:      return genIndexValue(codegen, rewriter, indexOp.getDim());
+call    0 never executed
+call    1 never executed
+    #####:  695:    if (def->getBlock() == block) {
+branch  0 never executed
+branch  1 never executed
+    #####:  696:      for (unsigned i = 0, n = def->getNumOperands(); i < n; i++)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  697:        def->setOperand(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  698:            i, relinkBranch(codegen, rewriter, block, def->getOperand(i), ldx));
+        -:  699:    }
+        -:  700:  }
+    #####:  701:  return e;
+        -:  702:}
+        -:  703:
+        -:  704:/// Recursively generates tensor expression.
+function _ZL6genExpRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_12RewriterBaseENS_6linalg9GenericOpEjj called 0 returned 0% blocks executed 0%
+    #####:  705:static Value genExp(Merger &merger, CodeGen &codegen, RewriterBase &rewriter,
+        -:  706:                    linalg::GenericOp op, unsigned exp, unsigned ldx) {
+    #####:  707:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  708:  if (exp == -1u)
+branch  0 never executed
+branch  1 never executed
+    #####:  709:    return Value();
+    #####:  710:  if (merger.exp(exp).kind == Kind::kTensor)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  711:    return genTensorLoad(merger, codegen, rewriter, op, exp);
+call    0 never executed
+    #####:  712:  if (merger.exp(exp).kind == Kind::kInvariant)
+branch  0 never executed
+branch  1 never executed
+    #####:  713:    return genInvariantValue(merger, codegen, rewriter, exp);
+call    0 never executed
+    #####:  714:  if (merger.exp(exp).kind == Kind::kIndex)
+branch  0 never executed
+branch  1 never executed
+    #####:  715:    return genIndexValue(codegen, rewriter, merger.exp(exp).index);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  716:
+    #####:  717:  if (merger.exp(exp).kind == Kind::kReduce) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  718:    // Make custom reduction identity accessible for expanded access pattern.
+    #####:  719:    assert(codegen.redCustom == -1u);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  720:    codegen.redCustom = exp;
+        -:  721:  }
+        -:  722:
+    #####:  723:  Value v0 =
+branch  0 never executed
+branch  1 never executed
+    #####:  724:      genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e0, ldx);
+call    0 never executed
+    #####:  725:  Value v1 =
+branch  0 never executed
+branch  1 never executed
+    #####:  726:      genExp(merger, codegen, rewriter, op, merger.exp(exp).children.e1, ldx);
+call    0 never executed
+    #####:  727:  Value ee = merger.buildExp(rewriter, loc, exp, v0, v1);
+call    0 never executed
+    #####:  728:  if (ee && (merger.exp(exp).kind == Kind::kUnary ||
+branch  0 never executed
+branch  1 never executed
+    #####:  729:             merger.exp(exp).kind == Kind::kBinary ||
+branch  0 never executed
+branch  1 never executed
+    #####:  730:             merger.exp(exp).kind == Kind::kBinaryBranch ||
+branch  0 never executed
+branch  1 never executed
+    #####:  731:             merger.exp(exp).kind == Kind::kReduce ||
+branch  0 never executed
+branch  1 never executed
+    #####:  732:             merger.exp(exp).kind == Kind::kSelect))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  733:    ee = relinkBranch(codegen, rewriter, ee.getParentBlock(), ee, ldx);
+call    0 never executed
+call    1 never executed
+        -:  734:
+    #####:  735:  if (merger.exp(exp).kind == kSelect) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  736:    assert(!merger.exp(exp).val);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  737:    merger.exp(exp).val = v0; // Preserve value for later use.
+        -:  738:  }
+        -:  739:
+    #####:  740:  if (merger.exp(exp).kind == Kind::kReduce) {
+branch  0 never executed
+branch  1 never executed
+    #####:  741:    assert(codegen.redCustom != -1u);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  742:    codegen.redCustom = -1u;
+        -:  743:  }
+        -:  744:
+    #####:  745:  return ee;
+        -:  746:}
+        -:  747:
+        -:  748:/// Determines if affine expression is invariant.
+function _ZL17isInvariantAffineRKN12_GLOBAL__N_17CodeGenEN4mlir10AffineExprEjRb called 0 returned 0% blocks executed 0%
+    #####:  749:static bool isInvariantAffine(const CodeGen &codegen, AffineExpr a,
+        -:  750:                              unsigned ldx, bool &atLevel) {
+    #####:  751:  switch (a.getKind()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  752:  case AffineExprKind::DimId: {
+    #####:  753:    unsigned idx = a.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  754:    if (idx == ldx)
+branch  0 never executed
+branch  1 never executed
+    #####:  755:      atLevel = true;
+    #####:  756:    return codegen.getLoopIdxValue(idx) != nullptr; // no longer in play?
+call    0 never executed
+        -:  757:  }
+    #####:  758:  case AffineExprKind::Add:
+    #####:  759:  case AffineExprKind::Mul: {
+    #####:  760:    auto binOp = a.cast<AffineBinaryOpExpr>();
+call    0 never executed
+    #####:  761:    return isInvariantAffine(codegen, binOp.getLHS(), ldx, atLevel) &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  762:           isInvariantAffine(codegen, binOp.getRHS(), ldx, atLevel);
+call    0 never executed
+call    1 never executed
+        -:  763:  }
+        -:  764:  default:
+        -:  765:    return true;
+        -:  766:  }
+        -:  767:}
+        -:  768:
+        -:  769:/// Hoists loop invariant tensor loads for which indices have been exhausted.
+function _ZL13genInvariantsRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjjbj called 0 returned 0% blocks executed 0%
+    #####:  770:static void genInvariants(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  771:                          linalg::GenericOp op, unsigned exp, unsigned ldx,
+        -:  772:                          bool atStart, unsigned last = -1u) {
+    #####:  773:  if (exp == -1u)
+branch  0 never executed
+branch  1 never executed
+        -:  774:    return;
+    #####:  775:  if (merger.exp(exp).kind == Kind::kTensor) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  776:    // Inspect tensor indices.
+    #####:  777:    bool atLevel = ldx == -1u;
+    #####:  778:    OpOperand &t = op->getOpOperand(merger.exp(exp).tensor);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  779:    auto map = op.getMatchingIndexingMap(&t);
+call    0 never executed
+    #####:  780:    auto enc = getSparseTensorEncoding(t.get().getType());
+call    0 never executed
+    #####:  781:    for (unsigned d = 0, rank = map.getNumResults(); d < rank; d++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  782:      AffineExpr a = map.getResult(toOrigDim(enc, d));
+call    0 never executed
+call    1 never executed
+    #####:  783:      if (!isInvariantAffine(codegen, a, ldx, atLevel))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  784:        return; // still in play
+        -:  785:    }
+        -:  786:    // All exhausted at this level (atLevel denotes exactly at this level).
+    #####:  787:    if (!atLevel)
+branch  0 never executed
+branch  1 never executed
+        -:  788:      return;
+    #####:  789:    OpOperand *lhs = op.getDpsInitOperand(0);
+call    0 never executed
+    #####:  790:    if (lhs == &t) {
+branch  0 never executed
+branch  1 never executed
+        -:  791:      // Start or end a scalarized reduction
+    #####:  792:      if (atStart) {
+branch  0 never executed
+branch  1 never executed
+    #####:  793:        Kind kind = merger.exp(last).kind;
+branch  0 never executed
+branch  1 never executed
+    #####:  794:        Value load = kind == Kind::kReduce
+    #####:  795:                         ? getCustomRedId(merger.exp(last).op)
+call    0 never executed
+    #####:  796:                         : genTensorLoad(merger, codegen, builder, op, exp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  797:        codegen.redKind = getReduction(kind);
+call    0 never executed
+    #####:  798:        codegen.redExp = exp;
+    #####:  799:        updateReduc(merger, codegen, load);
+call    0 never executed
+        -:  800:      } else {
+    #####:  801:        Value redVal = codegen.redVal;
+    #####:  802:        updateReduc(merger, codegen, Value());
+call    0 never executed
+    #####:  803:        codegen.redExp = -1u;
+    #####:  804:        codegen.redKind = kNoReduc;
+    #####:  805:        genTensorStore(merger, codegen, builder, op, exp, redVal);
+call    0 never executed
+        -:  806:      }
+        -:  807:    } else {
+        -:  808:      // Start or end loop invariant hoisting of a tensor load.
+    #####:  809:      merger.exp(exp).val =
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  810:          atStart ? genTensorLoad(merger, codegen, builder, op, exp) : Value();
+call    0 never executed
+        -:  811:    }
+    #####:  812:  } else if (merger.exp(exp).kind != Kind::kInvariant &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  813:             merger.exp(exp).kind != Kind::kIndex) {
+branch  0 never executed
+branch  1 never executed
+        -:  814:    // Traverse into the binary operations. Note that we only hoist
+        -:  815:    // tensor loads, since subsequent MLIR/LLVM passes know how to
+        -:  816:    // deal with all other kinds of derived loop invariants.
+    #####:  817:    unsigned e0 = merger.exp(exp).children.e0;
+call    0 never executed
+    #####:  818:    unsigned e1 = merger.exp(exp).children.e1;
+    #####:  819:    genInvariants(merger, codegen, builder, op, e0, ldx, atStart, exp);
+call    0 never executed
+    #####:  820:    genInvariants(merger, codegen, builder, op, e1, ldx, atStart, exp);
+call    0 never executed
+        -:  821:  }
+        -:  822:}
+        -:  823:
+        -:  824:/// Generates an expanded access pattern in innermost dimension.
+function _ZL12genExpansionRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjb called 0 returned 0% blocks executed 0%
+    #####:  825:static void genExpansion(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  826:                         linalg::GenericOp op, unsigned at, bool atStart) {
+    #####:  827:  OpOperand *lhs = codegen.sparseOut;
+    #####:  828:  if (!lhs || codegen.outerParNest != op.getRank(lhs) - 1 ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  829:      at != codegen.outerParNest)
+branch  0 never executed
+branch  1 never executed
+    #####:  830:    return; // not needed at this level
+    #####:  831:  assert(codegen.redVal == nullptr);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  832:  // Generate start or end of an expanded access pattern. Note that because
+        -:  833:  // an expension does not rely on the ongoing contents of the sparse storage
+        -:  834:  // scheme, we can use the original tensor as incoming SSA value (which
+        -:  835:  // simplifies codegen a bit). If expansion on the actual contents is ever
+        -:  836:  // needed, we will need to use the SSA value in the insertion chain instead.
+    #####:  837:  Value tensor = lhs->get();
+branch  0 never executed
+branch  1 never executed
+    #####:  838:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  839:  if (atStart) {
+branch  0 never executed
+branch  1 never executed
+    #####:  840:    auto dynShape = {ShapedType::kDynamicSize};
+    #####:  841:    Type etp = tensor.getType().cast<ShapedType>().getElementType();
+call    0 never executed
+call    1 never executed
+    #####:  842:    Type t1 = MemRefType::get(dynShape, etp);
+call    0 never executed
+call    1 never executed
+    #####:  843:    Type t2 = MemRefType::get(dynShape, builder.getI1Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  844:    Type t3 = MemRefType::get(dynShape, builder.getIndexType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  845:    Type t4 = builder.getIndexType();
+call    0 never executed
+    #####:  846:    auto res =
+    #####:  847:        builder.create<ExpandOp>(loc, TypeRange({t1, t2, t3, t4}), tensor);
+call    0 never executed
+call    1 never executed
+    #####:  848:    assert(res.getNumResults() == 4);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  849:    assert(!codegen.expValues);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  850:    codegen.expValues = res.getResult(0);
+    #####:  851:    codegen.expFilled = res.getResult(1);
+    #####:  852:    codegen.expAdded = res.getResult(2);
+    #####:  853:    codegen.expCount = res.getResult(3);
+        -:  854:  } else {
+    #####:  855:    assert(codegen.expValues);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  856:    SmallVector<Value, 4> indices;
+    #####:  857:    for (unsigned i = 0; i < at; i++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  858:      assert(codegen.loopEmitter.getLoopIV(i));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  859:      indices.push_back(codegen.loopEmitter.getLoopIV(i));
+call    0 never executed
+        -:  860:    }
+    #####:  861:    codegen.insChain = builder.create<CompressOp>(
+    #####:  862:        loc, codegen.expValues, codegen.expFilled, codegen.expAdded,
+    #####:  863:        codegen.expCount, codegen.insChain, indices);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  864:    codegen.expValues = codegen.expFilled = codegen.expAdded =
+    #####:  865:        codegen.expCount = Value();
+branch  0 never executed
+branch  1 never executed
+        -:  866:  }
+        -:  867:}
+        -:  868:
+        -:  869:/// Returns parallelization strategy. Any implicit loop in the Linalg
+        -:  870:/// operation that is marked "parallel" is a candidate. Whether it is actually
+        -:  871:/// converted to a parallel operation depends on the requested strategy.
+function _ZL13isParallelForRN12_GLOBAL__N_17CodeGenEbbb called 0 returned 0% blocks executed 0%
+    #####:  872:static bool isParallelFor(CodeGen &codegen, bool isOuter, bool isReduction,
+        -:  873:                          bool isSparse) {
+        -:  874:  // Reject parallelization of sparse output.
+    #####:  875:  if (codegen.sparseOut)
+branch  0 never executed
+branch  1 never executed
+        -:  876:    return false;
+        -:  877:  // Inspect strategy.
+    #####:  878:  switch (codegen.options.parallelizationStrategy) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  879:  case SparseParallelizationStrategy::kNone:
+        -:  880:    return false;
+    #####:  881:  case SparseParallelizationStrategy::kDenseOuterLoop:
+    #####:  882:    return isOuter && !isSparse && !isReduction;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  883:  case SparseParallelizationStrategy::kAnyStorageOuterLoop:
+    #####:  884:    return isOuter && !isReduction;
+    #####:  885:  case SparseParallelizationStrategy::kDenseAnyLoop:
+    #####:  886:    return !isSparse && !isReduction;
+    #####:  887:  case SparseParallelizationStrategy::kAnyStorageAnyLoop:
+    #####:  888:    return !isReduction;
+        -:  889:  }
+    #####:  890:  llvm_unreachable("unexpected parallelization strategy");
+call    0 never executed
+        -:  891:}
+        -:  892:
+        -:  893:/// Generates a for-loop on a single index.
+function _ZL6genForRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEbbjmmN4llvm8ArrayRefImEESC_ called 0 returned 0% blocks executed 0%
+    #####:  894:static Operation *genFor(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  895:                         linalg::GenericOp op, bool isOuter, bool isInner,
+        -:  896:                         unsigned idx, size_t tid, size_t dim,
+        -:  897:                         ArrayRef<size_t> extraTids,
+        -:  898:                         ArrayRef<size_t> extraDims) {
+    #####:  899:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  900:  auto iteratorTypes = op.getIteratorTypesArray();
+call    0 never executed
+    #####:  901:  bool isReduction = linalg::isReductionIterator(iteratorTypes[idx]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  902:  bool isSparse = isCompressedDLT(merger.getDimLevelType(tid, idx)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  903:                  isSingletonDLT(merger.getDimLevelType(tid, idx));
+branch  0 never executed
+branch  1 never executed
+    #####:  904:  bool isParallel = isParallelFor(codegen, isOuter, isReduction, isSparse);
+call    0 never executed
+    #####:  905:  assert(!isParallel);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  906:
+        -:  907:  // Emit a sequential for loop.
+    #####:  908:  SmallVector<Value, 4> operands;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  909:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####:  910:    operands.push_back(codegen.redVal);
+call    0 never executed
+    #####:  911:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####:  912:    operands.push_back(codegen.expCount);
+call    0 never executed
+    #####:  913:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  914:    operands.push_back(codegen.insChain);
+call    0 never executed
+        -:  915:
+    #####:  916:  Operation *loop = codegen.loopEmitter.enterLoopOverTensorAtDim(
+call    0 never executed
+        -:  917:      builder, loc, tid, dim, operands, isParallel, extraTids, extraDims);
+        -:  918:
+    #####:  919:  unsigned o = 0;
+    #####:  920:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####:  921:    updateReduc(merger, codegen, operands[o++]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  922:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####:  923:    codegen.expCount = operands[o++];
+branch  0 never executed
+branch  1 never executed
+    #####:  924:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  925:    codegen.insChain = operands[o++];
+branch  0 never executed
+branch  1 never executed
+    #####:  926:  assert(o == operands.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  927:
+    #####:  928:  return loop;
+branch  0 never executed
+branch  1 never executed
+        -:  929:}
+        -:  930:
+        -:  931:/// Emit a while-loop for co-iteration over multiple indices.
+function _ZL8genWhileRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjbN4llvm8ArrayRefImEESC_SC_SC_ called 0 returned 0% blocks executed 0%
+    #####:  932:static Operation *genWhile(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  933:                           linalg::GenericOp op, unsigned idx, bool needsUniv,
+        -:  934:                           ArrayRef<size_t> condTids, ArrayRef<size_t> condDims,
+        -:  935:                           ArrayRef<size_t> extraTids,
+        -:  936:                           ArrayRef<size_t> extraDims) {
+    #####:  937:  SmallVector<Value, 4> operands;
+branch  0 never executed
+branch  1 never executed
+        -:  938:
+        -:  939:  // Construct the while-loop with a parameter for each index.
+    #####:  940:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####:  941:    operands.push_back(codegen.redVal);
+call    0 never executed
+    #####:  942:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####:  943:    operands.push_back(codegen.expCount);
+call    0 never executed
+    #####:  944:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  945:    operands.push_back(codegen.insChain);
+call    0 never executed
+        -:  946:
+    #####:  947:  Operation *loop = codegen.loopEmitter.enterCoIterationOverTensorsAtDims(
+call    0 never executed
+        -:  948:      builder, op.getLoc(), condTids, condDims, needsUniv, operands, extraTids,
+        -:  949:      extraDims);
+        -:  950:
+    #####:  951:  unsigned o = 0;
+    #####:  952:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####:  953:    updateReduc(merger, codegen, operands[o++]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  954:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####:  955:    codegen.expCount = operands[o++];
+branch  0 never executed
+branch  1 never executed
+    #####:  956:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  957:    codegen.insChain = operands[o++];
+branch  0 never executed
+branch  1 never executed
+    #####:  958:  assert(o == operands.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  959:
+    #####:  960:  return loop;
+branch  0 never executed
+branch  1 never executed
+        -:  961:}
+        -:  962:
+        -:  963:/// Generates a for-loop or a while-loop, depending on whether it implements
+        -:  964:/// singleton iteration or co-iteration over the given conjunction.
+function _ZL7genLoopRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjbN4llvm8ArrayRefImEESC_SC_SC_ called 0 returned 0% blocks executed 0%
+    #####:  965:static Operation *genLoop(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -:  966:                          linalg::GenericOp op, unsigned at, bool needsUniv,
+        -:  967:                          ArrayRef<size_t> condTids, ArrayRef<size_t> condDims,
+        -:  968:                          ArrayRef<size_t> extraTids,
+        -:  969:                          ArrayRef<size_t> extraDims) {
+    #####:  970:  assert(condTids.size() == condDims.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  971:  assert(extraTids.size() == extraDims.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  972:  unsigned idx = codegen.topSort[at];
+branch  0 never executed
+branch  1 never executed
+    #####:  973:  if (condTids.size() == 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  974:    bool isOuter = at == 0;
+    #####:  975:    bool isInner = at == codegen.topSort.size() - 1;
+branch  0 never executed
+branch  1 never executed
+    #####:  976:    return genFor(merger, codegen, builder, op, isOuter, isInner, idx,
+branch  0 never executed
+branch  1 never executed
+    #####:  977:                  condTids.front(), condDims.front(), extraTids, extraDims);
+call    0 never executed
+        -:  978:  }
+    #####:  979:  return genWhile(merger, codegen, builder, op, idx, needsUniv, condTids,
+call    0 never executed
+    #####:  980:                  condDims, extraTids, extraDims);
+        -:  981:}
+        -:  982:
+        -:  983:/// Generates the induction structure for a while-loop.
+function _ZL15finalizeWhileOpRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjbRN4llvm9BitVectorENS_3scf7WhileOpE called 0 returned 0% blocks executed 0%
+    #####:  984:static void finalizeWhileOp(Merger &merger, CodeGen &codegen,
+        -:  985:                            OpBuilder &builder, linalg::GenericOp op,
+        -:  986:                            unsigned idx, bool needsUniv, BitVector &induction,
+        -:  987:                            scf::WhileOp whileOp) {
+    #####:  988:  Location loc = op.getLoc();
+branch  0 never executed
+branch  1 never executed
+        -:  989:  // Finalize each else branch of all if statements.
+    #####:  990:  if (codegen.redVal || codegen.expValues || codegen.insChain) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  991:    while (auto ifOp = dyn_cast_or_null<scf::IfOp>(
+    #####:  992:               builder.getInsertionBlock()->getParentOp())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  993:      unsigned y = 0;
+    #####:  994:      SmallVector<Value, 4> yields;
+branch  0 never executed
+branch  1 never executed
+    #####:  995:      if (codegen.redVal) {
+branch  0 never executed
+branch  1 never executed
+    #####:  996:        yields.push_back(codegen.redVal);
+call    0 never executed
+    #####:  997:        updateReduc(merger, codegen, ifOp.getResult(y++));
+call    0 never executed
+        -:  998:      }
+    #####:  999:      if (codegen.expValues) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1000:        yields.push_back(codegen.expCount);
+call    0 never executed
+    #####: 1001:        codegen.expCount = ifOp->getResult(y++);
+        -: 1002:      }
+    #####: 1003:      if (codegen.insChain) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1004:        yields.push_back(codegen.insChain);
+call    0 never executed
+    #####: 1005:        codegen.insChain = ifOp->getResult(y++);
+        -: 1006:      }
+    #####: 1007:      assert(y == yields.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1008:      builder.create<scf::YieldOp>(loc, yields);
+call    0 never executed
+    #####: 1009:      builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1010:    }
+        -: 1011:  }
+    #####: 1012:  builder.setInsertionPointToEnd(&whileOp.getAfter().front());
+call    0 never executed
+call    1 never executed
+    #####: 1013:}
+        -: 1014:
+        -: 1015:/// Generates a single if-statement within a while-loop.
+function _ZL5genIfRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjRN4llvm9BitVectorE called 0 returned 0% blocks executed 0%
+    #####: 1016:static scf::IfOp genIf(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -: 1017:                       linalg::GenericOp op, unsigned idx,
+        -: 1018:                       BitVector &conditions) {
+    #####: 1019:  Location loc = op.getLoc();
+    #####: 1020:  SmallVector<Type, 4> types;
+    #####: 1021:  Value cond;
+    #####: 1022:  for (unsigned b = 0, be = conditions.size(); b < be; b++) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1023:    if (!conditions[b])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1024:      continue;
+    #####: 1025:    unsigned tensor = merger.tensor(b);
+branch  0 never executed
+branch  1 never executed
+    #####: 1026:    assert(idx == merger.index(b));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1027:    Value clause;
+    #####: 1028:    if (isCompressedDLT(merger.getDimLevelType(b)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1029:        isSingletonDLT(merger.getDimLevelType(b))) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1030:      auto dim = merger.getDimNum(tensor, idx).value();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1031:      Value op1 = codegen.loopEmitter.getCoord()[tensor][dim];
+call    0 never executed
+    #####: 1032:      Value op2 = codegen.getLoopIdxValue(idx);
+call    0 never executed
+    #####: 1033:      clause = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, op1,
+    #####: 1034:                                             op2);
+call    0 never executed
+        -: 1035:    } else {
+    #####: 1036:      assert(isDenseDLT(merger.getDimLevelType(b)) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1037:             isUndefDLT(merger.getDimLevelType(b)));
+    #####: 1038:      clause = constantI1(builder, loc, true);
+call    0 never executed
+        -: 1039:    }
+    #####: 1040:    cond = cond ? builder.create<arith::AndIOp>(loc, cond, clause) : clause;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1041:  }
+    #####: 1042:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####: 1043:    types.push_back(codegen.redVal.getType());
+call    0 never executed
+    #####: 1044:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####: 1045:    types.push_back(builder.getIndexType());
+call    0 never executed
+call    1 never executed
+    #####: 1046:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####: 1047:    types.push_back(codegen.insChain.getType());
+call    0 never executed
+    #####: 1048:  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, types, cond, /*else=*/true);
+call    0 never executed
+    #####: 1049:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1050:  return ifOp;
+branch  0 never executed
+branch  1 never executed
+        -: 1051:}
+        -: 1052:
+        -: 1053:/// Generates end of true branch of if-statement within a while-loop.
+        -: 1054:static void endIf(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -: 1055:                  linalg::GenericOp op, scf::IfOp ifOp, Operation *loop,
+        -: 1056:                  Value redInput, Value cntInput, Value insInput) {
+        -: 1057:  SmallVector<Value, 4> operands;
+        -: 1058:  if (codegen.redVal) {
+        -: 1059:    operands.push_back(codegen.redVal);
+        -: 1060:    updateReduc(merger, codegen, redInput);
+        -: 1061:  }
+        -: 1062:  if (codegen.expValues) {
+        -: 1063:    operands.push_back(codegen.expCount);
+        -: 1064:    codegen.expCount = cntInput;
+        -: 1065:  }
+        -: 1066:  if (codegen.insChain) {
+        -: 1067:    operands.push_back(codegen.insChain);
+        -: 1068:    codegen.insChain = insInput;
+        -: 1069:  }
+        -: 1070:  if (!operands.empty())
+        -: 1071:    builder.create<scf::YieldOp>(op.getLoc(), operands);
+        -: 1072:  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+        -: 1073:}
+        -: 1074:
+        -: 1075://===----------------------------------------------------------------------===//
+        -: 1076:// Sparse compiler synthesis methods (loop sequence).
+        -: 1077://===----------------------------------------------------------------------===//
+        -: 1078:
+        -: 1079:/// Starts a loop sequence at given level. Returns true if
+        -: 1080:/// the universal loop index must be maintained at this level.
+function _ZL12startLoopSeqRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjjjjj called 0 returned 0% blocks executed 0%
+    #####: 1081:static bool startLoopSeq(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -: 1082:                         linalg::GenericOp op, unsigned exp, unsigned at,
+        -: 1083:                         unsigned idx, unsigned ldx, unsigned lts) {
+    #####: 1084:  assert(!codegen.getLoopIdxValue(idx));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1085:  // Emit invariants at this loop sequence level.
+    #####: 1086:  genInvariants(merger, codegen, builder, op, exp, ldx, /*atStart=*/true);
+call    0 never executed
+        -: 1087:  // Emit access pattern expansion for sparse tensor output.
+    #####: 1088:  genExpansion(merger, codegen, builder, op, at, /*atStart=*/true);
+call    0 never executed
+        -: 1089:  // Emit further intitialization at this loop sequence level.
+    #####: 1090:  unsigned l0 = merger.set(lts)[0];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1091:  bool needsUniv = false;
+        -: 1092:
+    #####: 1093:  SmallVector<size_t> tids;
+branch  0 never executed
+branch  1 never executed
+    #####: 1094:  SmallVector<size_t> dims;
+branch  0 never executed
+branch  1 never executed
+    #####: 1095:  merger.foreachTidDimPairInBits(
+branch  0 never executed
+branch  1 never executed
+    #####: 1096:      merger.lat(l0).bits,
+call    0 never executed
+function _ZZL12startLoopSeqRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjjjjjENKUljjN4llvm8OptionalIjEENS0_12DimLevelTypeEE_clEjjSC_SD_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1097:      [&](unsigned b, unsigned tid, Optional<unsigned> dim, DimLevelType dlt) {
+    #####: 1098:        assert(merger.index(b) == idx);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1099:        if (isDenseDLT(dlt) || isUndefDLT(dlt)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1100:          needsUniv = true;
+        -: 1101:        } else {
+        -: 1102:          // sparse/singleton dim levels.
+    #####: 1103:          tids.push_back(tid);
+call    0 never executed
+    #####: 1104:          dims.push_back(dim.value());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1105:        }
+    #####: 1106:      });
+        -: 1107:
+    #####: 1108:  codegen.loopEmitter.enterNewLoopSeq(builder, op.getLoc(), tids, dims);
+call    0 never executed
+        -: 1109:
+        -: 1110:  // Maintain the universal index only if it is actually
+        -: 1111:  // consumed by a subsequent lattice point.
+    #####: 1112:  if (needsUniv) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1113:    unsigned lsize = merger.set(lts).size();
+branch  0 never executed
+branch  1 never executed
+    #####: 1114:    for (unsigned i = 1; i < lsize; i++) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1115:      unsigned li = merger.set(lts)[i];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1116:      if (!merger.hasAnySparse(merger.lat(li).simple))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1117:        return true;
+        -: 1118:    }
+        -: 1119:  }
+        -: 1120:  return false;
+        -: 1121:}
+        -: 1122:
+        -: 1123:static void translateBitsToTidDimPairs(Merger &merger, CodeGen &codegen,
+        -: 1124:                                       unsigned li, unsigned idx,
+        -: 1125:                                       SmallVectorImpl<size_t> &condTids,
+        -: 1126:                                       SmallVectorImpl<size_t> &condDims,
+        -: 1127:                                       SmallVectorImpl<size_t> &extraTids,
+        -: 1128:                                       SmallVectorImpl<size_t> &extraDims) {
+        -: 1129:  const BitVector &all = merger.lat(li).bits;
+        -: 1130:  const BitVector &simple = merger.lat(li).simple;
+        -: 1131:
+        -: 1132:  // Converts bits to array + dim pair
+function _ZZL26translateBitsToTidDimPairsRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenEjjRN4llvm15SmallVectorImplImEES9_S9_S9_ENKUljjNS6_8OptionalIjEENS0_12DimLevelTypeEE_clEjjSB_SC_ called 0 returned 0% blocks executed 0%
+    #####: 1133:  merger.foreachTidDimPairInBits(all, [&, idx](unsigned b, unsigned tid,
+        -: 1134:                                               Optional<unsigned> dim,
+    #####: 1135:                                               DimLevelType dlt) {
+    #####: 1136:    if (simple.test(b)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1137:      if (isUndefDLT(dlt)) {
+branch  0 never executed
+branch  1 never executed
+        -: 1138:        // An undefined dlt in the lattices, we probably mean to iterate based
+        -: 1139:        // on the dim of output tensor.
+        -: 1140:        // E.g., this could be a synthetic tensor (for invariants and sparse
+        -: 1141:        // output tensor).
+        -: 1142:        // out[i][j] = invariant; or a broadcast
+        -: 1143:        // out[i][j] = in[i] (j is undef for input)
+    #####: 1144:        tid = merger.getOutTensorID();
+call    0 never executed
+    #####: 1145:        dim = merger.getDimNum(tid, idx);
+call    0 never executed
+        -: 1146:        // Skips invalid dim (e.g., when this is a zero ranked tensor).
+    #####: 1147:        if (!dim)
+branch  0 never executed
+branch  1 never executed
+        -: 1148:          return;
+        -: 1149:      }
+    #####: 1150:      condTids.push_back(tid);
+call    0 never executed
+    #####: 1151:      condDims.push_back(dim.value());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1152:    } else if (isDenseDLT(dlt)) {
+branch  0 never executed
+branch  1 never executed
+        -: 1153:      // TODO: get rid of extraTids and extraDims.
+    #####: 1154:      extraTids.push_back(tid);
+call    0 never executed
+    #####: 1155:      extraDims.push_back(dim.value());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1156:    }
+        -: 1157:  });
+        -: 1158:
+        -: 1159:  if (isDenseDLT(merger.getDimLevelType(merger.getOutTensorID(), idx))) {
+        -: 1160:    // Note that we generate dense indices of the output tensor
+        -: 1161:    // unconditionally, since they may not appear in the lattice, but may be
+        -: 1162:    // needed for linearized codegen.
+        -: 1163:    // Only dense dimensions should be optimized from conditions.
+        -: 1164:    auto dim = merger.getDimNum(merger.getOutTensorID(), idx).value();
+        -: 1165:    extraTids.push_back(merger.getOutTensorID());
+        -: 1166:    extraDims.push_back(dim);
+        -: 1167:  }
+        -: 1168:}
+        -: 1169:
+        -: 1170:/// Starts a single loop in current sequence.
+function _ZL9startLoopRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjjb called 0 returned 0% blocks executed 0%
+    #####: 1171:static Operation *startLoop(Merger &merger, CodeGen &codegen,
+        -: 1172:                            OpBuilder &builder, linalg::GenericOp op,
+        -: 1173:                            unsigned at, unsigned li, bool needsUniv) {
+        -: 1174:  // The set of tensors + dims to generate loops on
+    #####: 1175:  SmallVector<size_t, 4> condTids, condDims;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1176:  // The set of (dense) tensors that is optimized from condition, yet still
+        -: 1177:  // need extra locals to iterate on them.
+    #####: 1178:  SmallVector<size_t, 4> extraTids, extraDims;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1179:
+    #####: 1180:  translateBitsToTidDimPairs(merger, codegen, li, codegen.topSort[at], condTids,
+call    0 never executed
+        -: 1181:                             condDims, extraTids, extraDims);
+        -: 1182:  // Emit the for/while-loop control.
+    #####: 1183:  Operation *loop = genLoop(merger, codegen, builder, op, at, needsUniv,
+call    0 never executed
+        -: 1184:                            condTids, condDims, extraTids, extraDims);
+    #####: 1185:  return loop;
+branch  0 never executed
+branch  1 never executed
+        -: 1186:}
+        -: 1187:
+        -: 1188:/// Ends a single loop in current sequence. Returns new values for needsUniv.
+function _ZL7endLoopRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEPNS_9OperationEjjb called 0 returned 0% blocks executed 0%
+    #####: 1189:static bool endLoop(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -: 1190:                    linalg::GenericOp op, Operation *loop, unsigned idx,
+        -: 1191:                    unsigned li, bool needsUniv) {
+        -: 1192:  // End a while-loop.
+    #####: 1193:  if (auto whileOp = dyn_cast<scf::WhileOp>(loop)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1194:    finalizeWhileOp(merger, codegen, builder, op, idx, needsUniv,
+branch  0 never executed
+branch  1 never executed
+    #####: 1195:                    merger.lat(li).bits, whileOp);
+call    0 never executed
+        -: 1196:  } else {
+        -: 1197:    needsUniv = false;
+        -: 1198:  }
+        -: 1199:
+    #####: 1200:  SmallVector<Value, 2> reduc;
+branch  0 never executed
+branch  1 never executed
+    #####: 1201:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####: 1202:    reduc.push_back(codegen.redVal);
+call    0 never executed
+    #####: 1203:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####: 1204:    reduc.push_back(codegen.expCount);
+call    0 never executed
+    #####: 1205:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####: 1206:    reduc.push_back(codegen.insChain);
+call    0 never executed
+        -: 1207:
+    #####: 1208:  auto loopRet =
+    #####: 1209:      codegen.loopEmitter.exitCurrentLoop(builder, op.getLoc(), reduc);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1210:  assert(reduc.size() == loopRet.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1211:
+    #####: 1212:  unsigned o = 0;
+    #####: 1213:  if (codegen.redVal)
+branch  0 never executed
+branch  1 never executed
+    #####: 1214:    updateReduc(merger, codegen, loopRet[o++]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1215:  if (codegen.expValues)
+branch  0 never executed
+branch  1 never executed
+    #####: 1216:    codegen.expCount = loopRet[o++];
+branch  0 never executed
+branch  1 never executed
+    #####: 1217:  if (codegen.insChain)
+branch  0 never executed
+branch  1 never executed
+    #####: 1218:    codegen.insChain = loopRet[o++];
+branch  0 never executed
+branch  1 never executed
+    #####: 1219:  assert(o == loopRet.size());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1220:
+    #####: 1221:  return needsUniv;
+branch  0 never executed
+branch  1 never executed
+        -: 1222:}
+        -: 1223:
+        -: 1224:/// Ends a loop sequence at given level.
+function _ZL10endLoopSeqRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_9OpBuilderENS_6linalg9GenericOpEjjjj called 0 returned 0% blocks executed 0%
+    #####: 1225:static void endLoopSeq(Merger &merger, CodeGen &codegen, OpBuilder &builder,
+        -: 1226:                       linalg::GenericOp op, unsigned exp, unsigned at,
+        -: 1227:                       unsigned idx, unsigned ldx) {
+    #####: 1228:  assert(codegen.getLoopIdxValue(idx) == nullptr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1229:  codegen.loopEmitter.exitCurrentLoopSeq();
+call    0 never executed
+        -: 1230:  // Unmark bookkeeping of invariants and loop index.
+    #####: 1231:  genInvariants(merger, codegen, builder, op, exp, ldx, /*atStart=*/false);
+call    0 never executed
+        -: 1232:  // Finalize access pattern expansion for sparse tensor output.
+    #####: 1233:  genExpansion(merger, codegen, builder, op, at, /*atStart=*/false);
+call    0 never executed
+    #####: 1234:}
+        -: 1235:
+        -: 1236:/// Recursively generates code while computing iteration lattices in order
+        -: 1237:/// to manage the complexity of implementing co-iteration over unions
+        -: 1238:/// and intersections of sparse iterations spaces.
+function _ZL7genStmtRN4mlir13sparse_tensor6MergerERN12_GLOBAL__N_17CodeGenERNS_12RewriterBaseENS_6linalg9GenericOpEjj called 0 returned 0% blocks executed 0%
+    #####: 1239:static void genStmt(Merger &merger, CodeGen &codegen, RewriterBase &rewriter,
+        -: 1240:                    linalg::GenericOp op, unsigned exp, unsigned at) {
+        -: 1241:  // At each leaf, assign remaining tensor (sub)expression to output tensor.
+    #####: 1242:  if (at == codegen.topSort.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1243:    unsigned ldx = codegen.topSort[at - 1];
+call    0 never executed
+    #####: 1244:    Value rhs = genExp(merger, codegen, rewriter, op, exp, ldx);
+call    0 never executed
+    #####: 1245:    genTensorStore(merger, codegen, rewriter, op, exp, rhs);
+call    0 never executed
+    #####: 1246:    return;
+        -: 1247:  }
+        -: 1248:
+        -: 1249:  // Construct iteration lattices for current loop index, with L0 at top.
+    #####: 1250:  unsigned idx = codegen.topSort[at];
+branch  0 never executed
+branch  1 never executed
+    #####: 1251:  unsigned ldx = at == 0 ? -1u : codegen.topSort[at - 1];
+branch  0 never executed
+branch  1 never executed
+    #####: 1252:  unsigned lts = merger.optimizeSet(merger.buildLattices(exp, idx));
+call    0 never executed
+call    1 never executed
+        -: 1253:
+        -: 1254:  // TODO: sort
+        -: 1255:  // TODO: dedup
+        -: 1256:
+        -: 1257:  // Start a loop sequence.
+    #####: 1258:  bool needsUniv =
+    #####: 1259:      startLoopSeq(merger, codegen, rewriter, op, exp, at, idx, ldx, lts);
+call    0 never executed
+        -: 1260:
+        -: 1261:  // Emit a loop for every lattice point L0 >= Li in this loop sequence.
+    #####: 1262:  unsigned lsize = merger.set(lts).size();
+branch  0 never executed
+branch  1 never executed
+    #####: 1263:  for (unsigned i = 0; i < lsize; i++) {
+branch  0 never executed
+branch  1 never executed
+        -: 1264:    // Start a loop.
+    #####: 1265:    unsigned li = merger.set(lts)[i];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1266:    Operation *loop =
+    #####: 1267:        startLoop(merger, codegen, rewriter, op, at, li, needsUniv);
+call    0 never executed
+        -: 1268:
+        -: 1269:    // Visit all lattices points with Li >= Lj to generate the
+        -: 1270:    // loop-body, possibly with if statements for coiteration.
+    #####: 1271:    Value redInput = codegen.redVal;
+    #####: 1272:    Value cntInput = codegen.expCount;
+    #####: 1273:    Value insInput = codegen.insChain;
+    #####: 1274:    bool isWhile = dyn_cast<scf::WhileOp>(loop) != nullptr;
+call    0 never executed
+    #####: 1275:    for (unsigned j = 0; j < lsize; j++) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1276:      unsigned lj = merger.set(lts)[j];
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1277:      unsigned ej = merger.lat(lj).exp;
+branch  0 never executed
+branch  1 never executed
+    #####: 1278:      if (li == lj || merger.latGT(li, lj)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1279:        // Recurse into body of each branch.
+    #####: 1280:        if (isWhile) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1281:          scf::IfOp ifOp =
+branch  0 never executed
+branch  1 never executed
+    #####: 1282:              genIf(merger, codegen, rewriter, op, idx, merger.lat(lj).simple);
+call    0 never executed
+    #####: 1283:          genStmt(merger, codegen, rewriter, op, ej, at + 1);
+call    0 never executed
+    #####: 1284:          endIf(merger, codegen, rewriter, op, ifOp, loop, redInput, cntInput,
+call    0 never executed
+        -: 1285:                insInput);
+        -: 1286:        } else {
+    #####: 1287:          genStmt(merger, codegen, rewriter, op, ej, at + 1);
+call    0 never executed
+        -: 1288:        }
+        -: 1289:      }
+        -: 1290:    }
+        -: 1291:
+        -: 1292:    // End a loop.
+    #####: 1293:    needsUniv =
+    #####: 1294:        endLoop(merger, codegen, rewriter, op, loop, idx, li, needsUniv);
+call    0 never executed
+        -: 1295:  }
+        -: 1296:
+        -: 1297:  // End a loop sequence.
+    #####: 1298:  endLoopSeq(merger, codegen, rewriter, op, exp, at, idx, ldx);
+call    0 never executed
+        -: 1299:}
+        -: 1300:
+        -: 1301:/// Converts the result computed by the sparse kernel into the required form.
+        -: 1302:static void genResult(Merger &merger, CodeGen &codegen, RewriterBase &rewriter,
+        -: 1303:                      linalg::GenericOp op) {
+        -: 1304:  OpOperand *lhs = op.getDpsInitOperand(0);
+        -: 1305:  Value tensor = lhs->get();
+        -: 1306:  Type resType = tensor.getType();
+        -: 1307:  if (getSparseTensorEncoding(resType)) {
+        -: 1308:    // The sparse tensor rematerializes from the original sparse tensor's
+        -: 1309:    // underlying sparse storage format. For an insertion chain, the
+        -: 1310:    // tensor materializes from the chain with 'hasInserts' enabled.
+        -: 1311:    bool hasInserts = codegen.sparseOut == lhs;
+        -: 1312:    if (hasInserts)
+        -: 1313:      tensor = codegen.insChain;
+        -: 1314:    rewriter.replaceOpWithNewOp<LoadOp>(op, resType, tensor, hasInserts);
+        -: 1315:  } else {
+        -: 1316:    // To rematerialize an non-annotated tensor, simply load it
+        -: 1317:    // from the bufferized value.
+        -: 1318:    Value val = codegen.loopEmitter.getValBuffer().back(); // value array
+        -: 1319:    rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(op, resType, val);
+        -: 1320:  }
+        -: 1321:}
+        -: 1322:
+        -: 1323://===----------------------------------------------------------------------===//
+        -: 1324:// Sparse compiler rewriting methods.
+        -: 1325://===----------------------------------------------------------------------===//
+        -: 1326:
+        -: 1327:namespace {
+        -: 1328:
+        -: 1329:/// Sparse rewriting rule for generic Lingalg operation.
+        -: 1330:struct GenericOpSparsifier : public OpRewritePattern<linalg::GenericOp> {
+        -: 1331:public:
+function _ZN12_GLOBAL__N_119GenericOpSparsifierC2EPN4mlir11MLIRContextENS1_21SparsificationOptionsE called 558 returned 100% blocks executed 100%
+      558: 1332:  GenericOpSparsifier(MLIRContext *context, SparsificationOptions o)
+      558: 1333:      : OpRewritePattern<linalg::GenericOp>(context), options(o) {}
+call    0 returned 100%
+call    1 returned 100%
+        -: 1334:
+function _ZNK12_GLOBAL__N_119GenericOpSparsifier15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterE called 457 returned 100% blocks executed 26%
+      457: 1335:  LogicalResult matchAndRewrite(linalg::GenericOp op,
+        -: 1336:                                PatternRewriter &rewriter) const override {
+        -: 1337:    // Detects sparse annotations and translate the per-dimension sparsity
+        -: 1338:    // information for all tensors to loop indices in the kernel.
+      457: 1339:    if (op.getNumDpsInits() != 1)
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####: 1340:      return failure();
+      457: 1341:    unsigned numTensors = op->getNumOperands();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+      457: 1342:    unsigned numLoops = op.getNumLoops();
+call    0 returned 100%
+      457: 1343:    Merger merger(numTensors, numLoops);
+call    0 returned 100%
+      457: 1344:    if (!findSparseAnnotations(merger, op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+      457: 1345:      return failure();
+        -: 1346:
+        -: 1347:    // Builds the tensor expression for the Linalg operation in SSA form.
+    #####: 1348:    Optional<unsigned> optExp = merger.buildTensorExpFromLinalg(op);
+call    0 never executed
+    #####: 1349:    if (!optExp.has_value())
+branch  0 never executed
+branch  1 never executed
+    #####: 1350:      return failure();
+        -: 1351:
+    #####: 1352:    unsigned exp = optExp.value();
+    #####: 1353:    OpOperand *sparseOut = nullptr;
+    #####: 1354:    unsigned outerParNest = 0;
+        -: 1355:    // Computes a topologically sorted iteration graph to ensure tensors
+        -: 1356:    // are visited in natural index order. Gradually relaxes the considered
+        -: 1357:    // constraints until an acyclic iteration graph results, such that sparse
+        -: 1358:    // code generation can proceed. As a last resort, an attempt is made
+        -: 1359:    // to resolve cycles by inserting a conversion.
+     457*: 1360:    std::vector<unsigned> topSort;
+call    0 returned 100%
+        -: 1361:    // Whether the current GenericOp is admissible.
+    #####: 1362:    bool isAdmissible = false;
+    #####: 1363:    bool hasCycle = true;
+        -: 1364:    // An const list of all masks that we used for interation graph
+        -: 1365:    // computation. Must be ordered from strict -> loose.
+    #####: 1366:    const auto allMask = {SortMask::kIncludeAll, SortMask::kIncludeUndef,
+    #####: 1367:                          SortMask::kIncludeDense, SortMask::kSparseOnly};
+    #####: 1368:    for (auto mask : allMask)
+branch  0 never executed
+branch  1 never executed
+    #####: 1369:      if (computeIterationGraph(merger, op, topSort, mask)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1370:        hasCycle = false;
+    #####: 1371:        if (isAdmissibleTensorExp(merger, op, topSort, exp, &sparseOut,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1372:                                  outerParNest)) {
+        -: 1373:          isAdmissible = true;
+        -: 1374:          break;
+        -: 1375:        }
+        -: 1376:        // else try a set of less strict constraints.
+        -: 1377:      }
+        -: 1378:
+    #####: 1379:    if (hasCycle)
+branch  0 never executed
+branch  1 never executed
+        -: 1380:      // Give it one last shot to resolve the cycle.
+    #####: 1381:      return resolveCycle(merger, rewriter, op);
+call    0 never executed
+    #####: 1382:    if (!isAdmissible)
+branch  0 never executed
+branch  1 never executed
+        -: 1383:      // Inadmissible expression, reject.
+    #####: 1384:      return failure();
+        -: 1385:
+    #####: 1386:    merger.setHasSparseOut(sparseOut != nullptr);
+call    0 never executed
+        -: 1387:
+    #####: 1388:    SmallVector<Value, 4> tensors;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1389:    for (OpOperand &t : op->getOpOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1390:      tensors.push_back(t.get());
+call    0 never executed
+        -: 1391:
+        -: 1392:    // Recursively generates code if admissible.
+    #####: 1393:    CodeGen codegen(options, tensors, numTensors, numLoops, sparseOut,
+    #####: 1394:                    outerParNest, topSort);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1395:    genBuffers(merger, codegen, rewriter, op);
+call    0 never executed
+    #####: 1396:    genStmt(merger, codegen, rewriter, op, exp, 0);
+call    0 never executed
+    #####: 1397:    genResult(merger, codegen, rewriter, op);
+call    0 never executed
+    #####: 1398:    return success();
+call    0 never executed
+        -: 1399:  }
+        -: 1400:
+        -: 1401:private:
+        -: 1402:  // Last resort cycle resolution.
+function _ZNK12_GLOBAL__N_119GenericOpSparsifier12resolveCycleERN4mlir13sparse_tensor6MergerERNS1_15PatternRewriterENS1_6linalg9GenericOpE called 0 returned 0% blocks executed 0%
+    #####: 1403:  LogicalResult resolveCycle(Merger &merger, PatternRewriter &rewriter,
+        -: 1404:                             linalg::GenericOp op) const {
+        -: 1405:    // Compute topological sort while leaving out every
+        -: 1406:    // sparse input tensor in succession until an acylic
+        -: 1407:    // iteration graph results.
+    #####: 1408:    std::vector<unsigned> topSort;
+call    0 never executed
+    #####: 1409:    for (OpOperand *t : op.getDpsInputOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1410:      unsigned tensor = t->getOperandNumber();
+call    0 never executed
+    #####: 1411:      Value tval = t->get();
+call    0 never executed
+    #####: 1412:      auto srcEnc = getSparseTensorEncoding(tval.getType());
+call    0 never executed
+    #####: 1413:      if (!srcEnc ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1414:          !computeIterationGraph(merger, op, topSort, SortMask::kSparseOnly, t))
+call    0 never executed
+    #####: 1415:        continue;
+        -: 1416:      // Found an input tensor that resolves the cycle by inserting a
+        -: 1417:      // conversion into a sparse tensor that adheres to the iteration
+        -: 1418:      // graph order. Also releases the temporary sparse tensor.
+        -: 1419:      //
+        -: 1420:      // TODO: investigate fusing the conversion with computation,
+        -: 1421:      //       especially if it is a direct yield!
+        -: 1422:      //
+    #####: 1423:      auto srcTp = tval.getType().cast<RankedTensorType>();
+call    0 never executed
+    #####: 1424:      auto dstEnc = SparseTensorEncodingAttr::get(
+        -: 1425:          op->getContext(), srcEnc.getDimLevelType(),
+        -: 1426:          permute(getContext(), op.getMatchingIndexingMap(t),
+        -: 1427:                  topSort), // new order
+        -: 1428:          srcEnc.getHigherOrdering(), srcEnc.getPointerBitWidth(),
+    #####: 1429:          srcEnc.getIndexBitWidth());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1430:      auto dstTp = RankedTensorType::get(srcTp.getShape(),
+    #####: 1431:                                         srcTp.getElementType(), dstEnc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1432:      auto convert = rewriter.create<ConvertOp>(tval.getLoc(), dstTp, tval);
+call    0 never executed
+call    1 never executed
+    #####: 1433:      op->setOperand(tensor, convert);
+call    0 never executed
+    #####: 1434:      rewriter.setInsertionPointAfter(op);
+call    0 never executed
+    #####: 1435:      rewriter.create<bufferization::DeallocTensorOp>(tval.getLoc(), convert);
+call    0 never executed
+call    1 never executed
+    #####: 1436:      return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1437:    }
+        -: 1438:    // Cannot be resolved with a single conversion.
+        -: 1439:    // TODO: convert more than one?
+    #####: 1440:    return failure();
+branch  0 never executed
+branch  1 never executed
+        -: 1441:  }
+        -: 1442:
+        -: 1443:  /// Options to control sparse code generation.
+        -: 1444:  SparsificationOptions options;
+        -: 1445:};
+        -: 1446:
+        -: 1447:} // namespace
+        -: 1448:
+        -: 1449:/// Populates the given patterns list with rewriting rules required for
+        -: 1450:/// the sparsification of linear algebra operations.
+function _ZN4mlir30populateSparsificationPatternsERNS_17RewritePatternSetERKNS_21SparsificationOptionsE called 558 returned 100% blocks executed 100%
+      558: 1451:void mlir::populateSparsificationPatterns(
+        -: 1452:    RewritePatternSet &patterns, const SparsificationOptions &options) {
+      558: 1453:  patterns.add<GenericOpSparsifier>(patterns.getContext(), options);
+call    0 returned 100%
+      558: 1454:}

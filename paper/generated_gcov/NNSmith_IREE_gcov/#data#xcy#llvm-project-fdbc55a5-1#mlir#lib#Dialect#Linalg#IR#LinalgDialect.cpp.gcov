@@ -1,0 +1,212 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Linalg/IR/LinalgDialect.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/IR/CMakeFiles/obj.MLIRLinalgDialect.dir/LinalgDialect.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/IR/CMakeFiles/obj.MLIRLinalgDialect.dir/LinalgDialect.cpp.gcda
+        -:    0:Runs:325546
+        -:    1://===- Dialect.cpp - Implementation of the linalg dialect and types -------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the Linalg dialect types and dialect.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   14:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   15:#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
+        -:   16:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   17:#include "mlir/Dialect/Math/IR/Math.h"
+        -:   18:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   19:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   20:#include "mlir/IR/BuiltinTypes.h"
+        -:   21:#include "mlir/IR/Dialect.h"
+        -:   22:#include "mlir/IR/DialectImplementation.h"
+        -:   23:#include "mlir/IR/FunctionInterfaces.h"
+        -:   24:#include "mlir/Parser/Parser.h"
+        -:   25:#include "mlir/Support/LLVM.h"
+        -:   26:#include "mlir/Transforms/InliningUtils.h"
+        -:   27:
+        -:   28:#include "llvm/ADT/StringExtras.h"
+        -:   29:#include "llvm/ADT/TypeSwitch.h"
+        -:   30:#include "llvm/Support/raw_ostream.h"
+        -:   31:
+        -:   32:using namespace mlir;
+        -:   33:using namespace mlir::linalg;
+        -:   34:
+        -:   35://===----------------------------------------------------------------------===//
+        -:   36:// LinalgDialect Dialect Interfaces
+        -:   37://===----------------------------------------------------------------------===//
+        -:   38:
+        -:   39:namespace {
+        -:   40:
+        -:   41:struct LinalgInlinerInterface : public DialectInlinerInterface {
+        -:   42:  using DialectInlinerInterface::DialectInlinerInterface;
+        -:   43:
+        -:   44:  // We don't have any special restrictions on what can be inlined into
+        -:   45:  // destination regions (e.g. while/conditional bodies). Always allow it.
+function _ZNK12_GLOBAL__N_122LinalgInlinerInterface15isLegalToInlineEPN4mlir6RegionES3_bRNS1_20BlockAndValueMappingE called 0 returned 0% blocks executed 0%
+    #####:   46:  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+        -:   47:                       BlockAndValueMapping &valueMapping) const final {
+    #####:   48:    return true;
+        -:   49:  }
+        -:   50:  // Operations in Linalg dialect are always legal to inline.
+function _ZNK12_GLOBAL__N_122LinalgInlinerInterface15isLegalToInlineEPN4mlir9OperationEPNS1_6RegionEbRNS1_20BlockAndValueMappingE called 0 returned 0% blocks executed 0%
+    #####:   51:  bool isLegalToInline(Operation *, Region *, bool,
+        -:   52:                       BlockAndValueMapping &) const final {
+    #####:   53:    return true;
+        -:   54:  }
+        -:   55:  // Handle the given inlined terminator by replacing it with a new operation
+        -:   56:  // as necessary. Required when the region has only one block.
+function _ZNK12_GLOBAL__N_122LinalgInlinerInterface16handleTerminatorEPN4mlir9OperationEN4llvm8ArrayRefINS1_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:   57:  void handleTerminator(Operation *op,
+    #####:   58:                        ArrayRef<Value> valuesToRepl) const final {}
+        -:   59:};
+        -:   60:
+        -:   61:} // namespace
+        -:   62:
+        -:   63://===----------------------------------------------------------------------===//
+        -:   64:// LinalgDialect
+        -:   65://===----------------------------------------------------------------------===//
+        -:   66:
+        -:   67:/// Attribute name used to to memoize indexing maps for named ops.
+        -:   68:constexpr const ::llvm::StringLiteral
+        -:   69:    LinalgDialect::kMemoizedIndexingMapsAttrName;
+        -:   70:
+        -:   71:/// Trait to check if T provides a `regionBuilder` method.
+        -:   72:template <typename T, typename... Args>
+        -:   73:using has_region_builder = decltype(T::regionBuilder);
+        -:   74:template <typename T>
+        -:   75:using detect_has_region_builder = llvm::is_detected<has_region_builder, T>;
+        -:   76:
+        -:   77:/// SFINAE helper for single C++ class without a `regionBuilder` method (e.g.
+        -:   78:/// an OpInterface).
+        -:   79:template <typename OpType, typename = std::enable_if_t<
+        -:   80:                               !detect_has_region_builder<OpType>::value>>
+   524192:   81:void addNamedOpBuilderImpl(
+        -:   82:    llvm::StringMap<LinalgDialect::RegionBuilderFunType> &map) {
+        -:   83:  // Do nothing.
+        -:   84:}
+        -:   85:
+        -:   86:template <typename OpType,
+        -:   87:          typename = std::enable_if_t<detect_has_region_builder<OpType>::value>,
+        -:   88:          typename = void>
+ 12056416:   89:void addNamedOpBuilderImpl(
+        -:   90:    llvm::StringMap<LinalgDialect::RegionBuilderFunType> &map) {
+   262096:   91:  map.insert(std::make_pair(
+call    0 returned 100%
+        -:   92:      OpType::getOperationName(),
+        -:   93:      static_cast<LinalgDialect::RegionBuilderFunType>(OpType::regionBuilder)));
+        -:   94:}
+        -:   95:
+        -:   96:template <typename... OpTypes>
+function _Z18addNamedOpBuildersIJN4mlir6linalg13BatchMatmulOpENS1_13BatchMatvecOpENS1_19BatchReduceMatmulOpENS1_14Conv1DNcwFcwOpENS1_14Conv1DNwcWcfOpENS1_8Conv1DOpENS1_16Conv2DNchwFchwOpENS1_18Conv2DNgchwFgchwOpENS1_16Conv2DNhwcFhwcOpENS1_16Conv2DNhwcHwcfOpENS1_17Conv2DNhwcHwcfQOpENS1_8Conv2DOpENS1_18Conv3DNdhwcDhwcfOpENS1_8Conv3DOpENS1_6CopyOpENS1_22DepthwiseConv1DNwcWcOpENS1_23DepthwiseConv1DNwcWcmOpENS1_24DepthwiseConv2DNchwChwOpENS1_24DepthwiseConv2DNhwcHwcOpENS1_25DepthwiseConv2DNhwcHwcQOpENS1_25DepthwiseConv2DNhwcHwcmOpENS1_26DepthwiseConv2DNhwcHwcmQOpENS1_26DepthwiseConv3DNdhwcDhwcOpENS1_27DepthwiseConv3DNdhwcDhwcmOpENS1_5DotOpENS1_16ElemwiseBinaryOpENS1_15ElemwiseUnaryOpENS1_6FillOpENS1_11FillRng2DOpENS1_9GenericOpENS1_5MapOpENS1_8MatmulOpENS1_16MatmulUnsignedOpENS1_8MatvecOpENS1_7Mmt4DOpENS1_16PoolingNchwMaxOpENS1_16PoolingNchwSumOpENS1_17PoolingNdhwcMaxOpENS1_17PoolingNdhwcMinOpENS1_17PoolingNdhwcSumOpENS1_16PoolingNhwcMaxOpENS1_24PoolingNhwcMaxUnsignedOpENS1_16PoolingNhwcMinOpENS1_24PoolingNhwcMinUnsignedOpENS1_16PoolingNhwcSumOpENS1_22QuantizedBatchMatmulOpENS1_17QuantizedMatmulOpENS1_8ReduceOpENS1_11TransposeOpENS1_8VecmatOpEEEvRN4llvm9StringMapINS1G_12function_refIFvRNS0_20ImplicitLocOpBuilderERNS0_5BlockENS1G_8ArrayRefINS0_14NamedAttributeEEEEEENS1G_15MallocAllocatorEEE called 262096 returned 100% blocks executed 100%
+   262096:   97:void addNamedOpBuilders(
+call    0 returned 100%
+        -:   98:    llvm::StringMap<LinalgDialect::RegionBuilderFunType> &map) {
+   262096:   99:  (addNamedOpBuilderImpl<OpTypes>(map), ...);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+call   32 returned 100%
+call   33 returned 100%
+call   34 returned 100%
+call   35 returned 100%
+call   36 returned 100%
+call   37 returned 100%
+call   38 returned 100%
+call   39 returned 100%
+call   40 returned 100%
+call   41 returned 100%
+call   42 returned 100%
+call   43 returned 100%
+call   44 returned 100%
+   262096:  100:}
+        -:  101:
+function _ZN4mlir6linalg13LinalgDialect10initializeEv called 262096 returned 100% blocks executed 100%
+   262096:  102:void mlir::linalg::LinalgDialect::initialize() {
+   262096:  103:  addAttributes<
+        -:  104:#define GET_ATTRDEF_LIST
+        -:  105:#include "mlir/Dialect/Linalg/IR/LinalgOpsAttrDefs.cpp.inc"
+   262096:  106:      >();
+call    0 returned 100%
+   262096:  107:  addOperations<
+        -:  108:#define GET_OP_LIST
+        -:  109:#include "mlir/Dialect/Linalg/IR/LinalgOps.cpp.inc"
+   262096:  110:      >();
+call    0 returned 100%
+   262096:  111:  addOperations<
+        -:  112:#define GET_OP_LIST
+        -:  113:#include "mlir/Dialect/Linalg/IR/LinalgStructuredOps.cpp.inc"
+   262096:  114:      >();
+call    0 returned 100%
+        -:  115:
+        -:  116:  // Fill the Linalg-specific OpName to RegionBuilder map.
+   262096:  117:  addNamedOpBuilders<
+        -:  118:#define GET_OP_LIST
+        -:  119:#include "mlir/Dialect/Linalg/IR/LinalgStructuredOps.cpp.inc"
+   262096:  120:      >(namedStructuredOpRegionBuilders);
+call    0 returned 100%
+        -:  121:
+   262096:  122:  addInterfaces<LinalgInlinerInterface>();
+call    0 returned 100%
+   262096:  123:}
+        -:  124:
+function _ZN4mlir6linalg13LinalgDialect24verifyOperationAttributeEPNS_9OperationENS_14NamedAttributeE called 0 returned 0% blocks executed 0%
+    #####:  125:LogicalResult LinalgDialect::verifyOperationAttribute(Operation *op,
+        -:  126:                                                      NamedAttribute attr) {
+    #####:  127:  if (attr.getName() == LinalgDialect::kMemoizedIndexingMapsAttrName)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  128:    return success();
+    #####:  129:  return op->emitError() << "attribute '" << attr.getName()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  130:                         << "' not supported by the linalg dialect";
+call    0 never executed
+        -:  131:}
+        -:  132:
+        -:  133:#include "mlir/Dialect/Linalg/IR/LinalgOpsEnums.cpp.inc"
+        -:  134:
+        -:  135:#define GET_ATTRDEF_CLASSES
+        -:  136:#include "mlir/Dialect/Linalg/IR/LinalgOpsAttrDefs.cpp.inc"
+        -:  137:
+        -:  138:#include "mlir/Dialect/Linalg/IR/LinalgOpsDialect.cpp.inc"

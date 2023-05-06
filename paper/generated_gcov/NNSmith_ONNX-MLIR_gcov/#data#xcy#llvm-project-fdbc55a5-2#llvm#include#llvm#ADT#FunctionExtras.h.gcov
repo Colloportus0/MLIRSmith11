@@ -1,0 +1,439 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/ADT/FunctionExtras.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:128646
+        -:    1://===- FunctionExtras.h - Function type erasure utilities -------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:/// \file
+        -:    9:/// This file provides a collection of function (or more generally, callable)
+        -:   10:/// type erasure utilities supplementing those provided by the standard library
+        -:   11:/// in `<function>`.
+        -:   12:///
+        -:   13:/// It provides `unique_function`, which works like `std::function` but supports
+        -:   14:/// move-only callable objects and const-qualification.
+        -:   15:///
+        -:   16:/// Future plans:
+        -:   17:/// - Add a `function` that provides ref-qualified support, which doesn't work
+        -:   18:///   with `std::function`.
+        -:   19:/// - Provide support for specifying multiple signatures to type erase callable
+        -:   20:///   objects with an overload set, such as those produced by generic lambdas.
+        -:   21:/// - Expand to include a copyable utility that directly replaces std::function
+        -:   22:///   but brings the above improvements.
+        -:   23:///
+        -:   24:/// Note that LLVM's utilities are greatly simplified by not supporting
+        -:   25:/// allocators.
+        -:   26:///
+        -:   27:/// If the standard library ever begins to provide comparable facilities we can
+        -:   28:/// consider switching to those.
+        -:   29:///
+        -:   30://===----------------------------------------------------------------------===//
+        -:   31:
+        -:   32:#ifndef LLVM_ADT_FUNCTIONEXTRAS_H
+        -:   33:#define LLVM_ADT_FUNCTIONEXTRAS_H
+        -:   34:
+        -:   35:#include "llvm/ADT/PointerIntPair.h"
+        -:   36:#include "llvm/ADT/PointerUnion.h"
+        -:   37:#include "llvm/ADT/STLForwardCompat.h"
+        -:   38:#include "llvm/Support/MemAlloc.h"
+        -:   39:#include "llvm/Support/type_traits.h"
+        -:   40:#include <cstring>
+        -:   41:#include <memory>
+        -:   42:#include <type_traits>
+        -:   43:
+        -:   44:namespace llvm {
+        -:   45:
+        -:   46:/// unique_function is a type-erasing functor similar to std::function.
+        -:   47:///
+        -:   48:/// It can hold move-only function objects, like lambdas capturing unique_ptrs.
+        -:   49:/// Accordingly, it is movable but not copyable.
+        -:   50:///
+        -:   51:/// It supports const-qualification:
+        -:   52:/// - unique_function<int() const> has a const operator().
+        -:   53:///   It can only hold functions which themselves have a const operator().
+        -:   54:/// - unique_function<int()> has a non-const operator().
+        -:   55:///   It can hold functions with a non-const operator(), like mutable lambdas.
+        -:   56:template <typename FunctionT> class unique_function;
+        -:   57:
+        -:   58:namespace detail {
+        -:   59:
+        -:   60:template <typename T>
+        -:   61:using EnableIfTrivial =
+        -:   62:    std::enable_if_t<llvm::is_trivially_move_constructible<T>::value &&
+        -:   63:                     std::is_trivially_destructible<T>::value>;
+        -:   64:template <typename CallableT, typename ThisT>
+        -:   65:using EnableUnlessSameType =
+        -:   66:    std::enable_if_t<!std::is_same<remove_cvref_t<CallableT>, ThisT>::value>;
+        -:   67:template <typename CallableT, typename Ret, typename... Params>
+        -:   68:using EnableIfCallable = std::enable_if_t<std::disjunction<
+        -:   69:    std::is_void<Ret>,
+        -:   70:    std::is_same<decltype(std::declval<CallableT>()(std::declval<Params>()...)),
+        -:   71:                 Ret>,
+        -:   72:    std::is_same<const decltype(std::declval<CallableT>()(
+        -:   73:                     std::declval<Params>()...)),
+        -:   74:                 Ret>,
+        -:   75:    std::is_convertible<decltype(std::declval<CallableT>()(
+        -:   76:                            std::declval<Params>()...)),
+        -:   77:                        Ret>>::value>;
+        -:   78:
+        -:   79:template <typename ReturnT, typename... ParamTs> class UniqueFunctionBase {
+        -:   80:protected:
+        -:   81:  static constexpr size_t InlineStorageSize = sizeof(void *) * 3;
+        -:   82:
+        -:   83:  template <typename T, class = void>
+        -:   84:  struct IsSizeLessThanThresholdT : std::false_type {};
+        -:   85:
+        -:   86:  template <typename T>
+        -:   87:  struct IsSizeLessThanThresholdT<
+        -:   88:      T, std::enable_if_t<sizeof(T) <= 2 * sizeof(void *)>> : std::true_type {};
+        -:   89:
+        -:   90:  // Provide a type function to map parameters that won't observe extra copies
+        -:   91:  // or moves and which are small enough to likely pass in register to values
+        -:   92:  // and all other types to l-value reference types. We use this to compute the
+        -:   93:  // types used in our erased call utility to minimize copies and moves unless
+        -:   94:  // doing so would force things unnecessarily into memory.
+        -:   95:  //
+        -:   96:  // The heuristic used is related to common ABI register passing conventions.
+        -:   97:  // It doesn't have to be exact though, and in one way it is more strict
+        -:   98:  // because we want to still be able to observe either moves *or* copies.
+        -:   99:  template <typename T> struct AdjustedParamTBase {
+        -:  100:    static_assert(!std::is_reference<T>::value,
+        -:  101:                  "references should be handled by template specialization");
+        -:  102:    using type = std::conditional_t<
+        -:  103:        llvm::is_trivially_copy_constructible<T>::value &&
+        -:  104:            llvm::is_trivially_move_constructible<T>::value &&
+        -:  105:            IsSizeLessThanThresholdT<T>::value,
+        -:  106:        T, T &>;
+        -:  107:  };
+        -:  108:
+        -:  109:  // This specialization ensures that 'AdjustedParam<V<T>&>' or
+        -:  110:  // 'AdjustedParam<V<T>&&>' does not trigger a compile-time error when 'T' is
+        -:  111:  // an incomplete type and V a templated type.
+        -:  112:  template <typename T> struct AdjustedParamTBase<T &> { using type = T &; };
+        -:  113:  template <typename T> struct AdjustedParamTBase<T &&> { using type = T &; };
+        -:  114:
+        -:  115:  template <typename T>
+        -:  116:  using AdjustedParamT = typename AdjustedParamTBase<T>::type;
+        -:  117:
+        -:  118:  // The type of the erased function pointer we use as a callback to dispatch to
+        -:  119:  // the stored callable when it is trivial to move and destroy.
+        -:  120:  using CallPtrT = ReturnT (*)(void *CallableAddr,
+        -:  121:                               AdjustedParamT<ParamTs>... Params);
+        -:  122:  using MovePtrT = void (*)(void *LHSCallableAddr, void *RHSCallableAddr);
+        -:  123:  using DestroyPtrT = void (*)(void *CallableAddr);
+        -:  124:
+        -:  125:  /// A struct to hold a single trivial callback with sufficient alignment for
+        -:  126:  /// our bitpacking.
+        -:  127:  struct alignas(8) TrivialCallback {
+        -:  128:    CallPtrT CallPtr;
+        -:  129:  };
+        -:  130:
+        -:  131:  /// A struct we use to aggregate three callbacks when we need full set of
+        -:  132:  /// operations.
+        -:  133:  struct alignas(8) NonTrivialCallbacks {
+        -:  134:    CallPtrT CallPtr;
+        -:  135:    MovePtrT MovePtr;
+        -:  136:    DestroyPtrT DestroyPtr;
+        -:  137:  };
+        -:  138:
+        -:  139:  // Create a pointer union between either a pointer to a static trivial call
+        -:  140:  // pointer in a struct or a pointer to a static struct of the call, move, and
+        -:  141:  // destroy pointers.
+        -:  142:  using CallbackPointerUnionT =
+        -:  143:      PointerUnion<TrivialCallback *, NonTrivialCallbacks *>;
+        -:  144:
+        -:  145:  // The main storage buffer. This will either have a pointer to out-of-line
+        -:  146:  // storage or an inline buffer storing the callable.
+        -:  147:  union StorageUnionT {
+        -:  148:    // For out-of-line storage we keep a pointer to the underlying storage and
+        -:  149:    // the size. This is enough to deallocate the memory.
+        -:  150:    struct OutOfLineStorageT {
+        -:  151:      void *StoragePtr;
+        -:  152:      size_t Size;
+        -:  153:      size_t Alignment;
+        -:  154:    } OutOfLineStorage;
+        -:  155:    static_assert(
+        -:  156:        sizeof(OutOfLineStorageT) <= InlineStorageSize,
+        -:  157:        "Should always use all of the out-of-line storage for inline storage!");
+        -:  158:
+        -:  159:    // For in-line storage, we just provide an aligned character buffer. We
+        -:  160:    // provide three pointers worth of storage here.
+        -:  161:    // This is mutable as an inlined `const unique_function<void() const>` may
+        -:  162:    // still modify its own mutable members.
+        -:  163:    mutable std::aligned_storage_t<InlineStorageSize, alignof(void *)>
+        -:  164:        InlineStorage;
+        -:  165:  } StorageUnion;
+        -:  166:
+        -:  167:  // A compressed pointer to either our dispatching callback or our table of
+        -:  168:  // dispatching callbacks and the flag for whether the callable itself is
+        -:  169:  // stored inline or not.
+        -:  170:  PointerIntPair<CallbackPointerUnionT, 1, bool> CallbackAndInlineFlag;
+        -:  171:
+    #####:  172:  bool isInlineStorage() const { return CallbackAndInlineFlag.getInt(); }
+branch  0 never executed
+branch  1 never executed
+        -:  173:
+    #####:  174:  bool isTrivialCallback() const {
+    #####:  175:    return CallbackAndInlineFlag.getPointer().template is<TrivialCallback *>();
+        -:  176:  }
+        -:  177:
+        -:  178:  CallPtrT getTrivialCallback() const {
+        -:  179:    return CallbackAndInlineFlag.getPointer().template get<TrivialCallback *>()->CallPtr;
+        -:  180:  }
+        -:  181:
+function _ZNK4llvm6detail18UniqueFunctionBaseIN4mlir18InFlightDiagnosticEJEE22getNonTrivialCallbacksEv called 0 returned 0% blocks executed 0%
+    #####:  182:  NonTrivialCallbacks *getNonTrivialCallbacks() const {
+        -:  183:    return CallbackAndInlineFlag.getPointer()
+    #####:  184:        .template get<NonTrivialCallbacks *>();
+branch  0 never executed
+branch  1 never executed
+        -:  185:  }
+        -:  186:
+        -:  187:  CallPtrT getCallPtr() const {
+        -:  188:    return isTrivialCallback() ? getTrivialCallback()
+        -:  189:                               : getNonTrivialCallbacks()->CallPtr;
+        -:  190:  }
+        -:  191:
+        -:  192:  // These three functions are only const in the narrow sense. They return
+        -:  193:  // mutable pointers to function state.
+        -:  194:  // This allows unique_function<T const>::operator() to be const, even if the
+        -:  195:  // underlying functor may be internally mutable.
+        -:  196:  //
+        -:  197:  // const callers must ensure they're only used in const-correct ways.
+        -:  198:  void *getCalleePtr() const {
+        -:  199:    return isInlineStorage() ? getInlineStorage() : getOutOfLineStorage();
+        -:  200:  }
+    #####:  201:  void *getInlineStorage() const { return &StorageUnion.InlineStorage; }
+    #####:  202:  void *getOutOfLineStorage() const {
+        -:  203:    return StorageUnion.OutOfLineStorage.StoragePtr;
+        -:  204:  }
+        -:  205:
+    #####:  206:  size_t getOutOfLineStorageSize() const {
+        -:  207:    return StorageUnion.OutOfLineStorage.Size;
+        -:  208:  }
+    #####:  209:  size_t getOutOfLineStorageAlignment() const {
+        -:  210:    return StorageUnion.OutOfLineStorage.Alignment;
+        -:  211:  }
+        -:  212:
+        -:  213:  void setOutOfLineStorage(void *Ptr, size_t Size, size_t Alignment) {
+        -:  214:    StorageUnion.OutOfLineStorage = {Ptr, Size, Alignment};
+        -:  215:  }
+        -:  216:
+        -:  217:  template <typename CalledAsT>
+        -:  218:  static ReturnT CallImpl(void *CallableAddr,
+        -:  219:                          AdjustedParamT<ParamTs>... Params) {
+        -:  220:    auto &Func = *reinterpret_cast<CalledAsT *>(CallableAddr);
+        -:  221:    return Func(std::forward<ParamTs>(Params)...);
+        -:  222:  }
+        -:  223:
+        -:  224:  template <typename CallableT>
+        -:  225:  static void MoveImpl(void *LHSCallableAddr, void *RHSCallableAddr) noexcept {
+        -:  226:    new (LHSCallableAddr)
+        -:  227:        CallableT(std::move(*reinterpret_cast<CallableT *>(RHSCallableAddr)));
+        -:  228:  }
+        -:  229:
+        -:  230:  template <typename CallableT>
+        -:  231:  static void DestroyImpl(void *CallableAddr) noexcept {
+        -:  232:    reinterpret_cast<CallableT *>(CallableAddr)->~CallableT();
+        -:  233:  }
+        -:  234:
+        -:  235:  // The pointers to call/move/destroy functions are determined for each
+        -:  236:  // callable type (and called-as type, which determines the overload chosen).
+        -:  237:  // (definitions are out-of-line).
+        -:  238:
+        -:  239:  // By default, we need an object that contains all the different
+        -:  240:  // type erased behaviors needed. Create a static instance of the struct type
+        -:  241:  // here and each instance will contain a pointer to it.
+        -:  242:  // Wrap in a struct to avoid https://gcc.gnu.org/PR71954
+        -:  243:  template <typename CallableT, typename CalledAs, typename Enable = void>
+        -:  244:  struct CallbacksHolder {
+        -:  245:    static NonTrivialCallbacks Callbacks;
+        -:  246:  };
+        -:  247:  // See if we can create a trivial callback. We need the callable to be
+        -:  248:  // trivially moved and trivially destroyed so that we don't have to store
+        -:  249:  // type erased callbacks for those operations.
+        -:  250:  template <typename CallableT, typename CalledAs>
+        -:  251:  struct CallbacksHolder<CallableT, CalledAs, EnableIfTrivial<CallableT>> {
+        -:  252:    static TrivialCallback Callbacks;
+        -:  253:  };
+        -:  254:
+        -:  255:  // A simple tag type so the call-as type to be passed to the constructor.
+        -:  256:  template <typename T> struct CalledAs {};
+        -:  257:
+        -:  258:  // Essentially the "main" unique_function constructor, but subclasses
+        -:  259:  // provide the qualified type to be used for the call.
+        -:  260:  // (We always store a T, even if the call will use a pointer to const T).
+        -:  261:  template <typename CallableT, typename CalledAsT>
+        -:  262:  UniqueFunctionBase(CallableT Callable, CalledAs<CalledAsT>) {
+        -:  263:    bool IsInlineStorage = true;
+        -:  264:    void *CallableAddr = getInlineStorage();
+        -:  265:    if (sizeof(CallableT) > InlineStorageSize ||
+        -:  266:        alignof(CallableT) > alignof(decltype(StorageUnion.InlineStorage))) {
+        -:  267:      IsInlineStorage = false;
+        -:  268:      // Allocate out-of-line storage. FIXME: Use an explicit alignment
+        -:  269:      // parameter in C++17 mode.
+        -:  270:      auto Size = sizeof(CallableT);
+        -:  271:      auto Alignment = alignof(CallableT);
+        -:  272:      CallableAddr = allocate_buffer(Size, Alignment);
+        -:  273:      setOutOfLineStorage(CallableAddr, Size, Alignment);
+        -:  274:    }
+        -:  275:
+        -:  276:    // Now move into the storage.
+        -:  277:    new (CallableAddr) CallableT(std::move(Callable));
+        -:  278:    CallbackAndInlineFlag.setPointerAndInt(
+        -:  279:        &CallbacksHolder<CallableT, CalledAsT>::Callbacks, IsInlineStorage);
+        -:  280:  }
+        -:  281:
+function _ZN4llvm6detail18UniqueFunctionBaseIN4mlir18InFlightDiagnosticEJEED2Ev called 0 returned 0% blocks executed 0%
+    #####:  282:  ~UniqueFunctionBase() {
+    #####:  283:    if (!CallbackAndInlineFlag.getPointer())
+branch  0 never executed
+branch  1 never executed
+    #####:  284:      return;
+        -:  285:
+        -:  286:    // Cache this value so we don't re-check it after type-erased operations.
+    #####:  287:    bool IsInlineStorage = isInlineStorage();
+branch  0 never executed
+branch  1 never executed
+        -:  288:
+    #####:  289:    if (!isTrivialCallback())
+branch  0 never executed
+branch  1 never executed
+    #####:  290:      getNonTrivialCallbacks()->DestroyPtr(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  291:          IsInlineStorage ? getInlineStorage() : getOutOfLineStorage());
+        -:  292:
+    #####:  293:    if (!IsInlineStorage)
+branch  0 never executed
+branch  1 never executed
+    #####:  294:      deallocate_buffer(getOutOfLineStorage(), getOutOfLineStorageSize(),
+call    0 never executed
+        -:  295:                        getOutOfLineStorageAlignment());
+    #####:  296:  }
+        -:  297:
+        -:  298:  UniqueFunctionBase(UniqueFunctionBase &&RHS) noexcept {
+        -:  299:    // Copy the callback and inline flag.
+        -:  300:    CallbackAndInlineFlag = RHS.CallbackAndInlineFlag;
+        -:  301:
+        -:  302:    // If the RHS is empty, just copying the above is sufficient.
+        -:  303:    if (!RHS)
+        -:  304:      return;
+        -:  305:
+        -:  306:    if (!isInlineStorage()) {
+        -:  307:      // The out-of-line case is easiest to move.
+        -:  308:      StorageUnion.OutOfLineStorage = RHS.StorageUnion.OutOfLineStorage;
+        -:  309:    } else if (isTrivialCallback()) {
+        -:  310:      // Move is trivial, just memcpy the bytes across.
+        -:  311:      memcpy(getInlineStorage(), RHS.getInlineStorage(), InlineStorageSize);
+        -:  312:    } else {
+        -:  313:      // Non-trivial move, so dispatch to a type-erased implementation.
+        -:  314:      getNonTrivialCallbacks()->MovePtr(getInlineStorage(),
+        -:  315:                                        RHS.getInlineStorage());
+        -:  316:    }
+        -:  317:
+        -:  318:    // Clear the old callback and inline flag to get back to as-if-null.
+        -:  319:    RHS.CallbackAndInlineFlag = {};
+        -:  320:
+        -:  321:#ifndef NDEBUG
+        -:  322:    // In debug builds, we also scribble across the rest of the storage.
+        -:  323:    memset(RHS.getInlineStorage(), 0xAD, InlineStorageSize);
+        -:  324:#endif
+        -:  325:  }
+        -:  326:
+        -:  327:  UniqueFunctionBase &operator=(UniqueFunctionBase &&RHS) noexcept {
+        -:  328:    if (this == &RHS)
+        -:  329:      return *this;
+        -:  330:
+        -:  331:    // Because we don't try to provide any exception safety guarantees we can
+        -:  332:    // implement move assignment very simply by first destroying the current
+        -:  333:    // object and then move-constructing over top of it.
+        -:  334:    this->~UniqueFunctionBase();
+        -:  335:    new (this) UniqueFunctionBase(std::move(RHS));
+        -:  336:    return *this;
+        -:  337:  }
+        -:  338:
+        -:  339:  UniqueFunctionBase() = default;
+        -:  340:
+        -:  341:public:
+        -:  342:  explicit operator bool() const {
+        -:  343:    return (bool)CallbackAndInlineFlag.getPointer();
+        -:  344:  }
+        -:  345:};
+        -:  346:
+        -:  347:template <typename R, typename... P>
+        -:  348:template <typename CallableT, typename CalledAsT, typename Enable>
+        -:  349:typename UniqueFunctionBase<R, P...>::NonTrivialCallbacks UniqueFunctionBase<
+        -:  350:    R, P...>::CallbacksHolder<CallableT, CalledAsT, Enable>::Callbacks = {
+        -:  351:    &CallImpl<CalledAsT>, &MoveImpl<CallableT>, &DestroyImpl<CallableT>};
+        -:  352:
+        -:  353:template <typename R, typename... P>
+        -:  354:template <typename CallableT, typename CalledAsT>
+        -:  355:typename UniqueFunctionBase<R, P...>::TrivialCallback
+        -:  356:    UniqueFunctionBase<R, P...>::CallbacksHolder<
+        -:  357:        CallableT, CalledAsT, EnableIfTrivial<CallableT>>::Callbacks{
+        -:  358:        &CallImpl<CalledAsT>};
+        -:  359:
+        -:  360:} // namespace detail
+        -:  361:
+        -:  362:template <typename R, typename... P>
+    #####:  363:class unique_function<R(P...)> : public detail::UniqueFunctionBase<R, P...> {
+call    0 never executed
+        -:  364:  using Base = detail::UniqueFunctionBase<R, P...>;
+        -:  365:
+        -:  366:public:
+        -:  367:  unique_function() = default;
+        -:  368:  unique_function(std::nullptr_t) {}
+        -:  369:  unique_function(unique_function &&) = default;
+        -:  370:  unique_function(const unique_function &) = delete;
+        -:  371:  unique_function &operator=(unique_function &&) = default;
+        -:  372:  unique_function &operator=(const unique_function &) = delete;
+        -:  373:
+        -:  374:  template <typename CallableT>
+        -:  375:  unique_function(
+        -:  376:      CallableT Callable,
+        -:  377:      detail::EnableUnlessSameType<CallableT, unique_function> * = nullptr,
+        -:  378:      detail::EnableIfCallable<CallableT, R, P...> * = nullptr)
+        -:  379:      : Base(std::forward<CallableT>(Callable),
+        -:  380:             typename Base::template CalledAs<CallableT>{}) {}
+        -:  381:
+        -:  382:  R operator()(P... Params) {
+        -:  383:    return this->getCallPtr()(this->getCalleePtr(), Params...);
+        -:  384:  }
+        -:  385:};
+        -:  386:
+        -:  387:template <typename R, typename... P>
+        -:  388:class unique_function<R(P...) const>
+        -:  389:    : public detail::UniqueFunctionBase<R, P...> {
+        -:  390:  using Base = detail::UniqueFunctionBase<R, P...>;
+        -:  391:
+        -:  392:public:
+        -:  393:  unique_function() = default;
+        -:  394:  unique_function(std::nullptr_t) {}
+        -:  395:  unique_function(unique_function &&) = default;
+        -:  396:  unique_function(const unique_function &) = delete;
+        -:  397:  unique_function &operator=(unique_function &&) = default;
+        -:  398:  unique_function &operator=(const unique_function &) = delete;
+        -:  399:
+        -:  400:  template <typename CallableT>
+        -:  401:  unique_function(
+        -:  402:      CallableT Callable,
+        -:  403:      detail::EnableUnlessSameType<CallableT, unique_function> * = nullptr,
+        -:  404:      detail::EnableIfCallable<const CallableT, R, P...> * = nullptr)
+        -:  405:      : Base(std::forward<CallableT>(Callable),
+        -:  406:             typename Base::template CalledAs<const CallableT>{}) {}
+        -:  407:
+        -:  408:  R operator()(P... Params) const {
+        -:  409:    return this->getCallPtr()(this->getCalleePtr(), Params...);
+        -:  410:  }
+        -:  411:};
+        -:  412:
+        -:  413:} // end namespace llvm
+        -:  414:
+        -:  415:#endif // LLVM_ADT_FUNCTIONEXTRAS_H

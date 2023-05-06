@@ -1,0 +1,3887 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Linalg/TransformOps/LinalgTransformOps.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/TransformOps/CMakeFiles/obj.MLIRLinalgTransformOps.dir/LinalgTransformOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/TransformOps/CMakeFiles/obj.MLIRLinalgTransformOps.dir/LinalgTransformOps.cpp.gcda
+        -:    0:Runs:128628
+        -:    1://===- LinalgTransformOps.cpp - Implementation of Linalg transform ops ----===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+        -:   10:
+        -:   11:#include "mlir/AsmParser/AsmParser.h"
+        -:   12:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   13:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   14:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   15:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   16:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   17:#include "mlir/Dialect/PDL/IR/PDL.h"
+        -:   18:#include "mlir/Dialect/PDL/IR/PDLTypes.h"
+        -:   19:#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+        -:   20:#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+        -:   21:#include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
+        -:   22:#include "mlir/Interfaces/TilingInterface.h"
+        -:   23:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   24:#include "llvm/ADT/StringSet.h"
+        -:   25:#include "llvm/Support/Debug.h"
+        -:   26:
+        -:   27:using namespace mlir;
+        -:   28:using namespace mlir::linalg;
+        -:   29:using namespace mlir::transform;
+        -:   30:
+        -:   31:#define DEBUG_TYPE "linalg-transforms"
+        -:   32:
+        -:   33:/// Extracts a vector of unsigned from an array attribute. Asserts if the
+        -:   34:/// attribute contains values other than intergers. May truncate.
+function _ZL16extractUIntArrayN4mlir9ArrayAttrE called 0 returned 0% blocks executed 0%
+    #####:   35:static SmallVector<unsigned> extractUIntArray(ArrayAttr attr) {
+    #####:   36:  SmallVector<unsigned> result;
+call    0 never executed
+    #####:   37:  result.reserve(attr.size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   38:  for (APInt value : attr.getAsValueRange<IntegerAttr>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   39:    result.push_back(value.getZExtValue());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   40:  return result;
+        -:   41:}
+        -:   42:
+        -:   43:/// Extracts a vector of int64_t from an array attribute. Asserts if the
+        -:   44:/// attribute contains values other than integers.
+function _ZL15extractI64ArrayN4mlir9ArrayAttrE called 0 returned 0% blocks executed 0%
+    #####:   45:static SmallVector<int64_t> extractI64Array(ArrayAttr attr) {
+    #####:   46:  SmallVector<int64_t> result;
+call    0 never executed
+    #####:   47:  result.reserve(attr.size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   48:  for (APInt value : attr.getAsValueRange<IntegerAttr>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   49:    result.push_back(value.getSExtValue());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   50:  return result;
+        -:   51:}
+        -:   52:
+        -:   53:namespace {
+        -:   54:/// A simple pattern rewriter that implements no special logic.
+    #####:   55:class SimpleRewriter : public PatternRewriter {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:   56:public:
+    #####:   57:  SimpleRewriter(MLIRContext *context) : PatternRewriter(context) {}
+        -:   58:};
+        -:   59:} // namespace
+        -:   60:
+        -:   61:/// Attempts to apply the pattern specified as template argument to the given
+        -:   62:/// operation. The pattern is expected to have a `returningMatchAndRewrite`
+        -:   63:/// function that returns the "main" result or failure. Returns failure if the
+        -:   64:/// pattern failed to apply. Extra arguments are forwarded to the pattern
+        -:   65:/// constructor.
+        -:   66:template <typename PatternTy, typename... Args>
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+    #####:   72:  if (!op)
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+    #####:   80:  if (failed(result))
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+        -:   83:}
+------------------
+_Z8tryApplyIN4mlir6linalg20LinalgPaddingPatternEJRNS1_20LinalgPaddingOptionsEEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_:
+function _Z8tryApplyIN4mlir6linalg20LinalgPaddingPatternEJRNS1_20LinalgPaddingOptionsEEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_ called 0 returned 0% blocks executed 0%
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   72:  if (!op)
+branch  0 never executed
+branch  1 never executed
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+call    0 never executed
+call    1 never executed
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:  if (failed(result))
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+call    0 never executed
+        -:   83:}
+------------------
+_Z8tryApplyIN4mlir6linalg27LinalgGeneralizationPatternEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_:
+function _Z8tryApplyIN4mlir6linalg27LinalgGeneralizationPatternEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_ called 0 returned 0% blocks executed 0%
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   72:  if (!op)
+branch  0 never executed
+branch  1 never executed
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+call    0 never executed
+call    1 never executed
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:  if (failed(result))
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+call    0 never executed
+        -:   83:}
+------------------
+_Z8tryApplyIN4mlir6linalg33DownscaleDepthwiseConv2DNhwcHwcOpEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_:
+function _Z8tryApplyIN4mlir6linalg33DownscaleDepthwiseConv2DNhwcHwcOpEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_ called 0 returned 0% blocks executed 0%
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   72:  if (!op)
+branch  0 never executed
+branch  1 never executed
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+call    0 never executed
+call    1 never executed
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:  if (failed(result))
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+call    0 never executed
+        -:   83:}
+------------------
+_Z8tryApplyIN4mlir6linalg37DownscaleSizeOneWindowed2DConvolutionINS1_16Conv2DNchwFchwOpENS1_14Conv1DNcwFcwOpEEEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_:
+function _Z8tryApplyIN4mlir6linalg37DownscaleSizeOneWindowed2DConvolutionINS1_16Conv2DNchwFchwOpENS1_14Conv1DNcwFcwOpEEEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_ called 0 returned 0% blocks executed 0%
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   72:  if (!op)
+branch  0 never executed
+branch  1 never executed
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+call    0 never executed
+call    1 never executed
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:  if (failed(result))
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+call    0 never executed
+        -:   83:}
+------------------
+_Z8tryApplyIN4mlir6linalg37DownscaleSizeOneWindowed2DConvolutionINS1_16Conv2DNhwcHwcfOpENS1_14Conv1DNwcWcfOpEEEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_:
+function _Z8tryApplyIN4mlir6linalg37DownscaleSizeOneWindowed2DConvolutionINS1_16Conv2DNhwcHwcfOpENS1_14Conv1DNwcWcfOpEEEJEENS0_9FailureOrINS1_8LinalgOpEEEPNS0_9OperationEDpOT0_ called 0 returned 0% blocks executed 0%
+    #####:   67:static FailureOr<LinalgOp> tryApply(Operation *operation, Args &&...args) {
+        -:   68:  // Check if the given operation has the type expected by the pattern.
+        -:   69:  using OpTy = typename llvm::function_traits<
+        -:   70:      decltype(&PatternTy::returningMatchAndRewrite)>::template arg_t<0>;
+    #####:   71:  auto op = dyn_cast<OpTy>(operation);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   72:  if (!op)
+branch  0 never executed
+branch  1 never executed
+    #####:   73:    return failure();
+        -:   74:
+        -:   75:  // Apply the pattern directly to the op.
+    #####:   76:  PatternTy pattern(operation->getContext(), std::forward<Args>(args)...);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   77:  SimpleRewriter rewriter(operation->getContext());
+call    0 never executed
+call    1 never executed
+    #####:   78:  rewriter.setInsertionPoint(operation);
+    #####:   79:  auto result = pattern.returningMatchAndRewrite(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:  if (failed(result))
+branch  0 never executed
+branch  1 never executed
+    #####:   81:    return failure();
+    #####:   82:  return cast<LinalgOp>(result->getOperation());
+call    0 never executed
+        -:   83:}
+------------------
+        -:   84:
+        -:   85://===----------------------------------------------------------------------===//
+        -:   86:// DecomposeOp
+        -:   87://===----------------------------------------------------------------------===//
+        -:   88:
+        -:   89:DiagnosedSilenceableFailure
+function _ZN4mlir9transform11DecomposeOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:   90:transform::DecomposeOp::applyToOne(linalg::LinalgOp target,
+        -:   91:                                   SmallVectorImpl<Operation *> &results,
+        -:   92:                                   transform::TransformState &state) {
+    #####:   93:  FailureOr<LinalgOp> windowedNhwc =
+        -:   94:      tryApply<DownscaleSizeOneWindowed2DConvolution<linalg::Conv2DNhwcHwcfOp,
+    #####:   95:                                                     Conv1DNwcWcfOp>>(target);
+call    0 never executed
+    #####:   96:  if (succeeded(windowedNhwc)) {
+branch  0 never executed
+branch  1 never executed
+    #####:   97:    results.push_back(*windowedNhwc);
+call    0 never executed
+    #####:   98:    return DiagnosedSilenceableFailure(success());
+        -:   99:  }
+    #####:  100:  FailureOr<LinalgOp> windowedNchw =
+        -:  101:      tryApply<DownscaleSizeOneWindowed2DConvolution<linalg::Conv2DNchwFchwOp,
+    #####:  102:                                                     Conv1DNcwFcwOp>>(target);
+call    0 never executed
+    #####:  103:  if (succeeded(windowedNchw)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  104:    results.push_back(*windowedNchw);
+call    0 never executed
+    #####:  105:    return DiagnosedSilenceableFailure(success());
+        -:  106:  }
+    #####:  107:  FailureOr<LinalgOp> depthwise =
+    #####:  108:      tryApply<DownscaleDepthwiseConv2DNhwcHwcOp>(target);
+call    0 never executed
+    #####:  109:  if (succeeded(depthwise)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  110:    results.push_back(*depthwise);
+call    0 never executed
+    #####:  111:    return DiagnosedSilenceableFailure(success());
+        -:  112:  }
+    #####:  113:  results.assign(1, nullptr);
+call    0 never executed
+    #####:  114:  return emitDefaultSilenceableFailure(target);
+call    0 never executed
+        -:  115:}
+        -:  116://===----------------------------------------------------------------------===//
+        -:  117:// FuseOp
+        -:  118://===----------------------------------------------------------------------===//
+        -:  119:
+        -:  120:/// Apply a tiling transformation to all payload ops and store both the
+        -:  121:/// tiled operation as well as the created tile loops.
+function _ZL16applyTilingToAllPN4mlir9OperationEN4llvm8ArrayRefIS1_EEjRNS_9transform16TransformResultsENS2_12function_refIFNS_9FailureOrINS_3scf20SCFTileAndFuseResultEEENS_15TilingInterfaceEEEE called 0 returned 0% blocks executed 0%
+    #####:  122:static LogicalResult applyTilingToAll(
+        -:  123:    Operation *transformOp, ArrayRef<Operation *> payloadOps, unsigned numLoops,
+        -:  124:    transform::TransformResults &transformResults,
+        -:  125:    function_ref<FailureOr<scf::SCFTileAndFuseResult>(TilingInterface)>
+        -:  126:        applyFn) {
+    #####:  127:  SmallVector<Operation *> tiledLinalgOps;
+call    0 never executed
+    #####:  128:  SmallVector<SmallVector<Operation *>> loopOps(numLoops);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  129:  for (unsigned int i = 0; i < numLoops; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  130:    loopOps[i].reserve(payloadOps.size());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  131:
+    #####:  132:  for (Operation *target : payloadOps) {
+branch  0 never executed
+branch  1 never executed
+    #####:  133:    auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+call    0 never executed
+    #####:  134:    if (!tilingInterfaceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  135:      return transformOp->emitError("only TilingInterface ops are supported");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  136:
+    #####:  137:    SimpleRewriter rewriter(target->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  138:    rewriter.setInsertionPoint(target);
+call    0 never executed
+    #####:  139:    FailureOr<scf::SCFTileAndFuseResult> tiledResults =
+    #####:  140:        applyFn(tilingInterfaceOp);
+call    0 never executed
+call    1 never executed
+    #####:  141:    if (failed(tiledResults))
+branch  0 never executed
+branch  1 never executed
+    #####:  142:      return failure();
+call    0 never executed
+        -:  143:
+        -:  144:    // Perform the replacement of tiled and fused values.
+    #####:  145:    SmallVector<Operation *> opsToReplace{target};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  146:    llvm::append_range(opsToReplace, tiledResults->fusedProducers);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  147:    for (Operation *toReplace : opsToReplace) {
+branch  0 never executed
+branch  1 never executed
+    #####:  148:      SmallVector<Value> replacements;
+branch  0 never executed
+branch  1 never executed
+    #####:  149:      replacements.reserve(toReplace->getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  150:      for (OpResult res : toReplace->getResults()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  151:        auto it = tiledResults->replacements.find(res);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  152:        if (it == tiledResults->replacements.end())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  153:          replacements.push_back(res);
+call    0 never executed
+        -:  154:        else
+    #####:  155:          replacements.push_back(it->getSecond());
+call    0 never executed
+call    1 never executed
+        -:  156:      }
+    #####:  157:      rewriter.replaceOp(toReplace, replacements);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  158:    }
+        -:  159:
+        -:  160:    // Report back the relevant handles to the transform op.
+    #####:  161:    tiledLinalgOps.push_back(tiledResults->tiledAndFusedOps.front());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  162:    assert(tiledResults->loops.size() == numLoops &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  163:           "Mismatched number of loops, tile and fuse transform should have "
+        -:  164:           "failed");
+    #####:  165:    for (unsigned int i = 0; i < numLoops; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  166:      loopOps[i].push_back(tiledResults->loops[i]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  167:  }
+        -:  168:
+    #####:  169:  transformResults.set(transformOp->getOpResult(0), tiledLinalgOps);
+call    0 never executed
+    #####:  170:  for (unsigned int i = 0; i < numLoops; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  171:    transformResults.set(transformOp->getOpResult(i + 1), loopOps[i]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  172:
+    #####:  173:  return success();
+call    0 never executed
+        -:  174:}
+        -:  175:
+        -:  176:/// Parse a tiling-like operation that returns the tiled op as well as the
+        -:  177:/// created tile loops. The function counts the non-zero tile sizes to compute
+        -:  178:/// the number of results.
+function _ZL15parseTileLikeOpRN4mlir11OpAsmParserERNS_14OperationStateEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  179:static ParseResult parseTileLikeOp(OpAsmParser &parser, OperationState &result,
+        -:  180:                                   StringRef sizesAttrName) {
+    #####:  181:  OpAsmParser::UnresolvedOperand targetOperand;
+call    0 never executed
+    #####:  182:  SMLoc opLoc = parser.getCurrentLocation();
+call    0 never executed
+    #####:  183:  if (parser.parseOperand(targetOperand) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  184:      parser.parseOptionalAttrDict(result.attributes))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  185:    return failure();
+    #####:  186:  Attribute sizesAttr = result.attributes.get(sizesAttrName);
+call    0 never executed
+    #####:  187:  if (!sizesAttr)
+branch  0 never executed
+branch  1 never executed
+    #####:  188:    return parser.emitError(opLoc)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  189:           << "expected '" << sizesAttrName << "' attribute";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  190:  auto sizesArrayAttr = sizesAttr.dyn_cast<ArrayAttr>();
+call    0 never executed
+    #####:  191:  if (!sizesArrayAttr)
+branch  0 never executed
+branch  1 never executed
+    #####:  192:    return parser.emitError(opLoc)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  193:           << "'" << sizesAttrName << "' attribute must be an array";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  194:  Type pdlOpType = parser.getBuilder().getType<pdl::OperationType>();
+call    0 never executed
+call    1 never executed
+    #####:  195:  size_t numExpectedLoops =
+call    0 never executed
+    #####:  196:      sizesArrayAttr.size() -
+    #####:  197:      llvm::count(extractFromI64ArrayAttr(sizesArrayAttr), 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  198:  result.addTypes(SmallVector<Type>(numExpectedLoops + 1, pdlOpType));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  199:  if (parser.resolveOperand(targetOperand, pdlOpType, result.operands))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  200:    return failure();
+    #####:  201:  return success();
+        -:  202:}
+        -:  203:
+        -:  204:DiagnosedSilenceableFailure
+function _ZN4mlir9transform6FuseOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  205:transform::FuseOp::apply(mlir::transform::TransformResults &transformResults,
+        -:  206:                         mlir::transform::TransformState &state) {
+    #####:  207:  SmallVector<int64_t> tileSizes = extractFromI64ArrayAttr(getTileSizes());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  208:  SmallVector<int64_t> tileInterchange =
+call    0 never executed
+    #####:  209:      extractFromI64ArrayAttr(getTileInterchange());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  210:
+    #####:  211:  scf::SCFTilingOptions tilingOptions;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  212:  tilingOptions.interchangeVector = tileInterchange;
+call    0 never executed
+    #####:  213:  tilingOptions = tilingOptions.setTileSizes(tileSizes);
+call    0 never executed
+call    1 never executed
+    #####:  214:  scf::SCFTileAndFuseOptions tileAndFuseOptions;
+call    0 never executed
+call    1 never executed
+    #####:  215:  tileAndFuseOptions.tilingOptions = tilingOptions;
+call    0 never executed
+    #####:  216:  LogicalResult result = applyTilingToAll(
+    #####:  217:      getOperation(), state.getPayloadOps(getTarget()),
+    #####:  218:      tileSizes.size() - llvm::count(tileSizes, 0), transformResults,
+function _ZZN4mlir9transform6FuseOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlNS_15TilingInterfaceEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  219:      [&](TilingInterface tilingInterfaceOp)
+        -:  220:          -> FailureOr<scf::SCFTileAndFuseResult> {
+    #####:  221:        SimpleRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  222:        return tileConsumerAndFuseProducerGreedilyUsingSCFForOp(
+    #####:  223:            rewriter, tilingInterfaceOp, tileAndFuseOptions);
+call    0 never executed
+call    1 never executed
+    #####:  224:      });
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  225:  return DiagnosedSilenceableFailure(result);
+call    0 never executed
+        -:  226:}
+        -:  227:
+function _ZN4mlir9transform6FuseOp5parseERNS_11OpAsmParserERNS_14OperationStateE called 0 returned 0% blocks executed 0%
+    #####:  228:ParseResult transform::FuseOp::parse(OpAsmParser &parser,
+        -:  229:                                     OperationState &result) {
+    #####:  230:  return parseTileLikeOp(
+call    0 never executed
+        -:  231:      parser, result,
+    #####:  232:      transform::FuseOp::getTileSizesAttrName(result.name).getValue());
+call    0 never executed
+call    1 never executed
+        -:  233:}
+        -:  234:
+function _ZN4mlir9transform6FuseOp5printERNS_12OpAsmPrinterE called 0 returned 0% blocks executed 0%
+    #####:  235:void transform::FuseOp::print(OpAsmPrinter &p) {
+    #####:  236:  p << ' ';
+call    0 never executed
+    #####:  237:  p << getTarget();
+call    0 never executed
+call    1 never executed
+    #####:  238:  p.printOptionalAttrDict((*this)->getAttrs());
+call    0 never executed
+call    1 never executed
+    #####:  239:}
+        -:  240:
+function _ZN4mlir9transform6FuseOp6verifyEv called 0 returned 0% blocks executed 0%
+    #####:  241:LogicalResult transform::FuseOp::verify() {
+    #####:  242:  SmallVector<int64_t> permutation =
+call    0 never executed
+    #####:  243:      extractFromI64ArrayAttr(getTileInterchange());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  244:  auto sequence = llvm::to_vector(llvm::seq<int64_t>(0, permutation.size()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  245:  if (!std::is_permutation(sequence.begin(), sequence.end(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  246:                           permutation.begin(), permutation.end())) {
+    #####:  247:    return emitOpError() << "expects interchange to be a permutation, found "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  248:                         << getTileInterchange();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  249:  }
+    #####:  250:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  251:}
+        -:  252:
+        -:  253://===----------------------------------------------------------------------===//
+        -:  254:// FuseIntoContainingOp
+        -:  255://===----------------------------------------------------------------------===//
+        -:  256:
+        -:  257:/// Find the first "extract" user of `producerOp` and tile it right before its
+        -:  258:/// use. The tiled op is fused under the `containingOp`.
+        -:  259:/// Return this fused op on success or nullptr if anything fails.
+function _ZL26tileAndFuseFirstExtractUseRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ called 0 returned 0% blocks executed 0%
+    #####:  260:static Operation *tileAndFuseFirstExtractUse(RewriterBase &rewriter,
+        -:  261:                                             Diagnostic &diag,
+        -:  262:                                             Operation *producerOp,
+        -:  263:                                             Operation *containingOp) {
+    #####:  264:  LLVM_DEBUG(llvm::dbgs() << "Try to fuse a direct extract use\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  265:  auto tileableProducer = dyn_cast<TilingInterface>(producerOp);
+call    0 never executed
+    #####:  266:  if (!tileableProducer) {
+branch  0 never executed
+branch  1 never executed
+    #####:  267:    diag.attachNote(producerOp->getLoc())
+call    0 never executed
+    #####:  268:        << "producer is not a TileableInterface: " << *producerOp;
+call    0 never executed
+call    1 never executed
+    #####:  269:    return nullptr;
+        -:  270:  }
+        -:  271:
+        -:  272:  // Search the producer slices accessed within the containing operation.
+        -:  273:  // TODO: Generalize to more extract/insert/parallel_insert triples, maybe
+        -:  274:  // evolve into an interface.
+function _ZZL26tileAndFuseFirstExtractUseRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ENKUlS5_E_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  275:  auto it = llvm::find_if(tileableProducer->getUsers(), [&](Operation *user) {
+    #####:  276:    auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(user);
+call    0 never executed
+    #####:  277:    return sliceOp && containingOp->isProperAncestor(sliceOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  278:  });
+call    0 never executed
+call    1 never executed
+        -:  279:
+        -:  280:  // Find a fusion opportunity.
+    #####:  281:  if (it == tileableProducer->getUsers().end()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  282:    diag.attachNote(tileableProducer->getLoc())
+call    0 never executed
+    #####:  283:        << "could not find fusion opportunity for: " << *tileableProducer;
+call    0 never executed
+call    1 never executed
+    #####:  284:    return nullptr;
+        -:  285:  }
+    #####:  286:  auto sliceOpToTile = cast<tensor::ExtractSliceOp>(*it);
+call    0 never executed
+        -:  287:
+        -:  288:  // Try to fuse the producer in-place.
+    #####:  289:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  290:  rewriter.setInsertionPoint(sliceOpToTile);
+call    0 never executed
+        -:  291:
+        -:  292:  // Tile the producer.
+    #####:  293:  int64_t resultNumber =
+    #####:  294:      sliceOpToTile.getSource().cast<OpResult>().getResultNumber();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  295:  LLVM_DEBUG(llvm::dbgs() << "resultNumber: " << resultNumber << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  296:
+    #####:  297:  FailureOr<Value> tiledProducer = tileableProducer.generateResultTileValue(
+    #####:  298:      rewriter, resultNumber, sliceOpToTile.getMixedOffsets(),
+call    0 never executed
+call    1 never executed
+    #####:  299:      sliceOpToTile.getMixedSizes());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  300:  if (failed(tiledProducer)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  301:    diag.attachNote(tileableProducer->getLoc())
+call    0 never executed
+    #####:  302:        << "failed to tile producer op: " << *tileableProducer;
+call    0 never executed
+call    1 never executed
+    #####:  303:    return nullptr;
+        -:  304:  }
+    #####:  305:  LLVM_DEBUG(llvm::dbgs() << "tiledProducer: " << *tiledProducer << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+call   10 never executed
+        -:  306:
+        -:  307:  // Replace the extract op.
+    #####:  308:  Operation *fusedOp = tiledProducer->getDefiningOp();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  309:  rewriter.replaceOp(sliceOpToTile, fusedOp->getResult(resultNumber));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  310:  return fusedOp;
+        -:  311:}
+        -:  312:
+        -:  313:/// First, find the first "scf::ForeachThreadOp" user of `producerOp` and ensure
+        -:  314:/// it is exactly the `containingOp`, otherwise bail.
+        -:  315:/// Then, find the first "extract" user of the tied block argument and tile it
+        -:  316:/// right before its "extract" use. The tiled op is fused under the
+        -:  317:/// `containingOp`.
+        -:  318:/// Return this fused op on success or nullptr if anything fails.
+function _ZL58tileAndFuseFirstExtractUseThroughContainingOpBlockArgumentRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ called 0 returned 0% blocks executed 0%
+    #####:  319:static Operation *tileAndFuseFirstExtractUseThroughContainingOpBlockArgument(
+        -:  320:    RewriterBase &rewriter, Diagnostic &diag, Operation *producerOp,
+        -:  321:    Operation *containingOp) {
+    #####:  322:  LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  323:      llvm::dbgs() << "Try to fuse an extract use through block argument\n");
+        -:  324:
+    #####:  325:  auto tileableProducer = dyn_cast<TilingInterface>(producerOp);
+call    0 never executed
+    #####:  326:  if (!tileableProducer) {
+branch  0 never executed
+branch  1 never executed
+    #####:  327:    diag.attachNote(producerOp->getLoc())
+call    0 never executed
+    #####:  328:        << "producer is not a TileableInterface: " << *producerOp;
+call    0 never executed
+call    1 never executed
+    #####:  329:    return nullptr;
+        -:  330:  }
+        -:  331:
+        -:  332:  // Search the first use by a "scf::ForeachThreadOp" user.
+    #####:  333:  scf::ForeachThreadOp foreachThreadOp;
+branch  0 never executed
+branch  1 never executed
+    #####:  334:  auto itProducerUses =
+    #####:  335:      llvm::find_if(tileableProducer->getUses(), [&](OpOperand &use) {
+        -:  336:        foreachThreadOp = dyn_cast<scf::ForeachThreadOp>(use.getOwner());
+        -:  337:        return foreachThreadOp;
+    #####:  338:      });
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  339:  // If it's not from the containing op, return.
+    #####:  340:  if (!foreachThreadOp || foreachThreadOp != containingOp) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  341:    diag.attachNote(tileableProducer->getLoc())
+call    0 never executed
+    #####:  342:        << "could not find a use by the containing op: " << *tileableProducer;
+call    0 never executed
+call    1 never executed
+    #####:  343:    return nullptr;
+        -:  344:  }
+        -:  345:
+        -:  346:  // Search the producer slices accessed within the containing
+        -:  347:  // operation.
+        -:  348:  // TODO: Generalize to more extract/insert/parallel_insert triples.
+        -:  349:  //   Maybe evolve into an interface.
+    #####:  350:  OpOperand *pUse = &(*itProducerUses);
+call    0 never executed
+    #####:  351:  BlockArgument bbArg = foreachThreadOp.getTiedBlockArgument(pUse);
+call    0 never executed
+        -:  352:
+        -:  353:  // Search the producer slices accessed within the containing operation.
+        -:  354:  // TODO: Generalize to more extract/insert/parallel_insert triples, maybe
+        -:  355:  // evolve into an interface.
+function _ZZL58tileAndFuseFirstExtractUseThroughContainingOpBlockArgumentRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ENKUlS5_E0_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  356:  auto itBBArgUsers = llvm::find_if(bbArg.getUsers(), [&](Operation *user) {
+    #####:  357:    auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(user);
+call    0 never executed
+    #####:  358:    return sliceOp && containingOp->isProperAncestor(sliceOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  359:  });
+call    0 never executed
+        -:  360:
+        -:  361:  // Find a fusion opportunity.
+    #####:  362:  if (itBBArgUsers == bbArg.getUsers().end()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  363:    diag.attachNote(containingOp->getLoc())
+call    0 never executed
+    #####:  364:        << "could not find fusion opportunity for bbArg: " << bbArg;
+call    0 never executed
+call    1 never executed
+    #####:  365:    return nullptr;
+        -:  366:  }
+    #####:  367:  auto sliceOpToTile = cast<tensor::ExtractSliceOp>(*itBBArgUsers);
+call    0 never executed
+        -:  368:
+        -:  369:  // Try to fuse the producer in-place.
+    #####:  370:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  371:  rewriter.setInsertionPoint(sliceOpToTile);
+call    0 never executed
+        -:  372:
+        -:  373:  // Replace the use in the tileableProducer before tiling: clone, replace and
+        -:  374:  // then tile.
+    #####:  375:  int64_t resultNumber = pUse->get().cast<OpResult>().getResultNumber();
+call    0 never executed
+call    1 never executed
+    #####:  376:  LLVM_DEBUG(llvm::dbgs() << "resultNumber: " << resultNumber << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  377:
+        -:  378:  // Gather destination tensors.
+    #####:  379:  SmallVector<Value> destinationTensors;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  380:  if (failed(tensor::getOrCreateDestinations(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  381:          rewriter, tileableProducer->getLoc(), tileableProducer,
+        -:  382:          destinationTensors))) {
+    #####:  383:    diag.attachNote(tileableProducer->getLoc())
+call    0 never executed
+    #####:  384:        << "failed to get destination tensors for: " << *tileableProducer;
+call    0 never executed
+call    1 never executed
+    #####:  385:    return nullptr;
+        -:  386:  }
+        -:  387:
+    #####:  388:  BlockAndValueMapping bvm;
+call    0 never executed
+    #####:  389:  bvm.map(destinationTensors[resultNumber], bbArg);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  390:  auto tileableProducerClone =
+    #####:  391:      cast<TilingInterface>(rewriter.clone(*tileableProducer, bvm));
+call    0 never executed
+call    1 never executed
+    #####:  392:  auto scopeGuard =
+    #####:  393:      llvm::make_scope_exit([&]() { rewriter.eraseOp(tileableProducerClone); });
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  394:
+        -:  395:  // Tile the producer.
+    #####:  396:  FailureOr<Value> tiledProducer =
+        -:  397:      tileableProducerClone.generateResultTileValue(
+    #####:  398:          rewriter, resultNumber, sliceOpToTile.getMixedOffsets(),
+call    0 never executed
+call    1 never executed
+    #####:  399:          sliceOpToTile.getMixedSizes());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  400:  if (failed(tiledProducer)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  401:    diag.attachNote(tileableProducer->getLoc())
+call    0 never executed
+    #####:  402:        << "failed to tile producer op: " << *tileableProducer;
+call    0 never executed
+call    1 never executed
+    #####:  403:    return nullptr;
+        -:  404:  }
+    #####:  405:  LLVM_DEBUG(llvm::dbgs() << "tiledProducer: " << *tiledProducer << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+call   10 never executed
+        -:  406:
+        -:  407:  // Replace the extract op.
+    #####:  408:  Operation *fusedOp = tiledProducer->getDefiningOp();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  409:  rewriter.replaceOp(sliceOpToTile, fusedOp->getResult(resultNumber));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  410:
+        -:  411:  // Replace the use in containingOp.
+function _ZZL58tileAndFuseFirstExtractUseThroughContainingOpBlockArgumentRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ENKUlvE2_clEv called 0 returned 0% blocks executed 0%
+    #####:  412:  rewriter.updateRootInPlace(containingOp, [&]() {
+call    0 never executed
+    #####:  413:    containingOp->setOperand(pUse->getOperandNumber(),
+call    0 never executed
+    #####:  414:                             destinationTensors.front());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  415:  });
+        -:  416:
+    #####:  417:  return fusedOp;
+        -:  418:}
+        -:  419:
+function _ZL20cloneAndFuseFirstUseRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ called 0 returned 0% blocks executed 0%
+    #####:  420:static Operation *cloneAndFuseFirstUse(RewriterBase &rewriter, Diagnostic &diag,
+        -:  421:                                       Operation *producerOp,
+        -:  422:                                       Operation *containingOp) {
+    #####:  423:  LLVM_DEBUG(llvm::dbgs() << "Try to fuse an use by cloning\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  424:
+        -:  425:  // Gather all uses inside the containing op.
+    #####:  426:  SmallVector<OpOperand *> uses;
+branch  0 never executed
+branch  1 never executed
+    #####:  427:  for (OpResult result : producerOp->getOpResults()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  428:    for (OpOperand &use : result.getUses()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  429:      if (containingOp->isProperAncestor(use.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  430:        uses.push_back(&use);
+call    0 never executed
+    #####:  431:        continue;
+        -:  432:      }
+        -:  433:      // Cannot clone and fuse if the use is by the containing op itself: fail
+        -:  434:      // immediately.
+    #####:  435:      if (containingOp == use.getOwner()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  436:        diag.attachNote(producerOp->getLoc())
+call    0 never executed
+    #####:  437:            << "producer op use by containing op cannot be fused by cloning";
+call    0 never executed
+    #####:  438:        return nullptr;
+        -:  439:      }
+        -:  440:    }
+        -:  441:  }
+        -:  442:
+        -:  443:  // Check for a non-empty list of fusion opportunities.
+    #####:  444:  if (uses.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  445:    diag.attachNote(producerOp->getLoc()) << "no fusion opportunity by cloning";
+call    0 never executed
+call    1 never executed
+    #####:  446:    return nullptr;
+        -:  447:  }
+        -:  448:
+        -:  449:  // Clone and fuse inside the containing op.
+    #####:  450:  Operation *fusedOp = nullptr;
+    #####:  451:  OpOperand *use = uses.front();
+call    0 never executed
+        -:  452:  // Parallel insert slice is not a valid clone destination.
+        -:  453:  // TODO: Generalize to other type of ops.
+    #####:  454:  assert(!isa<tensor::ParallelInsertSliceOp>(use->getOwner()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  455:         "Parallel insert slice is not a valid clone destination");
+    #####:  456:  unsigned resultNumber = use->get().cast<OpResult>().getResultNumber();
+call    0 never executed
+call    1 never executed
+    #####:  457:  LLVM_DEBUG(llvm::dbgs() << "resultNumber: " << resultNumber << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  458:
+    #####:  459:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  460:  rewriter.setInsertionPoint(use->getOwner());
+call    0 never executed
+    #####:  461:  fusedOp = rewriter.clone(*producerOp);
+call    0 never executed
+    #####:  462:  rewriter.updateRootInPlace(
+call    0 never executed
+function _ZZL20cloneAndFuseFirstUseRN4mlir12RewriterBaseERNS_10DiagnosticEPNS_9OperationES5_ENKUlvE_clEv called 0 returned 0% blocks executed 0%
+    #####:  463:      use->getOwner(), [&] { use->set(fusedOp->getOpResult(resultNumber)); });
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  464:
+    #####:  465:  return fusedOp;
+branch  0 never executed
+branch  1 never executed
+        -:  466:}
+        -:  467:
+        -:  468:DiagnosedSilenceableFailure
+function _ZN4mlir9transform20FuseIntoContainingOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  469:transform::FuseIntoContainingOp::apply(transform::TransformResults &results,
+        -:  470:                                       transform::TransformState &state) {
+    #####:  471:  SmallVector<Operation *> fusedOps;
+call    0 never executed
+    #####:  472:  ArrayRef<Operation *> producerOps = state.getPayloadOps(getProducerOp());
+call    0 never executed
+call    1 never executed
+        -:  473:  // If nothing to fuse, propagate success.
+    #####:  474:  if (producerOps.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  475:    results.set(getFusedOp().cast<OpResult>(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  476:                SmallVector<mlir::Operation *>{});
+call    0 never executed
+    #####:  477:    return DiagnosedSilenceableFailure::success();
+        -:  478:  }
+    #####:  479:  ArrayRef<Operation *> containingOps = state.getPayloadOps(getContainingOp());
+call    0 never executed
+call    1 never executed
+    #####:  480:  if (containingOps.size() != 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  481:    return emitDefiniteFailure()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  482:           << "requires exactly one containing_op handle (got "
+    #####:  483:           << containingOps.size() << ")";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  484:  }
+    #####:  485:  Operation *containingOp = containingOps.front();
+call    0 never executed
+        -:  486:
+        -:  487:  // Helper function to find the next producer that should be fused. Take any
+        -:  488:  // producer that has a use inside the containing op.
+    #####:  489:  SmallVector<Operation *> remainingProducers(producerOps.begin(),
+    #####:  490:                                              producerOps.end());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+function _ZZN4mlir9transform20FuseIntoContainingOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  491:  auto getNextProducer = [&]() -> FailureOr<Operation *> {
+    #####:  492:    for (const auto &it : enumerate(remainingProducers)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  493:      Operation *producerOp = it.value();
+call    0 never executed
+        -:  494:      // The containing op may be a user of producerOp: use isAncestor.
+    #####:  495:      int64_t numUsesInContainingOp =
+    #####:  496:          llvm::count_if(producerOp->getUsers(), [&](Operation *op) {
+call    0 never executed
+    #####:  497:            return containingOp->isAncestor(op);
+call    0 never executed
+        -:  498:          });
+        -:  499:      // TODO: When resolving the TODO below (no duplicate ops), take an op
+        -:  500:      // that has no use among the remaining producers. This is a topological
+        -:  501:      // sorting.
+    #####:  502:      if (numUsesInContainingOp > 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  503:        if (numUsesInContainingOp == 1)
+branch  0 never executed
+branch  1 never executed
+    #####:  504:          remainingProducers.erase(remainingProducers.begin() + it.index());
+call    0 never executed
+    #####:  505:        return producerOp;
+        -:  506:      }
+        -:  507:    }
+    #####:  508:    return failure();
+    #####:  509:  };
+        -:  510:
+    #####:  511:  IRRewriter rewriter(getContext());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  512:  while (!remainingProducers.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  513:    auto nextProducer = getNextProducer();
+call    0 never executed
+    #####:  514:    if (failed(nextProducer)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  515:      results.set(getFusedOp().cast<OpResult>(), ArrayRef<Operation *>());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  516:      Diagnostic diag(containingOp->getLoc(), DiagnosticSeverity::Remark);
+call    0 never executed
+    #####:  517:      diag << "could not find next producer to fuse into container";
+call    0 never executed
+    #####:  518:      return DiagnosedSilenceableFailure::silenceableFailure(std::move(diag));
+call    0 never executed
+call    1 never executed
+        -:  519:    }
+        -:  520:
+    #####:  521:    Operation *producerOp = *nextProducer;
+call    0 never executed
+        -:  522:
+        -:  523:    // Default diagnostic, to be complemented with more failure information.
+    #####:  524:    Diagnostic diag(producerOp->getLoc(), DiagnosticSeverity::Remark);
+call    0 never executed
+    #####:  525:    diag << "could not fuse " << *producerOp << " into " << *containingOp;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  526:
+        -:  527:    // TODO: If there are multiple uses of the producer in the containing op,
+        -:  528:    // we currently tile/clone the op multiple times (once per use). In some
+        -:  529:    // cases, we can tile/clone once and reuse the value for each use.
+        -:  530:    // Futhermore, producers should then be traversed according to a
+        -:  531:    // topological sorting.
+    #####:  532:    Operation *tiled =
+    #####:  533:        tileAndFuseFirstExtractUse(rewriter, diag, producerOp, containingOp);
+call    0 never executed
+    #####:  534:    if (tiled) {
+branch  0 never executed
+branch  1 never executed
+    #####:  535:      LLVM_DEBUG(llvm::dbgs() << "\nFused a direct extract use\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  536:                              << *containingOp);
+    #####:  537:      fusedOps.push_back(tiled);
+call    0 never executed
+    #####:  538:      continue;
+call    0 never executed
+        -:  539:    }
+        -:  540:
+    #####:  541:    Operation *tiledContainingOpOperand =
+    #####:  542:        tileAndFuseFirstExtractUseThroughContainingOpBlockArgument(
+call    0 never executed
+        -:  543:            rewriter, diag, producerOp, containingOp);
+    #####:  544:    if (tiledContainingOpOperand) {
+branch  0 never executed
+branch  1 never executed
+    #####:  545:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  546:                 << "\nFused an extract use through block argument\n"
+        -:  547:                 << *containingOp);
+    #####:  548:      fusedOps.push_back(tiledContainingOpOperand);
+call    0 never executed
+    #####:  549:      continue;
+        -:  550:    }
+        -:  551:
+    #####:  552:    Operation *cloned =
+    #####:  553:        cloneAndFuseFirstUse(rewriter, diag, producerOp, containingOp);
+call    0 never executed
+    #####:  554:    if (cloned) {
+branch  0 never executed
+branch  1 never executed
+    #####:  555:      LLVM_DEBUG(llvm::dbgs() << "\nFused an use by cloning\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  556:                              << *containingOp);
+    #####:  557:      fusedOps.push_back(cloned);
+call    0 never executed
+    #####:  558:      continue;
+        -:  559:    }
+    #####:  560:    results.set(getFusedOp().cast<OpResult>(), ArrayRef<Operation *>());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  561:    return DiagnosedSilenceableFailure::silenceableFailure(std::move(diag));
+call    0 never executed
+call    1 never executed
+        -:  562:  }
+        -:  563:
+    #####:  564:  results.set(getFusedOp().cast<OpResult>(), fusedOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  565:  return DiagnosedSilenceableFailure::success();
+        -:  566:}
+        -:  567:
+        -:  568://===----------------------------------------------------------------------===//
+        -:  569:// GeneralizeOp
+        -:  570://===----------------------------------------------------------------------===//
+        -:  571:
+        -:  572:DiagnosedSilenceableFailure
+function _ZN4mlir9transform12GeneralizeOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  573:transform::GeneralizeOp::applyToOne(linalg::LinalgOp target,
+        -:  574:                                    SmallVectorImpl<Operation *> &results,
+        -:  575:                                    transform::TransformState &state) {
+        -:  576:  // Exit early if no transformation is needed.
+    #####:  577:  if (isa<GenericOp>(target)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  578:    results.push_back(target);
+call    0 never executed
+    #####:  579:    return DiagnosedSilenceableFailure(success());
+        -:  580:  }
+    #####:  581:  FailureOr<LinalgOp> generic = tryApply<LinalgGeneralizationPattern>(target);
+call    0 never executed
+    #####:  582:  if (succeeded(generic)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  583:    results.push_back(generic->getOperation());
+call    0 never executed
+    #####:  584:    return DiagnosedSilenceableFailure(success());
+        -:  585:  }
+    #####:  586:  results.assign(1, nullptr);
+call    0 never executed
+    #####:  587:  return emitDefaultSilenceableFailure(target);
+call    0 never executed
+        -:  588:}
+        -:  589:
+        -:  590://===----------------------------------------------------------------------===//
+        -:  591:// InterchangeOp
+        -:  592://===----------------------------------------------------------------------===//
+        -:  593:
+        -:  594:DiagnosedSilenceableFailure
+function _ZN4mlir9transform13InterchangeOp10applyToOneENS_6linalg9GenericOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  595:transform::InterchangeOp::applyToOne(linalg::GenericOp target,
+        -:  596:                                     SmallVectorImpl<Operation *> &results,
+        -:  597:                                     transform::TransformState &state) {
+    #####:  598:  SmallVector<unsigned> interchangeVector =
+call    0 never executed
+    #####:  599:      extractUIntArray(getIteratorInterchange());
+call    0 never executed
+        -:  600:  // Exit early if no transformation is needed.
+    #####:  601:  if (interchangeVector.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  602:    results.push_back(target);
+call    0 never executed
+    #####:  603:    return DiagnosedSilenceableFailure(success());
+        -:  604:  }
+    #####:  605:  SimpleRewriter rewriter(target->getContext());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  606:  FailureOr<GenericOp> res =
+call    0 never executed
+    #####:  607:      interchangeGenericOp(rewriter, target, interchangeVector);
+call    0 never executed
+    #####:  608:  if (failed(res))
+branch  0 never executed
+branch  1 never executed
+    #####:  609:    return DiagnosedSilenceableFailure::definiteFailure();
+    #####:  610:  results.push_back(res->getOperation());
+call    0 never executed
+    #####:  611:  return DiagnosedSilenceableFailure(success());
+        -:  612:}
+        -:  613:
+function _ZN4mlir9transform13InterchangeOp6verifyEv called 0 returned 0% blocks executed 0%
+    #####:  614:LogicalResult transform::InterchangeOp::verify() {
+    #####:  615:  SmallVector<unsigned> permutation =
+call    0 never executed
+    #####:  616:      extractUIntArray(getIteratorInterchange());
+call    0 never executed
+    #####:  617:  auto sequence = llvm::to_vector(llvm::seq<unsigned>(0, permutation.size()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  618:  if (!std::is_permutation(sequence.begin(), sequence.end(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  619:                           permutation.begin(), permutation.end())) {
+    #####:  620:    return emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  621:           << "expects iterator_interchange to be a permutation, found "
+call    0 never executed
+    #####:  622:           << getIteratorInterchange();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  623:  }
+    #####:  624:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  625:}
+        -:  626:
+        -:  627://===---------------------------------------------------------------------===//
+        -:  628:// MatchOp
+        -:  629://===---------------------------------------------------------------------===//
+        -:  630:
+        -:  631:DiagnosedSilenceableFailure
+function _ZN4mlir9transform7MatchOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  632:transform::MatchOp::apply(transform::TransformResults &results,
+        -:  633:                          transform::TransformState &state) {
+    #####:  634:  llvm::StringSet<> strs;
+call    0 never executed
+    #####:  635:  if (getOps().has_value())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  636:    strs.insert(getOps()->getAsValueRange<StringAttr>().begin(),
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  637:                getOps()->getAsValueRange<StringAttr>().end());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+        -:  638:
+    #####:  639:  ArrayRef<Operation *> payloadOps = state.getPayloadOps(getTarget());
+call    0 never executed
+call    1 never executed
+    #####:  640:  if (payloadOps.size() != 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  641:    results.set(getResult().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+    #####:  642:    return DiagnosedSilenceableFailure(
+    #####:  643:        this->emitOpError("requires exactly one target handle"));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  644:  }
+        -:  645:
+    #####:  646:  SmallVector<Operation *> res;
+call    0 never executed
+call    1 never executed
+function _ZZN4mlir9transform7MatchOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlPNS_9OperationEE_clES7_ called 0 returned 0% blocks executed 0%
+    #####:  647:  auto matchFun = [&](Operation *op) {
+    #####:  648:    if (getOps().has_value() && !strs.contains(op->getName().getStringRef()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+    #####:  649:      return;
+        -:  650:
+        -:  651:    // Interfaces cannot be matched by name, just by ID.
+        -:  652:    // So we specifically encode the interfaces we care about for this op.
+    #####:  653:    if (getInterface().has_value()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  654:      auto iface = getInterface().value();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  655:      if (iface == transform::MatchInterfaceEnum::LinalgOp &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  656:          !isa<linalg::LinalgOp>(op))
+call    0 never executed
+        -:  657:        return;
+    #####:  658:      if (iface == transform::MatchInterfaceEnum::TilingInterface &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  659:          isa<TilingInterface>(op))
+call    0 never executed
+        -:  660:        return;
+        -:  661:    }
+        -:  662:
+        -:  663:    // Check if all specified attributes match.
+    #####:  664:    if (getOpAttrs().has_value()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  665:      DictionaryAttr opAttrs = getOpAttrs().value();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  666:      for (NamedAttribute attr : opAttrs) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  667:        if (attr.getName() == getInterfaceAttrName() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  668:            attr.getName() == getOpsAttrName())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  669:          continue;
+    #####:  670:        if (!op->hasAttr(attr.getName()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  671:          return;
+    #####:  672:        if (op->getAttr(attr.getName()) != attr.getValue())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  673:          return;
+        -:  674:      }
+        -:  675:    }
+        -:  676:
+    #####:  677:    if (getFilterResultType().has_value()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  678:      Type t = getFilterResultType().value();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  679:      if (op->getNumResults() != 1 || op->getResultTypes().front() != t)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  680:        return;
+        -:  681:    }
+        -:  682:
+        -:  683:    // All constraints are satisfied.
+    #####:  684:    res.push_back(op);
+    #####:  685:    return;
+call    0 never executed
+    #####:  686:  };
+        -:  687:
+    #####:  688:  payloadOps.front()->walk(matchFun);
+call    0 never executed
+    #####:  689:  results.set(getResult().cast<OpResult>(), res);
+call    0 never executed
+call    1 never executed
+    #####:  690:  return DiagnosedSilenceableFailure(success());
+branch  0 never executed
+branch  1 never executed
+        -:  691:}
+        -:  692:
+        -:  693://===---------------------------------------------------------------------===//
+        -:  694:// MultiTileSizesOp
+        -:  695://===---------------------------------------------------------------------===//
+        -:  696:
+function _ZN4mlir9transform16MultiTileSizesOp10applyToOneENS_6linalg8LinalgOpERN4llvm11SmallVectorIPNS_9OperationELj6EEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  697:DiagnosedSilenceableFailure transform::MultiTileSizesOp::applyToOne(
+        -:  698:    LinalgOp target, SmallVector<Operation *> &results, TransformState &state) {
+    #####:  699:  OpBuilder builder(target.getContext());
+call    0 never executed
+call    1 never executed
+    #####:  700:  builder.setInsertionPoint(target);
+call    0 never executed
+    #####:  701:  OpFoldResult targetSize = builder.getIndexAttr(getTargetSize());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  702:  OpFoldResult divisor = builder.getIndexAttr(getDivisor());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  703:  FailureOr<MultiSizeSpecification> spec = computeMultiTileSizes(
+    #####:  704:      builder, target, getDimension(), targetSize, divisor);
+call    0 never executed
+call    1 never executed
+    #####:  705:  if (failed(spec)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  706:    return emitSilenceableError() << "could not generate tile size computation";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  707:  }
+        -:  708:
+    #####:  709:  AffineExpr s0 = builder.getAffineSymbolExpr(0);
+call    0 never executed
+    #####:  710:  AffineExpr s1 = builder.getAffineSymbolExpr(1);
+call    0 never executed
+    #####:  711:  Operation *splitPoint =
+branch  0 never executed
+branch  1 never executed
+    #####:  712:      makeComposedAffineApply(builder, target.getLoc(), s0 * s1,
+    #####:  713:                              {spec->lowTileSize, spec->lowTripCount});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  714:  Operation *lowTileSize = spec->lowTileSize.getDefiningOp();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  715:  Operation *highTileSize = spec->highTileSize.getDefiningOp();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  716:  assert(lowTileSize && highTileSize && splitPoint &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  717:         "tile sizes are not produced by operations");
+    #####:  718:  results.reserve(results.size() + 3);
+branch  0 never executed
+branch  1 never executed
+    #####:  719:  results.push_back(lowTileSize);
+call    0 never executed
+    #####:  720:  results.push_back(highTileSize);
+call    0 never executed
+    #####:  721:  results.push_back(splitPoint);
+call    0 never executed
+    #####:  722:  return DiagnosedSilenceableFailure::success();
+        -:  723:}
+        -:  724:
+function _ZN4mlir9transform16MultiTileSizesOp10getEffectsERN4llvm15SmallVectorImplINS_11SideEffects14EffectInstanceINS_13MemoryEffects6EffectEEEEE called 0 returned 0% blocks executed 0%
+    #####:  725:void transform::MultiTileSizesOp::getEffects(
+        -:  726:    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    #####:  727:  onlyReadsHandle(getTarget(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  728:  producesHandle(getResults(), effects);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  729:  modifiesPayload(effects);
+call    0 never executed
+    #####:  730:}
+        -:  731:
+        -:  732://===---------------------------------------------------------------------===//
+        -:  733:// PadOp
+        -:  734://===---------------------------------------------------------------------===//
+        -:  735:
+        -:  736:DiagnosedSilenceableFailure
+function _ZN4mlir9transform5PadOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  737:transform::PadOp::applyToOne(linalg::LinalgOp target,
+        -:  738:                             SmallVectorImpl<Operation *> &results,
+        -:  739:                             transform::TransformState &state) {
+        -:  740:  // Convert the integer packing flags to booleans.
+    #####:  741:  SmallVector<bool> packPaddings;
+call    0 never executed
+    #####:  742:  for (int64_t packPadding : extractFromI64ArrayAttr(getPackPaddings()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  743:    packPaddings.push_back(static_cast<bool>(packPadding));
+call    0 never executed
+        -:  744:
+        -:  745:  // Convert the padding values to attributes.
+    #####:  746:  SmallVector<Attribute> paddingValues;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  747:  for (auto const &it :
+    #####:  748:       llvm::zip(getPaddingValues(), target->getOperandTypes())) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  749:    auto attr = std::get<0>(it).dyn_cast<TypedAttr>();
+call    0 never executed
+    #####:  750:    if (!attr) {
+branch  0 never executed
+branch  1 never executed
+    #####:  751:      emitOpError("expects padding values to be typed attributes");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  752:      return DiagnosedSilenceableFailure::definiteFailure();
+        -:  753:    }
+    #####:  754:    Type elementType = getElementTypeOrSelf(std::get<1>(it));
+call    0 never executed
+        -:  755:    // Try to parse string attributes to obtain an attribute of element type.
+    #####:  756:    if (auto stringAttr = attr.dyn_cast<StringAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  757:      paddingValues.push_back(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  758:          parseAttribute(attr.cast<StringAttr>(), elementType));
+call    0 never executed
+    #####:  759:      if (!paddingValues.back()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  760:        auto diag = this->emitOpError("expects a padding that parses to ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  761:                    << elementType << ", got " << std::get<0>(it);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  762:        diag.attachNote(target.getLoc()) << "when applied to this op";
+call    0 never executed
+call    1 never executed
+    #####:  763:        return DiagnosedSilenceableFailure::definiteFailure();
+call    0 never executed
+        -:  764:      }
+    #####:  765:      continue;
+        -:  766:    }
+        -:  767:    // Otherwise, add the attribute directly.
+    #####:  768:    if (attr.getType() != elementType) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  769:      auto diag = this->emitOpError("expects a padding value of type ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  770:                  << elementType << ", got " << attr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  771:      diag.attachNote(target.getLoc()) << "when applied to this op";
+call    0 never executed
+call    1 never executed
+    #####:  772:      return DiagnosedSilenceableFailure::definiteFailure();
+call    0 never executed
+        -:  773:    }
+    #####:  774:    paddingValues.push_back(attr);
+call    0 never executed
+        -:  775:  }
+        -:  776:
+        -:  777:  // Extract the transpose vectors.
+    #####:  778:  SmallVector<SmallVector<int64_t>> transposePaddings;
+call    0 never executed
+call    1 never executed
+    #####:  779:  for (Attribute transposeVector : getTransposePaddings().cast<ArrayAttr>())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  780:    transposePaddings.push_back(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  781:        extractFromI64ArrayAttr(transposeVector.cast<ArrayAttr>()));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  782:
+    #####:  783:  LinalgPaddingOptions paddingOptions;
+call    0 never executed
+call    1 never executed
+    #####:  784:  paddingOptions.setPaddingValues(paddingValues);
+call    0 never executed
+    #####:  785:  paddingOptions.setPaddingDimensions(
+call    0 never executed
+    #####:  786:      extractFromI64ArrayAttr(getPaddingDimensions()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  787:  paddingOptions.setPackPaddings(packPaddings);
+call    0 never executed
+    #####:  788:  paddingOptions.setHoistPaddings(extractFromI64ArrayAttr(getHoistPaddings()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  789:  paddingOptions.setTransposePaddings(transposePaddings);
+call    0 never executed
+        -:  790:
+    #####:  791:  FailureOr<LinalgOp> result =
+    #####:  792:      tryApply<LinalgPaddingPattern>(target, paddingOptions);
+call    0 never executed
+    #####:  793:  if (succeeded(result)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  794:    results.push_back(result->getOperation());
+call    0 never executed
+    #####:  795:    return DiagnosedSilenceableFailure(success());
+        -:  796:  }
+        -:  797:
+    #####:  798:  results.assign(1, nullptr);
+call    0 never executed
+    #####:  799:  return emitDefaultSilenceableFailure(target);
+call    0 never executed
+        -:  800:}
+        -:  801:
+function _ZN4mlir9transform5PadOp6verifyEv called 0 returned 0% blocks executed 0%
+    #####:  802:LogicalResult transform::PadOp::verify() {
+    #####:  803:  SmallVector<int64_t> packPaddings =
+call    0 never executed
+    #####:  804:      extractFromI64ArrayAttr(getPackPaddings());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  805:  if (any_of(packPaddings, [](int64_t packPadding) {
+branch  0 never executed
+branch  1 never executed
+        -:  806:        return packPadding != 0 && packPadding != 1;
+        -:  807:      })) {
+    #####:  808:    return emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  809:           << "expects pack_paddings to contain booleans (0/1), found "
+call    0 never executed
+    #####:  810:           << getPackPaddings();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  811:  }
+        -:  812:
+    #####:  813:  SmallVector<int64_t> paddingDimensions =
+call    0 never executed
+    #####:  814:      extractFromI64ArrayAttr(getPaddingDimensions());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  815:  if (any_of(paddingDimensions,
+branch  0 never executed
+branch  1 never executed
+        -:  816:             [](int64_t paddingDimension) { return paddingDimension < 0; })) {
+    #####:  817:    return emitOpError() << "expects padding_dimensions to contain positive "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  818:                            "integers, found "
+call    0 never executed
+    #####:  819:                         << getPaddingDimensions();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  820:  }
+        -:  821:
+    #####:  822:  SmallVector<int64_t> hoistPaddings =
+call    0 never executed
+    #####:  823:      extractFromI64ArrayAttr(getHoistPaddings());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  824:  if (any_of(hoistPaddings,
+branch  0 never executed
+branch  1 never executed
+        -:  825:             [](int64_t hoistPadding) { return hoistPadding < 0; })) {
+    #####:  826:    return emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  827:           << "expects hoist_paddings to contain positive integers, found "
+call    0 never executed
+    #####:  828:           << getHoistPaddings();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  829:  }
+        -:  830:
+    #####:  831:  ArrayAttr transposes = getTransposePaddings();
+call    0 never executed
+    #####:  832:  for (Attribute attr : transposes) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  833:    SmallVector<int64_t> transpose = extractFromI64ArrayAttr(attr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  834:    auto sequence = llvm::to_vector(llvm::seq<int64_t>(0, transpose.size()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  835:    if (!std::is_permutation(sequence.begin(), sequence.end(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  836:                             transpose.begin(), transpose.end())) {
+    #####:  837:      return emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  838:             << "expects transpose_paddings to be a permutation, found "
+call    0 never executed
+    #####:  839:             << attr;
+call    0 never executed
+        -:  840:    }
+        -:  841:  }
+    #####:  842:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  843:}
+        -:  844:
+        -:  845://===----------------------------------------------------------------------===//
+        -:  846:// PromoteOp
+        -:  847://===----------------------------------------------------------------------===//
+        -:  848:
+        -:  849:DiagnosedSilenceableFailure
+function _ZN4mlir9transform9PromoteOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  850:transform::PromoteOp::applyToOne(linalg::LinalgOp target,
+        -:  851:                                 SmallVectorImpl<Operation *> &results,
+        -:  852:                                 transform::TransformState &state) {
+    #####:  853:  LinalgPromotionOptions promotionOptions;
+call    0 never executed
+    #####:  854:  if (!getOperandsToPromote().empty())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  855:    promotionOptions = promotionOptions.setOperandsToPromote(
+call    0 never executed
+    #####:  856:        extractFromI64ArrayAttr(getOperandsToPromote()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  857:  if (getUseFullTilesByDefault())
+call    0 never executed
+    #####:  858:    promotionOptions = promotionOptions.setUseFullTileBuffersByDefault(
+call    0 never executed
+    #####:  859:        getUseFullTilesByDefault());
+call    0 never executed
+    #####:  860:  if (getUseAlloca())
+call    0 never executed
+    #####:  861:    promotionOptions = promotionOptions.setUseAlloca(getUseAlloca());
+call    0 never executed
+call    1 never executed
+    #####:  862:  if (!getUseFullTileBuffers().empty())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  863:    promotionOptions = promotionOptions.setUseFullTileBuffers(
+call    0 never executed
+    #####:  864:        llvm::to_vector(getUseFullTileBuffers().getAsValueRange<BoolAttr>()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  865:  if (getAlignment().has_value())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  866:    promotionOptions = promotionOptions.setAlignment(*getAlignment());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  867:
+    #####:  868:  if (failed(promoteSubviewsPrecondition(target, promotionOptions)))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  869:    return DiagnosedSilenceableFailure(reportUnknownTransformError(target));
+call    0 never executed
+        -:  870:
+    #####:  871:  SimpleRewriter rewriter(target->getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  872:  rewriter.setInsertionPoint(target);
+call    0 never executed
+    #####:  873:  FailureOr<LinalgOp> res = promoteSubViews(rewriter, target, promotionOptions);
+call    0 never executed
+    #####:  874:  if (failed(res))
+branch  0 never executed
+branch  1 never executed
+    #####:  875:    return DiagnosedSilenceableFailure(reportUnknownTransformError(target));
+call    0 never executed
+    #####:  876:  results.push_back(target);
+call    0 never executed
+    #####:  877:  return DiagnosedSilenceableFailure(success());
+        -:  878:}
+        -:  879:
+        -:  880://===----------------------------------------------------------------------===//
+        -:  881:// ScalarizeOp
+        -:  882://===----------------------------------------------------------------------===//
+        -:  883:
+        -:  884:DiagnosedSilenceableFailure
+function _ZN4mlir9transform11ScalarizeOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  885:transform::ScalarizeOp::applyToOne(linalg::LinalgOp target,
+        -:  886:                                   SmallVectorImpl<Operation *> &results,
+        -:  887:                                   transform::TransformState &state) {
+    #####:  888:  scf::SCFTilingOptions tilingOptions;
+call    0 never executed
+function _ZZN4mlir9transform11ScalarizeOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateEENKUlRNS_9OpBuilderES7_E_clESD_S7_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  889:  tilingOptions.setTileSizeComputationFunction([&](OpBuilder &b, Operation *) {
+    #####:  890:    SmallVector<Value, 4> tileSizes;
+call    0 never executed
+    #####:  891:    Location loc = target.getLoc();
+call    0 never executed
+    #####:  892:    SmallVector<OpFoldResult> allShapeSizes =
+    #####:  893:        target.createFlatListOfOperandDims(b, loc);
+call    0 never executed
+    #####:  894:    AffineMap map = target.getShapesToLoopsMap();
+call    0 never executed
+    #####:  895:    if (!map)
+branch  0 never executed
+branch  1 never executed
+        -:  896:      return tileSizes;
+    #####:  897:    IRRewriter rewriter(b);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  898:    SmallVector<OpFoldResult> shapeSizes =
+call    0 never executed
+        -:  899:        makeComposedFoldedMultiResultAffineApply(rewriter, loc, map,
+    #####:  900:                                                 allShapeSizes);
+call    0 never executed
+call    1 never executed
+        -:  901:    // If the shape size is dynamic, tile by 1.
+        -:  902:    // Otherwise, do not tile (i.e. tile size 0).
+    #####:  903:    for (OpFoldResult shapeSize : shapeSizes) {
+branch  0 never executed
+branch  1 never executed
+    #####:  904:      tileSizes.push_back(getConstantIntValue(shapeSize)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  905:                              ? b.create<arith::ConstantIndexOp>(loc, 0)
+call    0 never executed
+    #####:  906:                              : b.create<arith::ConstantIndexOp>(loc, 1));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  907:    }
+    #####:  908:    return tileSizes;
+branch  0 never executed
+branch  1 never executed
+    #####:  909:  });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  910:  SmallVector<int64_t> emptyTileSizes;
+call    0 never executed
+call    1 never executed
+    #####:  911:  SimpleRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  912:  rewriter.setInsertionPoint(target);
+call    0 never executed
+    #####:  913:  FailureOr<scf::SCFTilingResult> maybeTilingResult = tileUsingSCFForOp(
+    #####:  914:      rewriter, cast<TilingInterface>(target.getOperation()), tilingOptions);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  915:  if (failed(maybeTilingResult))
+branch  0 never executed
+branch  1 never executed
+    #####:  916:    return DiagnosedSilenceableFailure(reportUnknownTransformError(target));
+call    0 never executed
+        -:  917:
+    #####:  918:  results.push_back(maybeTilingResult->tiledOp);
+call    0 never executed
+    #####:  919:  return DiagnosedSilenceableFailure(success());
+        -:  920:}
+        -:  921:
+        -:  922://===----------------------------------------------------------------------===//
+        -:  923:// SplitOp
+        -:  924://===----------------------------------------------------------------------===//
+        -:  925:
+function _ZN4mlir9transform7SplitOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####:  926:DiagnosedSilenceableFailure SplitOp::apply(TransformResults &results,
+        -:  927:                                           TransformState &state) {
+        -:  928:  // Collect the dynamic split points if provided.
+    #####:  929:  ArrayRef<Operation *> payload = state.getPayloadOps(getTarget());
+call    0 never executed
+call    1 never executed
+    #####:  930:  SimpleRewriter rewriter(getContext());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  931:  SmallVector<OpFoldResult> splitPoints;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  932:  splitPoints.reserve(payload.size());
+branch  0 never executed
+branch  1 never executed
+    #####:  933:  if (getDynamicSplitPoint()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  934:    auto diag = DiagnosedSilenceableFailure::success();
+call    0 never executed
+    #####:  935:    splitPoints = llvm::to_vector(llvm::map_range(
+call    0 never executed
+function _ZZN4mlir9transform7SplitOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlPNS_9OperationEE_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  936:        state.getPayloadOps(getDynamicSplitPoint()), [&](Operation *op) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  937:          if (op->getNumResults() != 1 ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  938:              !op->getResult(0).getType().isIndex()) {
+call    0 never executed
+    #####:  939:            diag = emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  940:                   << "expected dynamic split point handle to point to a "
+    #####:  941:                      "single-result index-typed op";
+call    0 never executed
+call    1 never executed
+    #####:  942:            diag.attachNote(op->getLoc()) << "dynamic split point";
+call    0 never executed
+call    1 never executed
+        -:  943:          }
+    #####:  944:          return OpFoldResult(op->getResult(0));
+call    0 never executed
+    #####:  945:        }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  946:    if (diag.isSilenceableFailure()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  947:      results.set(getFirst().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  948:      results.set(getSecond().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  949:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  950:    }
+        -:  951:
+    #####:  952:    if (splitPoints.size() != payload.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  953:      return emitDefiniteFailure()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  954:             << "expected the dynamic split point handle to point to as "
+    #####:  955:                "many operations ("
+    #####:  956:             << splitPoints.size() << ") as the target handle ("
+call    0 never executed
+call    1 never executed
+    #####:  957:             << payload.size() << ")";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  958:    }
+        -:  959:  } else {
+    #####:  960:    splitPoints.resize(payload.size(),
+call    0 never executed
+    #####:  961:                       rewriter.getIndexAttr(getStaticSplitPoint()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  962:  }
+        -:  963:
+        -:  964:  // Split each target operation.
+    #####:  965:  SmallVector<Operation *> first, second;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  966:  for (const auto &pair : llvm::zip(payload, splitPoints)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  967:    Operation *target = std::get<0>(pair);
+    #####:  968:    auto linalgOp = dyn_cast<LinalgOp>(target);
+call    0 never executed
+    #####:  969:    if (!linalgOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  970:      auto diag = emitSilenceableError() << "only applies to structured ops";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  971:      diag.attachNote(target->getLoc()) << "target op";
+call    0 never executed
+call    1 never executed
+    #####:  972:      results.set(getFirst().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  973:      results.set(getSecond().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  974:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  975:    }
+        -:  976:
+    #####:  977:    if (getDimension() >= linalgOp.getNumLoops()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  978:      auto diag = emitSilenceableError() << "dimension " << getDimension()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  979:                                         << " does not exist in target op";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  980:      diag.attachNote(target->getLoc()) << "target op";
+call    0 never executed
+call    1 never executed
+    #####:  981:      results.set(getFirst().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  982:      results.set(getSecond().cast<OpResult>(), {});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  983:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  984:    }
+        -:  985:
+    #####:  986:    rewriter.setInsertionPoint(linalgOp);
+call    0 never executed
+    #####:  987:    std::tie(first.emplace_back(), second.emplace_back()) = linalg::splitOp(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  988:        rewriter, cast<TilingInterface>(linalgOp.getOperation()),
+    #####:  989:        getDimension(), std::get<1>(pair));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  990:  }
+        -:  991:
+    #####:  992:  results.set(getFirst().cast<OpResult>(), first);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  993:  results.set(getSecond().cast<OpResult>(), second);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  994:  return DiagnosedSilenceableFailure::success();
+        -:  995:}
+        -:  996:
+function _ZN4mlir9transform7SplitOp10getEffectsERN4llvm15SmallVectorImplINS_11SideEffects14EffectInstanceINS_13MemoryEffects6EffectEEEEE called 0 returned 0% blocks executed 0%
+    #####:  997:void SplitOp::getEffects(
+        -:  998:    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    #####:  999:  consumesHandle(getTarget(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1000:  if (getDynamicSplitPoint())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1001:    onlyReadsHandle(getDynamicSplitPoint(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1002:  producesHandle(getResults(), effects);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1003:  modifiesPayload(effects);
+call    0 never executed
+    #####: 1004:}
+        -: 1005:
+function _ZN4mlir9transform7SplitOp5parseERNS_11OpAsmParserERNS_14OperationStateE called 0 returned 0% blocks executed 0%
+    #####: 1006:ParseResult SplitOp::parse(OpAsmParser &parser, OperationState &result) {
+    #####: 1007:  OpAsmParser::UnresolvedOperand target, dynamicSplitPoint;
+call    0 never executed
+    #####: 1008:  IntegerAttr staticSplitPoint;
+    #####: 1009:  auto pdlOperationType =
+    #####: 1010:      pdl::OperationType::get(parser.getBuilder().getContext());
+call    0 never executed
+call    1 never executed
+    #####: 1011:  if (parser.parseOperand(target) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1012:      parser.resolveOperand(target, pdlOperationType, result.operands) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1013:      parser.parseKeyword("after"))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1014:    return failure();
+        -: 1015:
+    #####: 1016:  OptionalParseResult dynamicPointParseResult =
+    #####: 1017:      parser.parseOptionalOperand(dynamicSplitPoint);
+call    0 never executed
+    #####: 1018:  if (!dynamicPointParseResult.has_value()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1019:    int64_t staticSplitPointValue;
+    #####: 1020:    if (failed(parser.parseInteger(staticSplitPointValue)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1021:      return failure();
+        -: 1022:
+    #####: 1023:    staticSplitPoint =
+    #####: 1024:        parser.getBuilder().getI64IntegerAttr(staticSplitPointValue);
+call    0 never executed
+call    1 never executed
+        -: 1025:  } else {
+    #####: 1026:    if (failed(*dynamicPointParseResult) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1027:        parser.resolveOperand(dynamicSplitPoint, pdlOperationType,
+    #####: 1028:                              result.operands)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1029:      return failure();
+        -: 1030:    }
+        -: 1031:
+    #####: 1032:    staticSplitPoint =
+    #####: 1033:        parser.getBuilder().getI64IntegerAttr(ShapedType::kDynamicSize);
+call    0 never executed
+call    1 never executed
+        -: 1034:  }
+        -: 1035:
+    #####: 1036:  result.addAttribute(
+call    0 never executed
+call    1 never executed
+    #####: 1037:      SplitOp::getStaticSplitPointAttrName(result.name).getValue(),
+call    0 never executed
+        -: 1038:      staticSplitPoint);
+    #####: 1039:  if (failed(parser.parseOptionalAttrDict(result.attributes)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1040:    return failure();
+        -: 1041:
+    #####: 1042:  result.addTypes({pdlOperationType, pdlOperationType});
+call    0 never executed
+    #####: 1043:  return success();
+        -: 1044:}
+        -: 1045:
+function _ZN4mlir9transform7SplitOp5printERNS_12OpAsmPrinterE called 0 returned 0% blocks executed 0%
+    #####: 1046:void SplitOp::print(OpAsmPrinter &printer) {
+    #####: 1047:  printer << " " << getTarget() << " after ";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1048:  int64_t staticSplitSize = static_cast<int64_t>(getStaticSplitPoint());
+call    0 never executed
+    #####: 1049:  if (staticSplitSize != ShapedType::kDynamicSize)
+branch  0 never executed
+branch  1 never executed
+    #####: 1050:    printer << staticSplitSize;
+call    0 never executed
+        -: 1051:  else
+    #####: 1052:    printer << getDynamicSplitPoint();
+call    0 never executed
+call    1 never executed
+    #####: 1053:  printer << " ";
+call    0 never executed
+    #####: 1054:  printer.printOptionalAttrDict(getOperation()->getAttrs(),
+call    0 never executed
+    #####: 1055:                                {getStaticSplitPointAttrName()});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1056:}
+        -: 1057:
+function _ZN4mlir9transform7SplitOp6verifyEv called 0 returned 0% blocks executed 0%
+    #####: 1058:LogicalResult SplitOp::verify() {
+    #####: 1059:  if ((static_cast<int64_t>(getStaticSplitPoint()) !=
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1060:       ShapedType::kDynamicSize) ^
+    #####: 1061:      (getDynamicSplitPoint() == nullptr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1062:    return emitOpError() << "expects either a dynamic or a static split "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1063:                            "point to be provided";
+call    0 never executed
+        -: 1064:  }
+    #####: 1065:  return success();
+        -: 1066:}
+        -: 1067:
+        -: 1068://===----------------------------------------------------------------------===//
+        -: 1069:// SplitReductionOp
+        -: 1070://===----------------------------------------------------------------------===//
+        -: 1071:
+        -: 1072:DiagnosedSilenceableFailure
+function _ZN4mlir9transform16SplitReductionOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####: 1073:transform::SplitReductionOp::applyToOne(linalg::LinalgOp target,
+        -: 1074:                                        SmallVectorImpl<Operation *> &results,
+        -: 1075:                                        transform::TransformState &state) {
+function _ZZN4mlir9transform16SplitReductionOp10applyToOneENS_6linalg8LinalgOpERN4llvm15SmallVectorImplIPNS_9OperationEEERNS0_14TransformStateEENKUlS3_E_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1076:  ControlSplitReductionFn splitFn = [&](LinalgOp) {
+    #####: 1077:    return linalg::SplitReductionOptions{int64_t(getSplitFactor()),
+call    0 never executed
+    #####: 1078:                                         unsigned(getInsertSplitDimension()),
+    #####: 1079:                                         bool(getInnerParallel())};
+call    0 never executed
+call    1 never executed
+    #####: 1080:  };
+call    0 never executed
+    #####: 1081:  SimpleRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1082:  rewriter.setInsertionPoint(target);
+call    0 never executed
+    #####: 1083:  FailureOr<SplitReductionResult> splitResult =
+call    0 never executed
+    #####: 1084:      (getUseScalingAlgorithm())
+call    0 never executed
+call    1 never executed
+    #####: 1085:          ? splitReductionByScaling(rewriter, target, splitFn, getUseAlloc())
+call    0 never executed
+    #####: 1086:          : splitReduction(rewriter, target, splitFn, getUseAlloc());
+call    0 never executed
+    #####: 1087:  if (failed(splitResult))
+branch  0 never executed
+branch  1 never executed
+    #####: 1088:    return DiagnosedSilenceableFailure(reportUnknownTransformError(target));
+call    0 never executed
+        -: 1089:
+    #####: 1090:  results.push_back(splitResult->initOrAlloc);
+call    0 never executed
+    #####: 1091:  results.push_back(splitResult->fillOp);
+call    0 never executed
+    #####: 1092:  results.push_back(splitResult->splitLinalgOp);
+call    0 never executed
+    #####: 1093:  results.push_back(splitResult->resultCombiningLinalgOp);
+call    0 never executed
+    #####: 1094:  return DiagnosedSilenceableFailure(success());
+        -: 1095:}
+        -: 1096:
+        -: 1097://===----------------------------------------------------------------------===//
+        -: 1098:// TileOp
+        -: 1099://===----------------------------------------------------------------------===//
+        -: 1100:
+        -: 1101:DiagnosedSilenceableFailure
+function _ZN4mlir9transform6TileOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####: 1102:transform::TileOp::apply(TransformResults &transformResults,
+        -: 1103:                         TransformState &state) {
+    #####: 1104:  SmallVector<int64_t> tileSizes = extractFromI64ArrayAttr(getStaticSizes());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1105:
+    #####: 1106:  ArrayRef<Operation *> targets = state.getPayloadOps(getTarget());
+call    0 never executed
+call    1 never executed
+    #####: 1107:  SmallVector<ArrayRef<Operation *>> dynamicSizeProducers;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1108:  dynamicSizeProducers.reserve(getDynamicSizes().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1109:  for (Value dynamicSizeProducerHandle : getDynamicSizes()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1110:    dynamicSizeProducers.push_back(
+call    0 never executed
+call    1 never executed
+        -: 1111:        state.getPayloadOps(dynamicSizeProducerHandle));
+        -: 1112:
+    #####: 1113:    if (dynamicSizeProducers.back().size() != targets.size()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1114:      DiagnosedSilenceableFailure diag =
+    #####: 1115:          emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1116:          << "expected as many dynamic size-producing operations ("
+    #####: 1117:          << dynamicSizeProducers.back().size() << ") as target ops ("
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1118:          << targets.size() << ")";
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1119:      diag.attachNote(dynamicSizeProducerHandle.getLoc()) << "for this handle";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1120:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1121:    }
+        -: 1122:
+    #####: 1123:    for (Operation *op : dynamicSizeProducers.back()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1124:      if (op->getNumResults() == 1 &&
+branch  0 never executed
+branch  1 never executed
+    #####: 1125:          op->getResult(0).getType().isa<IndexType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1126:        continue;
+    #####: 1127:      DiagnosedSilenceableFailure diag =
+    #####: 1128:          emitSilenceableError() << "expected sizes to be produced by ops "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1129:                                    "with a single index-type result";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1130:      diag.attachNote(op->getLoc()) << "size producer op";
+call    0 never executed
+call    1 never executed
+    #####: 1131:      diag.attachNote(dynamicSizeProducerHandle.getLoc()) << "for this handle";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1132:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1133:    }
+        -: 1134:  }
+        -: 1135:
+    #####: 1136:  SmallVector<Operation *> tiled;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1137:  SmallVector<SmallVector<Operation *, 4>, 4> loops;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1138:  loops.resize(getLoops().size());
+call    0 never executed
+call    1 never executed
+    #####: 1139:  for (auto &en : llvm::enumerate(targets)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1140:    auto linalgOp = dyn_cast<LinalgOp>(en.value());
+call    0 never executed
+    #####: 1141:    if (!linalgOp) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1142:      DiagnosedSilenceableFailure diag = emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1143:                                         << "only linalg ops are supported";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1144:      diag.attachNote(en.value()->getLoc()) << "target op";
+call    0 never executed
+call    1 never executed
+    #####: 1145:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1146:    }
+        -: 1147:
+    #####: 1148:    scf::SCFTilingOptions tilingOptions;
+branch  0 never executed
+branch  1 never executed
+    #####: 1149:    unsigned index = en.index();
+branch  0 never executed
+branch  1 never executed
+    #####: 1150:    if (!tileSizes.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1151:      tilingOptions.setTileSizeComputationFunction(
+function _ZZN4mlir9transform6TileOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlRNS_9OpBuilderEPNS_9OperationEE_clES7_S9_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1152:          [&, index](OpBuilder &b, Operation *) {
+    #####: 1153:            SmallVector<Value, 4> sizes;
+branch  0 never executed
+branch  1 never executed
+    #####: 1154:            sizes.reserve(tileSizes.size());
+branch  0 never executed
+branch  1 never executed
+    #####: 1155:            unsigned dynamicIdx = 0;
+    #####: 1156:            for (OpFoldResult ofr : getMixedSizes()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1157:              if (auto attr = ofr.dyn_cast<Attribute>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1158:                sizes.push_back(b.create<arith::ConstantIndexOp>(
+call    0 never executed
+call    1 never executed
+    #####: 1159:                    getLoc(), attr.cast<IntegerAttr>().getInt()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1160:              } else {
+    #####: 1161:                sizes.push_back(
+call    0 never executed
+    #####: 1162:                    dynamicSizeProducers[dynamicIdx++][index]->getResult(0));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1163:              }
+        -: 1164:            }
+    #####: 1165:            return sizes;
+    #####: 1166:          });
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1167:    }
+        -: 1168:
+    #####: 1169:    tilingOptions.setInterchange(extractI64Array(getInterchange()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1170:    SimpleRewriter rewriter(linalgOp.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1171:    FailureOr<scf::SCFTilingResult> maybeTilingResult = tileUsingSCFForOp(
+        -: 1172:        rewriter, cast<TilingInterface>(linalgOp.getOperation()),
+    #####: 1173:        tilingOptions);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1174:    if (failed(maybeTilingResult))
+branch  0 never executed
+branch  1 never executed
+    #####: 1175:      return DiagnosedSilenceableFailure::definiteFailure();
+call    0 never executed
+        -: 1176:
+    #####: 1177:    if (linalgOp.hasBufferSemantics())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1178:      rewriter.eraseOp(linalgOp);
+call    0 never executed
+        -: 1179:    else
+    #####: 1180:      rewriter.replaceOp(linalgOp,
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1181:                         maybeTilingResult->loops.front()->getResults());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1182:
+    #####: 1183:    tiled.push_back(maybeTilingResult->tiledOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1184:    for (const auto &en2 : llvm::enumerate(maybeTilingResult->loops))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1185:      loops[en2.index()].push_back(en2.value());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1186:  }
+        -: 1187:
+    #####: 1188:  transformResults.set(getTiledLinalgOp().cast<OpResult>(), tiled);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1189:  for (const auto &en : llvm::enumerate(loops))
+branch  0 never executed
+branch  1 never executed
+    #####: 1190:    transformResults.set(getLoops()[en.index()].cast<OpResult>(), en.value());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1191:
+    #####: 1192:  return DiagnosedSilenceableFailure::success();
+        -: 1193:}
+        -: 1194:
+function _ZN4mlir9transform6TileOp13getMixedSizesEv called 0 returned 0% blocks executed 0%
+    #####: 1195:SmallVector<OpFoldResult> transform::TileOp::getMixedSizes() {
+    #####: 1196:  ValueRange dynamic = getDynamicSizes();
+call    0 never executed
+call    1 never executed
+    #####: 1197:  SmallVector<int64_t> tileSizes = extractFromI64ArrayAttr(getStaticSizes());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1198:  SmallVector<OpFoldResult> results;
+branch  0 never executed
+branch  1 never executed
+    #####: 1199:  results.reserve(tileSizes.size());
+branch  0 never executed
+branch  1 never executed
+    #####: 1200:  unsigned dynamicPos = 0;
+    #####: 1201:  Builder builder(getContext());
+call    0 never executed
+    #####: 1202:  for (int64_t size : tileSizes) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1203:    if (size == ShapedType::kDynamicSize) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1204:      results.push_back(dynamic[dynamicPos++]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1205:    } else {
+    #####: 1206:      results.push_back(builder.getIndexAttr(size));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1207:    }
+        -: 1208:  }
+    #####: 1209:  return results;
+branch  0 never executed
+branch  1 never executed
+        -: 1210:}
+        -: 1211:
+function _ZN4mlir9transform6TileOp5parseERNS_11OpAsmParserERNS_14OperationStateE called 0 returned 0% blocks executed 0%
+    #####: 1212:ParseResult transform::TileOp::parse(OpAsmParser &parser,
+        -: 1213:                                     OperationState &result) {
+    #####: 1214:  OpAsmParser::UnresolvedOperand target;
+call    0 never executed
+    #####: 1215:  SmallVector<OpAsmParser::UnresolvedOperand> dynamicSizes;
+call    0 never executed
+    #####: 1216:  ArrayAttr staticSizes;
+    #####: 1217:  auto pdlOperationType = pdl::OperationType::get(parser.getContext());
+call    0 never executed
+call    1 never executed
+    #####: 1218:  if (parser.parseOperand(target) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1219:      parser.resolveOperand(target, pdlOperationType, result.operands) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1220:      parseDynamicIndexList(parser, dynamicSizes, staticSizes,
+    #####: 1221:                            ShapedType::kDynamicSize) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1222:      parser.resolveOperands(dynamicSizes, pdlOperationType, result.operands) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1223:      parser.parseOptionalAttrDict(result.attributes))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1224:    return ParseResult::failure();
+        -: 1225:
+    #####: 1226:  result.addAttribute(getStaticSizesAttrName(result.name), staticSizes);
+call    0 never executed
+call    1 never executed
+    #####: 1227:  size_t numExpectedLoops =
+call    0 never executed
+    #####: 1228:      staticSizes.size() - llvm::count(extractFromI64ArrayAttr(staticSizes), 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1229:  result.addTypes(SmallVector<Type>(numExpectedLoops + 1, pdlOperationType));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1230:  return success();
+        -: 1231:}
+        -: 1232:
+function _ZN4mlir9transform6TileOp5printERNS_12OpAsmPrinterE called 0 returned 0% blocks executed 0%
+    #####: 1233:void TileOp::print(OpAsmPrinter &p) {
+    #####: 1234:  p << ' ' << getTarget();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1235:  printDynamicIndexList(p, getOperation(), getDynamicSizes(), getStaticSizes(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1236:                        ShapedType::kDynamicSize);
+    #####: 1237:  p.printOptionalAttrDict((*this)->getAttrs(), {getStaticSizesAttrName()});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1238:}
+        -: 1239:
+function _ZN4mlir9transform6TileOp10getEffectsERN4llvm15SmallVectorImplINS_11SideEffects14EffectInstanceINS_13MemoryEffects6EffectEEEEE called 0 returned 0% blocks executed 0%
+    #####: 1240:void transform::TileOp::getEffects(
+        -: 1241:    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    #####: 1242:  consumesHandle(getTarget(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1243:  onlyReadsHandle(getDynamicSizes(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1244:  producesHandle(getTiledLinalgOp(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1245:  producesHandle(getLoops(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1246:  modifiesPayload(effects);
+call    0 never executed
+    #####: 1247:}
+        -: 1248:
+        -: 1249://===----------------------------------------------------------------------===//
+        -: 1250:// TileToForeachThreadOp
+        -: 1251://===----------------------------------------------------------------------===//
+        -: 1252:
+function _ZN4mlir9transform25tileToForeachThreadOpImplERNS_12RewriterBaseERNS0_14TransformStateENS0_20TransformOpInterfaceEN4llvm8ArrayRefIPNS_9OperationEEENS7_INS_12OpFoldResultEEESC_NS6_8OptionalINS_9ArrayAttrEEERNS6_11SmallVectorIS9_Lj6EEESI_ called 0 returned 0% blocks executed 0%
+    #####: 1253:DiagnosedSilenceableFailure transform::tileToForeachThreadOpImpl(
+        -: 1254:    RewriterBase &rewriter, transform::TransformState &state,
+        -: 1255:    TransformOpInterface transformOp, ArrayRef<Operation *> targets,
+        -: 1256:    ArrayRef<OpFoldResult> mixedNumThreads,
+        -: 1257:    ArrayRef<OpFoldResult> mixedTileSizes, Optional<ArrayAttr> threadDimMapping,
+        -: 1258:    SmallVector<Operation *> &tileOps, SmallVector<Operation *> &tiledOps) {
+        -: 1259:
+    #####: 1260:  if (targets.empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1261:    return DiagnosedSilenceableFailure(success());
+        -: 1262:
+        -: 1263:  // Given a list of OpFoldResults that are either index attrs or op handles,
+        -: 1264:  // return a list of OpFoldResults where all op handles are replaced with the
+        -: 1265:  // first (and only) OpResult of that payload op. (There must be exactly one
+        -: 1266:  // mapped payload op and it must have exactly one index result.)
+    #####: 1267:  auto getOpResultsOrIndexAttrs =
+function _ZZN4mlir9transform25tileToForeachThreadOpImplERNS_12RewriterBaseERNS0_14TransformStateENS0_20TransformOpInterfaceEN4llvm8ArrayRefIPNS_9OperationEEENS7_INS_12OpFoldResultEEESC_NS6_8OptionalINS_9ArrayAttrEEERNS6_11SmallVectorIS9_Lj6EEESI_ENKUlRNSG_ISB_Lj6EEESC_E_clESK_SC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1268:      [&](SmallVector<OpFoldResult> &result,
+        -: 1269:          ArrayRef<OpFoldResult> opHandlesOrIndexAttrs) {
+    #####: 1270:        for (OpFoldResult ofr : opHandlesOrIndexAttrs) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1271:          if (ofr.is<Attribute>()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1272:            result.push_back(ofr);
+call    0 never executed
+    #####: 1273:            continue;
+        -: 1274:          }
+    #####: 1275:          ArrayRef<Operation *> dynamicNumThreads =
+    #####: 1276:              state.getPayloadOps(ofr.get<Value>());
+call    0 never executed
+call    1 never executed
+    #####: 1277:          if (dynamicNumThreads.size() != 1) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1278:            DiagnosedSilenceableFailure diag =
+    #####: 1279:                transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1280:                << "handle must be mapped to exactly 1 payload op";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1281:            diag.attachNote(ofr.get<Value>().getLoc())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1282:                << "mapped to " << dynamicNumThreads.size() << " ops";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1283:            return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1284:          }
+    #####: 1285:          Operation *op = dynamicNumThreads[0];
+branch  0 never executed
+branch  1 never executed
+    #####: 1286:          if (op->getNumResults() != 1 ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1287:              !op->getResult(0).getType().isIndex()) {
+call    0 never executed
+    #####: 1288:            DiagnosedSilenceableFailure diag =
+    #####: 1289:                transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1290:                << "payload op must have exactly 1 index result";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1291:            diag.attachNote(op->getLoc())
+call    0 never executed
+    #####: 1292:                << "has " << op->getNumResults() << " results";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1293:            return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1294:          }
+    #####: 1295:          result.push_back(op->getResult(0));
+call    0 never executed
+call    1 never executed
+        -: 1296:        }
+        -: 1297:
+    #####: 1298:        return DiagnosedSilenceableFailure(success());
+    #####: 1299:      };
+        -: 1300:
+        -: 1301:  // getMixedNumThreads are OpFoldResults[index attributes or PDL operation].
+        -: 1302:  // Convert to OpFoldResults[index attributes or payload op].
+    #####: 1303:  SmallVector<OpFoldResult> numThreads;
+call    0 never executed
+    #####: 1304:  DiagnosedSilenceableFailure status =
+    #####: 1305:      getOpResultsOrIndexAttrs(numThreads, mixedNumThreads);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1306:  if (!status.succeeded())
+branch  0 never executed
+branch  1 never executed
+    #####: 1307:    return status;
+branch  0 never executed
+branch  1 never executed
+        -: 1308:
+        -: 1309:  // getMixedTileSizes are OpFoldResults[index attributes or PDL operation].
+        -: 1310:  // Convert to OpFoldResults[index attributes or payload op].
+    #####: 1311:  SmallVector<OpFoldResult> tileSizes;
+call    0 never executed
+call    1 never executed
+    #####: 1312:  status = getOpResultsOrIndexAttrs(tileSizes, mixedTileSizes);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1313:  if (!status.succeeded())
+branch  0 never executed
+branch  1 never executed
+    #####: 1314:    return status;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1315:
+        -: 1316:  // Transform all targets one by one.
+    #####: 1317:  for (Operation *target : targets) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1318:    auto tilableOp = dyn_cast<TilingInterface>(target);
+call    0 never executed
+    #####: 1319:    if (!tilableOp) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1320:      DiagnosedSilenceableFailure diag =
+    #####: 1321:          transformOp.emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1322:          << "only TilingInterface ops are supported";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1323:      diag.attachNote(target->getLoc()) << "target op";
+call    0 never executed
+call    1 never executed
+    #####: 1324:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1325:    }
+    #####: 1326:    rewriter.setInsertionPoint(tilableOp);
+call    0 never executed
+    #####: 1327:    auto maybeThreadDimMappingAttr = threadDimMapping;
+    #####: 1328:    auto dimMapping = llvm::to_vector(
+branch  0 never executed
+branch  1 never executed
+        -: 1329:        maybeThreadDimMappingAttr
+    #####: 1330:            ? extractFromI64ArrayAttr(*maybeThreadDimMappingAttr)
+call    0 never executed
+call    1 never executed
+    #####: 1331:            : ArrayRef<int64_t>{});
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1332:
+    #####: 1333:    FailureOr<linalg::ForeachThreadTilingResult> tilingResult = failure();
+branch  0 never executed
+branch  1 never executed
+    #####: 1334:    if (!mixedNumThreads.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1335:      tilingResult = linalg::tileToForeachThreadOp(rewriter, tilableOp,
+call    0 never executed
+    #####: 1336:                                                   numThreads, dimMapping);
+call    0 never executed
+        -: 1337:    } else {
+    #####: 1338:      tilingResult = linalg::tileToForeachThreadOpUsingTileSizes(
+call    0 never executed
+    #####: 1339:          rewriter, tilableOp, tileSizes, dimMapping);
+call    0 never executed
+        -: 1340:    }
+        -: 1341:
+    #####: 1342:    if (failed(tilingResult))
+branch  0 never executed
+branch  1 never executed
+    #####: 1343:      return transformOp.emitDefaultSilenceableFailure(tilableOp);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1344:    rewriter.replaceOp(tilableOp, tilingResult->tileOp->getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1345:
+    #####: 1346:    tileOps.push_back(tilingResult->tileOp);
+call    0 never executed
+    #####: 1347:    tiledOps.push_back(tilingResult->tiledOp);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1348:  }
+    #####: 1349:  return DiagnosedSilenceableFailure(success());
+        -: 1350:}
+        -: 1351:
+function _ZN4mlir9transform21TileToForeachThreadOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####: 1352:DiagnosedSilenceableFailure transform::TileToForeachThreadOp::apply(
+        -: 1353:    transform::TransformResults &transformResults,
+        -: 1354:    transform::TransformState &state) {
+    #####: 1355:  IRRewriter rewriter(getContext());
+call    0 never executed
+call    1 never executed
+    #####: 1356:  ArrayRef<Operation *> targets = state.getPayloadOps(getTarget());
+call    0 never executed
+call    1 never executed
+        -: 1357:
+        -: 1358:  // Result payload ops.
+    #####: 1359:  SmallVector<Operation *> tileOps;
+call    0 never executed
+call    1 never executed
+    #####: 1360:  SmallVector<Operation *> tiledOps;
+branch  0 never executed
+branch  1 never executed
+        -: 1361:
+    #####: 1362:  DiagnosedSilenceableFailure diag = tileToForeachThreadOpImpl(
+        -: 1363:      rewriter, state, cast<TransformOpInterface>(getOperation()), targets,
+    #####: 1364:      getMixedNumThreads(), getMixedTileSizes(), getThreadDimMapping(), tileOps,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1365:      tiledOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+        -: 1366:
+    #####: 1367:  if (!diag.succeeded())
+branch  0 never executed
+branch  1 never executed
+    #####: 1368:    return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1369:
+    #####: 1370:  transformResults.set(getForeachThreadOp().cast<OpResult>(), tileOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1371:  transformResults.set(getTiledOp().cast<OpResult>(), tiledOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1372:
+    #####: 1373:  return DiagnosedSilenceableFailure(success());
+        -: 1374:}
+        -: 1375:
+function _ZN4mlir9transform21TileToForeachThreadOp10getEffectsERN4llvm15SmallVectorImplINS_11SideEffects14EffectInstanceINS_13MemoryEffects6EffectEEEEE called 0 returned 0% blocks executed 0%
+    #####: 1376:void transform::TileToForeachThreadOp::getEffects(
+        -: 1377:    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    #####: 1378:  consumesHandle(getTarget(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1379:  onlyReadsHandle(getTileSizes(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1380:  onlyReadsHandle(getNumThreads(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1381:  producesHandle(getResults(), effects);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1382:}
+        -: 1383:
+function _ZN4mlir9transform21TileToForeachThreadOp18getMixedNumThreadsEv called 0 returned 0% blocks executed 0%
+    #####: 1384:SmallVector<OpFoldResult> TileToForeachThreadOp::getMixedNumThreads() {
+    #####: 1385:  return getMixedSizes(getStaticNumThreads(), getNumThreads());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+        -: 1386:}
+        -: 1387:
+function _ZN4mlir9transform21TileToForeachThreadOp17getMixedTileSizesEv called 0 returned 0% blocks executed 0%
+    #####: 1388:SmallVector<OpFoldResult> TileToForeachThreadOp::getMixedTileSizes() {
+    #####: 1389:  return getMixedSizes(getStaticTileSizes(), getTileSizes());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+        -: 1390:}
+        -: 1391:
+function _ZN4mlir9transform21TileToForeachThreadOp6verifyEv called 0 returned 0% blocks executed 0%
+    #####: 1392:LogicalResult TileToForeachThreadOp::verify() {
+    #####: 1393:  if (getMixedNumThreads().empty() == getMixedTileSizes().empty())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1394:    return emitOpError("either num_threads or tile_sizes must be specified");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1395:  return success();
+        -: 1396:}
+        -: 1397:
+        -: 1398://===----------------------------------------------------------------------===//
+        -: 1399:// TileToScfForOp
+        -: 1400://===----------------------------------------------------------------------===//
+        -: 1401:
+        -: 1402:DiagnosedSilenceableFailure
+function _ZN4mlir9transform14TileToScfForOp5applyERNS0_16TransformResultsERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####: 1403:transform::TileToScfForOp::apply(TransformResults &transformResults,
+        -: 1404:                                 TransformState &state) {
+    #####: 1405:  SmallVector<int64_t> tileSizes = extractFromI64ArrayAttr(getStaticSizes());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1406:
+    #####: 1407:  ArrayRef<Operation *> targets = state.getPayloadOps(getTarget());
+call    0 never executed
+call    1 never executed
+    #####: 1408:  SmallVector<ArrayRef<Operation *>> dynamicSizeProducers;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1409:  dynamicSizeProducers.reserve(getDynamicSizes().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1410:  for (Value dynamicSizeProducerHandle : getDynamicSizes()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1411:    dynamicSizeProducers.push_back(
+call    0 never executed
+call    1 never executed
+        -: 1412:        state.getPayloadOps(dynamicSizeProducerHandle));
+        -: 1413:
+    #####: 1414:    if (dynamicSizeProducers.back().size() != targets.size()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1415:      DiagnosedSilenceableFailure diag =
+    #####: 1416:          emitSilenceableError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1417:          << "expected as many dynamic size-producing operations ("
+    #####: 1418:          << dynamicSizeProducers.back().size() << ") as target ops ("
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1419:          << targets.size() << ")";
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1420:      diag.attachNote(dynamicSizeProducerHandle.getLoc()) << "for this handle";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1421:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1422:    }
+        -: 1423:
+    #####: 1424:    for (Operation *op : dynamicSizeProducers.back()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1425:      if (op->getNumResults() == 1 &&
+branch  0 never executed
+branch  1 never executed
+    #####: 1426:          op->getResult(0).getType().isa<IndexType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1427:        continue;
+    #####: 1428:      DiagnosedSilenceableFailure diag =
+    #####: 1429:          emitSilenceableError() << "expected sizes to be produced by ops "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1430:                                    "with a single index-type result";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1431:      diag.attachNote(op->getLoc()) << "size producer op";
+call    0 never executed
+call    1 never executed
+    #####: 1432:      diag.attachNote(dynamicSizeProducerHandle.getLoc()) << "for this handle";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1433:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1434:    }
+        -: 1435:  }
+        -: 1436:
+    #####: 1437:  SmallVector<Operation *> tiled;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1438:  SmallVector<SmallVector<Operation *, 4>, 4> loops;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1439:  loops.resize(getLoops().size());
+call    0 never executed
+call    1 never executed
+    #####: 1440:  for (auto &en : llvm::enumerate(targets)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1441:    auto tilingInterfaceOp = dyn_cast<TilingInterface>(en.value());
+call    0 never executed
+    #####: 1442:    if (!tilingInterfaceOp) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1443:      DiagnosedSilenceableFailure diag =
+    #####: 1444:          emitSilenceableError() << "only TilingInterface ops are supported";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####: 1445:      diag.attachNote(en.value()->getLoc()) << "target op";
+call    0 never executed
+call    1 never executed
+    #####: 1446:      return diag;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1447:    }
+        -: 1448:
+    #####: 1449:    scf::SCFTilingOptions tilingOptions;
+branch  0 never executed
+branch  1 never executed
+    #####: 1450:    unsigned index = en.index();
+branch  0 never executed
+branch  1 never executed
+    #####: 1451:    if (!tileSizes.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1452:      tilingOptions.setTileSizeComputationFunction(
+function _ZZN4mlir9transform14TileToScfForOp5applyERNS0_16TransformResultsERNS0_14TransformStateEENKUlRNS_9OpBuilderEPNS_9OperationEE_clES7_S9_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1453:          [&, index](OpBuilder &b, Operation *) {
+    #####: 1454:            SmallVector<Value, 4> sizes;
+branch  0 never executed
+branch  1 never executed
+    #####: 1455:            sizes.reserve(tileSizes.size());
+branch  0 never executed
+branch  1 never executed
+    #####: 1456:            unsigned dynamicIdx = 0;
+    #####: 1457:            for (OpFoldResult ofr : getMixedSizes()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1458:              if (auto attr = ofr.dyn_cast<Attribute>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1459:                sizes.push_back(b.create<arith::ConstantIndexOp>(
+call    0 never executed
+call    1 never executed
+    #####: 1460:                    getLoc(), attr.cast<IntegerAttr>().getInt()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1461:              } else {
+    #####: 1462:                sizes.push_back(
+call    0 never executed
+    #####: 1463:                    dynamicSizeProducers[dynamicIdx++][index]->getResult(0));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1464:              }
+        -: 1465:            }
+    #####: 1466:            return sizes;
+    #####: 1467:          });
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1468:    }
+        -: 1469:
+    #####: 1470:    tilingOptions.setInterchange(extractI64Array(getInterchange()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1471:    SimpleRewriter rewriter(tilingInterfaceOp.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1472:    FailureOr<scf::SCFTilingResult> tilingResult =
+    #####: 1473:        tileUsingSCFForOp(rewriter, tilingInterfaceOp, tilingOptions);
+call    0 never executed
+call    1 never executed
+    #####: 1474:    if (failed(tilingResult))
+branch  0 never executed
+branch  1 never executed
+    #####: 1475:      return DiagnosedSilenceableFailure::definiteFailure();
+call    0 never executed
+        -: 1476:
+    #####: 1477:    rewriter.replaceOp(tilingInterfaceOp, tilingResult->replacements);
+call    0 never executed
+call    1 never executed
+        -: 1478:
+    #####: 1479:    tiled.push_back(tilingResult->tiledOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1480:    for (const auto &en2 : llvm::enumerate(tilingResult->loops))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1481:      loops[en2.index()].push_back(en2.value());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1482:  }
+        -: 1483:
+    #####: 1484:  transformResults.set(getTiledLinalgOp().cast<OpResult>(), tiled);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1485:  for (const auto &en : llvm::enumerate(loops))
+branch  0 never executed
+branch  1 never executed
+    #####: 1486:    transformResults.set(getLoops()[en.index()].cast<OpResult>(), en.value());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1487:
+    #####: 1488:  return DiagnosedSilenceableFailure::success();
+        -: 1489:}
+        -: 1490:
+function _ZN4mlir9transform14TileToScfForOp13getMixedSizesEv called 0 returned 0% blocks executed 0%
+    #####: 1491:SmallVector<OpFoldResult> transform::TileToScfForOp::getMixedSizes() {
+    #####: 1492:  ValueRange dynamic = getDynamicSizes();
+call    0 never executed
+call    1 never executed
+    #####: 1493:  SmallVector<int64_t> tileSizes = extractFromI64ArrayAttr(getStaticSizes());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1494:  SmallVector<OpFoldResult> results;
+branch  0 never executed
+branch  1 never executed
+    #####: 1495:  results.reserve(tileSizes.size());
+branch  0 never executed
+branch  1 never executed
+    #####: 1496:  unsigned dynamicPos = 0;
+    #####: 1497:  Builder builder(getContext());
+call    0 never executed
+    #####: 1498:  for (int64_t size : tileSizes) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1499:    if (size == ShapedType::kDynamicSize) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1500:      results.push_back(dynamic[dynamicPos++]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1501:    } else {
+    #####: 1502:      results.push_back(builder.getIndexAttr(size));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1503:    }
+        -: 1504:  }
+    #####: 1505:  return results;
+branch  0 never executed
+branch  1 never executed
+        -: 1506:}
+        -: 1507:
+function _ZN4mlir9transform14TileToScfForOp5parseERNS_11OpAsmParserERNS_14OperationStateE called 0 returned 0% blocks executed 0%
+    #####: 1508:ParseResult transform::TileToScfForOp::parse(OpAsmParser &parser,
+        -: 1509:                                             OperationState &result) {
+    #####: 1510:  OpAsmParser::UnresolvedOperand target;
+call    0 never executed
+    #####: 1511:  SmallVector<OpAsmParser::UnresolvedOperand> dynamicSizes;
+call    0 never executed
+    #####: 1512:  ArrayAttr staticSizes;
+    #####: 1513:  auto pdlOperationType = pdl::OperationType::get(parser.getContext());
+call    0 never executed
+call    1 never executed
+    #####: 1514:  if (parser.parseOperand(target) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1515:      parser.resolveOperand(target, pdlOperationType, result.operands) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1516:      parseDynamicIndexList(parser, dynamicSizes, staticSizes,
+    #####: 1517:                            ShapedType::kDynamicSize) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1518:      parser.resolveOperands(dynamicSizes, pdlOperationType, result.operands) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1519:      parser.parseOptionalAttrDict(result.attributes))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1520:    return ParseResult::failure();
+        -: 1521:
+    #####: 1522:  result.addAttribute(getStaticSizesAttrName(result.name), staticSizes);
+call    0 never executed
+call    1 never executed
+    #####: 1523:  size_t numExpectedLoops =
+call    0 never executed
+    #####: 1524:      staticSizes.size() - llvm::count(extractFromI64ArrayAttr(staticSizes), 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1525:  result.addTypes(SmallVector<Type>(numExpectedLoops + 1, pdlOperationType));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1526:  return success();
+        -: 1527:}
+        -: 1528:
+function _ZN4mlir9transform14TileToScfForOp5printERNS_12OpAsmPrinterE called 0 returned 0% blocks executed 0%
+    #####: 1529:void TileToScfForOp::print(OpAsmPrinter &p) {
+    #####: 1530:  p << ' ' << getTarget();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1531:  printDynamicIndexList(p, getOperation(), getDynamicSizes(), getStaticSizes(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1532:                        ShapedType::kDynamicSize);
+    #####: 1533:  p.printOptionalAttrDict((*this)->getAttrs(), {getStaticSizesAttrName()});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1534:}
+        -: 1535:
+function _ZN4mlir9transform14TileToScfForOp10getEffectsERN4llvm15SmallVectorImplINS_11SideEffects14EffectInstanceINS_13MemoryEffects6EffectEEEEE called 0 returned 0% blocks executed 0%
+    #####: 1536:void transform::TileToScfForOp::getEffects(
+        -: 1537:    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+    #####: 1538:  consumesHandle(getTarget(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1539:  onlyReadsHandle(getDynamicSizes(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1540:  producesHandle(getTiledLinalgOp(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1541:  producesHandle(getLoops(), effects);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1542:  modifiesPayload(effects);
+call    0 never executed
+    #####: 1543:}
+        -: 1544:
+        -: 1545://===----------------------------------------------------------------------===//
+        -: 1546:// VectorizeOp
+        -: 1547://===----------------------------------------------------------------------===//
+        -: 1548:
+        -: 1549:namespace {
+        -: 1550:/// This is an helper only to call vectorize via a pattern inside of
+        -: 1551:/// VectorizeOp::applyToOne.
+        -: 1552:struct VectorizationPattern : public RewritePattern {
+function _ZN12_GLOBAL__N_120VectorizationPatternC2EPN4mlir11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####: 1553:  explicit VectorizationPattern(MLIRContext *context)
+    #####: 1554:      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+call    0 never executed
+call    1 never executed
+function _ZNK12_GLOBAL__N_120VectorizationPattern15matchAndRewriteEPN4mlir9OperationERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1555:  LogicalResult matchAndRewrite(Operation *op,
+        -: 1556:                                PatternRewriter &rewriter) const override {
+    #####: 1557:    LinalgOp linalgOp = dyn_cast<LinalgOp>(op);
+call    0 never executed
+    #####: 1558:    if (!linalgOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1559:      return failure();
+    #####: 1560:    return vectorize(rewriter, linalgOp);
+call    0 never executed
+        -: 1561:  }
+        -: 1562:};
+        -: 1563:} // namespace
+        -: 1564:
+        -: 1565:DiagnosedSilenceableFailure
+function _ZN4mlir9transform11VectorizeOp10applyToOneEPNS_9OperationERN4llvm15SmallVectorImplIS3_EERNS0_14TransformStateE called 0 returned 0% blocks executed 0%
+    #####: 1566:transform::VectorizeOp::applyToOne(Operation *target,
+        -: 1567:                                   SmallVectorImpl<Operation *> &results,
+        -: 1568:                                   transform::TransformState &state) {
+    #####: 1569:  if (!target->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1570:    auto diag = this->emitOpError("requires isolated-from-above targets");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1571:    diag.attachNote(target->getLoc()) << "non-isolated target";
+call    0 never executed
+call    1 never executed
+    #####: 1572:    return DiagnosedSilenceableFailure::definiteFailure();
+call    0 never executed
+        -: 1573:  }
+        -: 1574:
+    #####: 1575:  MLIRContext *ctx = getContext();
+call    0 never executed
+    #####: 1576:  RewritePatternSet patterns(ctx);
+call    0 never executed
+    #####: 1577:  patterns.add<VectorizationPattern>(ctx);
+call    0 never executed
+        -: 1578:
+    #####: 1579:  if (!getDisableTransferPermutationMapLoweringPatterns())
+call    0 never executed
+    #####: 1580:    vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
+call    0 never executed
+call    1 never executed
+        -: 1581:
+    #####: 1582:  if (!getDisableMultiReductionToContractPatterns())
+call    0 never executed
+    #####: 1583:    vector::populateVectorReductionToContractPatterns(patterns);
+call    0 never executed
+call    1 never executed
+        -: 1584:
+    #####: 1585:  patterns.add<linalg::LinalgCopyVTRForwardingPattern,
+        -: 1586:               linalg::LinalgCopyVTWForwardingPattern>(ctx,
+    #####: 1587:                                                       /*benefit=*/2);
+call    0 never executed
+    #####: 1588:  vector::TransferReadOp::getCanonicalizationPatterns(patterns, ctx);
+call    0 never executed
+    #####: 1589:  vector::TransferWriteOp::getCanonicalizationPatterns(patterns, ctx);
+call    0 never executed
+        -: 1590:
+    #####: 1591:  patterns.add<CopyVectorizationPattern>(ctx);
+call    0 never executed
+        -: 1592:
+    #####: 1593:  if (getVectorizePadding())
+call    0 never executed
+    #####: 1594:    linalg::populatePadOpVectorizationPatterns(patterns);
+call    0 never executed
+call    1 never executed
+        -: 1595:
+    #####: 1596:  if (failed(applyPatternsAndFoldGreedily(target, std::move(patterns))))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1597:    return DiagnosedSilenceableFailure(reportUnknownTransformError(target));
+call    0 never executed
+        -: 1598:
+    #####: 1599:  results.push_back(target);
+call    0 never executed
+    #####: 1600:  return DiagnosedSilenceableFailure(success());
+        -: 1601:}
+        -: 1602:
+        -: 1603://===----------------------------------------------------------------------===//
+        -: 1604:// Transform op registration
+        -: 1605://===----------------------------------------------------------------------===//
+        -: 1606:
+        -: 1607:namespace {
+        -: 1608:/// Registers new ops and declares PDL as dependent dialect since the
+        -: 1609:/// additional ops are using PDL types for operands and results.
+   232311: 1610:class LinalgTransformDialectExtension
+call    0 returned 100%
+call    1 returned 100%
+        -: 1611:    : public transform::TransformDialectExtension<
+        -: 1612:          LinalgTransformDialectExtension> {
+        -: 1613:public:
+        -: 1614:  using Base::Base;
+        -: 1615:
+function _ZN12_GLOBAL__N_131LinalgTransformDialectExtension4initEv called 128628 returned 100% blocks executed 100%
+   128628: 1616:  void init() {
+   128628: 1617:    declareDependentDialect<pdl::PDLDialect>();
+call    0 returned 100%
+   128628: 1618:    declareDependentDialect<LinalgDialect>();
+call    0 returned 100%
+   128628: 1619:    declareGeneratedDialect<AffineDialect>();
+call    0 returned 100%
+   128628: 1620:    declareGeneratedDialect<arith::ArithDialect>();
+call    0 returned 100%
+   128628: 1621:    declareGeneratedDialect<scf::SCFDialect>();
+call    0 returned 100%
+   128628: 1622:    declareGeneratedDialect<vector::VectorDialect>();
+call    0 returned 100%
+   128628: 1623:    declareGeneratedDialect<gpu::GPUDialect>();
+call    0 returned 100%
+        -: 1624:
+   128628: 1625:    registerTransformOps<
+        -: 1626:#define GET_OP_LIST
+        -: 1627:#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.cpp.inc"
+   128628: 1628:        >();
+call    0 returned 100%
+   128628: 1629:  }
+        -: 1630:};
+        -: 1631:} // namespace
+        -: 1632:
+        -: 1633:#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOpsEnums.cpp.inc"
+        -: 1634:
+        -: 1635:#define GET_OP_CLASSES
+        -: 1636:#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.cpp.inc"
+        -: 1637:
+function _ZN4mlir6linalg33registerTransformDialectExtensionERNS_15DialectRegistryE called 128628 returned 100% blocks executed 100%
+   128628: 1638:void mlir::linalg::registerTransformDialectExtension(
+        -: 1639:    DialectRegistry &registry) {
+   128628: 1640:  registry.addExtensions<LinalgTransformDialectExtension>();
+call    0 returned 100%
+   128628: 1641:}

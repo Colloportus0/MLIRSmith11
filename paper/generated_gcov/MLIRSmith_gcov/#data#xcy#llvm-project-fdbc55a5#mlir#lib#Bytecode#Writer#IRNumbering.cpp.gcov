@@ -1,0 +1,875 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Bytecode/Writer/IRNumbering.cpp
+        -:    0:Graph:../tools/mlir/lib/Bytecode/Writer/CMakeFiles/obj.MLIRBytecodeWriter.dir/IRNumbering.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Bytecode/Writer/CMakeFiles/obj.MLIRBytecodeWriter.dir/IRNumbering.cpp.gcda
+        -:    0:Runs:116177
+        -:    1://===- IRNumbering.cpp - MLIR Bytecode IR numbering -----------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "IRNumbering.h"
+        -:   10:#include "mlir/Bytecode/BytecodeImplementation.h"
+        -:   11:#include "mlir/Bytecode/BytecodeWriter.h"
+        -:   12:#include "mlir/IR/AsmState.h"
+        -:   13:#include "mlir/IR/BuiltinTypes.h"
+        -:   14:#include "mlir/IR/OpDefinition.h"
+        -:   15:
+        -:   16:using namespace mlir;
+        -:   17:using namespace mlir::bytecode::detail;
+        -:   18:
+        -:   19://===----------------------------------------------------------------------===//
+        -:   20:// NumberingDialectWriter
+        -:   21://===----------------------------------------------------------------------===//
+        -:   22:
+   20557*:   23:struct IRNumberingState::NumberingDialectWriter : public DialectBytecodeWriter {
+   996983:   24:  NumberingDialectWriter(IRNumberingState &state) : state(state) {}
+        -:   25:
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter14writeAttributeENS_9AttributeE called 1086812 returned 100% blocks executed 100%
+  1086812:   26:  void writeAttribute(Attribute attr) override { state.number(attr); }
+call    0 returned 100%
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter9writeTypeENS_4TypeE called 96531 returned 100% blocks executed 100%
+    96531:   27:  void writeType(Type type) override { state.number(type); }
+call    0 returned 100%
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter19writeResourceHandleERKNS_24AsmDialectResourceHandleE called 0 returned 0% blocks executed 0%
+    #####:   28:  void writeResourceHandle(const AsmDialectResourceHandle &resource) override {
+    #####:   29:    state.number(resource.getDialect(), resource);
+call    0 never executed
+    #####:   30:  }
+        -:   31:
+        -:   32:  /// Stubbed out methods that are not used for numbering.
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter11writeVarIntEm called 2666893 returned 100% blocks executed 100%
+  2666893:   33:  void writeVarInt(uint64_t) override {}
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter17writeSignedVarIntEl called 102026 returned 100% blocks executed 100%
+   102026:   34:  void writeSignedVarInt(int64_t value) override {}
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter24writeAPIntWithKnownWidthERKN4llvm5APIntE called 24859 returned 100% blocks executed 100%
+    24859:   35:  void writeAPIntWithKnownWidth(const APInt &value) override {}
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter30writeAPFloatWithKnownSemanticsERKN4llvm7APFloatE called 4459 returned 100% blocks executed 100%
+     4459:   36:  void writeAPFloatWithKnownSemantics(const APFloat &value) override {}
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter16writeOwnedStringEN4llvm9StringRefE called 13429 returned 100% blocks executed 100%
+    13429:   37:  void writeOwnedString(StringRef) override {
+        -:   38:    // TODO: It might be nice to prenumber strings and sort by the number of
+        -:   39:    // references. This could potentially be useful for optimizing things like
+        -:   40:    // file locations.
+    13429:   41:  }
+function _ZN4mlir8bytecode6detail16IRNumberingState22NumberingDialectWriter14writeOwnedBlobEN4llvm8ArrayRefIcEE called 7296 returned 100% blocks executed 100%
+     7296:   42:  void writeOwnedBlob(ArrayRef<char> blob) override {}
+        -:   43:
+        -:   44:  /// The parent numbering state that is populated by this writer.
+        -:   45:  IRNumberingState &state;
+        -:   46:};
+        -:   47:
+        -:   48://===----------------------------------------------------------------------===//
+        -:   49:// IR Numbering
+        -:   50://===----------------------------------------------------------------------===//
+        -:   51:
+        -:   52:/// Group and sort the elements of the given range by their parent dialect. This
+        -:   53:/// grouping is applied to sub-sections of the ranged defined by how many bytes
+        -:   54:/// it takes to encode a varint index to that sub-section.
+        -:   55:template <typename T>
+     1155:   56:static void groupByDialectPerByte(T range) {
+     1155:   57:  if (range.empty())
+       7*:   58:    return;
+        -:   59:
+        -:   60:  // A functor used to sort by a given dialect, with a desired dialect to be
+        -:   61:  // ordered first (to better enable sharing of dialects across byte groups).
+    #####:   62:  auto sortByDialect = [](unsigned dialectToOrderFirst, const auto &lhs,
+        -:   63:                          const auto &rhs) {
+    #####:   64:    if (lhs->dialect->number == dialectToOrderFirst)
+    #####:   65:      return rhs->dialect->number != dialectToOrderFirst;
+    #####:   66:    return lhs->dialect->number < rhs->dialect->number;
+        -:   67:  };
+        -:   68:
+     1148:   69:  unsigned dialectToOrderFirst = 0;
+     1148:   70:  size_t elementsInByteGroup = 0;
+     1148:   71:  auto iterRange = range;
+     2144:   72:  for (unsigned i = 1; i < 9; ++i) {
+        -:   73:    // Update the number of elements in the current byte grouping. Reminder
+        -:   74:    // that varint encodes 7-bits per byte, so that's how we compute the
+        -:   75:    // number of elements in each byte grouping.
+     2144:   76:    elementsInByteGroup = (1ULL << (7ULL * i)) - elementsInByteGroup;
+        -:   77:
+        -:   78:    // Slice out the sub-set of elements that are in the current byte grouping
+        -:   79:    // to be sorted.
+     2144:   80:    auto byteSubRange = iterRange.take_front(elementsInByteGroup);
+     2144:   81:    iterRange = iterRange.drop_front(byteSubRange.size());
+        -:   82:
+        -:   83:    // Sort the sub range for this byte.
+    2144*:   84:    llvm::stable_sort(byteSubRange, [&](const auto &lhs, const auto &rhs) {
+    #####:   85:      return sortByDialect(dialectToOrderFirst, lhs, rhs);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+        -:   86:    });
+        -:   87:
+        -:   88:    // Update the dialect to order first to be the dialect at the end of the
+        -:   89:    // current grouping. This seeks to allow larger dialect groupings across
+        -:   90:    // byte boundaries.
+     2144:   91:    dialectToOrderFirst = byteSubRange.back()->dialect->number;
+        -:   92:
+        -:   93:    // If the data range is now empty, we are done.
+     2144:   94:    if (iterRange.empty())
+        -:   95:      break;
+        -:   96:  }
+        -:   97:
+        -:   98:  // Assign the entry numbers based on the sort order.
+  1051339:   99:  for (auto &entry : llvm::enumerate(range))
+  1050191:  100:    entry.value()->number = entry.index();
+        -:  101:}
+------------------
+_Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail13TypeNumberingEEEEvT_:
+function _Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail13TypeNumberingEEEEvT_ called 385 returned 100% blocks executed 100%
+      385:   56:static void groupByDialectPerByte(T range) {
+      385:   57:  if (range.empty())
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+        7:   58:    return;
+        -:   59:
+        -:   60:  // A functor used to sort by a given dialect, with a desired dialect to be
+        -:   61:  // ordered first (to better enable sharing of dialects across byte groups).
+        -:   62:  auto sortByDialect = [](unsigned dialectToOrderFirst, const auto &lhs,
+        -:   63:                          const auto &rhs) {
+        -:   64:    if (lhs->dialect->number == dialectToOrderFirst)
+        -:   65:      return rhs->dialect->number != dialectToOrderFirst;
+        -:   66:    return lhs->dialect->number < rhs->dialect->number;
+        -:   67:  };
+        -:   68:
+      378:   69:  unsigned dialectToOrderFirst = 0;
+      378:   70:  size_t elementsInByteGroup = 0;
+      378:   71:  auto iterRange = range;
+      680:   72:  for (unsigned i = 1; i < 9; ++i) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:   73:    // Update the number of elements in the current byte grouping. Reminder
+        -:   74:    // that varint encodes 7-bits per byte, so that's how we compute the
+        -:   75:    // number of elements in each byte grouping.
+      680:   76:    elementsInByteGroup = (1ULL << (7ULL * i)) - elementsInByteGroup;
+branch  0 taken 56% (fallthrough)
+branch  1 taken 44%
+        -:   77:
+        -:   78:    // Slice out the sub-set of elements that are in the current byte grouping
+        -:   79:    // to be sorted.
+      680:   80:    auto byteSubRange = iterRange.take_front(elementsInByteGroup);
+      680:   81:    iterRange = iterRange.drop_front(byteSubRange.size());
+call    0 returned 100%
+        -:   82:
+        -:   83:    // Sort the sub range for this byte.
+      680:   84:    llvm::stable_sort(byteSubRange, [&](const auto &lhs, const auto &rhs) {
+call    0 returned 100%
+        -:   85:      return sortByDialect(dialectToOrderFirst, lhs, rhs);
+        -:   86:    });
+        -:   87:
+        -:   88:    // Update the dialect to order first to be the dialect at the end of the
+        -:   89:    // current grouping. This seeks to allow larger dialect groupings across
+        -:   90:    // byte boundaries.
+      680:   91:    dialectToOrderFirst = byteSubRange.back()->dialect->number;
+call    0 returned 100%
+        -:   92:
+        -:   93:    // If the data range is now empty, we are done.
+      680:   94:    if (iterRange.empty())
+branch  0 taken 44% (fallthrough)
+branch  1 taken 56%
+        -:   95:      break;
+        -:   96:  }
+        -:   97:
+        -:   98:  // Assign the entry numbers based on the sort order.
+    62257:   99:  for (auto &entry : llvm::enumerate(range))
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    61879:  100:    entry.value()->number = entry.index();
+call    0 returned 100%
+        -:  101:}
+------------------
+_Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail15OpNameNumberingEEEEvT_:
+function _Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail15OpNameNumberingEEEEvT_ called 385 returned 100% blocks executed 94%
+      385:   56:static void groupByDialectPerByte(T range) {
+      385:   57:  if (range.empty())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:   58:    return;
+        -:   59:
+        -:   60:  // A functor used to sort by a given dialect, with a desired dialect to be
+        -:   61:  // ordered first (to better enable sharing of dialects across byte groups).
+        -:   62:  auto sortByDialect = [](unsigned dialectToOrderFirst, const auto &lhs,
+        -:   63:                          const auto &rhs) {
+        -:   64:    if (lhs->dialect->number == dialectToOrderFirst)
+        -:   65:      return rhs->dialect->number != dialectToOrderFirst;
+        -:   66:    return lhs->dialect->number < rhs->dialect->number;
+        -:   67:  };
+        -:   68:
+      385:   69:  unsigned dialectToOrderFirst = 0;
+      385:   70:  size_t elementsInByteGroup = 0;
+      385:   71:  auto iterRange = range;
+      701:   72:  for (unsigned i = 1; i < 9; ++i) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:   73:    // Update the number of elements in the current byte grouping. Reminder
+        -:   74:    // that varint encodes 7-bits per byte, so that's how we compute the
+        -:   75:    // number of elements in each byte grouping.
+      701:   76:    elementsInByteGroup = (1ULL << (7ULL * i)) - elementsInByteGroup;
+branch  0 taken 55% (fallthrough)
+branch  1 taken 45%
+        -:   77:
+        -:   78:    // Slice out the sub-set of elements that are in the current byte grouping
+        -:   79:    // to be sorted.
+      701:   80:    auto byteSubRange = iterRange.take_front(elementsInByteGroup);
+      701:   81:    iterRange = iterRange.drop_front(byteSubRange.size());
+call    0 returned 100%
+        -:   82:
+        -:   83:    // Sort the sub range for this byte.
+      701:   84:    llvm::stable_sort(byteSubRange, [&](const auto &lhs, const auto &rhs) {
+call    0 returned 100%
+        -:   85:      return sortByDialect(dialectToOrderFirst, lhs, rhs);
+        -:   86:    });
+        -:   87:
+        -:   88:    // Update the dialect to order first to be the dialect at the end of the
+        -:   89:    // current grouping. This seeks to allow larger dialect groupings across
+        -:   90:    // byte boundaries.
+      701:   91:    dialectToOrderFirst = byteSubRange.back()->dialect->number;
+call    0 returned 100%
+        -:   92:
+        -:   93:    // If the data range is now empty, we are done.
+      701:   94:    if (iterRange.empty())
+branch  0 taken 45% (fallthrough)
+branch  1 taken 55%
+        -:   95:      break;
+        -:   96:  }
+        -:   97:
+        -:   98:  // Assign the entry numbers based on the sort order.
+    49208:   99:  for (auto &entry : llvm::enumerate(range))
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    48823:  100:    entry.value()->number = entry.index();
+call    0 returned 100%
+        -:  101:}
+------------------
+_Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail18AttributeNumberingEEEEvT_:
+function _Z21groupByDialectPerByteIN4llvm15MutableArrayRefIPN4mlir8bytecode6detail18AttributeNumberingEEEEvT_ called 385 returned 100% blocks executed 94%
+      385:   56:static void groupByDialectPerByte(T range) {
+      385:   57:  if (range.empty())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:   58:    return;
+        -:   59:
+        -:   60:  // A functor used to sort by a given dialect, with a desired dialect to be
+        -:   61:  // ordered first (to better enable sharing of dialects across byte groups).
+        -:   62:  auto sortByDialect = [](unsigned dialectToOrderFirst, const auto &lhs,
+        -:   63:                          const auto &rhs) {
+        -:   64:    if (lhs->dialect->number == dialectToOrderFirst)
+        -:   65:      return rhs->dialect->number != dialectToOrderFirst;
+        -:   66:    return lhs->dialect->number < rhs->dialect->number;
+        -:   67:  };
+        -:   68:
+      385:   69:  unsigned dialectToOrderFirst = 0;
+      385:   70:  size_t elementsInByteGroup = 0;
+      385:   71:  auto iterRange = range;
+      763:   72:  for (unsigned i = 1; i < 9; ++i) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:   73:    // Update the number of elements in the current byte grouping. Reminder
+        -:   74:    // that varint encodes 7-bits per byte, so that's how we compute the
+        -:   75:    // number of elements in each byte grouping.
+      763:   76:    elementsInByteGroup = (1ULL << (7ULL * i)) - elementsInByteGroup;
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+        -:   77:
+        -:   78:    // Slice out the sub-set of elements that are in the current byte grouping
+        -:   79:    // to be sorted.
+      763:   80:    auto byteSubRange = iterRange.take_front(elementsInByteGroup);
+      763:   81:    iterRange = iterRange.drop_front(byteSubRange.size());
+call    0 returned 100%
+        -:   82:
+        -:   83:    // Sort the sub range for this byte.
+      763:   84:    llvm::stable_sort(byteSubRange, [&](const auto &lhs, const auto &rhs) {
+call    0 returned 100%
+        -:   85:      return sortByDialect(dialectToOrderFirst, lhs, rhs);
+        -:   86:    });
+        -:   87:
+        -:   88:    // Update the dialect to order first to be the dialect at the end of the
+        -:   89:    // current grouping. This seeks to allow larger dialect groupings across
+        -:   90:    // byte boundaries.
+      763:   91:    dialectToOrderFirst = byteSubRange.back()->dialect->number;
+call    0 returned 100%
+        -:   92:
+        -:   93:    // If the data range is now empty, we are done.
+      763:   94:    if (iterRange.empty())
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+        -:   95:      break;
+        -:   96:  }
+        -:   97:
+        -:   98:  // Assign the entry numbers based on the sort order.
+   939874:   99:  for (auto &entry : llvm::enumerate(range))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+   939489:  100:    entry.value()->number = entry.index();
+call    0 returned 100%
+        -:  101:}
+------------------
+        -:  102:
+function _ZN4mlir8bytecode6detail16IRNumberingStateC2EPNS_9OperationE called 385 returned 100% blocks executed 100%
+      385:  103:IRNumberingState::IRNumberingState(Operation *op) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+        -:  104:  // Number the root operation.
+      385:  105:  number(*op);
+call    0 returned 100%
+        -:  106:
+        -:  107:  // Push all of the regions of the root operation onto the worklist.
+      385:  108:  SmallVector<std::pair<Region *, unsigned>, 8> numberContext;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     1155:  109:  for (Region &region : op->getRegions())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+      385:  110:    numberContext.emplace_back(&region, nextValueID);
+call    0 returned 100%
+        -:  111:
+        -:  112:  // Iteratively process each of the nested regions.
+    43730:  113:  while (!numberContext.empty()) {
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    43345:  114:    Region *region;
+    43345:  115:    std::tie(region, nextValueID) = numberContext.pop_back_val();
+call    0 returned 100%
+call    1 returned 100%
+    43345:  116:    number(*region);
+call    0 returned 100%
+        -:  117:
+        -:  118:    // Traverse into nested regions.
+   819571:  119:    for (Operation &op : region->getOps()) {
+call    0 returned 100%
+branch  1 taken 95% (fallthrough)
+branch  2 taken 5%
+call    3 returned 100%
+        -:  120:      // Isolated regions don't share value numbers with their parent, so we can
+        -:  121:      // start numbering these regions at zero.
+   776226:  122:      unsigned opFirstValueID =
+call    0 returned 100%
+   776226:  123:          op.hasTrait<OpTrait::IsIsolatedFromAbove>() ? 0 : nextValueID;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+   864188:  124:      for (Region &region : op.getRegions())
+branch  0 taken 6% (fallthrough)
+branch  1 taken 94%
+branch  2 taken 5% (fallthrough)
+branch  3 taken 95%
+    42960:  125:        numberContext.emplace_back(&region, opFirstValueID);
+call    0 returned 100%
+        -:  126:    }
+        -:  127:  }
+        -:  128:
+        -:  129:  // Number each of the dialects. For now this is just in the order they were
+        -:  130:  // found, given that the number of dialects on average is small enough to fit
+        -:  131:  // within a singly byte (128). If we ever have real world use cases that have
+        -:  132:  // a huge number of dialects, this could be made more intelligent.
+     4887:  133:  for (auto &it : llvm::enumerate(dialects))
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+     4502:  134:    it.value().second->number = it.index();
+call    0 returned 100%
+        -:  135:
+        -:  136:  // Number each of the recorded components within each dialect.
+        -:  137:
+        -:  138:  // First sort by ref count so that the most referenced elements are first. We
+        -:  139:  // try to bias more heavily used elements to the front. This allows for more
+        -:  140:  // frequently referenced things to be encoded using smaller varints.
+     385*:  141:  auto sortByRefCountFn = [](const auto &lhs, const auto &rhs) {
+    #####:  142:    return lhs->refCount > rhs->refCount;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  143:  };
+      385:  144:  llvm::stable_sort(orderedAttrs, sortByRefCountFn);
+call    0 returned 100%
+      385:  145:  llvm::stable_sort(orderedOpNames, sortByRefCountFn);
+call    0 returned 100%
+      385:  146:  llvm::stable_sort(orderedTypes, sortByRefCountFn);
+call    0 returned 100%
+        -:  147:
+        -:  148:  // After that, we apply a secondary ordering based on the parent dialect. This
+        -:  149:  // ordering is applied to sub-sections of the element list defined by how many
+        -:  150:  // bytes it takes to encode a varint index to that sub-section. This allows
+        -:  151:  // for more efficiently encoding components of the same dialect (e.g. we only
+        -:  152:  // have to encode the dialect reference once).
+      385:  153:  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedAttrs));
+call    0 returned 100%
+      385:  154:  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedOpNames));
+call    0 returned 100%
+      385:  155:  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedTypes));
+call    0 returned 100%
+        -:  156:
+        -:  157:  // Finalize the numbering of the dialect resources.
+      385:  158:  finalizeDialectResourceNumberings(op);
+call    0 returned 100%
+branch  1 taken 98% (fallthrough)
+branch  2 taken 2%
+      385:  159:}
+        -:  160:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberENS_9AttributeE called 2143316 returned 100% blocks executed 81%
+  2143316:  161:void IRNumberingState::number(Attribute attr) {
+  2143316:  162:  auto it = attrs.insert({attr, nullptr});
+call    0 returned 100%
+  2143316:  163:  if (!it.second) {
+branch  0 taken 56% (fallthrough)
+branch  1 taken 44%
+  1203827:  164:    ++it.first->second->refCount;
+call    0 returned 100%
+  2118459:  165:    return;
+        -:  166:  }
+   939489:  167:  auto *numbering = new (attrAllocator.Allocate()) AttributeNumbering(attr);
+call    0 returned 100%
+call    1 returned 100%
+   939489:  168:  it.first->second = numbering;
+call    0 returned 100%
+   939489:  169:  orderedAttrs.push_back(numbering);
+call    0 returned 100%
+        -:  170:
+        -:  171:  // Check for OpaqueAttr, which is a dialect-specific attribute that didn't
+        -:  172:  // have a registered dialect when it got created. We don't want to encode this
+        -:  173:  // as the builtin OpaqueAttr, we want to encode it as if the dialect was
+        -:  174:  // actually loaded.
+   939489:  175:  if (OpaqueAttr opaqueAttr = attr.dyn_cast<OpaqueAttr>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  176:    numbering->dialect = &numberDialect(opaqueAttr.getDialectNamespace());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  177:    return;
+        -:  178:  }
+   939489:  179:  numbering->dialect = &numberDialect(&attr.getDialect());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+        -:  180:
+        -:  181:  // If this attribute will be emitted using the bytecode format, perform a
+        -:  182:  // dummy writing to number any nested components.
+   939489:  183:  if (const auto *interface = numbering->dialect->interface) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+        -:  184:    // TODO: We don't allow custom encodings for mutable attributes right now.
+   935189:  185:    if (!attr.hasTrait<AttributeTrait::IsMutable>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+   955746:  186:      NumberingDialectWriter writer(*this);
+call    0 returned 100%
+   935189:  187:      if (succeeded(interface->writeAttribute(attr, writer)))
+call    0 returned 100%
+branch  1 taken 98% (fallthrough)
+branch  2 taken 2%
+   914632:  188:        return;
+        -:  189:    }
+        -:  190:  }
+        -:  191:  // If this attribute will be emitted using the fallback, number the nested
+        -:  192:  // dialect resources. We don't number everything (e.g. no nested
+        -:  193:  // attributes/types), because we don't want to encode things we won't decode
+        -:  194:  // (the textual format can't really share much).
+    49714:  195:  AsmState tempState(attr.getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+    49714:  196:  llvm::raw_null_ostream dummyOS;
+call    0 returned 100%
+call    1 returned 100%
+    24857:  197:  attr.print(dummyOS, tempState);
+call    0 returned 100%
+        -:  198:
+        -:  199:  // Number the used dialect resources.
+   49714*:  200:  for (const auto &it : tempState.getDialectResources())
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+call    6 never executed
+call    7 never executed
+    #####:  201:    number(it.getFirst(), it.getSecond().getArrayRef());
+call    0 never executed
+        -:  202:}
+        -:  203:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberERNS_5BlockE called 42678 returned 100% blocks executed 100%
+    42678:  204:void IRNumberingState::number(Block &block) {
+        -:  205:  // Number the arguments of the block.
+    86033:  206:  for (BlockArgument arg : block.getArguments()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    43355:  207:    valueIDs.try_emplace(arg, nextValueID++);
+call    0 returned 100%
+    43355:  208:    number(arg.getLoc());
+call    0 returned 100%
+    43355:  209:    number(arg.getType());
+call    0 returned 100%
+        -:  210:  }
+        -:  211:
+        -:  212:  // Number the operations in this block.
+    42678:  213:  unsigned &numOps = blockOperationCounts[&block];
+call    0 returned 100%
+   818904:  214:  for (Operation &op : block) {
+branch  0 taken 95% (fallthrough)
+branch  1 taken 5%
+call    2 returned 100%
+   776226:  215:    number(op);
+call    0 returned 100%
+   776226:  216:    ++numOps;
+        -:  217:  }
+    42678:  218:}
+        -:  219:
+function _ZN4mlir8bytecode6detail16IRNumberingState13numberDialectEPNS_7DialectE called 1050191 returned 100% blocks executed 100%
+  1050191:  220:auto IRNumberingState::numberDialect(Dialect *dialect) -> DialectNumbering & {
+  1050191:  221:  DialectNumbering *&numbering = registeredDialects[dialect];
+call    0 returned 100%
+  1050191:  222:  if (!numbering) {
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+     4502:  223:    numbering = &numberDialect(dialect->getNamespace());
+call    0 returned 100%
+     4502:  224:    numbering->interface = dyn_cast<BytecodeDialectInterface>(dialect);
+call    0 returned 100%
+     4502:  225:    numbering->asmInterface = dyn_cast<OpAsmDialectInterface>(dialect);
+call    0 returned 100%
+        -:  226:  }
+  1050191:  227:  return *numbering;
+        -:  228:}
+        -:  229:
+function _ZN4mlir8bytecode6detail16IRNumberingState13numberDialectEN4llvm9StringRefE called 4502 returned 100% blocks executed 100%
+     4502:  230:auto IRNumberingState::numberDialect(StringRef dialect) -> DialectNumbering & {
+     4502:  231:  DialectNumbering *&numbering = dialects[dialect];
+call    0 returned 100%
+     4502:  232:  if (!numbering) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     4502:  233:    numbering = new (dialectAllocator.Allocate())
+     4502:  234:        DialectNumbering(dialect, dialects.size() - 1);
+call    0 returned 100%
+call    1 returned 100%
+        -:  235:  }
+     4502:  236:  return *numbering;
+        -:  237:}
+        -:  238:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberERNS_6RegionE called 43345 returned 100% blocks executed 100%
+    43345:  239:void IRNumberingState::number(Region &region) {
+    43345:  240:  if (region.empty())
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+      667:  241:    return;
+    42678:  242:  size_t firstValueID = nextValueID;
+        -:  243:
+        -:  244:  // Number the blocks within this region.
+    42678:  245:  size_t blockCount = 0;
+    85356:  246:  for (auto &it : llvm::enumerate(region)) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+    42678:  247:    blockIDs.try_emplace(&it.value(), it.index());
+call    0 returned 100%
+call    1 returned 100%
+    42678:  248:    number(it.value());
+call    0 returned 100%
+call    1 returned 100%
+    42678:  249:    ++blockCount;
+call    0 returned 100%
+        -:  250:  }
+        -:  251:
+        -:  252:  // Remember the number of blocks and values in this region.
+    85356:  253:  regionBlockValueCounts.try_emplace(&region, blockCount,
+    42678:  254:                                     nextValueID - firstValueID);
+call    0 returned 100%
+        -:  255:}
+        -:  256:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberERNS_9OperationE called 776611 returned 100% blocks executed 100%
+   776611:  257:void IRNumberingState::number(Operation &op) {
+        -:  258:  // Number the components of an operation that won't be numbered elsewhere
+        -:  259:  // (e.g. we don't number operands, regions, or successors here).
+   776611:  260:  number(op.getName());
+call    0 returned 100%
+  2097531:  261:  for (OpResult result : op.getResults()) {
+branch  0 taken 85% (fallthrough)
+branch  1 taken 15%
+branch  2 taken 54% (fallthrough)
+branch  3 taken 46%
+call    4 returned 100%
+   663030:  262:    valueIDs.try_emplace(result, nextValueID++);
+call    0 returned 100%
+   663030:  263:    number(result.getType());
+call    0 returned 100%
+        -:  264:  }
+        -:  265:
+        -:  266:  // Only number the operation's dictionary if it isn't empty.
+   776611:  267:  DictionaryAttr dictAttr = op.getAttrDictionary();
+call    0 returned 100%
+   776611:  268:  if (!dictAttr.empty())
+call    0 returned 100%
+branch  1 taken 30%
+branch  2 taken 70%
+   236538:  269:    number(dictAttr);
+call    0 returned 100%
+        -:  270:
+   776611:  271:  number(op.getLoc());
+call    0 returned 100%
+   776611:  272:}
+        -:  273:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberENS_13OperationNameE called 776611 returned 100% blocks executed 75%
+   776611:  274:void IRNumberingState::number(OperationName opName) {
+   776611:  275:  OpNameNumbering *&numbering = opNames[opName];
+call    0 returned 100%
+   776611:  276:  if (numbering) {
+branch  0 taken 94% (fallthrough)
+branch  1 taken 6%
+   727788:  277:    ++numbering->refCount;
+   727788:  278:    return;
+        -:  279:  }
+    48823:  280:  DialectNumbering *dialectNumber = nullptr;
+    48823:  281:  if (Dialect *dialect = opName.getDialect())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+    48823:  282:    dialectNumber = &numberDialect(dialect);
+call    0 returned 100%
+        -:  283:  else
+    #####:  284:    dialectNumber = &numberDialect(opName.getDialectNamespace());
+call    0 never executed
+call    1 never executed
+        -:  285:
+    97646:  286:  numbering =
+    48823:  287:      new (opNameAllocator.Allocate()) OpNameNumbering(dialectNumber, opName);
+call    0 returned 100%
+call    1 returned 100%
+    48823:  288:  orderedOpNames.push_back(numbering);
+call    0 returned 100%
+        -:  289:}
+        -:  290:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberENS_4TypeE called 802916 returned 100% blocks executed 79%
+   802916:  291:void IRNumberingState::number(Type type) {
+   802916:  292:  auto it = types.insert({type, nullptr});
+call    0 returned 100%
+   802916:  293:  if (!it.second) {
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+   741037:  294:    ++it.first->second->refCount;
+call    0 returned 100%
+   802831:  295:    return;
+        -:  296:  }
+    61879:  297:  auto *numbering = new (typeAllocator.Allocate()) TypeNumbering(type);
+call    0 returned 100%
+call    1 returned 100%
+    61879:  298:  it.first->second = numbering;
+call    0 returned 100%
+    61879:  299:  orderedTypes.push_back(numbering);
+call    0 returned 100%
+        -:  300:
+        -:  301:  // Check for OpaqueType, which is a dialect-specific type that didn't have a
+        -:  302:  // registered dialect when it got created. We don't want to encode this as the
+        -:  303:  // builtin OpaqueType, we want to encode it as if the dialect was actually
+        -:  304:  // loaded.
+    61879:  305:  if (OpaqueType opaqueType = type.dyn_cast<OpaqueType>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  306:    numbering->dialect = &numberDialect(opaqueType.getDialectNamespace());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  307:    return;
+        -:  308:  }
+    61879:  309:  numbering->dialect = &numberDialect(&type.getDialect());
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+        -:  310:
+        -:  311:  // If this type will be emitted using the bytecode format, perform a dummy
+        -:  312:  // writing to number any nested components.
+    61879:  313:  if (const auto *interface = numbering->dialect->interface) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+        -:  314:    // TODO: We don't allow custom encodings for mutable types right now.
+    61794:  315:    if (!type.hasTrait<TypeTrait::IsMutable>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+   61794*:  316:      NumberingDialectWriter writer(*this);
+call    0 returned 100%
+    61794:  317:      if (succeeded(interface->writeType(type, writer)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+    61794:  318:        return;
+        -:  319:    }
+        -:  320:  }
+        -:  321:  // If this type will be emitted using the fallback, number the nested dialect
+        -:  322:  // resources. We don't number everything (e.g. no nested attributes/types),
+        -:  323:  // because we don't want to encode things we won't decode (the textual format
+        -:  324:  // can't really share much).
+      170:  325:  AsmState tempState(type.getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+      170:  326:  llvm::raw_null_ostream dummyOS;
+call    0 returned 100%
+call    1 returned 100%
+       85:  327:  type.print(dummyOS, tempState);
+call    0 returned 100%
+        -:  328:
+        -:  329:  // Number the used dialect resources.
+     170*:  330:  for (const auto &it : tempState.getDialectResources())
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+call    6 never executed
+call    7 never executed
+    #####:  331:    number(it.getFirst(), it.getSecond().getArrayRef());
+call    0 never executed
+        -:  332:}
+        -:  333:
+function _ZN4mlir8bytecode6detail16IRNumberingState6numberEPNS_7DialectEN4llvm8ArrayRefINS_24AsmDialectResourceHandleEEE called 0 returned 0% blocks executed 0%
+    #####:  334:void IRNumberingState::number(Dialect *dialect,
+        -:  335:                              ArrayRef<AsmDialectResourceHandle> resources) {
+    #####:  336:  DialectNumbering &dialectNumber = numberDialect(dialect);
+call    0 never executed
+    #####:  337:  assert(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  338:      dialectNumber.asmInterface &&
+        -:  339:      "expected dialect owning a resource to implement OpAsmDialectInterface");
+        -:  340:
+    #####:  341:  for (const auto &resource : resources) {
+branch  0 never executed
+branch  1 never executed
+        -:  342:    // Check if this is a newly seen resource.
+    #####:  343:    if (!dialectNumber.resources.insert(resource))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  344:      return;
+        -:  345:
+    #####:  346:    auto *numbering =
+    #####:  347:        new (resourceAllocator.Allocate()) DialectResourceNumbering(
+call    0 never executed
+    #####:  348:            dialectNumber.asmInterface->getResourceKey(resource));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  349:    dialectNumber.resourceMap.insert({numbering->key, numbering});
+call    0 never executed
+    #####:  350:    dialectResources.try_emplace(resource, numbering);
+call    0 never executed
+        -:  351:  }
+        -:  352:}
+        -:  353:
+        -:  354:namespace {
+        -:  355:/// A dummy resource builder used to number dialect resources.
+        -:  356:struct NumberingResourceBuilder : public AsmResourceBuilder {
+      394:  357:  NumberingResourceBuilder(DialectNumbering *dialect, unsigned &nextResourceID)
+      394:  358:      : dialect(dialect), nextResourceID(nextResourceID) {}
+     394*:  359:  ~NumberingResourceBuilder() override = default;
+call    0 returned 100%
+------------------
+_ZN12_GLOBAL__N_124NumberingResourceBuilderD0Ev:
+function _ZN12_GLOBAL__N_124NumberingResourceBuilderD0Ev called 0 returned 0% blocks executed 0%
+    #####:  359:  ~NumberingResourceBuilder() override = default;
+call    0 never executed
+call    1 never executed
+------------------
+_ZN12_GLOBAL__N_124NumberingResourceBuilderD2Ev:
+function _ZN12_GLOBAL__N_124NumberingResourceBuilderD2Ev called 0 returned 0% blocks executed 0%
+    #####:  359:  ~NumberingResourceBuilder() override = default;
+call    0 never executed
+------------------
+        -:  360:
+function _ZN12_GLOBAL__N_124NumberingResourceBuilder9buildBlobEN4llvm9StringRefENS1_8ArrayRefIcEEj called 0 returned 0% blocks executed 0%
+    #####:  361:  void buildBlob(StringRef key, ArrayRef<char>, uint32_t) final {
+    #####:  362:    numberEntry(key);
+call    0 never executed
+    #####:  363:  }
+function _ZN12_GLOBAL__N_124NumberingResourceBuilder9buildBoolEN4llvm9StringRefEb called 0 returned 0% blocks executed 0%
+    #####:  364:  void buildBool(StringRef key, bool) final { numberEntry(key); }
+call    0 never executed
+function _ZN12_GLOBAL__N_124NumberingResourceBuilder11buildStringEN4llvm9StringRefES2_ called 0 returned 0% blocks executed 0%
+    #####:  365:  void buildString(StringRef key, StringRef) final {
+        -:  366:    // TODO: We could pre-number the value string here as well.
+    #####:  367:    numberEntry(key);
+call    0 never executed
+    #####:  368:  }
+        -:  369:
+        -:  370:  /// Number the dialect entry for the given key.
+        -:  371:  void numberEntry(StringRef key) {
+        -:  372:    // TODO: We could pre-number resource key strings here as well.
+        -:  373:
+        -:  374:    auto it = dialect->resourceMap.find(key);
+        -:  375:    if (it != dialect->resourceMap.end()) {
+        -:  376:      it->second->number = nextResourceID++;
+        -:  377:      it->second->isDeclaration = false;
+        -:  378:    }
+        -:  379:  }
+        -:  380:
+        -:  381:  DialectNumbering *dialect;
+        -:  382:  unsigned &nextResourceID;
+        -:  383:};
+        -:  384:} // namespace
+        -:  385:
+function _ZN4mlir8bytecode6detail16IRNumberingState33finalizeDialectResourceNumberingsEPNS_9OperationE called 385 returned 100% blocks executed 80%
+      385:  386:void IRNumberingState::finalizeDialectResourceNumberings(Operation *rootOp) {
+      385:  387:  unsigned nextResourceID = 0;
+     4887:  388:  for (DialectNumbering &dialect : getDialects()) {
+call    0 returned 100%
+branch  1 taken 92% (fallthrough)
+branch  2 taken 8%
+     4502:  389:    if (!dialect.asmInterface)
+branch  0 taken 91% (fallthrough)
+branch  1 taken 9%
+     4108:  390:      continue;
+      788:  391:    NumberingResourceBuilder entryBuilder(&dialect, nextResourceID);
+call    0 returned 100%
+      394:  392:    dialect.asmInterface->buildResources(rootOp, dialect.resources,
+      394:  393:                                         entryBuilder);
+call    0 returned 100%
+        -:  394:
+        -:  395:    // Number any resources that weren't added by the dialect. This can happen
+        -:  396:    // if there was no backing data to the resource, but we still want these
+        -:  397:    // resource references to roundtrip, so we number them and indicate that the
+        -:  398:    // data is missing.
+     394*:  399:    for (const auto &it : dialect.resourceMap)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+    #####:  400:      if (it.second->isDeclaration)
+branch  0 never executed
+branch  1 never executed
+    #####:  401:        it.second->number = nextResourceID++;
+        -:  402:  }
+      385:  403:}

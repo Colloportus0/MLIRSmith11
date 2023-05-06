@@ -1,0 +1,2928 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Affine/Transforms/SuperVectorize.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/SuperVectorize.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/SuperVectorize.cpp.gcda
+        -:    0:Runs:325545
+        -:    1://===- SuperVectorize.cpp - Vectorize Pass Impl ---------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements vectorization of loops, operations and data types to
+        -:   10:// a target-independent, n-D super-vector abstraction.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Dialect/Affine/Passes.h"
+        -:   15:
+        -:   16:#include "mlir/Analysis/SliceAnalysis.h"
+        -:   17:#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+        -:   18:#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+        -:   19:#include "mlir/Dialect/Affine/Analysis/NestedMatcher.h"
+        -:   20:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   21:#include "mlir/Dialect/Affine/Utils.h"
+        -:   22:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   23:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   24:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   25:#include "mlir/Dialect/Vector/Utils/VectorUtils.h"
+        -:   26:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   27:#include "mlir/Pass/Pass.h"
+        -:   28:#include "mlir/Support/LLVM.h"
+        -:   29:#include "llvm/ADT/STLExtras.h"
+        -:   30:#include "llvm/Support/Debug.h"
+        -:   31:
+        -:   32:namespace mlir {
+        -:   33:#define GEN_PASS_DEF_AFFINEVECTORIZE
+        -:   34:#include "mlir/Dialect/Affine/Passes.h.inc"
+        -:   35:} // namespace mlir
+        -:   36:
+        -:   37:using namespace mlir;
+        -:   38:using namespace vector;
+        -:   39:
+        -:   40:///
+        -:   41:/// Implements a high-level vectorization strategy on a Function.
+        -:   42:/// The abstraction used is that of super-vectors, which provide a single,
+        -:   43:/// compact, representation in the vector types, information that is expected
+        -:   44:/// to reduce the impact of the phase ordering problem
+        -:   45:///
+        -:   46:/// Vector granularity:
+        -:   47:/// ===================
+        -:   48:/// This pass is designed to perform vectorization at a super-vector
+        -:   49:/// granularity. A super-vector is loosely defined as a vector type that is a
+        -:   50:/// multiple of a "good" vector size so the HW can efficiently implement a set
+        -:   51:/// of high-level primitives. Multiple is understood along any dimension; e.g.
+        -:   52:/// both vector<16xf32> and vector<2x8xf32> are valid super-vectors for a
+        -:   53:/// vector<8xf32> HW vector. Note that a "good vector size so the HW can
+        -:   54:/// efficiently implement a set of high-level primitives" is not necessarily an
+        -:   55:/// integer multiple of actual hardware registers. We leave details of this
+        -:   56:/// distinction unspecified for now.
+        -:   57:///
+        -:   58:/// Some may prefer the terminology a "tile of HW vectors". In this case, one
+        -:   59:/// should note that super-vectors implement an "always full tile" abstraction.
+        -:   60:/// They guarantee no partial-tile separation is necessary by relying on a
+        -:   61:/// high-level copy-reshape abstraction that we call vector.transfer. This
+        -:   62:/// copy-reshape operations is also responsible for performing layout
+        -:   63:/// transposition if necessary. In the general case this will require a scoped
+        -:   64:/// allocation in some notional local memory.
+        -:   65:///
+        -:   66:/// Whatever the mental model one prefers to use for this abstraction, the key
+        -:   67:/// point is that we burn into a single, compact, representation in the vector
+        -:   68:/// types, information that is expected to reduce the impact of the phase
+        -:   69:/// ordering problem. Indeed, a vector type conveys information that:
+        -:   70:///   1. the associated loops have dependency semantics that do not prevent
+        -:   71:///      vectorization;
+        -:   72:///   2. the associate loops have been sliced in chunks of static sizes that are
+        -:   73:///      compatible with vector sizes (i.e. similar to unroll-and-jam);
+        -:   74:///   3. the inner loops, in the unroll-and-jam analogy of 2, are captured by
+        -:   75:///   the
+        -:   76:///      vector type and no vectorization hampering transformations can be
+        -:   77:///      applied to them anymore;
+        -:   78:///   4. the underlying memrefs are accessed in some notional contiguous way
+        -:   79:///      that allows loading into vectors with some amount of spatial locality;
+        -:   80:/// In other words, super-vectorization provides a level of separation of
+        -:   81:/// concern by way of opacity to subsequent passes. This has the effect of
+        -:   82:/// encapsulating and propagating vectorization constraints down the list of
+        -:   83:/// passes until we are ready to lower further.
+        -:   84:///
+        -:   85:/// For a particular target, a notion of minimal n-d vector size will be
+        -:   86:/// specified and vectorization targets a multiple of those. In the following
+        -:   87:/// paragraph, let "k ." represent "a multiple of", to be understood as a
+        -:   88:/// multiple in the same dimension (e.g. vector<16 x k . 128> summarizes
+        -:   89:/// vector<16 x 128>, vector<16 x 256>, vector<16 x 1024>, etc).
+        -:   90:///
+        -:   91:/// Some non-exhaustive notable super-vector sizes of interest include:
+        -:   92:///   - CPU: vector<k . HW_vector_size>,
+        -:   93:///          vector<k' . core_count x k . HW_vector_size>,
+        -:   94:///          vector<socket_count x k' . core_count x k . HW_vector_size>;
+        -:   95:///   - GPU: vector<k . warp_size>,
+        -:   96:///          vector<k . warp_size x float2>,
+        -:   97:///          vector<k . warp_size x float4>,
+        -:   98:///          vector<k . warp_size x 4 x 4x 4> (for tensor_core sizes).
+        -:   99:///
+        -:  100:/// Loops and operations are emitted that operate on those super-vector shapes.
+        -:  101:/// Subsequent lowering passes will materialize to actual HW vector sizes. These
+        -:  102:/// passes are expected to be (gradually) more target-specific.
+        -:  103:///
+        -:  104:/// At a high level, a vectorized load in a loop will resemble:
+        -:  105:/// ```mlir
+        -:  106:///   affine.for %i = ? to ? step ? {
+        -:  107:///     %v_a = vector.transfer_read A[%i] : memref<?xf32>, vector<128xf32>
+        -:  108:///   }
+        -:  109:/// ```
+        -:  110:/// It is the responsibility of the implementation of vector.transfer_read to
+        -:  111:/// materialize vector registers from the original scalar memrefs. A later (more
+        -:  112:/// target-dependent) lowering pass will materialize to actual HW vector sizes.
+        -:  113:/// This lowering may be occur at different times:
+        -:  114:///   1. at the MLIR level into a combination of loops, unrolling, DmaStartOp +
+        -:  115:///      DmaWaitOp + vectorized operations for data transformations and shuffle;
+        -:  116:///      thus opening opportunities for unrolling and pipelining. This is an
+        -:  117:///      instance of library call "whiteboxing"; or
+        -:  118:///   2. later in the a target-specific lowering pass or hand-written library
+        -:  119:///      call; achieving full separation of concerns. This is an instance of
+        -:  120:///      library call; or
+        -:  121:///   3. a mix of both, e.g. based on a model.
+        -:  122:/// In the future, these operations will expose a contract to constrain the
+        -:  123:/// search on vectorization patterns and sizes.
+        -:  124:///
+        -:  125:/// Occurrence of super-vectorization in the compiler flow:
+        -:  126:/// =======================================================
+        -:  127:/// This is an active area of investigation. We start with 2 remarks to position
+        -:  128:/// super-vectorization in the context of existing ongoing work: LLVM VPLAN
+        -:  129:/// and LLVM SLP Vectorizer.
+        -:  130:///
+        -:  131:/// LLVM VPLAN:
+        -:  132:/// -----------
+        -:  133:/// The astute reader may have noticed that in the limit, super-vectorization
+        -:  134:/// can be applied at a similar time and with similar objectives than VPLAN.
+        -:  135:/// For instance, in the case of a traditional, polyhedral compilation-flow (for
+        -:  136:/// instance, the PPCG project uses ISL to provide dependence analysis,
+        -:  137:/// multi-level(scheduling + tiling), lifting footprint to fast memory,
+        -:  138:/// communication synthesis, mapping, register optimizations) and before
+        -:  139:/// unrolling. When vectorization is applied at this *late* level in a typical
+        -:  140:/// polyhedral flow, and is instantiated with actual hardware vector sizes,
+        -:  141:/// super-vectorization is expected to match (or subsume) the type of patterns
+        -:  142:/// that LLVM's VPLAN aims at targeting. The main difference here is that MLIR
+        -:  143:/// is higher level and our implementation should be significantly simpler. Also
+        -:  144:/// note that in this mode, recursive patterns are probably a bit of an overkill
+        -:  145:/// although it is reasonable to expect that mixing a bit of outer loop and
+        -:  146:/// inner loop vectorization + unrolling will provide interesting choices to
+        -:  147:/// MLIR.
+        -:  148:///
+        -:  149:/// LLVM SLP Vectorizer:
+        -:  150:/// --------------------
+        -:  151:/// Super-vectorization however is not meant to be usable in a similar fashion
+        -:  152:/// to the SLP vectorizer. The main difference lies in the information that
+        -:  153:/// both vectorizers use: super-vectorization examines contiguity of memory
+        -:  154:/// references along fastest varying dimensions and loops with recursive nested
+        -:  155:/// patterns capturing imperfectly-nested loop nests; the SLP vectorizer, on
+        -:  156:/// the other hand, performs flat pattern matching inside a single unrolled loop
+        -:  157:/// body and stitches together pieces of load and store operations into full
+        -:  158:/// 1-D vectors. We envision that the SLP vectorizer is a good way to capture
+        -:  159:/// innermost loop, control-flow dependent patterns that super-vectorization may
+        -:  160:/// not be able to capture easily. In other words, super-vectorization does not
+        -:  161:/// aim at replacing the SLP vectorizer and the two solutions are complementary.
+        -:  162:///
+        -:  163:/// Ongoing investigations:
+        -:  164:/// -----------------------
+        -:  165:/// We discuss the following *early* places where super-vectorization is
+        -:  166:/// applicable and touch on the expected benefits and risks . We list the
+        -:  167:/// opportunities in the context of the traditional polyhedral compiler flow
+        -:  168:/// described in PPCG. There are essentially 6 places in the MLIR pass pipeline
+        -:  169:/// we expect to experiment with super-vectorization:
+        -:  170:/// 1. Right after language lowering to MLIR: this is the earliest time where
+        -:  171:///    super-vectorization is expected to be applied. At this level, all the
+        -:  172:///    language/user/library-level annotations are available and can be fully
+        -:  173:///    exploited. Examples include loop-type annotations (such as parallel,
+        -:  174:///    reduction, scan, dependence distance vector, vectorizable) as well as
+        -:  175:///    memory access annotations (such as non-aliasing writes guaranteed,
+        -:  176:///    indirect accesses that are permutations by construction) accesses or
+        -:  177:///    that a particular operation is prescribed atomic by the user. At this
+        -:  178:///    level, anything that enriches what dependence analysis can do should be
+        -:  179:///    aggressively exploited. At this level we are close to having explicit
+        -:  180:///    vector types in the language, except we do not impose that burden on the
+        -:  181:///    programmer/library: we derive information from scalar code + annotations.
+        -:  182:/// 2. After dependence analysis and before polyhedral scheduling: the
+        -:  183:///    information that supports vectorization does not need to be supplied by a
+        -:  184:///    higher level of abstraction. Traditional dependence analysis is available
+        -:  185:///    in MLIR and will be used to drive vectorization and cost models.
+        -:  186:///
+        -:  187:/// Let's pause here and remark that applying super-vectorization as described
+        -:  188:/// in 1. and 2. presents clear opportunities and risks:
+        -:  189:///   - the opportunity is that vectorization is burned in the type system and
+        -:  190:///   is protected from the adverse effect of loop scheduling, tiling, loop
+        -:  191:///   interchange and all passes downstream. Provided that subsequent passes are
+        -:  192:///   able to operate on vector types; the vector shapes, associated loop
+        -:  193:///   iterator properties, alignment, and contiguity of fastest varying
+        -:  194:///   dimensions are preserved until we lower the super-vector types. We expect
+        -:  195:///   this to significantly rein in on the adverse effects of phase ordering.
+        -:  196:///   - the risks are that a. all passes after super-vectorization have to work
+        -:  197:///   on elemental vector types (not that this is always true, wherever
+        -:  198:///   vectorization is applied) and b. that imposing vectorization constraints
+        -:  199:///   too early may be overall detrimental to loop fusion, tiling and other
+        -:  200:///   transformations because the dependence distances are coarsened when
+        -:  201:///   operating on elemental vector types. For this reason, the pattern
+        -:  202:///   profitability analysis should include a component that also captures the
+        -:  203:///   maximal amount of fusion available under a particular pattern. This is
+        -:  204:///   still at the stage of rough ideas but in this context, search is our
+        -:  205:///   friend as the Tensor Comprehensions and auto-TVM contributions
+        -:  206:///   demonstrated previously.
+        -:  207:/// Bottom-line is we do not yet have good answers for the above but aim at
+        -:  208:/// making it easy to answer such questions.
+        -:  209:///
+        -:  210:/// Back to our listing, the last places where early super-vectorization makes
+        -:  211:/// sense are:
+        -:  212:/// 3. right after polyhedral-style scheduling: PLUTO-style algorithms are known
+        -:  213:///    to improve locality, parallelism and be configurable (e.g. max-fuse,
+        -:  214:///    smart-fuse etc). They can also have adverse effects on contiguity
+        -:  215:///    properties that are required for vectorization but the vector.transfer
+        -:  216:///    copy-reshape-pad-transpose abstraction is expected to help recapture
+        -:  217:///    these properties.
+        -:  218:/// 4. right after polyhedral-style scheduling+tiling;
+        -:  219:/// 5. right after scheduling+tiling+rescheduling: points 4 and 5 represent
+        -:  220:///    probably the most promising places because applying tiling achieves a
+        -:  221:///    separation of concerns that allows rescheduling to worry less about
+        -:  222:///    locality and more about parallelism and distribution (e.g. min-fuse).
+        -:  223:///
+        -:  224:/// At these levels the risk-reward looks different: on one hand we probably
+        -:  225:/// lost a good deal of language/user/library-level annotation; on the other
+        -:  226:/// hand we gained parallelism and locality through scheduling and tiling.
+        -:  227:/// However we probably want to ensure tiling is compatible with the
+        -:  228:/// full-tile-only abstraction used in super-vectorization or suffer the
+        -:  229:/// consequences. It is too early to place bets on what will win but we expect
+        -:  230:/// super-vectorization to be the right abstraction to allow exploring at all
+        -:  231:/// these levels. And again, search is our friend.
+        -:  232:///
+        -:  233:/// Lastly, we mention it again here:
+        -:  234:/// 6. as a MLIR-based alternative to VPLAN.
+        -:  235:///
+        -:  236:/// Lowering, unrolling, pipelining:
+        -:  237:/// ================================
+        -:  238:/// TODO: point to the proper places.
+        -:  239:///
+        -:  240:/// Algorithm:
+        -:  241:/// ==========
+        -:  242:/// The algorithm proceeds in a few steps:
+        -:  243:///  1. defining super-vectorization patterns and matching them on the tree of
+        -:  244:///     AffineForOp. A super-vectorization pattern is defined as a recursive
+        -:  245:///     data structures that matches and captures nested, imperfectly-nested
+        -:  246:///     loops that have a. conformable loop annotations attached (e.g. parallel,
+        -:  247:///     reduction, vectorizable, ...) as well as b. all contiguous load/store
+        -:  248:///     operations along a specified minor dimension (not necessarily the
+        -:  249:///     fastest varying) ;
+        -:  250:///  2. analyzing those patterns for profitability (TODO: and
+        -:  251:///     interference);
+        -:  252:///  3. then, for each pattern in order:
+        -:  253:///    a. applying iterative rewriting of the loops and all their nested
+        -:  254:///       operations in topological order. Rewriting is implemented by
+        -:  255:///       coarsening the loops and converting operations and operands to their
+        -:  256:///       vector forms. Processing operations in topological order is relatively
+        -:  257:///       simple due to the structured nature of the control-flow
+        -:  258:///       representation. This order ensures that all the operands of a given
+        -:  259:///       operation have been vectorized before the operation itself in a single
+        -:  260:///       traversal, except for operands defined outside of the loop nest. The
+        -:  261:///       algorithm can convert the following operations to their vector form:
+        -:  262:///         * Affine load and store operations are converted to opaque vector
+        -:  263:///           transfer read and write operations.
+        -:  264:///         * Scalar constant operations/operands are converted to vector
+        -:  265:///           constant operations (splat).
+        -:  266:///         * Uniform operands (only induction variables of loops not mapped to
+        -:  267:///           a vector dimension, or operands defined outside of the loop nest
+        -:  268:///           for now) are broadcasted to a vector.
+        -:  269:///           TODO: Support more uniform cases.
+        -:  270:///         * Affine for operations with 'iter_args' are vectorized by
+        -:  271:///           vectorizing their 'iter_args' operands and results.
+        -:  272:///           TODO: Support more complex loops with divergent lbs and/or ubs.
+        -:  273:///         * The remaining operations in the loop nest are vectorized by
+        -:  274:///           widening their scalar types to vector types.
+        -:  275:///    b. if everything under the root AffineForOp in the current pattern
+        -:  276:///       is vectorized properly, we commit that loop to the IR and remove the
+        -:  277:///       scalar loop. Otherwise, we discard the vectorized loop and keep the
+        -:  278:///       original scalar loop.
+        -:  279:///    c. vectorization is applied on the next pattern in the list. Because
+        -:  280:///       pattern interference avoidance is not yet implemented and that we do
+        -:  281:///       not support further vectorizing an already vector load we need to
+        -:  282:///       re-verify that the pattern is still vectorizable. This is expected to
+        -:  283:///       make cost models more difficult to write and is subject to improvement
+        -:  284:///       in the future.
+        -:  285:///
+        -:  286:/// Choice of loop transformation to support the algorithm:
+        -:  287:/// =======================================================
+        -:  288:/// The choice of loop transformation to apply for coarsening vectorized loops
+        -:  289:/// is still subject to exploratory tradeoffs. In particular, say we want to
+        -:  290:/// vectorize by a factor 128, we want to transform the following input:
+        -:  291:/// ```mlir
+        -:  292:///   affine.for %i = %M to %N {
+        -:  293:///     %a = affine.load %A[%i] : memref<?xf32>
+        -:  294:///   }
+        -:  295:/// ```
+        -:  296:///
+        -:  297:/// Traditionally, one would vectorize late (after scheduling, tiling,
+        -:  298:/// memory promotion etc) say after stripmining (and potentially unrolling in
+        -:  299:/// the case of LLVM's SLP vectorizer):
+        -:  300:/// ```mlir
+        -:  301:///   affine.for %i = floor(%M, 128) to ceil(%N, 128) {
+        -:  302:///     affine.for %ii = max(%M, 128 * %i) to min(%N, 128*%i + 127) {
+        -:  303:///       %a = affine.load %A[%ii] : memref<?xf32>
+        -:  304:///     }
+        -:  305:///   }
+        -:  306:/// ```
+        -:  307:///
+        -:  308:/// Instead, we seek to vectorize early and freeze vector types before
+        -:  309:/// scheduling, so we want to generate a pattern that resembles:
+        -:  310:/// ```mlir
+        -:  311:///   affine.for %i = ? to ? step ? {
+        -:  312:///     %v_a = vector.transfer_read %A[%i] : memref<?xf32>, vector<128xf32>
+        -:  313:///   }
+        -:  314:/// ```
+        -:  315:///
+        -:  316:/// i. simply dividing the lower / upper bounds by 128 creates issues
+        -:  317:///    when representing expressions such as ii + 1 because now we only
+        -:  318:///    have access to original values that have been divided. Additional
+        -:  319:///    information is needed to specify accesses at below-128 granularity;
+        -:  320:/// ii. another alternative is to coarsen the loop step but this may have
+        -:  321:///    consequences on dependence analysis and fusability of loops: fusable
+        -:  322:///    loops probably need to have the same step (because we don't want to
+        -:  323:///    stripmine/unroll to enable fusion).
+        -:  324:/// As a consequence, we choose to represent the coarsening using the loop
+        -:  325:/// step for now and reevaluate in the future. Note that we can renormalize
+        -:  326:/// loop steps later if/when we have evidence that they are problematic.
+        -:  327:///
+        -:  328:/// For the simple strawman example above, vectorizing for a 1-D vector
+        -:  329:/// abstraction of size 128 returns code similar to:
+        -:  330:/// ```mlir
+        -:  331:///   affine.for %i = %M to %N step 128 {
+        -:  332:///     %v_a = vector.transfer_read %A[%i] : memref<?xf32>, vector<128xf32>
+        -:  333:///   }
+        -:  334:/// ```
+        -:  335:///
+        -:  336:/// Unsupported cases, extensions, and work in progress (help welcome :-) ):
+        -:  337:/// ========================================================================
+        -:  338:///   1. lowering to concrete vector types for various HW;
+        -:  339:///   2. reduction support for n-D vectorization and non-unit steps;
+        -:  340:///   3. non-effecting padding during vector.transfer_read and filter during
+        -:  341:///      vector.transfer_write;
+        -:  342:///   4. misalignment support vector.transfer_read / vector.transfer_write
+        -:  343:///      (hopefully without read-modify-writes);
+        -:  344:///   5. control-flow support;
+        -:  345:///   6. cost-models, heuristics and search;
+        -:  346:///   7. Op implementation, extensions and implication on memref views;
+        -:  347:///   8. many TODOs left around.
+        -:  348:///
+        -:  349:/// Examples:
+        -:  350:/// =========
+        -:  351:/// Consider the following Function:
+        -:  352:/// ```mlir
+        -:  353:/// func @vector_add_2d(%M : index, %N : index) -> f32 {
+        -:  354:///   %A = alloc (%M, %N) : memref<?x?xf32, 0>
+        -:  355:///   %B = alloc (%M, %N) : memref<?x?xf32, 0>
+        -:  356:///   %C = alloc (%M, %N) : memref<?x?xf32, 0>
+        -:  357:///   %f1 = arith.constant 1.0 : f32
+        -:  358:///   %f2 = arith.constant 2.0 : f32
+        -:  359:///   affine.for %i0 = 0 to %M {
+        -:  360:///     affine.for %i1 = 0 to %N {
+        -:  361:///       // non-scoped %f1
+        -:  362:///       affine.store %f1, %A[%i0, %i1] : memref<?x?xf32, 0>
+        -:  363:///     }
+        -:  364:///   }
+        -:  365:///   affine.for %i2 = 0 to %M {
+        -:  366:///     affine.for %i3 = 0 to %N {
+        -:  367:///       // non-scoped %f2
+        -:  368:///       affine.store %f2, %B[%i2, %i3] : memref<?x?xf32, 0>
+        -:  369:///     }
+        -:  370:///   }
+        -:  371:///   affine.for %i4 = 0 to %M {
+        -:  372:///     affine.for %i5 = 0 to %N {
+        -:  373:///       %a5 = affine.load %A[%i4, %i5] : memref<?x?xf32, 0>
+        -:  374:///       %b5 = affine.load %B[%i4, %i5] : memref<?x?xf32, 0>
+        -:  375:///       %s5 = arith.addf %a5, %b5 : f32
+        -:  376:///       // non-scoped %f1
+        -:  377:///       %s6 = arith.addf %s5, %f1 : f32
+        -:  378:///       // non-scoped %f2
+        -:  379:///       %s7 = arith.addf %s5, %f2 : f32
+        -:  380:///       // diamond dependency.
+        -:  381:///       %s8 = arith.addf %s7, %s6 : f32
+        -:  382:///       affine.store %s8, %C[%i4, %i5] : memref<?x?xf32, 0>
+        -:  383:///     }
+        -:  384:///   }
+        -:  385:///   %c7 = arith.constant 7 : index
+        -:  386:///   %c42 = arith.constant 42 : index
+        -:  387:///   %res = load %C[%c7, %c42] : memref<?x?xf32, 0>
+        -:  388:///   return %res : f32
+        -:  389:/// }
+        -:  390:/// ```
+        -:  391:///
+        -:  392:/// The -affine-super-vectorize pass with the following arguments:
+        -:  393:/// ```
+        -:  394:/// -affine-super-vectorize="virtual-vector-size=256 test-fastest-varying=0"
+        -:  395:/// ```
+        -:  396:///
+        -:  397:/// produces this standard innermost-loop vectorized code:
+        -:  398:/// ```mlir
+        -:  399:/// func @vector_add_2d(%arg0 : index, %arg1 : index) -> f32 {
+        -:  400:///   %0 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  401:///   %1 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  402:///   %2 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  403:///   %cst = arith.constant 1.0 : f32
+        -:  404:///   %cst_0 = arith.constant 2.0 : f32
+        -:  405:///   affine.for %i0 = 0 to %arg0 {
+        -:  406:///     affine.for %i1 = 0 to %arg1 step 256 {
+        -:  407:///       %cst_1 = arith.constant dense<vector<256xf32>, 1.0> :
+        -:  408:///                vector<256xf32>
+        -:  409:///       vector.transfer_write %cst_1, %0[%i0, %i1] :
+        -:  410:///                vector<256xf32>, memref<?x?xf32>
+        -:  411:///     }
+        -:  412:///   }
+        -:  413:///   affine.for %i2 = 0 to %arg0 {
+        -:  414:///     affine.for %i3 = 0 to %arg1 step 256 {
+        -:  415:///       %cst_2 = arith.constant dense<vector<256xf32>, 2.0> :
+        -:  416:///                vector<256xf32>
+        -:  417:///       vector.transfer_write %cst_2, %1[%i2, %i3] :
+        -:  418:///                vector<256xf32>, memref<?x?xf32>
+        -:  419:///     }
+        -:  420:///   }
+        -:  421:///   affine.for %i4 = 0 to %arg0 {
+        -:  422:///     affine.for %i5 = 0 to %arg1 step 256 {
+        -:  423:///       %3 = vector.transfer_read %0[%i4, %i5] :
+        -:  424:///            memref<?x?xf32>, vector<256xf32>
+        -:  425:///       %4 = vector.transfer_read %1[%i4, %i5] :
+        -:  426:///            memref<?x?xf32>, vector<256xf32>
+        -:  427:///       %5 = arith.addf %3, %4 : vector<256xf32>
+        -:  428:///       %cst_3 = arith.constant dense<vector<256xf32>, 1.0> :
+        -:  429:///                vector<256xf32>
+        -:  430:///       %6 = arith.addf %5, %cst_3 : vector<256xf32>
+        -:  431:///       %cst_4 = arith.constant dense<vector<256xf32>, 2.0> :
+        -:  432:///                vector<256xf32>
+        -:  433:///       %7 = arith.addf %5, %cst_4 : vector<256xf32>
+        -:  434:///       %8 = arith.addf %7, %6 : vector<256xf32>
+        -:  435:///       vector.transfer_write %8, %2[%i4, %i5] :
+        -:  436:///                vector<256xf32>, memref<?x?xf32>
+        -:  437:///     }
+        -:  438:///   }
+        -:  439:///   %c7 = arith.constant 7 : index
+        -:  440:///   %c42 = arith.constant 42 : index
+        -:  441:///   %9 = load %2[%c7, %c42] : memref<?x?xf32>
+        -:  442:///   return %9 : f32
+        -:  443:/// }
+        -:  444:/// ```
+        -:  445:///
+        -:  446:/// The -affine-super-vectorize pass with the following arguments:
+        -:  447:/// ```
+        -:  448:/// -affine-super-vectorize="virtual-vector-size=32,256 \
+        -:  449:///                          test-fastest-varying=1,0"
+        -:  450:/// ```
+        -:  451:///
+        -:  452:/// produces this more interesting mixed outer-innermost-loop vectorized code:
+        -:  453:/// ```mlir
+        -:  454:/// func @vector_add_2d(%arg0 : index, %arg1 : index) -> f32 {
+        -:  455:///   %0 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  456:///   %1 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  457:///   %2 = memref.alloc(%arg0, %arg1) : memref<?x?xf32>
+        -:  458:///   %cst = arith.constant 1.0 : f32
+        -:  459:///   %cst_0 = arith.constant 2.0 : f32
+        -:  460:///   affine.for %i0 = 0 to %arg0 step 32 {
+        -:  461:///     affine.for %i1 = 0 to %arg1 step 256 {
+        -:  462:///       %cst_1 = arith.constant dense<vector<32x256xf32>, 1.0> :
+        -:  463:///                vector<32x256xf32>
+        -:  464:///       vector.transfer_write %cst_1, %0[%i0, %i1] :
+        -:  465:///                vector<32x256xf32>, memref<?x?xf32>
+        -:  466:///     }
+        -:  467:///   }
+        -:  468:///   affine.for %i2 = 0 to %arg0 step 32 {
+        -:  469:///     affine.for %i3 = 0 to %arg1 step 256 {
+        -:  470:///       %cst_2 = arith.constant dense<vector<32x256xf32>, 2.0> :
+        -:  471:///                vector<32x256xf32>
+        -:  472:///       vector.transfer_write %cst_2, %1[%i2, %i3] :
+        -:  473:///                vector<32x256xf32>, memref<?x?xf32>
+        -:  474:///     }
+        -:  475:///   }
+        -:  476:///   affine.for %i4 = 0 to %arg0 step 32 {
+        -:  477:///     affine.for %i5 = 0 to %arg1 step 256 {
+        -:  478:///       %3 = vector.transfer_read %0[%i4, %i5] :
+        -:  479:///                memref<?x?xf32> vector<32x256xf32>
+        -:  480:///       %4 = vector.transfer_read %1[%i4, %i5] :
+        -:  481:///                memref<?x?xf32>, vector<32x256xf32>
+        -:  482:///       %5 = arith.addf %3, %4 : vector<32x256xf32>
+        -:  483:///       %cst_3 = arith.constant dense<vector<32x256xf32>, 1.0> :
+        -:  484:///                vector<32x256xf32>
+        -:  485:///       %6 = arith.addf %5, %cst_3 : vector<32x256xf32>
+        -:  486:///       %cst_4 = arith.constant dense<vector<32x256xf32>, 2.0> :
+        -:  487:///                vector<32x256xf32>
+        -:  488:///       %7 = arith.addf %5, %cst_4 : vector<32x256xf32>
+        -:  489:///       %8 = arith.addf %7, %6 : vector<32x256xf32>
+        -:  490:///       vector.transfer_write %8, %2[%i4, %i5] :
+        -:  491:///                vector<32x256xf32>, memref<?x?xf32>
+        -:  492:///     }
+        -:  493:///   }
+        -:  494:///   %c7 = arith.constant 7 : index
+        -:  495:///   %c42 = arith.constant 42 : index
+        -:  496:///   %9 = load %2[%c7, %c42] : memref<?x?xf32>
+        -:  497:///   return %9 : f32
+        -:  498:/// }
+        -:  499:/// ```
+        -:  500:///
+        -:  501:/// Of course, much more intricate n-D imperfectly-nested patterns can be
+        -:  502:/// vectorized too and specified in a fully declarative fashion.
+        -:  503:///
+        -:  504:/// Reduction:
+        -:  505:/// ==========
+        -:  506:/// Vectorizing reduction loops along the reduction dimension is supported if:
+        -:  507:/// - the reduction kind is supported,
+        -:  508:/// - the vectorization is 1-D, and
+        -:  509:/// - the step size of the loop equals to one.
+        -:  510:///
+        -:  511:/// Comparing to the non-vector-dimension case, two additional things are done
+        -:  512:/// during vectorization of such loops:
+        -:  513:/// - The resulting vector returned from the loop is reduced to a scalar using
+        -:  514:///   `vector.reduce`.
+        -:  515:/// - In some cases a mask is applied to the vector yielded at the end of the
+        -:  516:///   loop to prevent garbage values from being written to the accumulator.
+        -:  517:///
+        -:  518:/// Reduction vectorization is switched off by default, it can be enabled by
+        -:  519:/// passing a map from loops to reductions to utility functions, or by passing
+        -:  520:/// `vectorize-reductions=true` to the vectorization pass.
+        -:  521:///
+        -:  522:/// Consider the following example:
+        -:  523:/// ```mlir
+        -:  524:/// func @vecred(%in: memref<512xf32>) -> f32 {
+        -:  525:///   %cst = arith.constant 0.000000e+00 : f32
+        -:  526:///   %sum = affine.for %i = 0 to 500 iter_args(%part_sum = %cst) -> (f32) {
+        -:  527:///     %ld = affine.load %in[%i] : memref<512xf32>
+        -:  528:///     %cos = math.cos %ld : f32
+        -:  529:///     %add = arith.addf %part_sum, %cos : f32
+        -:  530:///     affine.yield %add : f32
+        -:  531:///   }
+        -:  532:///   return %sum : f32
+        -:  533:/// }
+        -:  534:/// ```
+        -:  535:///
+        -:  536:/// The -affine-super-vectorize pass with the following arguments:
+        -:  537:/// ```
+        -:  538:/// -affine-super-vectorize="virtual-vector-size=128 test-fastest-varying=0 \
+        -:  539:///                          vectorize-reductions=true"
+        -:  540:/// ```
+        -:  541:/// produces the following output:
+        -:  542:/// ```mlir
+        -:  543:/// #map = affine_map<(d0) -> (-d0 + 500)>
+        -:  544:/// func @vecred(%arg0: memref<512xf32>) -> f32 {
+        -:  545:///   %cst = arith.constant 0.000000e+00 : f32
+        -:  546:///   %cst_0 = arith.constant dense<0.000000e+00> : vector<128xf32>
+        -:  547:///   %0 = affine.for %arg1 = 0 to 500 step 128 iter_args(%arg2 = %cst_0)
+        -:  548:///           -> (vector<128xf32>) {
+        -:  549:///     // %2 is the number of iterations left in the original loop.
+        -:  550:///     %2 = affine.apply #map(%arg1)
+        -:  551:///     %3 = vector.create_mask %2 : vector<128xi1>
+        -:  552:///     %cst_1 = arith.constant 0.000000e+00 : f32
+        -:  553:///     %4 = vector.transfer_read %arg0[%arg1], %cst_1 :
+        -:  554:///                     memref<512xf32>, vector<128xf32>
+        -:  555:///     %5 = math.cos %4 : vector<128xf32>
+        -:  556:///     %6 = arith.addf %arg2, %5 : vector<128xf32>
+        -:  557:///     // We filter out the effect of last 12 elements using the mask.
+        -:  558:///     %7 = select %3, %6, %arg2 : vector<128xi1>, vector<128xf32>
+        -:  559:///     affine.yield %7 : vector<128xf32>
+        -:  560:///   }
+        -:  561:///   %1 = vector.reduction <add>, %0 : vector<128xf32> into f32
+        -:  562:///   return %1 : f32
+        -:  563:/// }
+        -:  564:/// ```
+        -:  565:///
+        -:  566:/// Note that because of loop misalignment we needed to apply a mask to prevent
+        -:  567:/// last 12 elements from affecting the final result. The mask is full of ones
+        -:  568:/// in every iteration except for the last one, in which it has the form
+        -:  569:/// `11...100...0` with 116 ones and 12 zeros.
+        -:  570:
+        -:  571:#define DEBUG_TYPE "early-vect"
+        -:  572:
+        -:  573:using llvm::dbgs;
+        -:  574:
+        -:  575:/// Forward declaration.
+        -:  576:static FilterFunctionType
+        -:  577:isVectorizableLoopPtrFactory(const DenseSet<Operation *> &parallelLoops,
+        -:  578:                             int fastestVaryingMemRefDimension);
+        -:  579:
+        -:  580:/// Creates a vectorization pattern from the command line arguments.
+        -:  581:/// Up to 3-D patterns are supported.
+        -:  582:/// If the command line argument requests a pattern of higher order, returns an
+        -:  583:/// empty pattern list which will conservatively result in no vectorization.
+        -:  584:static Optional<NestedPattern>
+function _ZL11makePatternRKN4llvm8DenseSetIPN4mlir9OperationENS_12DenseMapInfoIS3_vEEEEiNS_8ArrayRefIlEE called 938 returned 100% blocks executed 15%
+      938:  585:makePattern(const DenseSet<Operation *> &parallelLoops, int vectorRank,
+        -:  586:            ArrayRef<int64_t> fastestVaryingPattern) {
+      938:  587:  using matcher::For;
+     938*:  588:  int64_t d0 = fastestVaryingPattern.empty() ? -1 : fastestVaryingPattern[0];
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     938*:  589:  int64_t d1 = fastestVaryingPattern.size() < 2 ? -1 : fastestVaryingPattern[1];
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     938*:  590:  int64_t d2 = fastestVaryingPattern.size() < 3 ? -1 : fastestVaryingPattern[2];
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      938:  591:  switch (vectorRank) {
+branch  0 taken 0%
+branch  1 taken 0%
+branch  2 taken 0%
+branch  3 taken 100%
+    #####:  592:  case 1:
+    #####:  593:    return For(isVectorizableLoopPtrFactory(parallelLoops, d0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  594:  case 2:
+    #####:  595:    return For(isVectorizableLoopPtrFactory(parallelLoops, d0),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  596:               For(isVectorizableLoopPtrFactory(parallelLoops, d1)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  597:  case 3:
+    #####:  598:    return For(isVectorizableLoopPtrFactory(parallelLoops, d0),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  599:               For(isVectorizableLoopPtrFactory(parallelLoops, d1),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  600:                   For(isVectorizableLoopPtrFactory(parallelLoops, d2))));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+      938:  601:  default: {
+      938:  602:    return llvm::None;
+        -:  603:  }
+        -:  604:  }
+        -:  605:}
+        -:  606:
+function _ZL21vectorTransferPatternv called 0 returned 0% blocks executed 0%
+    #####:  607:static NestedPattern &vectorTransferPattern() {
+    #####:  608:  static auto pattern = matcher::Op([](Operation &op) {
+    #####:  609:    return isa<vector::TransferReadOp, vector::TransferWriteOp>(op);
+call    0 never executed
+    #####:  610:  });
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+    #####:  611:  return pattern;
+        -:  612:}
+        -:  613:
+        -:  614:namespace {
+        -:  615:
+        -:  616:/// Base state for the vectorize pass.
+        -:  617:/// Command line arguments are preempted by non-empty pass arguments.
+   388389:  618:struct Vectorize : public impl::AffineVectorizeBase<Vectorize> {
+call    0 returned 100%
+call    1 returned 100%
+    #####:  619:  using Base::Base;
+call    0 never executed
+        -:  620:
+        -:  621:  void runOnOperation() override;
+        -:  622:};
+        -:  623:
+        -:  624:} // namespace
+        -:  625:
+function _ZL25vectorizeLoopIfProfitablePN4mlir9OperationEjjPNS_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####:  626:static void vectorizeLoopIfProfitable(Operation *loop, unsigned depthInPattern,
+        -:  627:                                      unsigned patternDepth,
+        -:  628:                                      VectorizationStrategy *strategy) {
+    #####:  629:  assert(patternDepth > depthInPattern &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  630:         "patternDepth is greater than depthInPattern");
+    #####:  631:  if (patternDepth - depthInPattern > strategy->vectorSizes.size()) {
+branch  0 never executed
+branch  1 never executed
+        -:  632:    // Don't vectorize this loop
+        -:  633:    return;
+        -:  634:  }
+    #####:  635:  strategy->loopToVectorDim[loop] =
+    #####:  636:      strategy->vectorSizes.size() - (patternDepth - depthInPattern);
+call    0 never executed
+        -:  637:}
+        -:  638:
+        -:  639:/// Implements a simple strawman strategy for vectorization.
+        -:  640:/// Given a matched pattern `matches` of depth `patternDepth`, this strategy
+        -:  641:/// greedily assigns the fastest varying dimension ** of the vector ** to the
+        -:  642:/// innermost loop in the pattern.
+        -:  643:/// When coupled with a pattern that looks for the fastest varying dimension in
+        -:  644:/// load/store MemRefs, this creates a generic vectorization strategy that works
+        -:  645:/// for any loop in a hierarchy (outermost, innermost or intermediate).
+        -:  646:///
+        -:  647:/// TODO: In the future we should additionally increase the power of the
+        -:  648:/// profitability analysis along 3 directions:
+        -:  649:///   1. account for loop extents (both static and parametric + annotations);
+        -:  650:///   2. account for data layout permutations;
+        -:  651:///   3. account for impact of vectorization on maximal loop fusion.
+        -:  652:/// Then we can quantify the above to build a cost model and search over
+        -:  653:/// strategies.
+function _ZL20analyzeProfitabilityN4llvm8ArrayRefIN4mlir11NestedMatchEEEjjPNS1_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####:  654:static LogicalResult analyzeProfitability(ArrayRef<NestedMatch> matches,
+        -:  655:                                          unsigned depthInPattern,
+        -:  656:                                          unsigned patternDepth,
+        -:  657:                                          VectorizationStrategy *strategy) {
+    #####:  658:  for (auto m : matches) {
+branch  0 never executed
+branch  1 never executed
+    #####:  659:    if (failed(analyzeProfitability(m.getMatchedChildren(), depthInPattern + 1,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  660:                                    patternDepth, strategy))) {
+    #####:  661:      return failure();
+        -:  662:    }
+    #####:  663:    vectorizeLoopIfProfitable(m.getMatchedOperation(), depthInPattern,
+call    0 never executed
+        -:  664:                              patternDepth, strategy);
+        -:  665:  }
+    #####:  666:  return success();
+        -:  667:}
+        -:  668:
+        -:  669:///// end TODO: Hoist to a VectorizationStrategy.cpp when appropriate /////
+        -:  670:
+        -:  671:namespace {
+        -:  672:
+        -:  673:struct VectorizationState {
+        -:  674:
+function _ZN12_GLOBAL__N_118VectorizationStateC2EPN4mlir11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  675:  VectorizationState(MLIRContext *context) : builder(context) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  676:
+        -:  677:  /// Registers the vector replacement of a scalar operation and its result
+        -:  678:  /// values. Both operations must have the same number of results.
+        -:  679:  ///
+        -:  680:  /// This utility is used to register the replacement for the vast majority of
+        -:  681:  /// the vectorized operations.
+        -:  682:  ///
+        -:  683:  /// Example:
+        -:  684:  ///   * 'replaced': %0 = arith.addf %1, %2 : f32
+        -:  685:  ///   * 'replacement': %0 = arith.addf %1, %2 : vector<128xf32>
+        -:  686:  void registerOpVectorReplacement(Operation *replaced, Operation *replacement);
+        -:  687:
+        -:  688:  /// Registers the vector replacement of a scalar value. The replacement
+        -:  689:  /// operation should have a single result, which replaces the scalar value.
+        -:  690:  ///
+        -:  691:  /// This utility is used to register the vector replacement of block arguments
+        -:  692:  /// and operation results which are not directly vectorized (i.e., their
+        -:  693:  /// scalar version still exists after vectorization), like uniforms.
+        -:  694:  ///
+        -:  695:  /// Example:
+        -:  696:  ///   * 'replaced': block argument or operation outside of the vectorized
+        -:  697:  ///     loop.
+        -:  698:  ///   * 'replacement': %0 = vector.broadcast %1 : f32 to vector<128xf32>
+        -:  699:  void registerValueVectorReplacement(Value replaced, Operation *replacement);
+        -:  700:
+        -:  701:  /// Registers the vector replacement of a block argument (e.g., iter_args).
+        -:  702:  ///
+        -:  703:  /// Example:
+        -:  704:  ///   * 'replaced': 'iter_arg' block argument.
+        -:  705:  ///   * 'replacement': vectorized 'iter_arg' block argument.
+        -:  706:  void registerBlockArgVectorReplacement(BlockArgument replaced,
+        -:  707:                                         BlockArgument replacement);
+        -:  708:
+        -:  709:  /// Registers the scalar replacement of a scalar value. 'replacement' must be
+        -:  710:  /// scalar. Both values must be block arguments. Operation results should be
+        -:  711:  /// replaced using the 'registerOp*' utilitites.
+        -:  712:  ///
+        -:  713:  /// This utility is used to register the replacement of block arguments
+        -:  714:  /// that are within the loop to be vectorized and will continue being scalar
+        -:  715:  /// within the vector loop.
+        -:  716:  ///
+        -:  717:  /// Example:
+        -:  718:  ///   * 'replaced': induction variable of a loop to be vectorized.
+        -:  719:  ///   * 'replacement': new induction variable in the new vector loop.
+        -:  720:  void registerValueScalarReplacement(BlockArgument replaced,
+        -:  721:                                      BlockArgument replacement);
+        -:  722:
+        -:  723:  /// Registers the scalar replacement of a scalar result returned from a
+        -:  724:  /// reduction loop. 'replacement' must be scalar.
+        -:  725:  ///
+        -:  726:  /// This utility is used to register the replacement for scalar results of
+        -:  727:  /// vectorized reduction loops with iter_args.
+        -:  728:  ///
+        -:  729:  /// Example 2:
+        -:  730:  ///   * 'replaced': %0 = affine.for %i = 0 to 512 iter_args(%x = ...) -> (f32)
+        -:  731:  ///   * 'replacement': %1 = vector.reduction <add>, %0 : vector<4xf32> into
+        -:  732:  ///   f32
+        -:  733:  void registerLoopResultScalarReplacement(Value replaced, Value replacement);
+        -:  734:
+        -:  735:  /// Returns in 'replacedVals' the scalar replacement for values in
+        -:  736:  /// 'inputVals'.
+        -:  737:  void getScalarValueReplacementsFor(ValueRange inputVals,
+        -:  738:                                     SmallVectorImpl<Value> &replacedVals);
+        -:  739:
+        -:  740:  /// Erases the scalar loop nest after its successful vectorization.
+        -:  741:  void finishVectorizationPattern(AffineForOp rootLoop);
+        -:  742:
+        -:  743:  // Used to build and insert all the new operations created. The insertion
+        -:  744:  // point is preserved and updated along the vectorization process.
+        -:  745:  OpBuilder builder;
+        -:  746:
+        -:  747:  // Maps input scalar operations to their vector counterparts.
+        -:  748:  DenseMap<Operation *, Operation *> opVectorReplacement;
+        -:  749:  // Maps input scalar values to their vector counterparts.
+        -:  750:  BlockAndValueMapping valueVectorReplacement;
+        -:  751:  // Maps input scalar values to their new scalar counterparts in the vector
+        -:  752:  // loop nest.
+        -:  753:  BlockAndValueMapping valueScalarReplacement;
+        -:  754:  // Maps results of reduction loops to their new scalar counterparts.
+        -:  755:  DenseMap<Value, Value> loopResultScalarReplacement;
+        -:  756:
+        -:  757:  // Maps the newly created vector loops to their vector dimension.
+        -:  758:  DenseMap<Operation *, unsigned> vecLoopToVecDim;
+        -:  759:
+        -:  760:  // Maps the new vectorized loops to the corresponding vector masks if it is
+        -:  761:  // required.
+        -:  762:  DenseMap<Operation *, Value> vecLoopToMask;
+        -:  763:
+        -:  764:  // The strategy drives which loop to vectorize by which amount.
+        -:  765:  const VectorizationStrategy *strategy = nullptr;
+        -:  766:
+        -:  767:private:
+        -:  768:  /// Internal implementation to map input scalar values to new vector or scalar
+        -:  769:  /// values.
+        -:  770:  void registerValueVectorReplacementImpl(Value replaced, Value replacement);
+        -:  771:  void registerValueScalarReplacementImpl(Value replaced, Value replacement);
+        -:  772:};
+        -:  773:
+        -:  774:} // namespace
+        -:  775:
+        -:  776:/// Registers the vector replacement of a scalar operation and its result
+        -:  777:/// values. Both operations must have the same number of results.
+        -:  778:///
+        -:  779:/// This utility is used to register the replacement for the vast majority of
+        -:  780:/// the vectorized operations.
+        -:  781:///
+        -:  782:/// Example:
+        -:  783:///   * 'replaced': %0 = arith.addf %1, %2 : f32
+        -:  784:///   * 'replacement': %0 = arith.addf %1, %2 : vector<128xf32>
+function _ZN12_GLOBAL__N_118VectorizationState27registerOpVectorReplacementEPN4mlir9OperationES3_ called 0 returned 0% blocks executed 0%
+    #####:  785:void VectorizationState::registerOpVectorReplacement(Operation *replaced,
+        -:  786:                                                     Operation *replacement) {
+    #####:  787:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ commit vectorized op:\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  788:  LLVM_DEBUG(dbgs() << *replaced << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  789:  LLVM_DEBUG(dbgs() << "into\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  790:  LLVM_DEBUG(dbgs() << *replacement << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  791:
+    #####:  792:  assert(replaced->getNumResults() == replacement->getNumResults() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  793:         "Unexpected replaced and replacement results");
+    #####:  794:  assert(opVectorReplacement.count(replaced) == 0 && "already registered");
+call    0 never executed
+call    1 never executed
+    #####:  795:  opVectorReplacement[replaced] = replacement;
+call    0 never executed
+        -:  796:
+    #####:  797:  for (auto resultTuple :
+branch  0 never executed
+branch  1 never executed
+    #####:  798:       llvm::zip(replaced->getResults(), replacement->getResults()))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  799:    registerValueVectorReplacementImpl(std::get<0>(resultTuple),
+call    0 never executed
+    #####:  800:                                       std::get<1>(resultTuple));
+call    0 never executed
+    #####:  801:}
+        -:  802:
+        -:  803:/// Registers the vector replacement of a scalar value. The replacement
+        -:  804:/// operation should have a single result, which replaces the scalar value.
+        -:  805:///
+        -:  806:/// This utility is used to register the vector replacement of block arguments
+        -:  807:/// and operation results which are not directly vectorized (i.e., their
+        -:  808:/// scalar version still exists after vectorization), like uniforms.
+        -:  809:///
+        -:  810:/// Example:
+        -:  811:///   * 'replaced': block argument or operation outside of the vectorized loop.
+        -:  812:///   * 'replacement': %0 = vector.broadcast %1 : f32 to vector<128xf32>
+function _ZN12_GLOBAL__N_118VectorizationState30registerValueVectorReplacementEN4mlir5ValueEPNS1_9OperationE called 0 returned 0% blocks executed 0%
+    #####:  813:void VectorizationState::registerValueVectorReplacement(
+        -:  814:    Value replaced, Operation *replacement) {
+    #####:  815:  assert(replacement->getNumResults() == 1 &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  816:         "Expected single-result replacement");
+    #####:  817:  if (Operation *defOp = replaced.getDefiningOp())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  818:    registerOpVectorReplacement(defOp, replacement);
+call    0 never executed
+        -:  819:  else
+    #####:  820:    registerValueVectorReplacementImpl(replaced, replacement->getResult(0));
+call    0 never executed
+    #####:  821:}
+        -:  822:
+        -:  823:/// Registers the vector replacement of a block argument (e.g., iter_args).
+        -:  824:///
+        -:  825:/// Example:
+        -:  826:///   * 'replaced': 'iter_arg' block argument.
+        -:  827:///   * 'replacement': vectorized 'iter_arg' block argument.
+    #####:  828:void VectorizationState::registerBlockArgVectorReplacement(
+        -:  829:    BlockArgument replaced, BlockArgument replacement) {
+    #####:  830:  registerValueVectorReplacementImpl(replaced, replacement);
+call    0 never executed
+        -:  831:}
+        -:  832:
+function _ZN12_GLOBAL__N_118VectorizationState34registerValueVectorReplacementImplEN4mlir5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  833:void VectorizationState::registerValueVectorReplacementImpl(Value replaced,
+        -:  834:                                                            Value replacement) {
+    #####:  835:  assert(!valueVectorReplacement.contains(replaced) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  836:         "Vector replacement already registered");
+    #####:  837:  assert(replacement.getType().isa<VectorType>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  838:         "Expected vector type in vector replacement");
+    #####:  839:  valueVectorReplacement.map(replaced, replacement);
+call    0 never executed
+    #####:  840:}
+        -:  841:
+        -:  842:/// Registers the scalar replacement of a scalar value. 'replacement' must be
+        -:  843:/// scalar. Both values must be block arguments. Operation results should be
+        -:  844:/// replaced using the 'registerOp*' utilitites.
+        -:  845:///
+        -:  846:/// This utility is used to register the replacement of block arguments
+        -:  847:/// that are within the loop to be vectorized and will continue being scalar
+        -:  848:/// within the vector loop.
+        -:  849:///
+        -:  850:/// Example:
+        -:  851:///   * 'replaced': induction variable of a loop to be vectorized.
+        -:  852:///   * 'replacement': new induction variable in the new vector loop.
+    #####:  853:void VectorizationState::registerValueScalarReplacement(
+        -:  854:    BlockArgument replaced, BlockArgument replacement) {
+    #####:  855:  registerValueScalarReplacementImpl(replaced, replacement);
+        -:  856:}
+        -:  857:
+        -:  858:/// Registers the scalar replacement of a scalar result returned from a
+        -:  859:/// reduction loop. 'replacement' must be scalar.
+        -:  860:///
+        -:  861:/// This utility is used to register the replacement for scalar results of
+        -:  862:/// vectorized reduction loops with iter_args.
+        -:  863:///
+        -:  864:/// Example 2:
+        -:  865:///   * 'replaced': %0 = affine.for %i = 0 to 512 iter_args(%x = ...) -> (f32)
+        -:  866:///   * 'replacement': %1 = vector.reduction <add>, %0 : vector<4xf32> into f32
+function _ZN12_GLOBAL__N_118VectorizationState35registerLoopResultScalarReplacementEN4mlir5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  867:void VectorizationState::registerLoopResultScalarReplacement(
+        -:  868:    Value replaced, Value replacement) {
+    #####:  869:  assert(isa<AffineForOp>(replaced.getDefiningOp()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  870:  assert(loopResultScalarReplacement.count(replaced) == 0 &&
+call    0 never executed
+call    1 never executed
+        -:  871:         "already registered");
+    #####:  872:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ will replace a result of the loop "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  873:                       "with scalar: "
+        -:  874:                    << replacement);
+    #####:  875:  loopResultScalarReplacement[replaced] = replacement;
+call    0 never executed
+    #####:  876:}
+        -:  877:
+function _ZN12_GLOBAL__N_118VectorizationState34registerValueScalarReplacementImplEN4mlir5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  878:void VectorizationState::registerValueScalarReplacementImpl(Value replaced,
+        -:  879:                                                            Value replacement) {
+    #####:  880:  assert(!valueScalarReplacement.contains(replaced) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  881:         "Scalar value replacement already registered");
+    #####:  882:  assert(!replacement.getType().isa<VectorType>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  883:         "Expected scalar type in scalar replacement");
+    #####:  884:  valueScalarReplacement.map(replaced, replacement);
+call    0 never executed
+    #####:  885:}
+        -:  886:
+        -:  887:/// Returns in 'replacedVals' the scalar replacement for values in 'inputVals'.
+function _ZN12_GLOBAL__N_118VectorizationState29getScalarValueReplacementsForEN4mlir10ValueRangeERN4llvm15SmallVectorImplINS1_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  888:void VectorizationState::getScalarValueReplacementsFor(
+        -:  889:    ValueRange inputVals, SmallVectorImpl<Value> &replacedVals) {
+    #####:  890:  for (Value inputVal : inputVals)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  891:    replacedVals.push_back(valueScalarReplacement.lookupOrDefault(inputVal));
+call    0 never executed
+call    1 never executed
+    #####:  892:}
+        -:  893:
+        -:  894:/// Erases a loop nest, including all its nested operations.
+function _ZL13eraseLoopNestN4mlir11AffineForOpE called 0 returned 0% blocks executed 0%
+    #####:  895:static void eraseLoopNest(AffineForOp forOp) {
+    #####:  896:  LLVM_DEBUG(dbgs() << "[early-vect]+++++ erasing:\n" << forOp << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  897:  forOp.erase();
+call    0 never executed
+    #####:  898:}
+        -:  899:
+        -:  900:/// Erases the scalar loop nest after its successful vectorization.
+        -:  901:void VectorizationState::finishVectorizationPattern(AffineForOp rootLoop) {
+        -:  902:  LLVM_DEBUG(dbgs() << "\n[early-vect] Finalizing vectorization\n");
+        -:  903:  eraseLoopNest(rootLoop);
+        -:  904:}
+        -:  905:
+        -:  906:// Apply 'map' with 'mapOperands' returning resulting values in 'results'.
+function _ZL22computeMemoryOpIndicesPN4mlir9OperationENS_9AffineMapENS_10ValueRangeERN12_GLOBAL__N_118VectorizationStateERN4llvm15SmallVectorImplINS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  907:static void computeMemoryOpIndices(Operation *op, AffineMap map,
+        -:  908:                                   ValueRange mapOperands,
+        -:  909:                                   VectorizationState &state,
+        -:  910:                                   SmallVectorImpl<Value> &results) {
+    #####:  911:  for (auto resultExpr : map.getResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  912:    auto singleResMap =
+    #####:  913:        AffineMap::get(map.getNumDims(), map.getNumSymbols(), resultExpr);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  914:    auto afOp = state.builder.create<AffineApplyOp>(op->getLoc(), singleResMap,
+    #####:  915:                                                    mapOperands);
+call    0 never executed
+    #####:  916:    results.push_back(afOp);
+call    0 never executed
+        -:  917:  }
+    #####:  918:}
+        -:  919:
+        -:  920:/// Returns a FilterFunctionType that can be used in NestedPattern to match a
+        -:  921:/// loop whose underlying load/store accesses are either invariant or all
+        -:  922:// varying along the `fastestVaryingMemRefDimension`.
+        -:  923:static FilterFunctionType
+    #####:  924:isVectorizableLoopPtrFactory(const DenseSet<Operation *> &parallelLoops,
+        -:  925:                             int fastestVaryingMemRefDimension) {
+function _ZZL28isVectorizableLoopPtrFactoryRKN4llvm8DenseSetIPN4mlir9OperationENS_12DenseMapInfoIS3_vEEEEiENKUlRS2_E_clES9_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  926:  return [&parallelLoops, fastestVaryingMemRefDimension](Operation &forOp) {
+    #####:  927:    auto loop = cast<AffineForOp>(forOp);
+call    0 never executed
+    #####:  928:    auto parallelIt = parallelLoops.find(loop);
+call    0 never executed
+    #####:  929:    if (parallelIt == parallelLoops.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  930:      return false;
+    #####:  931:    int memRefDim = -1;
+    #####:  932:    auto vectorizableBody =
+    #####:  933:        isVectorizableLoopBody(loop, &memRefDim, vectorTransferPattern());
+call    0 never executed
+call    1 never executed
+    #####:  934:    if (!vectorizableBody)
+branch  0 never executed
+branch  1 never executed
+        -:  935:      return false;
+    #####:  936:    return memRefDim == -1 || fastestVaryingMemRefDimension == -1 ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  937:           memRefDim == fastestVaryingMemRefDimension;
+    #####:  938:  };
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  939:}
+        -:  940:
+        -:  941:/// Returns the vector type resulting from applying the provided vectorization
+        -:  942:/// strategy on the scalar type.
+function _ZL13getVectorTypeN4mlir4TypeEPKNS_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####:  943:static VectorType getVectorType(Type scalarTy,
+        -:  944:                                const VectorizationStrategy *strategy) {
+    #####:  945:  assert(!scalarTy.isa<VectorType>() && "Expected scalar type");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  946:  return VectorType::get(strategy->vectorSizes, scalarTy);
+call    0 never executed
+        -:  947:}
+        -:  948:
+        -:  949:/// Tries to transform a scalar constant into a vector constant. Returns the
+        -:  950:/// vector constant if the scalar type is valid vector element type. Returns
+        -:  951:/// nullptr, otherwise.
+function _ZL17vectorizeConstantN4mlir5arith10ConstantOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####:  952:static arith::ConstantOp vectorizeConstant(arith::ConstantOp constOp,
+        -:  953:                                           VectorizationState &state) {
+    #####:  954:  Type scalarTy = constOp.getType();
+call    0 never executed
+    #####:  955:  if (!VectorType::isValidElementType(scalarTy))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  956:    return nullptr;
+        -:  957:
+    #####:  958:  auto vecTy = getVectorType(scalarTy, state.strategy);
+call    0 never executed
+    #####:  959:  auto vecAttr = DenseElementsAttr::get(vecTy, constOp.getValue());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  960:
+    #####:  961:  OpBuilder::InsertionGuard guard(state.builder);
+call    0 never executed
+    #####:  962:  Operation *parentOp = state.builder.getInsertionBlock()->getParentOp();
+call    0 never executed
+        -:  963:  // Find the innermost vectorized ancestor loop to insert the vector constant.
+    #####:  964:  while (parentOp && !state.vecLoopToVecDim.count(parentOp))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  965:    parentOp = parentOp->getParentOp();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  966:  assert(parentOp && state.vecLoopToVecDim.count(parentOp) &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  967:         isa<AffineForOp>(parentOp) && "Expected a vectorized for op");
+    #####:  968:  auto vecForOp = cast<AffineForOp>(parentOp);
+call    0 never executed
+    #####:  969:  state.builder.setInsertionPointToStart(vecForOp.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  970:  auto newConstOp =
+    #####:  971:      state.builder.create<arith::ConstantOp>(constOp.getLoc(), vecAttr);
+call    0 never executed
+        -:  972:
+        -:  973:  // Register vector replacement for future uses in the scope.
+    #####:  974:  state.registerOpVectorReplacement(constOp, newConstOp);
+call    0 never executed
+    #####:  975:  return newConstOp;
+branch  0 never executed
+branch  1 never executed
+        -:  976:}
+        -:  977:
+        -:  978:/// Creates a constant vector filled with the neutral elements of the given
+        -:  979:/// reduction. The scalar type of vector elements will be taken from
+        -:  980:/// `oldOperand`.
+function _ZL19createInitialVectorN4mlir5arith13AtomicRMWKindENS_5ValueERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####:  981:static arith::ConstantOp createInitialVector(arith::AtomicRMWKind reductionKind,
+        -:  982:                                             Value oldOperand,
+        -:  983:                                             VectorizationState &state) {
+    #####:  984:  Type scalarTy = oldOperand.getType();
+call    0 never executed
+    #####:  985:  if (!VectorType::isValidElementType(scalarTy))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  986:    return nullptr;
+        -:  987:
+    #####:  988:  Attribute valueAttr = getIdentityValueAttr(
+    #####:  989:      reductionKind, scalarTy, state.builder, oldOperand.getLoc());
+call    0 never executed
+call    1 never executed
+    #####:  990:  auto vecTy = getVectorType(scalarTy, state.strategy);
+call    0 never executed
+    #####:  991:  auto vecAttr = DenseElementsAttr::get(vecTy, valueAttr);
+call    0 never executed
+call    1 never executed
+    #####:  992:  auto newConstOp =
+    #####:  993:      state.builder.create<arith::ConstantOp>(oldOperand.getLoc(), vecAttr);
+call    0 never executed
+call    1 never executed
+        -:  994:
+    #####:  995:  return newConstOp;
+        -:  996:}
+        -:  997:
+        -:  998:/// Creates a mask used to filter out garbage elements in the last iteration
+        -:  999:/// of unaligned loops. If a mask is not required then `nullptr` is returned.
+        -: 1000:/// The mask will be a vector of booleans representing meaningful vector
+        -: 1001:/// elements in the current iteration. It is filled with ones for each iteration
+        -: 1002:/// except for the last one, where it has the form `11...100...0` with the
+        -: 1003:/// number of ones equal to the number of meaningful elements (i.e. the number
+        -: 1004:/// of iterations that would be left in the original loop).
+function _ZL10createMaskN4mlir11AffineForOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1005:static Value createMask(AffineForOp vecForOp, VectorizationState &state) {
+    #####: 1006:  assert(state.strategy->vectorSizes.size() == 1 &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1007:         "Creating a mask non-1-D vectors is not supported.");
+    #####: 1008:  assert(vecForOp.getStep() == state.strategy->vectorSizes[0] &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -: 1009:         "Creating a mask for loops with non-unit original step size is not "
+        -: 1010:         "supported.");
+        -: 1011:
+        -: 1012:  // Check if we have already created the mask.
+    #####: 1013:  if (Value mask = state.vecLoopToMask.lookup(vecForOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1014:    return mask;
+        -: 1015:
+        -: 1016:  // If the loop has constant bounds and the original number of iterations is
+        -: 1017:  // divisable by the vector size then we don't need a mask.
+    #####: 1018:  if (vecForOp.hasConstantBounds()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1019:    int64_t originalTripCount =
+    #####: 1020:        vecForOp.getConstantUpperBound() - vecForOp.getConstantLowerBound();
+call    0 never executed
+call    1 never executed
+    #####: 1021:    if (originalTripCount % vecForOp.getStep() == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1022:      return nullptr;
+        -: 1023:  }
+        -: 1024:
+    #####: 1025:  OpBuilder::InsertionGuard guard(state.builder);
+call    0 never executed
+    #####: 1026:  state.builder.setInsertionPointToStart(vecForOp.getBody());
+call    0 never executed
+call    1 never executed
+        -: 1027:
+        -: 1028:  // We generate the mask using the `vector.create_mask` operation which accepts
+        -: 1029:  // the number of meaningful elements (i.e. the length of the prefix of 1s).
+        -: 1030:  // To compute the number of meaningful elements we subtract the current value
+        -: 1031:  // of the iteration variable from the upper bound of the loop. Example:
+        -: 1032:  //
+        -: 1033:  //     // 500 is the upper bound of the loop
+        -: 1034:  //     #map = affine_map<(d0) -> (500 - d0)>
+        -: 1035:  //     %elems_left = affine.apply #map(%iv)
+        -: 1036:  //     %mask = vector.create_mask %elems_left : vector<128xi1>
+        -: 1037:
+    #####: 1038:  Location loc = vecForOp.getLoc();
+call    0 never executed
+        -: 1039:
+        -: 1040:  // First we get the upper bound of the loop using `affine.apply` or
+        -: 1041:  // `affine.min`.
+    #####: 1042:  AffineMap ubMap = vecForOp.getUpperBoundMap();
+call    0 never executed
+    #####: 1043:  Value ub;
+    #####: 1044:  if (ubMap.getNumResults() == 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1045:    ub = state.builder.create<AffineApplyOp>(loc, vecForOp.getUpperBoundMap(),
+    #####: 1046:                                             vecForOp.getUpperBoundOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1047:  else
+    #####: 1048:    ub = state.builder.create<AffineMinOp>(loc, vecForOp.getUpperBoundMap(),
+    #####: 1049:                                           vecForOp.getUpperBoundOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1050:  // Then we compute the number of (original) iterations left in the loop.
+    #####: 1051:  AffineExpr subExpr =
+    #####: 1052:      state.builder.getAffineDimExpr(0) - state.builder.getAffineDimExpr(1);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1053:  Value itersLeft =
+    #####: 1054:      makeComposedAffineApply(state.builder, loc, AffineMap::get(2, 0, subExpr),
+    #####: 1055:                              {ub, vecForOp.getInductionVar()});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1056:  // If the affine maps were successfully composed then `ub` is unneeded.
+    #####: 1057:  if (ub.use_empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1058:    ub.getDefiningOp()->erase();
+call    0 never executed
+call    1 never executed
+        -: 1059:  // Finally we create the mask.
+    #####: 1060:  Type maskTy = VectorType::get(state.strategy->vectorSizes,
+    #####: 1061:                                state.builder.getIntegerType(1));
+call    0 never executed
+call    1 never executed
+    #####: 1062:  Value mask =
+    #####: 1063:      state.builder.create<vector::CreateMaskOp>(loc, maskTy, itersLeft);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1064:
+    #####: 1065:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ creating a mask:\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -: 1066:                    << itersLeft << "\n"
+        -: 1067:                    << mask << "\n");
+        -: 1068:
+    #####: 1069:  state.vecLoopToMask[vecForOp] = mask;
+call    0 never executed
+    #####: 1070:  return mask;
+branch  0 never executed
+branch  1 never executed
+        -: 1071:}
+        -: 1072:
+        -: 1073:/// Returns true if the provided value is vector uniform given the vectorization
+        -: 1074:/// strategy.
+        -: 1075:// TODO: For now, only values that are induction variables of loops not in
+        -: 1076:// `loopToVectorDim` or invariants to all the loops in the vectorization
+        -: 1077:// strategy are considered vector uniforms.
+function _ZL19isUniformDefinitionN4mlir5ValueEPKNS_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####: 1078:static bool isUniformDefinition(Value value,
+        -: 1079:                                const VectorizationStrategy *strategy) {
+    #####: 1080:  AffineForOp forOp = getForInductionVarOwner(value);
+call    0 never executed
+    #####: 1081:  if (forOp && strategy->loopToVectorDim.count(forOp) == 0)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1082:    return true;
+        -: 1083:
+    #####: 1084:  for (auto loopToDim : strategy->loopToVectorDim) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1085:    auto loop = cast<AffineForOp>(loopToDim.first);
+call    0 never executed
+    #####: 1086:    if (!loop.isDefinedOutsideOfLoop(value))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1087:      return false;
+        -: 1088:  }
+    #####: 1089:  return true;
+        -: 1090:}
+        -: 1091:
+        -: 1092:/// Generates a broadcast op for the provided uniform value using the
+        -: 1093:/// vectorization strategy in 'state'.
+function _ZL16vectorizeUniformN4mlir5ValueERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1094:static Operation *vectorizeUniform(Value uniformVal,
+        -: 1095:                                   VectorizationState &state) {
+    #####: 1096:  OpBuilder::InsertionGuard guard(state.builder);
+call    0 never executed
+    #####: 1097:  Value uniformScalarRepl =
+    #####: 1098:      state.valueScalarReplacement.lookupOrDefault(uniformVal);
+call    0 never executed
+    #####: 1099:  state.builder.setInsertionPointAfterValue(uniformScalarRepl);
+call    0 never executed
+        -: 1100:
+    #####: 1101:  auto vectorTy = getVectorType(uniformVal.getType(), state.strategy);
+call    0 never executed
+    #####: 1102:  auto bcastOp = state.builder.create<BroadcastOp>(uniformVal.getLoc(),
+    #####: 1103:                                                   vectorTy, uniformScalarRepl);
+call    0 never executed
+call    1 never executed
+    #####: 1104:  state.registerValueVectorReplacement(uniformVal, bcastOp);
+call    0 never executed
+    #####: 1105:  return bcastOp;
+branch  0 never executed
+branch  1 never executed
+        -: 1106:}
+        -: 1107:
+        -: 1108:/// Tries to vectorize a given `operand` by applying the following logic:
+        -: 1109:/// 1. if the defining operation has been already vectorized, `operand` is
+        -: 1110:///    already in the proper vector form;
+        -: 1111:/// 2. if the `operand` is a constant, returns the vectorized form of the
+        -: 1112:///    constant;
+        -: 1113:/// 3. if the `operand` is uniform, returns a vector broadcast of the `op`;
+        -: 1114:/// 4. otherwise, the vectorization of `operand` is not supported.
+        -: 1115:/// Newly created vector operations are registered in `state` as replacement
+        -: 1116:/// for their scalar counterparts.
+        -: 1117:/// In particular this logic captures some of the use cases where definitions
+        -: 1118:/// that are not scoped under the current pattern are needed to vectorize.
+        -: 1119:/// One such example is top level function constants that need to be splatted.
+        -: 1120:///
+        -: 1121:/// Returns an operand that has been vectorized to match `state`'s strategy if
+        -: 1122:/// vectorization is possible with the above logic. Returns nullptr otherwise.
+        -: 1123:///
+        -: 1124:/// TODO: handle more complex cases.
+function _ZL16vectorizeOperandN4mlir5ValueERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1125:static Value vectorizeOperand(Value operand, VectorizationState &state) {
+    #####: 1126:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorize operand: " << operand);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1127:  // If this value is already vectorized, we are done.
+    #####: 1128:  if (Value vecRepl = state.valueVectorReplacement.lookupOrNull(operand)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1129:    LLVM_DEBUG(dbgs() << " -> already vectorized: " << vecRepl);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1130:    return vecRepl;
+        -: 1131:  }
+        -: 1132:
+        -: 1133:  // An vector operand that is not in the replacement map should never reach
+        -: 1134:  // this point. Reaching this point could mean that the code was already
+        -: 1135:  // vectorized and we shouldn't try to vectorize already vectorized code.
+    #####: 1136:  assert(!operand.getType().isa<VectorType>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1137:         "Vector op not found in replacement map");
+        -: 1138:
+        -: 1139:  // Vectorize constant.
+    #####: 1140:  if (auto constOp = operand.getDefiningOp<arith::ConstantOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1141:    auto vecConstant = vectorizeConstant(constOp, state);
+call    0 never executed
+    #####: 1142:    LLVM_DEBUG(dbgs() << "-> constant: " << vecConstant);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1143:    return vecConstant.getResult();
+call    0 never executed
+        -: 1144:  }
+        -: 1145:
+        -: 1146:  // Vectorize uniform values.
+    #####: 1147:  if (isUniformDefinition(operand, state.strategy)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1148:    Operation *vecUniform = vectorizeUniform(operand, state);
+call    0 never executed
+    #####: 1149:    LLVM_DEBUG(dbgs() << "-> uniform: " << *vecUniform);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1150:    return vecUniform->getResult(0);
+        -: 1151:  }
+        -: 1152:
+        -: 1153:  // Check for unsupported block argument scenarios. A supported block argument
+        -: 1154:  // should have been vectorized already.
+    #####: 1155:  if (!operand.getDefiningOp())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1156:    LLVM_DEBUG(dbgs() << "-> unsupported block argument\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1157:  else
+        -: 1158:    // Generic unsupported case.
+    #####: 1159:    LLVM_DEBUG(dbgs() << "-> non-vectorizable\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1160:
+    #####: 1161:  return nullptr;
+        -: 1162:}
+        -: 1163:
+        -: 1164:/// Vectorizes an affine load with the vectorization strategy in 'state' by
+        -: 1165:/// generating a 'vector.transfer_read' op with the proper permutation map
+        -: 1166:/// inferred from the indices of the load. The new 'vector.transfer_read' is
+        -: 1167:/// registered as replacement of the scalar load. Returns the newly created
+        -: 1168:/// 'vector.transfer_read' if vectorization was successful. Returns nullptr,
+        -: 1169:/// otherwise.
+function _ZL19vectorizeAffineLoadN4mlir12AffineLoadOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1170:static Operation *vectorizeAffineLoad(AffineLoadOp loadOp,
+        -: 1171:                                      VectorizationState &state) {
+    #####: 1172:  MemRefType memRefType = loadOp.getMemRefType();
+call    0 never executed
+    #####: 1173:  Type elementType = memRefType.getElementType();
+call    0 never executed
+    #####: 1174:  auto vectorType = VectorType::get(state.strategy->vectorSizes, elementType);
+call    0 never executed
+        -: 1175:
+        -: 1176:  // Replace map operands with operands from the vector loop nest.
+    #####: 1177:  SmallVector<Value, 8> mapOperands;
+call    0 never executed
+    #####: 1178:  state.getScalarValueReplacementsFor(loadOp.getMapOperands(), mapOperands);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1179:
+        -: 1180:  // Compute indices for the transfer op. AffineApplyOp's may be generated.
+    #####: 1181:  SmallVector<Value, 8> indices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1182:  indices.reserve(memRefType.getRank());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1183:  if (loadOp.getAffineMap() !=
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1184:      state.builder.getMultiDimIdentityMap(memRefType.getRank()))
+call    0 never executed
+    #####: 1185:    computeMemoryOpIndices(loadOp, loadOp.getAffineMap(), mapOperands, state,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1186:                           indices);
+        -: 1187:  else
+    #####: 1188:    indices.append(mapOperands.begin(), mapOperands.end());
+call    0 never executed
+        -: 1189:
+        -: 1190:  // Compute permutation map using the information of new vector loops.
+    #####: 1191:  auto permutationMap = makePermutationMap(state.builder.getInsertionBlock(),
+    #####: 1192:                                           indices, state.vecLoopToVecDim);
+call    0 never executed
+    #####: 1193:  if (!permutationMap) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1194:    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ can't compute permutationMap\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1195:    return nullptr;
+        -: 1196:  }
+    #####: 1197:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1198:  LLVM_DEBUG(permutationMap.print(dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1199:
+    #####: 1200:  auto transfer = state.builder.create<vector::TransferReadOp>(
+    #####: 1201:      loadOp.getLoc(), vectorType, loadOp.getMemRef(), indices, permutationMap);
+call    0 never executed
+call    1 never executed
+        -: 1202:
+        -: 1203:  // Register replacement for future uses in the scope.
+    #####: 1204:  state.registerOpVectorReplacement(loadOp, transfer);
+call    0 never executed
+    #####: 1205:  return transfer;
+call    0 never executed
+        -: 1206:}
+        -: 1207:
+        -: 1208:/// Vectorizes an affine store with the vectorization strategy in 'state' by
+        -: 1209:/// generating a 'vector.transfer_write' op with the proper permutation map
+        -: 1210:/// inferred from the indices of the store. The new 'vector.transfer_store' is
+        -: 1211:/// registered as replacement of the scalar load. Returns the newly created
+        -: 1212:/// 'vector.transfer_write' if vectorization was successful. Returns nullptr,
+        -: 1213:/// otherwise.
+function _ZL20vectorizeAffineStoreN4mlir13AffineStoreOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1214:static Operation *vectorizeAffineStore(AffineStoreOp storeOp,
+        -: 1215:                                       VectorizationState &state) {
+    #####: 1216:  MemRefType memRefType = storeOp.getMemRefType();
+call    0 never executed
+    #####: 1217:  Value vectorValue = vectorizeOperand(storeOp.getValueToStore(), state);
+call    0 never executed
+call    1 never executed
+    #####: 1218:  if (!vectorValue)
+branch  0 never executed
+branch  1 never executed
+        -: 1219:    return nullptr;
+        -: 1220:
+        -: 1221:  // Replace map operands with operands from the vector loop nest.
+    #####: 1222:  SmallVector<Value, 8> mapOperands;
+call    0 never executed
+    #####: 1223:  state.getScalarValueReplacementsFor(storeOp.getMapOperands(), mapOperands);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1224:
+        -: 1225:  // Compute indices for the transfer op. AffineApplyOp's may be generated.
+    #####: 1226:  SmallVector<Value, 8> indices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1227:  indices.reserve(memRefType.getRank());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1228:  if (storeOp.getAffineMap() !=
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1229:      state.builder.getMultiDimIdentityMap(memRefType.getRank()))
+call    0 never executed
+    #####: 1230:    computeMemoryOpIndices(storeOp, storeOp.getAffineMap(), mapOperands, state,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1231:                           indices);
+        -: 1232:  else
+    #####: 1233:    indices.append(mapOperands.begin(), mapOperands.end());
+call    0 never executed
+        -: 1234:
+        -: 1235:  // Compute permutation map using the information of new vector loops.
+    #####: 1236:  auto permutationMap = makePermutationMap(state.builder.getInsertionBlock(),
+    #####: 1237:                                           indices, state.vecLoopToVecDim);
+call    0 never executed
+    #####: 1238:  if (!permutationMap)
+branch  0 never executed
+branch  1 never executed
+        -: 1239:    return nullptr;
+    #####: 1240:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ permutationMap: ");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1241:  LLVM_DEBUG(permutationMap.print(dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1242:
+    #####: 1243:  auto transfer = state.builder.create<vector::TransferWriteOp>(
+    #####: 1244:      storeOp.getLoc(), vectorValue, storeOp.getMemRef(), indices,
+    #####: 1245:      permutationMap);
+call    0 never executed
+call    1 never executed
+    #####: 1246:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorized store: " << transfer);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1247:
+        -: 1248:  // Register replacement for future uses in the scope.
+    #####: 1249:  state.registerOpVectorReplacement(storeOp, transfer);
+call    0 never executed
+    #####: 1250:  return transfer;
+call    0 never executed
+        -: 1251:}
+        -: 1252:
+        -: 1253:/// Returns true if `value` is a constant equal to the neutral element of the
+        -: 1254:/// given vectorizable reduction.
+function _ZL21isNeutralElementConstN4mlir5arith13AtomicRMWKindENS_5ValueERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1255:static bool isNeutralElementConst(arith::AtomicRMWKind reductionKind,
+        -: 1256:                                  Value value, VectorizationState &state) {
+    #####: 1257:  Type scalarTy = value.getType();
+call    0 never executed
+    #####: 1258:  if (!VectorType::isValidElementType(scalarTy))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1259:    return false;
+    #####: 1260:  Attribute valueAttr = getIdentityValueAttr(reductionKind, scalarTy,
+    #####: 1261:                                             state.builder, value.getLoc());
+call    0 never executed
+call    1 never executed
+    #####: 1262:  if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(value.getDefiningOp()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1263:    return constOp.getValue() == valueAttr;
+call    0 never executed
+    #####: 1264:  return false;
+        -: 1265:}
+        -: 1266:
+        -: 1267:/// Vectorizes a loop with the vectorization strategy in 'state'. A new loop is
+        -: 1268:/// created and registered as replacement for the scalar loop. The builder's
+        -: 1269:/// insertion point is set to the new loop's body so that subsequent vectorized
+        -: 1270:/// operations are inserted into the new loop. If the loop is a vector
+        -: 1271:/// dimension, the step of the newly created loop will reflect the vectorization
+        -: 1272:/// factor used to vectorized that dimension.
+function _ZL20vectorizeAffineForOpN4mlir11AffineForOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1273:static Operation *vectorizeAffineForOp(AffineForOp forOp,
+        -: 1274:                                       VectorizationState &state) {
+    #####: 1275:  const VectorizationStrategy &strategy = *state.strategy;
+    #####: 1276:  auto loopToVecDimIt = strategy.loopToVectorDim.find(forOp);
+call    0 never executed
+    #####: 1277:  bool isLoopVecDim = loopToVecDimIt != strategy.loopToVectorDim.end();
+call    0 never executed
+call    1 never executed
+        -: 1278:
+        -: 1279:  // TODO: Vectorization of reduction loops is not supported for non-unit steps.
+    #####: 1280:  if (isLoopVecDim && forOp.getNumIterOperands() > 0 && forOp.getStep() != 1) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1281:    LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+        -: 1282:        dbgs()
+        -: 1283:        << "\n[early-vect]+++++ unsupported step size for reduction loop: "
+        -: 1284:        << forOp.getStep() << "\n");
+    #####: 1285:    return nullptr;
+        -: 1286:  }
+        -: 1287:
+        -: 1288:  // If we are vectorizing a vector dimension, compute a new step for the new
+        -: 1289:  // vectorized loop using the vectorization factor for the vector dimension.
+        -: 1290:  // Otherwise, propagate the step of the scalar loop.
+    #####: 1291:  unsigned newStep;
+    #####: 1292:  if (isLoopVecDim) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1293:    unsigned vectorDim = loopToVecDimIt->second;
+call    0 never executed
+    #####: 1294:    assert(vectorDim < strategy.vectorSizes.size() && "vector dim overflow");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1295:    int64_t forOpVecFactor = strategy.vectorSizes[vectorDim];
+branch  0 never executed
+branch  1 never executed
+    #####: 1296:    newStep = forOp.getStep() * forOpVecFactor;
+call    0 never executed
+        -: 1297:  } else {
+    #####: 1298:    newStep = forOp.getStep();
+call    0 never executed
+        -: 1299:  }
+        -: 1300:
+        -: 1301:  // Get information about reduction kinds.
+    #####: 1302:  ArrayRef<LoopReduction> reductions;
+    #####: 1303:  if (isLoopVecDim && forOp.getNumIterOperands() > 0) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1304:    auto it = strategy.reductionLoops.find(forOp);
+call    0 never executed
+    #####: 1305:    assert(it != strategy.reductionLoops.end() &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1306:           "Reduction descriptors not found when vectorizing a reduction loop");
+    #####: 1307:    reductions = it->second;
+call    0 never executed
+call    1 never executed
+    #####: 1308:    assert(reductions.size() == forOp.getNumIterOperands() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1309:           "The size of reductions array must match the number of iter_args");
+        -: 1310:  }
+        -: 1311:
+        -: 1312:  // Vectorize 'iter_args'.
+    #####: 1313:  SmallVector<Value, 8> vecIterOperands;
+branch  0 never executed
+branch  1 never executed
+    #####: 1314:  if (!isLoopVecDim) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1315:    for (auto operand : forOp.getIterOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1316:      vecIterOperands.push_back(vectorizeOperand(operand, state));
+call    0 never executed
+call    1 never executed
+        -: 1317:  } else {
+        -: 1318:    // For reduction loops we need to pass a vector of neutral elements as an
+        -: 1319:    // initial value of the accumulator. We will add the original initial value
+        -: 1320:    // later.
+    #####: 1321:    for (auto redAndOperand : llvm::zip(reductions, forOp.getIterOperands())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1322:      vecIterOperands.push_back(createInitialVector(
+call    0 never executed
+call    1 never executed
+    #####: 1323:          std::get<0>(redAndOperand).kind, std::get<1>(redAndOperand), state));
+call    0 never executed
+call    1 never executed
+        -: 1324:    }
+        -: 1325:  }
+        -: 1326:
+    #####: 1327:  auto vecForOp = state.builder.create<AffineForOp>(
+    #####: 1328:      forOp.getLoc(), forOp.getLowerBoundOperands(), forOp.getLowerBoundMap(),
+call    0 never executed
+    #####: 1329:      forOp.getUpperBoundOperands(), forOp.getUpperBoundMap(), newStep,
+call    0 never executed
+call    1 never executed
+        -: 1330:      vecIterOperands,
+    #####: 1331:      /*bodyBuilder=*/[](OpBuilder &, Location, Value, ValueRange) {
+        -: 1332:        // Make sure we don't create a default terminator in the loop body as
+        -: 1333:        // the proper terminator will be added during vectorization.
+    #####: 1334:      });
+call    0 never executed
+call    1 never executed
+        -: 1335:
+        -: 1336:  // Register loop-related replacements:
+        -: 1337:  //   1) The new vectorized loop is registered as vector replacement of the
+        -: 1338:  //      scalar loop.
+        -: 1339:  //   2) The new iv of the vectorized loop is registered as scalar replacement
+        -: 1340:  //      since a scalar copy of the iv will prevail in the vectorized loop.
+        -: 1341:  //      TODO: A vector replacement will also be added in the future when
+        -: 1342:  //      vectorization of linear ops is supported.
+        -: 1343:  //   3) The new 'iter_args' region arguments are registered as vector
+        -: 1344:  //      replacements since they have been vectorized.
+        -: 1345:  //   4) If the loop performs a reduction along the vector dimension, a
+        -: 1346:  //      `vector.reduction` or similar op is inserted for each resulting value
+        -: 1347:  //      of the loop and its scalar value replaces the corresponding scalar
+        -: 1348:  //      result of the loop.
+    #####: 1349:  state.registerOpVectorReplacement(forOp, vecForOp);
+call    0 never executed
+    #####: 1350:  state.registerValueScalarReplacement(forOp.getInductionVar(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1351:                                       vecForOp.getInductionVar());
+    #####: 1352:  for (auto iterTuple :
+    #####: 1353:       llvm ::zip(forOp.getRegionIterArgs(), vecForOp.getRegionIterArgs()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1354:    state.registerBlockArgVectorReplacement(std::get<0>(iterTuple),
+call    0 never executed
+    #####: 1355:                                            std::get<1>(iterTuple));
+call    0 never executed
+        -: 1356:
+    #####: 1357:  if (isLoopVecDim) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1358:    for (unsigned i = 0; i < vecForOp.getNumIterOperands(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1359:      // First, we reduce the vector returned from the loop into a scalar.
+    #####: 1360:      Value reducedRes =
+branch  0 never executed
+branch  1 never executed
+    #####: 1361:          getVectorReductionOp(reductions[i].kind, state.builder,
+branch  0 never executed
+branch  1 never executed
+    #####: 1362:                               vecForOp.getLoc(), vecForOp.getResult(i));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1363:      LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ creating a vector reduction: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1364:                        << reducedRes);
+        -: 1365:      // Then we combine it with the original (scalar) initial value unless it
+        -: 1366:      // is equal to the neutral element of the reduction.
+    #####: 1367:      Value origInit = forOp.getOperand(forOp.getNumControlOperands() + i);
+call    0 never executed
+call    1 never executed
+    #####: 1368:      Value finalRes = reducedRes;
+    #####: 1369:      if (!isNeutralElementConst(reductions[i].kind, origInit, state))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1370:        finalRes =
+    #####: 1371:            arith::getReductionOp(reductions[i].kind, state.builder,
+call    0 never executed
+    #####: 1372:                                  reducedRes.getLoc(), reducedRes, origInit);
+call    0 never executed
+call    1 never executed
+    #####: 1373:      state.registerLoopResultScalarReplacement(forOp.getResult(i), finalRes);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1374:    }
+        -: 1375:  }
+        -: 1376:
+    #####: 1377:  if (isLoopVecDim)
+branch  0 never executed
+branch  1 never executed
+    #####: 1378:    state.vecLoopToVecDim[vecForOp] = loopToVecDimIt->second;
+call    0 never executed
+call    1 never executed
+        -: 1379:
+        -: 1380:  // Change insertion point so that upcoming vectorized instructions are
+        -: 1381:  // inserted into the vectorized loop's body.
+    #####: 1382:  state.builder.setInsertionPointToStart(vecForOp.getBody());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1383:
+        -: 1384:  // If this is a reduction loop then we may need to create a mask to filter out
+        -: 1385:  // garbage in the last iteration.
+    #####: 1386:  if (isLoopVecDim && forOp.getNumIterOperands() > 0)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1387:    createMask(vecForOp, state);
+call    0 never executed
+        -: 1388:
+    #####: 1389:  return vecForOp;
+branch  0 never executed
+branch  1 never executed
+        -: 1390:}
+        -: 1391:
+        -: 1392:/// Vectorizes arbitrary operation by plain widening. We apply generic type
+        -: 1393:/// widening of all its results and retrieve the vector counterparts for all its
+        -: 1394:/// operands.
+function _ZL7widenOpPN4mlir9OperationERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1395:static Operation *widenOp(Operation *op, VectorizationState &state) {
+    #####: 1396:  SmallVector<Type, 8> vectorTypes;
+branch  0 never executed
+branch  1 never executed
+    #####: 1397:  for (Value result : op->getResults())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1398:    vectorTypes.push_back(
+call    0 never executed
+    #####: 1399:        VectorType::get(state.strategy->vectorSizes, result.getType()));
+call    0 never executed
+        -: 1400:
+    #####: 1401:  SmallVector<Value, 8> vectorOperands;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1402:  for (Value operand : op->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1403:    Value vecOperand = vectorizeOperand(operand, state);
+call    0 never executed
+    #####: 1404:    if (!vecOperand) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1405:      LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ an operand failed vectorize\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1406:      return nullptr;
+        -: 1407:    }
+    #####: 1408:    vectorOperands.push_back(vecOperand);
+call    0 never executed
+        -: 1409:  }
+        -: 1410:
+        -: 1411:  // Create a clone of the op with the proper operands and return types.
+        -: 1412:  // TODO: The following assumes there is always an op with a fixed
+        -: 1413:  // name that works both in scalar mode and vector mode.
+        -: 1414:  // TODO: Is it worth considering an Operation.clone operation which
+        -: 1415:  // changes the type so we can promote an Operation with less boilerplate?
+    #####: 1416:  Operation *vecOp =
+    #####: 1417:      state.builder.create(op->getLoc(), op->getName().getIdentifier(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1418:                           vectorOperands, vectorTypes, op->getAttrs());
+    #####: 1419:  state.registerOpVectorReplacement(op, vecOp);
+    #####: 1420:  return vecOp;
+call    0 never executed
+        -: 1421:}
+        -: 1422:
+        -: 1423:/// Vectorizes a yield operation by widening its types. The builder's insertion
+        -: 1424:/// point is set after the vectorized parent op to continue vectorizing the
+        -: 1425:/// operations after the parent op. When vectorizing a reduction loop a mask may
+        -: 1426:/// be used to prevent adding garbage values to the accumulator.
+function _ZL22vectorizeAffineYieldOpN4mlir13AffineYieldOpERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1427:static Operation *vectorizeAffineYieldOp(AffineYieldOp yieldOp,
+        -: 1428:                                         VectorizationState &state) {
+    #####: 1429:  Operation *newYieldOp = widenOp(yieldOp, state);
+call    0 never executed
+    #####: 1430:  Operation *newParentOp = state.builder.getInsertionBlock()->getParentOp();
+call    0 never executed
+        -: 1431:
+        -: 1432:  // If there is a mask for this loop then we must prevent garbage values from
+        -: 1433:  // being added to the accumulator by inserting `select` operations, for
+        -: 1434:  // example:
+        -: 1435:  //
+        -: 1436:  //   %val_masked = select %mask, %val, %neutralCst : vector<128xi1>,
+        -: 1437:  //   vector<128xf32>
+        -: 1438:  //   %res = arith.addf %acc, %val_masked : vector<128xf32>
+        -: 1439:  //   affine.yield %res : vector<128xf32>
+        -: 1440:  //
+    #####: 1441:  if (Value mask = state.vecLoopToMask.lookup(newParentOp)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1442:    state.builder.setInsertionPoint(newYieldOp);
+call    0 never executed
+    #####: 1443:    for (unsigned i = 0; i < newYieldOp->getNumOperands(); ++i) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1444:      SmallVector<Operation *> combinerOps;
+call    0 never executed
+    #####: 1445:      Value reducedVal = matchReduction(
+    #####: 1446:          cast<AffineForOp>(newParentOp).getRegionIterArgs(), i, combinerOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1447:      assert(reducedVal && "expect non-null value for parallel reduction loop");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1448:      assert(combinerOps.size() == 1 && "expect only one combiner op");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1449:      // IterOperands are neutral element vectors.
+    #####: 1450:      Value neutralVal = cast<AffineForOp>(newParentOp).getIterOperands()[i];
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1451:      state.builder.setInsertionPoint(combinerOps.back());
+call    0 never executed
+call    1 never executed
+    #####: 1452:      Value maskedReducedVal = state.builder.create<arith::SelectOp>(
+    #####: 1453:          reducedVal.getLoc(), mask, reducedVal, neutralVal);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1454:      LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1455:          dbgs() << "\n[early-vect]+++++ masking an input to a binary op that"
+        -: 1456:                    "produces value for a yield Op: "
+        -: 1457:                 << maskedReducedVal);
+    #####: 1458:      combinerOps.back()->replaceUsesOfWith(reducedVal, maskedReducedVal);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1459:    }
+        -: 1460:  }
+        -: 1461:
+    #####: 1462:  state.builder.setInsertionPointAfter(newParentOp);
+call    0 never executed
+    #####: 1463:  return newYieldOp;
+        -: 1464:}
+        -: 1465:
+        -: 1466:/// Encodes Operation-specific behavior for vectorization. In general we
+        -: 1467:/// assume that all operands of an op must be vectorized but this is not
+        -: 1468:/// always true. In the future, it would be nice to have a trait that
+        -: 1469:/// describes how a particular operation vectorizes. For now we implement the
+        -: 1470:/// case distinction here. Returns a vectorized form of an operation or
+        -: 1471:/// nullptr if vectorization fails.
+        -: 1472:// TODO: consider adding a trait to Op to describe how it gets vectorized.
+        -: 1473:// Maybe some Ops are not vectorizable or require some tricky logic, we cannot
+        -: 1474:// do one-off logic here; ideally it would be TableGen'd.
+function _ZL21vectorizeOneOperationPN4mlir9OperationERN12_GLOBAL__N_118VectorizationStateE called 0 returned 0% blocks executed 0%
+    #####: 1475:static Operation *vectorizeOneOperation(Operation *op,
+        -: 1476:                                        VectorizationState &state) {
+        -: 1477:  // Sanity checks.
+    #####: 1478:  assert(!isa<vector::TransferReadOp>(op) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1479:         "vector.transfer_read cannot be further vectorized");
+    #####: 1480:  assert(!isa<vector::TransferWriteOp>(op) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1481:         "vector.transfer_write cannot be further vectorized");
+        -: 1482:
+    #####: 1483:  if (auto loadOp = dyn_cast<AffineLoadOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1484:    return vectorizeAffineLoad(loadOp, state);
+call    0 never executed
+    #####: 1485:  if (auto storeOp = dyn_cast<AffineStoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1486:    return vectorizeAffineStore(storeOp, state);
+call    0 never executed
+    #####: 1487:  if (auto forOp = dyn_cast<AffineForOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1488:    return vectorizeAffineForOp(forOp, state);
+call    0 never executed
+    #####: 1489:  if (auto yieldOp = dyn_cast<AffineYieldOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1490:    return vectorizeAffineYieldOp(yieldOp, state);
+call    0 never executed
+    #####: 1491:  if (auto constant = dyn_cast<arith::ConstantOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1492:    return vectorizeConstant(constant, state);
+call    0 never executed
+        -: 1493:
+        -: 1494:  // Other ops with regions are not supported.
+    #####: 1495:  if (op->getNumRegions() != 0)
+branch  0 never executed
+branch  1 never executed
+        -: 1496:    return nullptr;
+        -: 1497:
+    #####: 1498:  return widenOp(op, state);
+call    0 never executed
+        -: 1499:}
+        -: 1500:
+        -: 1501:/// Recursive implementation to convert all the nested loops in 'match' to a 2D
+        -: 1502:/// vector container that preserves the relative nesting level of each loop with
+        -: 1503:/// respect to the others in 'match'. 'currentLevel' is the nesting level that
+        -: 1504:/// will be assigned to the loop in the current 'match'.
+        -: 1505:static void
+function _ZL24getMatchedAffineLoopsRecN4mlir11NestedMatchEjRSt6vectorIN4llvm11SmallVectorINS_11AffineForOpELj2EEESaIS5_EE called 0 returned 0% blocks executed 0%
+    #####: 1506:getMatchedAffineLoopsRec(NestedMatch match, unsigned currentLevel,
+        -: 1507:                         std::vector<SmallVector<AffineForOp, 2>> &loops) {
+        -: 1508:  // Add a new empty level to the output if it doesn't exist already.
+    #####: 1509:  assert(currentLevel <= loops.size() && "Unexpected currentLevel");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1510:  if (currentLevel == loops.size())
+branch  0 never executed
+branch  1 never executed
+    #####: 1511:    loops.emplace_back();
+call    0 never executed
+        -: 1512:
+        -: 1513:  // Add current match and recursively visit its children.
+    #####: 1514:  loops[currentLevel].push_back(cast<AffineForOp>(match.getMatchedOperation()));
+call    0 never executed
+call    1 never executed
+    #####: 1515:  for (auto childMatch : match.getMatchedChildren()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1516:    getMatchedAffineLoopsRec(childMatch, currentLevel + 1, loops);
+call    0 never executed
+        -: 1517:  }
+    #####: 1518:}
+        -: 1519:
+        -: 1520:/// Converts all the nested loops in 'match' to a 2D vector container that
+        -: 1521:/// preserves the relative nesting level of each loop with respect to the others
+        -: 1522:/// in 'match'. This means that every loop in 'loops[i]' will have a parent loop
+        -: 1523:/// in 'loops[i-1]'. A loop in 'loops[i]' may or may not have a child loop in
+        -: 1524:/// 'loops[i+1]'.
+        -: 1525:static void
+    #####: 1526:getMatchedAffineLoops(NestedMatch match,
+        -: 1527:                      std::vector<SmallVector<AffineForOp, 2>> &loops) {
+    #####: 1528:  getMatchedAffineLoopsRec(match, /*currLoopDepth=*/0, loops);
+        -: 1529:}
+        -: 1530:
+        -: 1531:/// Internal implementation to vectorize affine loops from a single loop nest
+        -: 1532:/// using an n-D vectorization strategy.
+        -: 1533:static LogicalResult
+function _ZL17vectorizeLoopNestRSt6vectorIN4llvm11SmallVectorIN4mlir11AffineForOpELj2EEESaIS4_EERKNS2_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####: 1534:vectorizeLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
+        -: 1535:                  const VectorizationStrategy &strategy) {
+    #####: 1536:  assert(loops[0].size() == 1 && "Expected single root loop");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1537:  AffineForOp rootLoop = loops[0][0];
+call    0 never executed
+    #####: 1538:  VectorizationState state(rootLoop.getContext());
+call    0 never executed
+call    1 never executed
+    #####: 1539:  state.builder.setInsertionPointAfter(rootLoop);
+call    0 never executed
+    #####: 1540:  state.strategy = &strategy;
+        -: 1541:
+        -: 1542:  // Since patterns are recursive, they can very well intersect.
+        -: 1543:  // Since we do not want a fully greedy strategy in general, we decouple
+        -: 1544:  // pattern matching, from profitability analysis, from application.
+        -: 1545:  // As a consequence we must check that each root pattern is still
+        -: 1546:  // vectorizable. If a pattern is not vectorizable anymore, we just skip it.
+        -: 1547:  // TODO: implement a non-greedy profitability analysis that keeps only
+        -: 1548:  // non-intersecting patterns.
+    #####: 1549:  if (!isVectorizableLoopBody(rootLoop, vectorTransferPattern())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1550:    LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ loop is not vectorizable");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1551:    return failure();
+        -: 1552:  }
+        -: 1553:
+        -: 1554:  //////////////////////////////////////////////////////////////////////////////
+        -: 1555:  // Vectorize the scalar loop nest following a topological order. A new vector
+        -: 1556:  // loop nest with the vectorized operations is created along the process. If
+        -: 1557:  // vectorization succeeds, the scalar loop nest is erased. If vectorization
+        -: 1558:  // fails, the vector loop nest is erased and the scalar loop nest is not
+        -: 1559:  // modified.
+        -: 1560:  //////////////////////////////////////////////////////////////////////////////
+        -: 1561:
+function _ZZL17vectorizeLoopNestRSt6vectorIN4llvm11SmallVectorIN4mlir11AffineForOpELj2EEESaIS4_EERKNS2_21VectorizationStrategyEENKUlPNS2_9OperationEE_clESC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1562:  auto opVecResult = rootLoop.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    #####: 1563:    LLVM_DEBUG(dbgs() << "[early-vect]+++++ Vectorizing: " << *op);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####: 1564:    Operation *vectorOp = vectorizeOneOperation(op, state);
+call    0 never executed
+    #####: 1565:    if (!vectorOp) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1566:      LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1567:          dbgs() << "[early-vect]+++++ failed vectorizing the operation: "
+        -: 1568:                 << *op << "\n");
+    #####: 1569:      return WalkResult::interrupt();
+        -: 1570:    }
+        -: 1571:
+    #####: 1572:    return WalkResult::advance();
+    #####: 1573:  });
+call    0 never executed
+        -: 1574:
+    #####: 1575:  if (opVecResult.wasInterrupted()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1576:    LLVM_DEBUG(dbgs() << "[early-vect]+++++ failed vectorization for: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1577:                      << rootLoop << "\n");
+        -: 1578:    // Erase vector loop nest if it was created.
+    #####: 1579:    auto vecRootLoopIt = state.opVectorReplacement.find(rootLoop);
+call    0 never executed
+    #####: 1580:    if (vecRootLoopIt != state.opVectorReplacement.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1581:      eraseLoopNest(cast<AffineForOp>(vecRootLoopIt->second));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1582:
+    #####: 1583:    return failure();
+        -: 1584:  }
+        -: 1585:
+        -: 1586:  // Replace results of reduction loops with the scalar values computed using
+        -: 1587:  // `vector.reduce` or similar ops.
+    #####: 1588:  for (auto resPair : state.loopResultScalarReplacement)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####: 1589:    resPair.first.replaceAllUsesWith(resPair.second);
+call    0 never executed
+call    1 never executed
+        -: 1590:
+    #####: 1591:  assert(state.opVectorReplacement.count(rootLoop) == 1 &&
+call    0 never executed
+call    1 never executed
+        -: 1592:         "Expected vector replacement for loop nest");
+    #####: 1593:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ success vectorizing pattern");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1594:  LLVM_DEBUG(dbgs() << "\n[early-vect]+++++ vectorization result:\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1595:                    << *state.opVectorReplacement[rootLoop]);
+        -: 1596:
+        -: 1597:  // Finish this vectorization pattern.
+    #####: 1598:  state.finishVectorizationPattern(rootLoop);
+call    0 never executed
+    #####: 1599:  return success();
+call    0 never executed
+        -: 1600:}
+        -: 1601:
+        -: 1602:/// Extracts the matched loops and vectorizes them following a topological
+        -: 1603:/// order. A new vector loop nest will be created if vectorization succeeds. The
+        -: 1604:/// original loop nest won't be modified in any case.
+function _ZL18vectorizeRootMatchN4mlir11NestedMatchERKNS_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####: 1605:static LogicalResult vectorizeRootMatch(NestedMatch m,
+        -: 1606:                                        const VectorizationStrategy &strategy) {
+    #####: 1607:  std::vector<SmallVector<AffineForOp, 2>> loopsToVectorize;
+call    0 never executed
+call    1 never executed
+    #####: 1608:  getMatchedAffineLoops(m, loopsToVectorize);
+call    0 never executed
+    #####: 1609:  return vectorizeLoopNest(loopsToVectorize, strategy);
+call    0 never executed
+        -: 1610:}
+        -: 1611:
+        -: 1612:/// Traverses all the loop matches and classifies them into intersection
+        -: 1613:/// buckets. Two matches intersect if any of them encloses the other one. A
+        -: 1614:/// match intersects with a bucket if the match intersects with the root
+        -: 1615:/// (outermost) loop in that bucket.
+function _ZL26computeIntersectionBucketsN4llvm8ArrayRefIN4mlir11NestedMatchEEERSt6vectorINS_11SmallVectorIS2_Lj8EEESaIS6_EE called 0 returned 0% blocks executed 0%
+    #####: 1616:static void computeIntersectionBuckets(
+        -: 1617:    ArrayRef<NestedMatch> matches,
+        -: 1618:    std::vector<SmallVector<NestedMatch, 8>> &intersectionBuckets) {
+    #####: 1619:  assert(intersectionBuckets.empty() && "Expected empty output");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1620:  // Keeps track of the root (outermost) loop of each bucket.
+    #####: 1621:  SmallVector<AffineForOp, 8> bucketRoots;
+        -: 1622:
+    #####: 1623:  for (const NestedMatch &match : matches) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1624:    AffineForOp matchRoot = cast<AffineForOp>(match.getMatchedOperation());
+call    0 never executed
+    #####: 1625:    bool intersects = false;
+    #####: 1626:    for (int i = 0, end = intersectionBuckets.size(); i < end; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1627:      AffineForOp bucketRoot = bucketRoots[i];
+branch  0 never executed
+branch  1 never executed
+        -: 1628:      // Add match to the bucket if the bucket root encloses the match root.
+    #####: 1629:      if (bucketRoot->isAncestor(matchRoot)) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1630:        intersectionBuckets[i].push_back(match);
+call    0 never executed
+    #####: 1631:        intersects = true;
+    #####: 1632:        break;
+call    0 never executed
+        -: 1633:      }
+        -: 1634:      // Add match to the bucket if the match root encloses the bucket root. The
+        -: 1635:      // match root becomes the new bucket root.
+    #####: 1636:      if (matchRoot->isAncestor(bucketRoot)) {
+call    0 never executed
+    #####: 1637:        bucketRoots[i] = matchRoot;
+branch  0 never executed
+branch  1 never executed
+    #####: 1638:        intersectionBuckets[i].push_back(match);
+call    0 never executed
+    #####: 1639:        intersects = true;
+    #####: 1640:        break;
+call    0 never executed
+        -: 1641:      }
+        -: 1642:    }
+        -: 1643:
+        -: 1644:    // Match doesn't intersect with any existing bucket. Create a new bucket for
+        -: 1645:    // it.
+    #####: 1646:    if (!intersects) {
+    #####: 1647:      bucketRoots.push_back(matchRoot);
+call    0 never executed
+    #####: 1648:      intersectionBuckets.emplace_back();
+call    0 never executed
+    #####: 1649:      intersectionBuckets.back().push_back(match);
+call    0 never executed
+        -: 1650:    }
+        -: 1651:  }
+    #####: 1652:}
+        -: 1653:
+        -: 1654:/// Internal implementation to vectorize affine loops in 'loops' using the n-D
+        -: 1655:/// vectorization factors in 'vectorSizes'. By default, each vectorization
+        -: 1656:/// factor is applied inner-to-outer to the loops of each loop nest.
+        -: 1657:/// 'fastestVaryingPattern' can be optionally used to provide a different loop
+        -: 1658:/// vectorization order. `reductionLoops` can be provided to specify loops which
+        -: 1659:/// can be vectorized along the reduction dimension.
+function _ZL14vectorizeLoopsPN4mlir9OperationERN4llvm8DenseSetIS1_NS2_12DenseMapInfoIS1_vEEEENS2_8ArrayRefIlEES9_RKNS2_8DenseMapIS1_NS2_11SmallVectorINS_13LoopReductionELj2EEES5_NS2_6detail12DenseMapPairIS1_SD_EEEE called 937 returned 100% blocks executed 10%
+      937: 1660:static void vectorizeLoops(Operation *parentOp, DenseSet<Operation *> &loops,
+        -: 1661:                           ArrayRef<int64_t> vectorSizes,
+        -: 1662:                           ArrayRef<int64_t> fastestVaryingPattern,
+        -: 1663:                           const ReductionLoopMap &reductionLoops) {
+     937*: 1664:  assert((reductionLoops.empty() || vectorSizes.size() == 1) &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1665:         "Vectorizing reductions is supported only for 1-D vectors");
+        -: 1666:
+        -: 1667:  // Compute 1-D, 2-D or 3-D loop pattern to be matched on the target loops.
+      937: 1668:  Optional<NestedPattern> pattern =
+     937*: 1669:      makePattern(loops, vectorSizes.size(), fastestVaryingPattern);
+call    0 returned 100%
+      938: 1670:  if (!pattern) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     938*: 1671:    LLVM_DEBUG(dbgs() << "\n[early-vect] pattern couldn't be computed\n");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+      938: 1672:    return;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -: 1673:  }
+        -: 1674:
+    #####: 1675:  LLVM_DEBUG(dbgs() << "\n******************************************");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1676:  LLVM_DEBUG(dbgs() << "\n******************************************");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1677:  LLVM_DEBUG(dbgs() << "\n[early-vect] new pattern on parent op\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1678:  LLVM_DEBUG(dbgs() << *parentOp << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -: 1679:
+    #####: 1680:  unsigned patternDepth = pattern->getDepth();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1681:
+        -: 1682:  // Compute all the pattern matches and classify them into buckets of
+        -: 1683:  // intersecting matches.
+    #####: 1684:  SmallVector<NestedMatch, 32> allMatches;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1685:  pattern->match(parentOp, &allMatches);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1686:  std::vector<SmallVector<NestedMatch, 8>> intersectionBuckets;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1687:  computeIntersectionBuckets(allMatches, intersectionBuckets);
+call    0 never executed
+        -: 1688:
+        -: 1689:  // Iterate over all buckets and vectorize the matches eagerly. We can only
+        -: 1690:  // vectorize one match from each bucket since all the matches within a bucket
+        -: 1691:  // intersect.
+    #####: 1692:  for (auto &intersectingMatches : intersectionBuckets) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1693:    for (NestedMatch &match : intersectingMatches) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1694:      VectorizationStrategy strategy;
+call    0 never executed
+call    1 never executed
+        -: 1695:      // TODO: depending on profitability, elect to reduce the vector size.
+    #####: 1696:      strategy.vectorSizes.assign(vectorSizes.begin(), vectorSizes.end());
+call    0 never executed
+    #####: 1697:      strategy.reductionLoops = reductionLoops;
+call    0 never executed
+    #####: 1698:      if (failed(analyzeProfitability(match.getMatchedChildren(), 1,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1699:                                      patternDepth, &strategy))) {
+    #####: 1700:        continue;
+call    0 never executed
+        -: 1701:      }
+    #####: 1702:      vectorizeLoopIfProfitable(match.getMatchedOperation(), 0, patternDepth,
+call    0 never executed
+        -: 1703:                                &strategy);
+        -: 1704:      // Vectorize match. Skip the rest of intersecting matches in the bucket if
+        -: 1705:      // vectorization succeeded.
+        -: 1706:      // TODO: if pattern does not apply, report it; alter the cost/benefit.
+        -: 1707:      // TODO: some diagnostics if failure to vectorize occurs.
+    #####: 1708:      if (succeeded(vectorizeRootMatch(match, strategy)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1709:        break;
+        -: 1710:    }
+        -: 1711:  }
+        -: 1712:
+    #####: 1713:  LLVM_DEBUG(dbgs() << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1714:}
+        -: 1715:
+        -: 1716:/// Applies vectorization to the current function by searching over a bunch of
+        -: 1717:/// predetermined patterns.
+function _ZN12_GLOBAL__N_19Vectorize14runOnOperationEv called 946 returned 99% blocks executed 54%
+      946: 1718:void Vectorize::runOnOperation() {
+      946: 1719:  func::FuncOp f = getOperation();
+call    0 returned 100%
+     946*: 1720:  if (!fastestVaryingPattern.empty() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+    #####: 1721:      fastestVaryingPattern.size() != vectorSizes.size()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1722:    f.emitRemark("Fastest varying pattern specified with different size than "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1723:                 "the vector size.");
+    #####: 1724:    return signalPassFailure();
+call    0 never executed
+        -: 1725:  }
+        -: 1726:
+     946*: 1727:  if (vectorizeReductions && vectorSizes.size() != 1) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+    #####: 1728:    f.emitError("Vectorizing reductions is supported only for 1-D vectors.");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1729:    return signalPassFailure();
+call    0 never executed
+        -: 1730:  }
+        -: 1731:
+     1882: 1732:  DenseSet<Operation *> parallelLoops;
+call    0 returned 100%
+     1883: 1733:  ReductionLoopMap reductionLoops;
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -: 1734:
+        -: 1735:  // If 'vectorize-reduction=true' is provided, we also populate the
+        -: 1736:  // `reductionLoops` map.
+      946: 1737:  if (vectorizeReductions) {
+branch  0 taken 0%
+branch  1 taken 100%
+function _ZZN12_GLOBAL__N_19Vectorize14runOnOperationEvENKUlN4mlir11AffineForOpEE_clES2_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1738:    f.walk([&parallelLoops, &reductionLoops](AffineForOp loop) {
+call    0 never executed
+    #####: 1739:      SmallVector<LoopReduction, 2> reductions;
+call    0 never executed
+    #####: 1740:      if (isLoopParallel(loop, &reductions)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1741:        parallelLoops.insert(loop);
+call    0 never executed
+        -: 1742:        // If it's not a reduction loop, adding it to the map is not necessary.
+    #####: 1743:        if (!reductions.empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1744:          reductionLoops[loop] = reductions;
+call    0 never executed
+call    1 never executed
+        -: 1745:      }
+    #####: 1746:    });
+        -: 1747:  } else {
+function _ZZN12_GLOBAL__N_19Vectorize14runOnOperationEvENKUlN4mlir11AffineForOpEE0_clES2_.isra.0 called 0 returned 0% blocks executed 0%
+     946*: 1748:    f.walk([&parallelLoops](AffineForOp loop) {
+call    0 returned 100%
+    #####: 1749:      if (isLoopParallel(loop))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1750:        parallelLoops.insert(loop);
+call    0 never executed
+    #####: 1751:    });
+        -: 1752:  }
+        -: 1753:
+        -: 1754:  // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
+     1881: 1755:  NestedPatternContext mlContext;
+call    0 returned 99%
+call    1 returned 100%
+      937: 1756:  vectorizeLoops(f, parallelLoops, vectorSizes, fastestVaryingPattern,
+call    0 returned 100%
+        -: 1757:                 reductionLoops);
+        -: 1758:}
+        -: 1759:
+        -: 1760:/// Verify that affine loops in 'loops' meet the nesting criteria expected by
+        -: 1761:/// SuperVectorizer:
+        -: 1762:///   * There must be at least one loop.
+        -: 1763:///   * There must be a single root loop (nesting level 0).
+        -: 1764:///   * Each loop at a given nesting level must be nested in a loop from a
+        -: 1765:///     previous nesting level.
+        -: 1766:static LogicalResult
+function _ZL17verifyLoopNestingRKSt6vectorIN4llvm11SmallVectorIN4mlir11AffineForOpELj2EEESaIS4_EE called 0 returned 0% blocks executed 0%
+    #####: 1767:verifyLoopNesting(const std::vector<SmallVector<AffineForOp, 2>> &loops) {
+        -: 1768:  // Expected at least one loop.
+    #####: 1769:  if (loops.empty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1770:    return failure();
+        -: 1771:
+        -: 1772:  // Expected only one root loop.
+    #####: 1773:  if (loops[0].size() != 1)
+branch  0 never executed
+branch  1 never executed
+    #####: 1774:    return failure();
+        -: 1775:
+        -: 1776:  // Traverse loops outer-to-inner to check some invariants.
+    #####: 1777:  for (int i = 1, end = loops.size(); i < end; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1778:    for (AffineForOp loop : loops[i]) {
+branch  0 never executed
+branch  1 never executed
+        -: 1779:      //  Check that each loop at this level is nested in one of the loops from
+        -: 1780:      //  the previous level.
+    #####: 1781:      if (none_of(loops[i - 1], [&](AffineForOp maybeParent) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1782:            return maybeParent->isProperAncestor(loop);
+        -: 1783:          }))
+    #####: 1784:        return failure();
+        -: 1785:
+        -: 1786:      //  Check that each loop at this level is not nested in another loop from
+        -: 1787:      //  this level.
+    #####: 1788:      for (AffineForOp sibling : loops[i]) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1789:        if (sibling->isProperAncestor(loop))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1790:          return failure();
+        -: 1791:      }
+        -: 1792:    }
+        -: 1793:  }
+        -: 1794:
+    #####: 1795:  return success();
+        -: 1796:}
+        -: 1797:
+        -: 1798:namespace mlir {
+        -: 1799:
+        -: 1800:/// External utility to vectorize affine loops in 'loops' using the n-D
+        -: 1801:/// vectorization factors in 'vectorSizes'. By default, each vectorization
+        -: 1802:/// factor is applied inner-to-outer to the loops of each loop nest.
+        -: 1803:/// 'fastestVaryingPattern' can be optionally used to provide a different loop
+        -: 1804:/// vectorization order.
+        -: 1805:/// If `reductionLoops` is not empty, the given reduction loops may be
+        -: 1806:/// vectorized along the reduction dimension.
+        -: 1807:/// TODO: Vectorizing reductions is supported only for 1-D vectorization.
+function _ZN4mlir20vectorizeAffineLoopsEPNS_9OperationERN4llvm8DenseSetIS1_NS2_12DenseMapInfoIS1_vEEEENS2_8ArrayRefIlEES9_RKNS2_8DenseMapIS1_NS2_11SmallVectorINS_13LoopReductionELj2EEES5_NS2_6detail12DenseMapPairIS1_SD_EEEE called 0 returned 0% blocks executed 0%
+    #####: 1808:void vectorizeAffineLoops(Operation *parentOp, DenseSet<Operation *> &loops,
+        -: 1809:                          ArrayRef<int64_t> vectorSizes,
+        -: 1810:                          ArrayRef<int64_t> fastestVaryingPattern,
+        -: 1811:                          const ReductionLoopMap &reductionLoops) {
+        -: 1812:  // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
+    #####: 1813:  NestedPatternContext mlContext;
+call    0 never executed
+call    1 never executed
+    #####: 1814:  vectorizeLoops(parentOp, loops, vectorSizes, fastestVaryingPattern,
+call    0 never executed
+        -: 1815:                 reductionLoops);
+    #####: 1816:}
+        -: 1817:
+        -: 1818:/// External utility to vectorize affine loops from a single loop nest using an
+        -: 1819:/// n-D vectorization strategy (see doc in VectorizationStrategy definition).
+        -: 1820:/// Loops are provided in a 2D vector container. The first dimension represents
+        -: 1821:/// the nesting level relative to the loops to be vectorized. The second
+        -: 1822:/// dimension contains the loops. This means that:
+        -: 1823:///   a) every loop in 'loops[i]' must have a parent loop in 'loops[i-1]',
+        -: 1824:///   b) a loop in 'loops[i]' may or may not have a child loop in 'loops[i+1]'.
+        -: 1825:///
+        -: 1826:/// For example, for the following loop nest:
+        -: 1827:///
+        -: 1828:///   func @vec2d(%in0: memref<64x128x512xf32>, %in1: memref<64x128x128xf32>,
+        -: 1829:///               %out0: memref<64x128x512xf32>,
+        -: 1830:///               %out1: memref<64x128x128xf32>) {
+        -: 1831:///     affine.for %i0 = 0 to 64 {
+        -: 1832:///       affine.for %i1 = 0 to 128 {
+        -: 1833:///         affine.for %i2 = 0 to 512 {
+        -: 1834:///           %ld = affine.load %in0[%i0, %i1, %i2] : memref<64x128x512xf32>
+        -: 1835:///           affine.store %ld, %out0[%i0, %i1, %i2] : memref<64x128x512xf32>
+        -: 1836:///         }
+        -: 1837:///         affine.for %i3 = 0 to 128 {
+        -: 1838:///           %ld = affine.load %in1[%i0, %i1, %i3] : memref<64x128x128xf32>
+        -: 1839:///           affine.store %ld, %out1[%i0, %i1, %i3] : memref<64x128x128xf32>
+        -: 1840:///         }
+        -: 1841:///       }
+        -: 1842:///     }
+        -: 1843:///     return
+        -: 1844:///   }
+        -: 1845:///
+        -: 1846:/// loops = {{%i0}, {%i2, %i3}}, to vectorize the outermost and the two
+        -: 1847:/// innermost loops;
+        -: 1848:/// loops = {{%i1}, {%i2, %i3}}, to vectorize the middle and the two innermost
+        -: 1849:/// loops;
+        -: 1850:/// loops = {{%i2}}, to vectorize only the first innermost loop;
+        -: 1851:/// loops = {{%i3}}, to vectorize only the second innermost loop;
+        -: 1852:/// loops = {{%i1}}, to vectorize only the middle loop.
+        -: 1853:LogicalResult
+function _ZN4mlir23vectorizeAffineLoopNestERSt6vectorIN4llvm11SmallVectorINS_11AffineForOpELj2EEESaIS4_EERKNS_21VectorizationStrategyE called 0 returned 0% blocks executed 0%
+    #####: 1854:vectorizeAffineLoopNest(std::vector<SmallVector<AffineForOp, 2>> &loops,
+        -: 1855:                        const VectorizationStrategy &strategy) {
+        -: 1856:  // Thread-safe RAII local context, BumpPtrAllocator freed on exit.
+    #####: 1857:  NestedPatternContext mlContext;
+call    0 never executed
+    #####: 1858:  if (failed(verifyLoopNesting(loops)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1859:    return failure();
+call    0 never executed
+    #####: 1860:  return vectorizeLoopNest(loops, strategy);
+call    0 never executed
+        -: 1861:}
+        -: 1862:
+        -: 1863:} // namespace mlir

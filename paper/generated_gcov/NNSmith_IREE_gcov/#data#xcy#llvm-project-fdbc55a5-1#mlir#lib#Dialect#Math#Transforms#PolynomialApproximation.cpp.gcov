@@ -1,0 +1,2928 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Math/Transforms/PolynomialApproximation.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Math/Transforms/CMakeFiles/obj.MLIRMathTransforms.dir/PolynomialApproximation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Math/Transforms/CMakeFiles/obj.MLIRMathTransforms.dir/PolynomialApproximation.cpp.gcda
+        -:    0:Runs:325587
+        -:    1://===- PolynomialApproximation.cpp - Approximate math operations ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements expansion of math operations to fast approximations
+        -:   10:// that do not rely on any of the library functions.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include <climits>
+        -:   15:#include <cstddef>
+        -:   16:
+        -:   17:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   18:#include "mlir/Dialect/Math/IR/Math.h"
+        -:   19:#include "mlir/Dialect/Math/Transforms/Approximation.h"
+        -:   20:#include "mlir/Dialect/Math/Transforms/Passes.h"
+        -:   21:#include "mlir/Dialect/Utils/IndexingUtils.h"
+        -:   22:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   23:#include "mlir/Dialect/Vector/Utils/VectorUtils.h"
+        -:   24:#include "mlir/Dialect/X86Vector/X86VectorDialect.h"
+        -:   25:#include "mlir/IR/Builders.h"
+        -:   26:#include "mlir/IR/BuiltinTypes.h"
+        -:   27:#include "mlir/IR/ImplicitLocOpBuilder.h"
+        -:   28:#include "mlir/IR/OpDefinition.h"
+        -:   29:#include "mlir/IR/PatternMatch.h"
+        -:   30:#include "mlir/IR/TypeUtilities.h"
+        -:   31:#include "mlir/Transforms/DialectConversion.h"
+        -:   32:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   33:#include "llvm/ADT/ArrayRef.h"
+        -:   34:#include "llvm/ADT/STLExtras.h"
+        -:   35:
+        -:   36:using namespace mlir;
+        -:   37:using namespace mlir::math;
+        -:   38:using namespace mlir::vector;
+        -:   39:
+        -:   40:// Returns vector shape if the type is a vector. Returns an empty shape if it is
+        -:   41:// not a vector.
+function _ZL11vectorShapeN4mlir4TypeE called 0 returned 0% blocks executed 0%
+    #####:   42:static ArrayRef<int64_t> vectorShape(Type type) {
+    #####:   43:  auto vectorType = type.dyn_cast<VectorType>();
+call    0 never executed
+    #####:   44:  return vectorType ? vectorType.getShape() : ArrayRef<int64_t>();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:   45:}
+        -:   46:
+    #####:   47:static ArrayRef<int64_t> vectorShape(Value value) {
+    #####:   48:  return vectorShape(value.getType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:   49:}
+        -:   50:
+        -:   51://----------------------------------------------------------------------------//
+        -:   52:// Broadcast scalar types and values into vector types and values.
+        -:   53://----------------------------------------------------------------------------//
+        -:   54:
+        -:   55:// Broadcasts scalar type into vector type (iff shape is non-scalar).
+function _ZL9broadcastN4mlir4TypeEN4llvm8ArrayRefIlEE called 0 returned 0% blocks executed 0%
+    #####:   56:static Type broadcast(Type type, ArrayRef<int64_t> shape) {
+    #####:   57:  assert(!type.isa<VectorType>() && "must be scalar type");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   58:  return !shape.empty() ? VectorType::get(shape, type) : type;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:   59:}
+        -:   60:
+        -:   61:// Broadcasts scalar value into vector (iff shape is non-scalar).
+function _ZL9broadcastRN4mlir20ImplicitLocOpBuilderENS_5ValueEN4llvm8ArrayRefIlEE called 0 returned 0% blocks executed 0%
+    #####:   62:static Value broadcast(ImplicitLocOpBuilder &builder, Value value,
+        -:   63:                       ArrayRef<int64_t> shape) {
+    #####:   64:  assert(!value.getType().isa<VectorType>() && "must be scalar value");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   65:  auto type = broadcast(value.getType(), shape);
+call    0 never executed
+    #####:   66:  return !shape.empty() ? builder.create<BroadcastOp>(type, value) : value;
+branch  0 never executed
+branch  1 never executed
+        -:   67:}
+        -:   68:
+        -:   69://----------------------------------------------------------------------------//
+        -:   70:// Helper function to handle n-D vectors with 1-D operations.
+        -:   71://----------------------------------------------------------------------------//
+        -:   72:
+        -:   73:// Expands and unrolls n-D vector operands into multiple fixed size 1-D vectors
+        -:   74:// and calls the compute function with 1-D vector operands. Stitches back all
+        -:   75:// results into the original n-D vector result.
+        -:   76://
+        -:   77:// Examples: vectorWidth = 8
+        -:   78://   - vector<4x8xf32> unrolled 4 times
+        -:   79://   - vector<16xf32> expanded to vector<2x8xf32> and unrolled 2 times
+        -:   80://   - vector<4x16xf32> expanded to vector<4x2x8xf32> and unrolled 4*2 times
+        -:   81://
+        -:   82:// Some math approximations rely on ISA-specific operations that only accept
+        -:   83:// fixed size 1-D vectors (e.g. AVX expects vectors of width 8).
+        -:   84://
+        -:   85:// It is the caller's responsibility to verify that the inner dimension is
+        -:   86:// divisible by the vectorWidth, and that all operands have the same vector
+        -:   87:// shape.
+        -:   88:static Value
+function _ZL29handleMultidimensionalVectorsRN4mlir20ImplicitLocOpBuilderENS_10ValueRangeElN4llvm12function_refIFNS_5ValueES2_EEE called 0 returned 0% blocks executed 0%
+    #####:   89:handleMultidimensionalVectors(ImplicitLocOpBuilder &builder,
+        -:   90:                              ValueRange operands, int64_t vectorWidth,
+        -:   91:                              llvm::function_ref<Value(ValueRange)> compute) {
+    #####:   92:  assert(!operands.empty() && "operands must be not empty");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   93:  assert(vectorWidth > 0 && "vector width must be larger than 0");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:   94:
+    #####:   95:  VectorType inputType = operands[0].getType().cast<VectorType>();
+call    0 never executed
+call    1 never executed
+    #####:   96:  ArrayRef<int64_t> inputShape = inputType.getShape();
+call    0 never executed
+        -:   97:
+        -:   98:  // If input shape matches target vector width, we can just call the
+        -:   99:  // user-provided compute function with the operands.
+    #####:  100:  if (inputShape == llvm::makeArrayRef(vectorWidth))
+branch  0 never executed
+branch  1 never executed
+    #####:  101:    return compute(operands);
+call    0 never executed
+        -:  102:
+        -:  103:  // Check if the inner dimension has to be expanded, or we can directly iterate
+        -:  104:  // over the outer dimensions of the vector.
+    #####:  105:  int64_t innerDim = inputShape.back();
+call    0 never executed
+    #####:  106:  int64_t expansionDim = innerDim / vectorWidth;
+    #####:  107:  assert((innerDim % vectorWidth == 0) && "invalid inner dimension size");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  108:
+        -:  109:  // Maybe expand operands to the higher rank vector shape that we'll use to
+        -:  110:  // iterate over and extract one dimensional vectors.
+    #####:  111:  SmallVector<int64_t> expandedShape(inputShape.begin(), inputShape.end());
+call    0 never executed
+    #####:  112:  SmallVector<Value> expandedOperands(operands);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  113:
+    #####:  114:  if (expansionDim > 1) {
+branch  0 never executed
+branch  1 never executed
+        -:  115:    // Expand shape from [..., innerDim] to [..., expansionDim, vectorWidth].
+    #####:  116:    expandedShape.insert(expandedShape.end() - 1, expansionDim);
+call    0 never executed
+    #####:  117:    expandedShape.back() = vectorWidth;
+call    0 never executed
+        -:  118:
+    #####:  119:    for (unsigned i = 0; i < operands.size(); ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  120:      auto operand = operands[i];
+call    0 never executed
+    #####:  121:      auto eltType = operand.getType().cast<VectorType>().getElementType();
+call    0 never executed
+call    1 never executed
+    #####:  122:      auto expandedType = VectorType::get(expandedShape, eltType);
+call    0 never executed
+    #####:  123:      expandedOperands[i] =
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  124:          builder.create<vector::ShapeCastOp>(expandedType, operand);
+branch  0 never executed
+branch  1 never executed
+        -:  125:    }
+        -:  126:  }
+        -:  127:
+        -:  128:  // Iterate over all outer dimensions of the compute shape vector type.
+    #####:  129:  auto iterationDims = ArrayRef<int64_t>(expandedShape).drop_back();
+call    0 never executed
+    #####:  130:  int64_t maxLinearIndex = computeMaxLinearIndex(iterationDims);
+call    0 never executed
+        -:  131:
+    #####:  132:  SmallVector<int64_t> ones(iterationDims.size(), 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  133:  auto strides = computeStrides(iterationDims, ones);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  134:
+        -:  135:  // Compute results for each one dimensional vector.
+    #####:  136:  SmallVector<Value> results(maxLinearIndex);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  137:
+    #####:  138:  for (int64_t i = 0; i < maxLinearIndex; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  139:    auto offsets = delinearize(strides, i);
+call    0 never executed
+        -:  140:
+    #####:  141:    SmallVector<Value> extracted(expandedOperands.size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  142:    for (const auto &tuple : llvm::enumerate(expandedOperands))
+branch  0 never executed
+branch  1 never executed
+    #####:  143:      extracted[tuple.index()] =
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  144:          builder.create<vector::ExtractOp>(tuple.value(), offsets);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  145:
+    #####:  146:    results[i] = compute(extracted);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  147:  }
+        -:  148:
+        -:  149:  // Stitch results together into one large vector.
+    #####:  150:  Type resultEltType = results[0].getType().cast<VectorType>().getElementType();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  151:  Type resultExpandedType = VectorType::get(expandedShape, resultEltType);
+call    0 never executed
+    #####:  152:  Value result = builder.create<arith::ConstantOp>(
+    #####:  153:      resultExpandedType, builder.getZeroAttr(resultExpandedType));
+call    0 never executed
+call    1 never executed
+        -:  154:
+    #####:  155:  for (int64_t i = 0; i < maxLinearIndex; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  156:    result = builder.create<vector::InsertOp>(results[i], result,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  157:                                              delinearize(strides, i));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  158:
+        -:  159:  // Reshape back to the original vector shape.
+    #####:  160:  return builder.create<vector::ShapeCastOp>(
+    #####:  161:      VectorType::get(inputShape, resultEltType), result);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  162:}
+        -:  163:
+        -:  164://----------------------------------------------------------------------------//
+        -:  165:// Helper functions to create constants.
+        -:  166://----------------------------------------------------------------------------//
+        -:  167:
+function _ZL8floatCstRN4mlir20ImplicitLocOpBuilderEfNS_4TypeE called 0 returned 0% blocks executed 0%
+    #####:  168:static Value floatCst(ImplicitLocOpBuilder &builder, float value,
+        -:  169:                      Type elementType) {
+    #####:  170:  assert((elementType.isF16() || elementType.isF32()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  171:         "x must be f16 or f32 type.");
+    #####:  172:  return builder.create<arith::ConstantOp>(
+    #####:  173:      builder.getFloatAttr(elementType, value));
+call    0 never executed
+call    1 never executed
+        -:  174:}
+        -:  175:
+function _ZL6f32CstRN4mlir20ImplicitLocOpBuilderEf called 0 returned 0% blocks executed 0%
+    #####:  176:static Value f32Cst(ImplicitLocOpBuilder &builder, float value) {
+    #####:  177:  return builder.create<arith::ConstantOp>(builder.getF32FloatAttr(value));
+call    0 never executed
+call    1 never executed
+        -:  178:}
+        -:  179:
+function _ZL6i32CstRN4mlir20ImplicitLocOpBuilderEi called 0 returned 0% blocks executed 0%
+    #####:  180:static Value i32Cst(ImplicitLocOpBuilder &builder, int32_t value) {
+    #####:  181:  return builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(value));
+call    0 never executed
+call    1 never executed
+        -:  182:}
+        -:  183:
+function _ZL11f32FromBitsRN4mlir20ImplicitLocOpBuilderEj called 0 returned 0% blocks executed 0%
+    #####:  184:static Value f32FromBits(ImplicitLocOpBuilder &builder, uint32_t bits) {
+    #####:  185:  Value i32Value = i32Cst(builder, static_cast<int32_t>(bits));
+call    0 never executed
+    #####:  186:  return builder.create<arith::BitcastOp>(builder.getF32Type(), i32Value);
+call    0 never executed
+call    1 never executed
+        -:  187:}
+        -:  188:
+        -:  189://----------------------------------------------------------------------------//
+        -:  190:// Helper functions to build math functions approximations.
+        -:  191://----------------------------------------------------------------------------//
+        -:  192:
+        -:  193:// Return the minimum of the two values or NaN if value is NaN
+function _ZL3minRN4mlir20ImplicitLocOpBuilderENS_5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  194:static Value min(ImplicitLocOpBuilder &builder, Value value, Value bound) {
+    #####:  195:  return builder.create<arith::SelectOp>(
+    #####:  196:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::ULT, value, bound),
+call    0 never executed
+call    1 never executed
+    #####:  197:      value, bound);
+        -:  198:}
+        -:  199:
+        -:  200:// Return the maximum of the two values or NaN if value is NaN
+function _ZL3maxRN4mlir20ImplicitLocOpBuilderENS_5ValueES2_ called 0 returned 0% blocks executed 0%
+    #####:  201:static Value max(ImplicitLocOpBuilder &builder, Value value, Value bound) {
+    #####:  202:  return builder.create<arith::SelectOp>(
+    #####:  203:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::UGT, value, bound),
+call    0 never executed
+call    1 never executed
+    #####:  204:      value, bound);
+        -:  205:}
+        -:  206:
+        -:  207:// Return the clamped value or NaN if value is NaN
+    #####:  208:static Value clamp(ImplicitLocOpBuilder &builder, Value value, Value lowerBound,
+        -:  209:                   Value upperBound) {
+    #####:  210:  return max(builder, min(builder, value, upperBound), lowerBound);
+call    0 never executed
+        -:  211:}
+        -:  212:
+        -:  213:// Decomposes given floating point value `arg` into a normalized fraction and
+        -:  214:// an integral power of two (see std::frexp). Returned values have float type.
+function _ZL5frexpRN4mlir20ImplicitLocOpBuilderENS_5ValueEb called 0 returned 0% blocks executed 0%
+    #####:  215:static std::pair<Value, Value> frexp(ImplicitLocOpBuilder &builder, Value arg,
+        -:  216:                                     bool isPositive = false) {
+    #####:  217:  assert(getElementTypeOrSelf(arg).isF32() && "arg must be f32 type");
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  218:  ArrayRef<int64_t> shape = vectorShape(arg);
+call    0 never executed
+        -:  219:
+    #####:  220:  auto bcast = [&](Value value) -> Value {
+    #####:  221:    return broadcast(builder, value, shape);
+    #####:  222:  };
+        -:  223:
+    #####:  224:  auto i32 = builder.getIntegerType(32);
+call    0 never executed
+    #####:  225:  auto i32Vec = broadcast(i32, shape);
+call    0 never executed
+    #####:  226:  auto f32Vec = broadcast(builder.getF32Type(), shape);
+call    0 never executed
+call    1 never executed
+        -:  227:
+    #####:  228:  Value cst126f = f32Cst(builder, 126.0f);
+call    0 never executed
+    #####:  229:  Value cstHalf = f32Cst(builder, 0.5f);
+call    0 never executed
+    #####:  230:  Value cstInvMantMask = f32FromBits(builder, ~0x7f800000u);
+call    0 never executed
+        -:  231:
+        -:  232:  // Bitcast to i32 for bitwise operations.
+    #####:  233:  Value i32Half = builder.create<arith::BitcastOp>(i32, cstHalf);
+call    0 never executed
+call    1 never executed
+    #####:  234:  Value i32InvMantMask = builder.create<arith::BitcastOp>(i32, cstInvMantMask);
+call    0 never executed
+call    1 never executed
+    #####:  235:  Value i32Arg = builder.create<arith::BitcastOp>(i32Vec, arg);
+call    0 never executed
+call    1 never executed
+        -:  236:
+        -:  237:  // Compute normalized fraction.
+    #####:  238:  Value tmp0 = builder.create<arith::AndIOp>(i32Arg, bcast(i32InvMantMask));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  239:  Value tmp1 = builder.create<arith::OrIOp>(tmp0, bcast(i32Half));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  240:  Value normalizedFraction = builder.create<arith::BitcastOp>(f32Vec, tmp1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  241:
+        -:  242:  // Compute exponent.
+    #####:  243:  Value arg0 = isPositive ? arg : builder.create<math::AbsFOp>(arg);
+branch  0 never executed
+branch  1 never executed
+    #####:  244:  Value biasedExponentBits = builder.create<arith::ShRUIOp>(
+    #####:  245:      builder.create<arith::BitcastOp>(i32Vec, arg0),
+call    0 never executed
+    #####:  246:      bcast(i32Cst(builder, 23)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  247:  Value biasedExponent =
+call    0 never executed
+    #####:  248:      builder.create<arith::SIToFPOp>(f32Vec, biasedExponentBits);
+call    0 never executed
+    #####:  249:  Value exponent =
+    #####:  250:      builder.create<arith::SubFOp>(biasedExponent, bcast(cst126f));
+call    0 never executed
+call    1 never executed
+        -:  251:
+    #####:  252:  return {normalizedFraction, exponent};
+        -:  253:}
+        -:  254:
+        -:  255:// Computes exp2 for an i32 argument.
+function _ZL7exp2I32RN4mlir20ImplicitLocOpBuilderENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  256:static Value exp2I32(ImplicitLocOpBuilder &builder, Value arg) {
+    #####:  257:  assert(getElementTypeOrSelf(arg).isInteger(32) && "arg must be i32 type");
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  258:  ArrayRef<int64_t> shape = vectorShape(arg);
+call    0 never executed
+        -:  259:
+    #####:  260:  auto bcast = [&](Value value) -> Value {
+    #####:  261:    return broadcast(builder, value, shape);
+    #####:  262:  };
+        -:  263:
+    #####:  264:  auto f32Vec = broadcast(builder.getF32Type(), shape);
+call    0 never executed
+call    1 never executed
+        -:  265:  // The exponent of f32 located at 23-bit.
+    #####:  266:  auto exponetBitLocation = bcast(i32Cst(builder, 23));
+call    0 never executed
+call    1 never executed
+        -:  267:  // Set the exponent bias to zero.
+    #####:  268:  auto bias = bcast(i32Cst(builder, 127));
+call    0 never executed
+call    1 never executed
+        -:  269:
+    #####:  270:  Value biasedArg = builder.create<arith::AddIOp>(arg, bias);
+call    0 never executed
+call    1 never executed
+    #####:  271:  Value exp2ValueInt =
+call    0 never executed
+    #####:  272:      builder.create<arith::ShLIOp>(biasedArg, exponetBitLocation);
+call    0 never executed
+    #####:  273:  Value exp2ValueF32 = builder.create<arith::BitcastOp>(f32Vec, exp2ValueInt);
+call    0 never executed
+        -:  274:
+    #####:  275:  return exp2ValueF32;
+        -:  276:}
+        -:  277:
+        -:  278:namespace {
+function _ZN12_GLOBAL__N_125makePolynomialCalculationERN4mlir20ImplicitLocOpBuilderEN4llvm8ArrayRefINS0_5ValueEEES5_ called 0 returned 0% blocks executed 0%
+    #####:  279:Value makePolynomialCalculation(ImplicitLocOpBuilder &builder,
+        -:  280:                                llvm::ArrayRef<Value> coeffs, Value x) {
+    #####:  281:  Type elementType = getElementTypeOrSelf(x);
+call    0 never executed
+    #####:  282:  assert((elementType.isF32() || elementType.isF16()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  283:         "x must be f32 or f16 type");
+    #####:  284:  ArrayRef<int64_t> shape = vectorShape(x);
+call    0 never executed
+        -:  285:
+    #####:  286:  if (coeffs.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  287:    return broadcast(builder, floatCst(builder, 0.0f, elementType), shape);
+call    0 never executed
+call    1 never executed
+        -:  288:
+    #####:  289:  if (coeffs.size() == 1)
+branch  0 never executed
+branch  1 never executed
+    #####:  290:    return coeffs[0];
+        -:  291:
+    #####:  292:  Value res = builder.create<math::FmaOp>(x, coeffs[coeffs.size() - 1],
+    #####:  293:                                          coeffs[coeffs.size() - 2]);
+call    0 never executed
+    #####:  294:  for (auto i = ptrdiff_t(coeffs.size()) - 3; i >= 0; --i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  295:    res = builder.create<math::FmaOp>(x, res, coeffs[i]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  296:  }
+    #####:  297:  return res;
+        -:  298:}
+        -:  299:} // namespace
+        -:  300:
+        -:  301://----------------------------------------------------------------------------//
+        -:  302:// Helper function/pattern to insert casts for reusing F32 bit expansion.
+        -:  303://----------------------------------------------------------------------------//
+        -:  304:
+        -:  305:template <typename T>
+function _Z11insertCastsIN4mlir4math7Atan2OpEENS0_13LogicalResultEPNS0_9OperationERNS0_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  306:LogicalResult insertCasts(Operation *op, PatternRewriter &rewriter) {
+        -:  307:  // Conservatively only allow where the operand and result types are exactly 1.
+    #####:  308:  Type origType = op->getResultTypes().front();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  309:  for (Type t : llvm::drop_begin(op->getResultTypes()))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  310:    if (origType != t)
+branch  0 never executed
+branch  1 never executed
+    #####:  311:      return rewriter.notifyMatchFailure(op, "required all types to match");
+call    0 never executed
+    #####:  312:  for (Type t : op->getOperandTypes())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  313:    if (origType != t)
+branch  0 never executed
+branch  1 never executed
+    #####:  314:      return rewriter.notifyMatchFailure(op, "required all types to match");
+call    0 never executed
+        -:  315:
+        -:  316:  // Skip if already F32  or larger than 32 bits.
+    #####:  317:  if (getElementTypeOrSelf(origType).isF32() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  318:      getElementTypeOrSelf(origType).getIntOrFloatBitWidth() > 32)
+call    0 never executed
+call    1 never executed
+    #####:  319:    return failure();
+        -:  320:
+        -:  321:  // Create F32 equivalent type.
+    #####:  322:  Type newType;
+call    0 never executed
+    #####:  323:  if (auto shaped = origType.dyn_cast<ShapedType>()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  324:    newType = shaped.clone(rewriter.getF32Type());
+call    0 never executed
+call    1 never executed
+    #####:  325:  } else if (origType.isa<FloatType>()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  326:    newType = rewriter.getF32Type();
+call    0 never executed
+        -:  327:  } else {
+    #####:  328:    return rewriter.notifyMatchFailure(op,
+call    0 never executed
+    #####:  329:                                       "unable to find F32 equivalent type");
+        -:  330:  }
+        -:  331:
+    #####:  332:  Location loc = op->getLoc();
+call    0 never executed
+    #####:  333:  SmallVector<Value> operands;
+    #####:  334:  for (auto operand : op->getOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  335:    operands.push_back(rewriter.create<arith::ExtFOp>(loc, newType, operand));
+call    0 never executed
+call    1 never executed
+    #####:  336:  auto result = rewriter.create<math::Atan2Op>(loc, newType, operands);
+call    0 never executed
+    #####:  337:  rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, origType, result);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  338:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  339:}
+        -:  340:
+        -:  341:namespace {
+        -:  342:// Pattern to cast to F32 to reuse F32 expansion as fallback for single-result
+        -:  343:// op.
+        -:  344:// TODO: Consider revising to avoid adding multiple casts for a subgraph that is
+        -:  345:// all in lower precision. Currently this is only fallback support and performs
+        -:  346:// simplistic casting.
+        -:  347:template <typename T>
+        -:  348:struct ReuseF32Expansion : public OpRewritePattern<T> {
+        -:  349:public:
+        -:  350:  using OpRewritePattern<T>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_117ReuseF32ExpansionIN4mlir4math7Atan2OpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  351:  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const final {
+        -:  352:    static_assert(
+        -:  353:        T::template hasTrait<mlir::OpTrait::SameOperandsAndResultType>(),
+        -:  354:        "requires same operands and result types");
+    #####:  355:    return insertCasts<T>(op, rewriter);
+call    0 never executed
+        -:  356:  }
+        -:  357:};
+        -:  358:} // namespace
+        -:  359:
+        -:  360://----------------------------------------------------------------------------//
+        -:  361:// AtanOp approximation.
+        -:  362://----------------------------------------------------------------------------//
+        -:  363:
+        -:  364:namespace {
+        -:  365:struct AtanApproximation : public OpRewritePattern<math::AtanOp> {
+        -:  366:public:
+        -:  367:  using OpRewritePattern::OpRewritePattern;
+        -:  368:
+        -:  369:  LogicalResult matchAndRewrite(math::AtanOp op,
+        -:  370:                                PatternRewriter &rewriter) const final;
+        -:  371:};
+        -:  372:} // namespace
+        -:  373:
+        -:  374:LogicalResult
+function _ZNK12_GLOBAL__N_117AtanApproximation15matchAndRewriteEN4mlir4math6AtanOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  375:AtanApproximation::matchAndRewrite(math::AtanOp op,
+        -:  376:                                   PatternRewriter &rewriter) const {
+    #####:  377:  auto operand = op.getOperand();
+call    0 never executed
+    #####:  378:  if (!getElementTypeOrSelf(operand).isF32())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  379:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  380:
+    #####:  381:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  382:
+    #####:  383:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  384:  auto one = broadcast(builder, f32Cst(builder, 1.0f), shape);
+call    0 never executed
+call    1 never executed
+        -:  385:
+        -:  386:  // Remap the problem over [0.0, 1.0] by looking at the absolute value and the
+        -:  387:  // handling symmetry.
+    #####:  388:  Value abs = builder.create<math::AbsFOp>(operand);
+call    0 never executed
+call    1 never executed
+    #####:  389:  Value reciprocal = builder.create<arith::DivFOp>(one, abs);
+call    0 never executed
+call    1 never executed
+    #####:  390:  Value compare =
+    #####:  391:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, abs, reciprocal);
+call    0 never executed
+call    1 never executed
+    #####:  392:  Value x = builder.create<arith::SelectOp>(compare, abs, reciprocal);
+call    0 never executed
+call    1 never executed
+        -:  393:
+        -:  394:  // Perform the Taylor series approximation for atan over the range
+        -:  395:  // [-1.0, 1.0].
+    #####:  396:  auto n1 = broadcast(builder, f32Cst(builder, 0.14418283f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  397:  auto n2 = broadcast(builder, f32Cst(builder, -0.34999234f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  398:  auto n3 = broadcast(builder, f32Cst(builder, -0.01067831f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  399:  auto n4 = broadcast(builder, f32Cst(builder, 1.00209986f), shape);
+call    0 never executed
+call    1 never executed
+        -:  400:
+    #####:  401:  Value p = builder.create<math::FmaOp>(x, n1, n2);
+call    0 never executed
+call    1 never executed
+    #####:  402:  p = builder.create<math::FmaOp>(x, p, n3);
+call    0 never executed
+call    1 never executed
+    #####:  403:  p = builder.create<math::FmaOp>(x, p, n4);
+call    0 never executed
+call    1 never executed
+    #####:  404:  p = builder.create<arith::MulFOp>(x, p);
+call    0 never executed
+call    1 never executed
+        -:  405:
+        -:  406:  // Remap the solution for over [0.0, 1.0] to [0.0, inf]
+    #####:  407:  auto halfPi = broadcast(builder, f32Cst(builder, 1.57079632679f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  408:  Value sub = builder.create<arith::SubFOp>(halfPi, p);
+call    0 never executed
+call    1 never executed
+    #####:  409:  Value select = builder.create<arith::SelectOp>(compare, p, sub);
+call    0 never executed
+call    1 never executed
+        -:  410:
+        -:  411:  // Correct for signing of the input.
+    #####:  412:  rewriter.replaceOpWithNewOp<math::CopySignOp>(op, select, operand);
+call    0 never executed
+    #####:  413:  return success();
+        -:  414:}
+        -:  415:
+        -:  416://----------------------------------------------------------------------------//
+        -:  417:// AtanOp approximation.
+        -:  418://----------------------------------------------------------------------------//
+        -:  419:
+        -:  420:namespace {
+        -:  421:struct Atan2Approximation : public OpRewritePattern<math::Atan2Op> {
+        -:  422:public:
+        -:  423:  using OpRewritePattern::OpRewritePattern;
+        -:  424:
+        -:  425:  LogicalResult matchAndRewrite(math::Atan2Op op,
+        -:  426:                                PatternRewriter &rewriter) const final;
+        -:  427:};
+        -:  428:} // namespace
+        -:  429:
+        -:  430:LogicalResult
+function _ZNK12_GLOBAL__N_118Atan2Approximation15matchAndRewriteEN4mlir4math7Atan2OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  431:Atan2Approximation::matchAndRewrite(math::Atan2Op op,
+        -:  432:                                    PatternRewriter &rewriter) const {
+    #####:  433:  auto y = op.getOperand(0);
+call    0 never executed
+    #####:  434:  auto x = op.getOperand(1);
+call    0 never executed
+    #####:  435:  if (!getElementTypeOrSelf(x).isF32())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  436:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  437:
+    #####:  438:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  439:  ArrayRef<int64_t> shape = vectorShape(op.getResult());
+call    0 never executed
+        -:  440:
+        -:  441:  // Compute atan in the valid range.
+    #####:  442:  auto div = builder.create<arith::DivFOp>(y, x);
+call    0 never executed
+    #####:  443:  auto atan = builder.create<math::AtanOp>(div);
+call    0 never executed
+        -:  444:
+        -:  445:  // Determine what the atan would be for a 180 degree rotation.
+    #####:  446:  auto zero = broadcast(builder, f32Cst(builder, 0.0f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  447:  auto pi = broadcast(builder, f32Cst(builder, 3.14159265359f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  448:  auto addPi = builder.create<arith::AddFOp>(atan, pi);
+call    0 never executed
+    #####:  449:  auto subPi = builder.create<arith::SubFOp>(atan, pi);
+call    0 never executed
+    #####:  450:  auto atanGt =
+    #####:  451:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OGT, atan, zero);
+call    0 never executed
+    #####:  452:  auto flippedAtan = builder.create<arith::SelectOp>(atanGt, subPi, addPi);
+call    0 never executed
+        -:  453:
+        -:  454:  // Determine whether to directly use atan or use the 180 degree flip
+    #####:  455:  auto xGt = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OGT, x, zero);
+call    0 never executed
+    #####:  456:  Value result = builder.create<arith::SelectOp>(xGt, atan, flippedAtan);
+call    0 never executed
+call    1 never executed
+        -:  457:
+        -:  458:  // Handle x = 0, y > 0
+    #####:  459:  Value xZero =
+    #####:  460:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ, x, zero);
+call    0 never executed
+call    1 never executed
+    #####:  461:  Value yGt = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OGT, y, zero);
+call    0 never executed
+call    1 never executed
+    #####:  462:  Value isHalfPi = builder.create<arith::AndIOp>(xZero, yGt);
+call    0 never executed
+call    1 never executed
+    #####:  463:  auto halfPi = broadcast(builder, f32Cst(builder, 1.57079632679f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  464:  result = builder.create<arith::SelectOp>(isHalfPi, halfPi, result);
+call    0 never executed
+call    1 never executed
+        -:  465:
+        -:  466:  // Handle x = 0, y < 0
+    #####:  467:  Value yLt = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, y, zero);
+call    0 never executed
+call    1 never executed
+    #####:  468:  Value isNegativeHalfPiPi = builder.create<arith::AndIOp>(xZero, yLt);
+call    0 never executed
+call    1 never executed
+    #####:  469:  auto negativeHalfPiPi =
+    #####:  470:      broadcast(builder, f32Cst(builder, -1.57079632679f), shape);
+call    0 never executed
+call    1 never executed
+    #####:  471:  result = builder.create<arith::SelectOp>(isNegativeHalfPiPi, negativeHalfPiPi,
+call    0 never executed
+    #####:  472:                                           result);
+call    0 never executed
+        -:  473:
+        -:  474:  // Handle x = 0, y = 0;
+    #####:  475:  Value yZero =
+    #####:  476:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ, y, zero);
+call    0 never executed
+call    1 never executed
+    #####:  477:  Value isNan = builder.create<arith::AndIOp>(xZero, yZero);
+call    0 never executed
+call    1 never executed
+    #####:  478:  Value cstNan = broadcast(builder, f32FromBits(builder, 0x7fc00000), shape);
+call    0 never executed
+call    1 never executed
+    #####:  479:  result = builder.create<arith::SelectOp>(isNan, cstNan, result);
+call    0 never executed
+call    1 never executed
+        -:  480:
+    #####:  481:  rewriter.replaceOp(op, result);
+call    0 never executed
+call    1 never executed
+    #####:  482:  return success();
+        -:  483:}
+        -:  484:
+        -:  485://----------------------------------------------------------------------------//
+        -:  486:// TanhOp approximation.
+        -:  487://----------------------------------------------------------------------------//
+        -:  488:
+        -:  489:namespace {
+        -:  490:struct TanhApproximation : public OpRewritePattern<math::TanhOp> {
+        -:  491:public:
+        -:  492:  using OpRewritePattern::OpRewritePattern;
+        -:  493:
+        -:  494:  LogicalResult matchAndRewrite(math::TanhOp op,
+        -:  495:                                PatternRewriter &rewriter) const final;
+        -:  496:};
+        -:  497:} // namespace
+        -:  498:
+        -:  499:LogicalResult
+function _ZNK12_GLOBAL__N_117TanhApproximation15matchAndRewriteEN4mlir4math6TanhOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  500:TanhApproximation::matchAndRewrite(math::TanhOp op,
+        -:  501:                                   PatternRewriter &rewriter) const {
+    #####:  502:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  503:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  504:
+    #####:  505:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  506:
+    #####:  507:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  508:  auto bcast = [&](Value value) -> Value {
+    #####:  509:    return broadcast(builder, value, shape);
+    #####:  510:  };
+        -:  511:
+        -:  512:  // Clamp operand into [plusClamp, minusClamp] range.
+    #####:  513:  Value minusClamp = bcast(f32Cst(builder, -7.99881172180175781f));
+call    0 never executed
+call    1 never executed
+    #####:  514:  Value plusClamp = bcast(f32Cst(builder, 7.99881172180175781f));
+call    0 never executed
+call    1 never executed
+    #####:  515:  Value x = clamp(builder, op.getOperand(), minusClamp, plusClamp);
+call    0 never executed
+call    1 never executed
+        -:  516:
+        -:  517:  // Mask for tiny values that are approximated with `operand`.
+    #####:  518:  Value tiny = bcast(f32Cst(builder, 0.0004f));
+call    0 never executed
+call    1 never executed
+    #####:  519:  Value tinyMask = builder.create<arith::CmpFOp>(
+    #####:  520:      arith::CmpFPredicate::OLT, builder.create<math::AbsFOp>(op.getOperand()),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  521:      tiny);
+call    0 never executed
+        -:  522:
+        -:  523:  // The monomial coefficients of the numerator polynomial (odd).
+    #####:  524:  Value alpha1 = bcast(f32Cst(builder, 4.89352455891786e-03f));
+call    0 never executed
+call    1 never executed
+    #####:  525:  Value alpha3 = bcast(f32Cst(builder, 6.37261928875436e-04f));
+call    0 never executed
+call    1 never executed
+    #####:  526:  Value alpha5 = bcast(f32Cst(builder, 1.48572235717979e-05f));
+call    0 never executed
+call    1 never executed
+    #####:  527:  Value alpha7 = bcast(f32Cst(builder, 5.12229709037114e-08f));
+call    0 never executed
+call    1 never executed
+    #####:  528:  Value alpha9 = bcast(f32Cst(builder, -8.60467152213735e-11f));
+call    0 never executed
+call    1 never executed
+    #####:  529:  Value alpha11 = bcast(f32Cst(builder, 2.00018790482477e-13f));
+call    0 never executed
+call    1 never executed
+    #####:  530:  Value alpha13 = bcast(f32Cst(builder, -2.76076847742355e-16f));
+call    0 never executed
+call    1 never executed
+        -:  531:
+        -:  532:  // The monomial coefficients of the denominator polynomial (even).
+    #####:  533:  Value beta0 = bcast(f32Cst(builder, 4.89352518554385e-03f));
+call    0 never executed
+call    1 never executed
+    #####:  534:  Value beta2 = bcast(f32Cst(builder, 2.26843463243900e-03f));
+call    0 never executed
+call    1 never executed
+    #####:  535:  Value beta4 = bcast(f32Cst(builder, 1.18534705686654e-04f));
+call    0 never executed
+call    1 never executed
+    #####:  536:  Value beta6 = bcast(f32Cst(builder, 1.19825839466702e-06f));
+call    0 never executed
+call    1 never executed
+        -:  537:
+        -:  538:  // Since the polynomials are odd/even, we need x^2.
+    #####:  539:  Value x2 = builder.create<arith::MulFOp>(x, x);
+call    0 never executed
+call    1 never executed
+        -:  540:
+        -:  541:  // Evaluate the numerator polynomial p.
+    #####:  542:  Value p = builder.create<math::FmaOp>(x2, alpha13, alpha11);
+call    0 never executed
+call    1 never executed
+    #####:  543:  p = builder.create<math::FmaOp>(x2, p, alpha9);
+call    0 never executed
+call    1 never executed
+    #####:  544:  p = builder.create<math::FmaOp>(x2, p, alpha7);
+call    0 never executed
+call    1 never executed
+    #####:  545:  p = builder.create<math::FmaOp>(x2, p, alpha5);
+call    0 never executed
+call    1 never executed
+    #####:  546:  p = builder.create<math::FmaOp>(x2, p, alpha3);
+call    0 never executed
+call    1 never executed
+    #####:  547:  p = builder.create<math::FmaOp>(x2, p, alpha1);
+call    0 never executed
+call    1 never executed
+    #####:  548:  p = builder.create<arith::MulFOp>(x, p);
+call    0 never executed
+call    1 never executed
+        -:  549:
+        -:  550:  // Evaluate the denominator polynomial q.
+    #####:  551:  Value q = builder.create<math::FmaOp>(x2, beta6, beta4);
+call    0 never executed
+call    1 never executed
+    #####:  552:  q = builder.create<math::FmaOp>(x2, q, beta2);
+call    0 never executed
+call    1 never executed
+    #####:  553:  q = builder.create<math::FmaOp>(x2, q, beta0);
+call    0 never executed
+call    1 never executed
+        -:  554:
+        -:  555:  // Divide the numerator by the denominator.
+    #####:  556:  Value res = builder.create<arith::SelectOp>(
+call    0 never executed
+    #####:  557:      tinyMask, x, builder.create<arith::DivFOp>(p, q));
+call    0 never executed
+call    1 never executed
+        -:  558:
+    #####:  559:  rewriter.replaceOp(op, res);
+call    0 never executed
+call    1 never executed
+        -:  560:
+    #####:  561:  return success();
+        -:  562:}
+        -:  563:
+        -:  564:#define LN2_VALUE                                                              \
+        -:  565:  0.693147180559945309417232121458176568075500134360255254120680009493393621L
+        -:  566:#define LOG2E_VALUE                                                            \
+        -:  567:  1.442695040888963407359924681001892137426645954152985934135449406931109219L
+        -:  568:
+        -:  569://----------------------------------------------------------------------------//
+        -:  570:// LogOp and Log2Op approximation.
+        -:  571://----------------------------------------------------------------------------//
+        -:  572:
+        -:  573:namespace {
+        -:  574:template <typename Op>
+        -:  575:struct LogApproximationBase : public OpRewritePattern<Op> {
+        -:  576:  using OpRewritePattern<Op>::OpRewritePattern;
+        -:  577:
+        -:  578:  /// Base 2 if 'base2' is set; natural logarithm (base e) otherwise.
+        -:  579:  LogicalResult logMatchAndRewrite(Op op, PatternRewriter &rewriter,
+        -:  580:                                   bool base2) const;
+        -:  581:};
+        -:  582:} // namespace
+        -:  583:
+        -:  584:// This approximation comes from Julien Pommier's SSE math library.
+        -:  585:// Link: http://gruntthepeon.free.fr/ssemath
+        -:  586:template <typename Op>
+        -:  587:LogicalResult
+    #####:  588:LogApproximationBase<Op>::logMatchAndRewrite(Op op, PatternRewriter &rewriter,
+        -:  589:                                             bool base2) const {
+    #####:  590:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+    #####:  591:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+        -:  592:
+    #####:  593:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+        -:  594:
+    #####:  595:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+    #####:  596:  auto bcast = [&](Value value) -> Value {
+    #####:  597:    return broadcast(builder, value, shape);
+        -:  598:  };
+        -:  599:
+    #####:  600:  Value cstZero = bcast(f32Cst(builder, 0.0f));
+    #####:  601:  Value cstOne = bcast(f32Cst(builder, 1.0f));
+    #####:  602:  Value cstNegHalf = bcast(f32Cst(builder, -0.5f));
+        -:  603:
+        -:  604:  // The smallest non denormalized float number.
+    #####:  605:  Value cstMinNormPos = bcast(f32FromBits(builder, 0x00800000u));
+    #####:  606:  Value cstMinusInf = bcast(f32FromBits(builder, 0xff800000u));
+    #####:  607:  Value cstPosInf = bcast(f32FromBits(builder, 0x7f800000u));
+    #####:  608:  Value cstNan = bcast(f32FromBits(builder, 0x7fc00000));
+        -:  609:
+        -:  610:  // Polynomial coefficients.
+    #####:  611:  Value cstCephesSQRTHF = bcast(f32Cst(builder, 0.707106781186547524f));
+    #####:  612:  Value cstCephesLogP0 = bcast(f32Cst(builder, 7.0376836292E-2f));
+    #####:  613:  Value cstCephesLogP1 = bcast(f32Cst(builder, -1.1514610310E-1f));
+    #####:  614:  Value cstCephesLogP2 = bcast(f32Cst(builder, 1.1676998740E-1f));
+    #####:  615:  Value cstCephesLogP3 = bcast(f32Cst(builder, -1.2420140846E-1f));
+    #####:  616:  Value cstCephesLogP4 = bcast(f32Cst(builder, +1.4249322787E-1f));
+    #####:  617:  Value cstCephesLogP5 = bcast(f32Cst(builder, -1.6668057665E-1f));
+    #####:  618:  Value cstCephesLogP6 = bcast(f32Cst(builder, +2.0000714765E-1f));
+    #####:  619:  Value cstCephesLogP7 = bcast(f32Cst(builder, -2.4999993993E-1f));
+    #####:  620:  Value cstCephesLogP8 = bcast(f32Cst(builder, +3.3333331174E-1f));
+        -:  621:
+    #####:  622:  Value x = op.getOperand();
+        -:  623:
+        -:  624:  // Truncate input values to the minimum positive normal.
+    #####:  625:  x = max(builder, x, cstMinNormPos);
+        -:  626:
+        -:  627:  // Extract significant in the range [0.5,1) and exponent.
+    #####:  628:  std::pair<Value, Value> pair = frexp(builder, x, /*isPositive=*/true);
+    #####:  629:  x = pair.first;
+    #####:  630:  Value e = pair.second;
+        -:  631:
+        -:  632:  // Shift the inputs from the range [0.5,1) to [sqrt(1/2), sqrt(2)) and shift
+        -:  633:  // by -1.0. The values are then centered around 0, which improves the
+        -:  634:  // stability of the polynomial evaluation:
+        -:  635:  //
+        -:  636:  //   if( x < SQRTHF ) {
+        -:  637:  //     e -= 1;
+        -:  638:  //     x = x + x - 1.0;
+        -:  639:  //   } else { x = x - 1.0; }
+    #####:  640:  Value mask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, x,
+        -:  641:                                             cstCephesSQRTHF);
+    #####:  642:  Value tmp = builder.create<arith::SelectOp>(mask, x, cstZero);
+        -:  643:
+    #####:  644:  x = builder.create<arith::SubFOp>(x, cstOne);
+    #####:  645:  e = builder.create<arith::SubFOp>(
+    #####:  646:      e, builder.create<arith::SelectOp>(mask, cstOne, cstZero));
+    #####:  647:  x = builder.create<arith::AddFOp>(x, tmp);
+        -:  648:
+    #####:  649:  Value x2 = builder.create<arith::MulFOp>(x, x);
+    #####:  650:  Value x3 = builder.create<arith::MulFOp>(x2, x);
+        -:  651:
+        -:  652:  // Evaluate the polynomial approximant of degree 8 in three parts.
+    #####:  653:  Value y0, y1, y2;
+    #####:  654:  y0 = builder.create<math::FmaOp>(cstCephesLogP0, x, cstCephesLogP1);
+    #####:  655:  y1 = builder.create<math::FmaOp>(cstCephesLogP3, x, cstCephesLogP4);
+    #####:  656:  y2 = builder.create<math::FmaOp>(cstCephesLogP6, x, cstCephesLogP7);
+    #####:  657:  y0 = builder.create<math::FmaOp>(y0, x, cstCephesLogP2);
+    #####:  658:  y1 = builder.create<math::FmaOp>(y1, x, cstCephesLogP5);
+    #####:  659:  y2 = builder.create<math::FmaOp>(y2, x, cstCephesLogP8);
+    #####:  660:  y0 = builder.create<math::FmaOp>(y0, x3, y1);
+    #####:  661:  y0 = builder.create<math::FmaOp>(y0, x3, y2);
+    #####:  662:  y0 = builder.create<arith::MulFOp>(y0, x3);
+        -:  663:
+    #####:  664:  y0 = builder.create<math::FmaOp>(cstNegHalf, x2, y0);
+    #####:  665:  x = builder.create<arith::AddFOp>(x, y0);
+        -:  666:
+    #####:  667:  if (base2) {
+    #####:  668:    Value cstLog2e = bcast(f32Cst(builder, static_cast<float>(LOG2E_VALUE)));
+    #####:  669:    x = builder.create<math::FmaOp>(x, cstLog2e, e);
+        -:  670:  } else {
+    #####:  671:    Value cstLn2 = bcast(f32Cst(builder, static_cast<float>(LN2_VALUE)));
+    #####:  672:    x = builder.create<math::FmaOp>(e, cstLn2, x);
+        -:  673:  }
+        -:  674:
+    #####:  675:  Value invalidMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::ULT,
+        -:  676:                                                    op.getOperand(), cstZero);
+    #####:  677:  Value zeroMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+        -:  678:                                                 op.getOperand(), cstZero);
+    #####:  679:  Value posInfMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+        -:  680:                                                   op.getOperand(), cstPosInf);
+        -:  681:
+        -:  682:  // Filter out invalid values:
+        -:  683:  //  • x == 0     -> -INF
+        -:  684:  //  • x < 0      ->  NAN
+        -:  685:  //  • x == +INF  -> +INF
+    #####:  686:  Value aproximation = builder.create<arith::SelectOp>(
+        -:  687:      zeroMask, cstMinusInf,
+    #####:  688:      builder.create<arith::SelectOp>(
+        -:  689:          invalidMask, cstNan,
+    #####:  690:          builder.create<arith::SelectOp>(posInfMask, cstPosInf, x)));
+        -:  691:
+    #####:  692:  rewriter.replaceOp(op, aproximation);
+        -:  693:
+    #####:  694:  return success();
+        -:  695:}
+------------------
+_ZNK12_GLOBAL__N_120LogApproximationBaseIN4mlir4math6Log2OpEE18logMatchAndRewriteES3_RNS1_15PatternRewriterEb:
+function _ZNK12_GLOBAL__N_120LogApproximationBaseIN4mlir4math6Log2OpEE18logMatchAndRewriteES3_RNS1_15PatternRewriterEb called 0 returned 0% blocks executed 0%
+    #####:  588:LogApproximationBase<Op>::logMatchAndRewrite(Op op, PatternRewriter &rewriter,
+        -:  589:                                             bool base2) const {
+    #####:  590:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  591:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  592:
+    #####:  593:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  594:
+    #####:  595:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  596:  auto bcast = [&](Value value) -> Value {
+    #####:  597:    return broadcast(builder, value, shape);
+        -:  598:  };
+        -:  599:
+    #####:  600:  Value cstZero = bcast(f32Cst(builder, 0.0f));
+call    0 never executed
+call    1 never executed
+    #####:  601:  Value cstOne = bcast(f32Cst(builder, 1.0f));
+call    0 never executed
+call    1 never executed
+    #####:  602:  Value cstNegHalf = bcast(f32Cst(builder, -0.5f));
+call    0 never executed
+call    1 never executed
+        -:  603:
+        -:  604:  // The smallest non denormalized float number.
+    #####:  605:  Value cstMinNormPos = bcast(f32FromBits(builder, 0x00800000u));
+call    0 never executed
+call    1 never executed
+    #####:  606:  Value cstMinusInf = bcast(f32FromBits(builder, 0xff800000u));
+call    0 never executed
+call    1 never executed
+    #####:  607:  Value cstPosInf = bcast(f32FromBits(builder, 0x7f800000u));
+call    0 never executed
+call    1 never executed
+    #####:  608:  Value cstNan = bcast(f32FromBits(builder, 0x7fc00000));
+call    0 never executed
+call    1 never executed
+        -:  609:
+        -:  610:  // Polynomial coefficients.
+    #####:  611:  Value cstCephesSQRTHF = bcast(f32Cst(builder, 0.707106781186547524f));
+call    0 never executed
+call    1 never executed
+    #####:  612:  Value cstCephesLogP0 = bcast(f32Cst(builder, 7.0376836292E-2f));
+call    0 never executed
+call    1 never executed
+    #####:  613:  Value cstCephesLogP1 = bcast(f32Cst(builder, -1.1514610310E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  614:  Value cstCephesLogP2 = bcast(f32Cst(builder, 1.1676998740E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  615:  Value cstCephesLogP3 = bcast(f32Cst(builder, -1.2420140846E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  616:  Value cstCephesLogP4 = bcast(f32Cst(builder, +1.4249322787E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  617:  Value cstCephesLogP5 = bcast(f32Cst(builder, -1.6668057665E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  618:  Value cstCephesLogP6 = bcast(f32Cst(builder, +2.0000714765E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  619:  Value cstCephesLogP7 = bcast(f32Cst(builder, -2.4999993993E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  620:  Value cstCephesLogP8 = bcast(f32Cst(builder, +3.3333331174E-1f));
+call    0 never executed
+call    1 never executed
+        -:  621:
+    #####:  622:  Value x = op.getOperand();
+call    0 never executed
+        -:  623:
+        -:  624:  // Truncate input values to the minimum positive normal.
+    #####:  625:  x = max(builder, x, cstMinNormPos);
+call    0 never executed
+        -:  626:
+        -:  627:  // Extract significant in the range [0.5,1) and exponent.
+    #####:  628:  std::pair<Value, Value> pair = frexp(builder, x, /*isPositive=*/true);
+call    0 never executed
+    #####:  629:  x = pair.first;
+    #####:  630:  Value e = pair.second;
+        -:  631:
+        -:  632:  // Shift the inputs from the range [0.5,1) to [sqrt(1/2), sqrt(2)) and shift
+        -:  633:  // by -1.0. The values are then centered around 0, which improves the
+        -:  634:  // stability of the polynomial evaluation:
+        -:  635:  //
+        -:  636:  //   if( x < SQRTHF ) {
+        -:  637:  //     e -= 1;
+        -:  638:  //     x = x + x - 1.0;
+        -:  639:  //   } else { x = x - 1.0; }
+    #####:  640:  Value mask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, x,
+call    0 never executed
+call    1 never executed
+        -:  641:                                             cstCephesSQRTHF);
+    #####:  642:  Value tmp = builder.create<arith::SelectOp>(mask, x, cstZero);
+call    0 never executed
+        -:  643:
+    #####:  644:  x = builder.create<arith::SubFOp>(x, cstOne);
+call    0 never executed
+    #####:  645:  e = builder.create<arith::SubFOp>(
+call    0 never executed
+    #####:  646:      e, builder.create<arith::SelectOp>(mask, cstOne, cstZero));
+call    0 never executed
+call    1 never executed
+    #####:  647:  x = builder.create<arith::AddFOp>(x, tmp);
+call    0 never executed
+        -:  648:
+    #####:  649:  Value x2 = builder.create<arith::MulFOp>(x, x);
+call    0 never executed
+    #####:  650:  Value x3 = builder.create<arith::MulFOp>(x2, x);
+call    0 never executed
+        -:  651:
+        -:  652:  // Evaluate the polynomial approximant of degree 8 in three parts.
+    #####:  653:  Value y0, y1, y2;
+call    0 never executed
+    #####:  654:  y0 = builder.create<math::FmaOp>(cstCephesLogP0, x, cstCephesLogP1);
+call    0 never executed
+    #####:  655:  y1 = builder.create<math::FmaOp>(cstCephesLogP3, x, cstCephesLogP4);
+call    0 never executed
+    #####:  656:  y2 = builder.create<math::FmaOp>(cstCephesLogP6, x, cstCephesLogP7);
+call    0 never executed
+    #####:  657:  y0 = builder.create<math::FmaOp>(y0, x, cstCephesLogP2);
+call    0 never executed
+    #####:  658:  y1 = builder.create<math::FmaOp>(y1, x, cstCephesLogP5);
+call    0 never executed
+    #####:  659:  y2 = builder.create<math::FmaOp>(y2, x, cstCephesLogP8);
+call    0 never executed
+    #####:  660:  y0 = builder.create<math::FmaOp>(y0, x3, y1);
+call    0 never executed
+    #####:  661:  y0 = builder.create<math::FmaOp>(y0, x3, y2);
+call    0 never executed
+    #####:  662:  y0 = builder.create<arith::MulFOp>(y0, x3);
+call    0 never executed
+        -:  663:
+    #####:  664:  y0 = builder.create<math::FmaOp>(cstNegHalf, x2, y0);
+call    0 never executed
+    #####:  665:  x = builder.create<arith::AddFOp>(x, y0);
+branch  0 never executed
+branch  1 never executed
+        -:  666:
+    #####:  667:  if (base2) {
+branch  0 never executed
+branch  1 never executed
+    #####:  668:    Value cstLog2e = bcast(f32Cst(builder, static_cast<float>(LOG2E_VALUE)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  669:    x = builder.create<math::FmaOp>(x, cstLog2e, e);
+        -:  670:  } else {
+    #####:  671:    Value cstLn2 = bcast(f32Cst(builder, static_cast<float>(LN2_VALUE)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  672:    x = builder.create<math::FmaOp>(e, cstLn2, x);
+        -:  673:  }
+        -:  674:
+    #####:  675:  Value invalidMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::ULT,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  676:                                                    op.getOperand(), cstZero);
+    #####:  677:  Value zeroMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  678:                                                 op.getOperand(), cstZero);
+    #####:  679:  Value posInfMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  680:                                                   op.getOperand(), cstPosInf);
+        -:  681:
+        -:  682:  // Filter out invalid values:
+        -:  683:  //  • x == 0     -> -INF
+        -:  684:  //  • x < 0      ->  NAN
+        -:  685:  //  • x == +INF  -> +INF
+    #####:  686:  Value aproximation = builder.create<arith::SelectOp>(
+call    0 never executed
+        -:  687:      zeroMask, cstMinusInf,
+    #####:  688:      builder.create<arith::SelectOp>(
+call    0 never executed
+        -:  689:          invalidMask, cstNan,
+    #####:  690:          builder.create<arith::SelectOp>(posInfMask, cstPosInf, x)));
+call    0 never executed
+        -:  691:
+    #####:  692:  rewriter.replaceOp(op, aproximation);
+call    0 never executed
+call    1 never executed
+        -:  693:
+    #####:  694:  return success();
+        -:  695:}
+------------------
+_ZNK12_GLOBAL__N_120LogApproximationBaseIN4mlir4math5LogOpEE18logMatchAndRewriteES3_RNS1_15PatternRewriterEb:
+function _ZNK12_GLOBAL__N_120LogApproximationBaseIN4mlir4math5LogOpEE18logMatchAndRewriteES3_RNS1_15PatternRewriterEb called 0 returned 0% blocks executed 0%
+    #####:  588:LogApproximationBase<Op>::logMatchAndRewrite(Op op, PatternRewriter &rewriter,
+        -:  589:                                             bool base2) const {
+    #####:  590:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  591:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  592:
+    #####:  593:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  594:
+    #####:  595:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  596:  auto bcast = [&](Value value) -> Value {
+    #####:  597:    return broadcast(builder, value, shape);
+        -:  598:  };
+        -:  599:
+    #####:  600:  Value cstZero = bcast(f32Cst(builder, 0.0f));
+call    0 never executed
+call    1 never executed
+    #####:  601:  Value cstOne = bcast(f32Cst(builder, 1.0f));
+call    0 never executed
+call    1 never executed
+    #####:  602:  Value cstNegHalf = bcast(f32Cst(builder, -0.5f));
+call    0 never executed
+call    1 never executed
+        -:  603:
+        -:  604:  // The smallest non denormalized float number.
+    #####:  605:  Value cstMinNormPos = bcast(f32FromBits(builder, 0x00800000u));
+call    0 never executed
+call    1 never executed
+    #####:  606:  Value cstMinusInf = bcast(f32FromBits(builder, 0xff800000u));
+call    0 never executed
+call    1 never executed
+    #####:  607:  Value cstPosInf = bcast(f32FromBits(builder, 0x7f800000u));
+call    0 never executed
+call    1 never executed
+    #####:  608:  Value cstNan = bcast(f32FromBits(builder, 0x7fc00000));
+call    0 never executed
+call    1 never executed
+        -:  609:
+        -:  610:  // Polynomial coefficients.
+    #####:  611:  Value cstCephesSQRTHF = bcast(f32Cst(builder, 0.707106781186547524f));
+call    0 never executed
+call    1 never executed
+    #####:  612:  Value cstCephesLogP0 = bcast(f32Cst(builder, 7.0376836292E-2f));
+call    0 never executed
+call    1 never executed
+    #####:  613:  Value cstCephesLogP1 = bcast(f32Cst(builder, -1.1514610310E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  614:  Value cstCephesLogP2 = bcast(f32Cst(builder, 1.1676998740E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  615:  Value cstCephesLogP3 = bcast(f32Cst(builder, -1.2420140846E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  616:  Value cstCephesLogP4 = bcast(f32Cst(builder, +1.4249322787E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  617:  Value cstCephesLogP5 = bcast(f32Cst(builder, -1.6668057665E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  618:  Value cstCephesLogP6 = bcast(f32Cst(builder, +2.0000714765E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  619:  Value cstCephesLogP7 = bcast(f32Cst(builder, -2.4999993993E-1f));
+call    0 never executed
+call    1 never executed
+    #####:  620:  Value cstCephesLogP8 = bcast(f32Cst(builder, +3.3333331174E-1f));
+call    0 never executed
+call    1 never executed
+        -:  621:
+    #####:  622:  Value x = op.getOperand();
+call    0 never executed
+        -:  623:
+        -:  624:  // Truncate input values to the minimum positive normal.
+    #####:  625:  x = max(builder, x, cstMinNormPos);
+call    0 never executed
+        -:  626:
+        -:  627:  // Extract significant in the range [0.5,1) and exponent.
+    #####:  628:  std::pair<Value, Value> pair = frexp(builder, x, /*isPositive=*/true);
+call    0 never executed
+    #####:  629:  x = pair.first;
+    #####:  630:  Value e = pair.second;
+        -:  631:
+        -:  632:  // Shift the inputs from the range [0.5,1) to [sqrt(1/2), sqrt(2)) and shift
+        -:  633:  // by -1.0. The values are then centered around 0, which improves the
+        -:  634:  // stability of the polynomial evaluation:
+        -:  635:  //
+        -:  636:  //   if( x < SQRTHF ) {
+        -:  637:  //     e -= 1;
+        -:  638:  //     x = x + x - 1.0;
+        -:  639:  //   } else { x = x - 1.0; }
+    #####:  640:  Value mask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, x,
+call    0 never executed
+call    1 never executed
+        -:  641:                                             cstCephesSQRTHF);
+    #####:  642:  Value tmp = builder.create<arith::SelectOp>(mask, x, cstZero);
+call    0 never executed
+        -:  643:
+    #####:  644:  x = builder.create<arith::SubFOp>(x, cstOne);
+call    0 never executed
+    #####:  645:  e = builder.create<arith::SubFOp>(
+call    0 never executed
+    #####:  646:      e, builder.create<arith::SelectOp>(mask, cstOne, cstZero));
+call    0 never executed
+call    1 never executed
+    #####:  647:  x = builder.create<arith::AddFOp>(x, tmp);
+call    0 never executed
+        -:  648:
+    #####:  649:  Value x2 = builder.create<arith::MulFOp>(x, x);
+call    0 never executed
+    #####:  650:  Value x3 = builder.create<arith::MulFOp>(x2, x);
+call    0 never executed
+        -:  651:
+        -:  652:  // Evaluate the polynomial approximant of degree 8 in three parts.
+    #####:  653:  Value y0, y1, y2;
+call    0 never executed
+    #####:  654:  y0 = builder.create<math::FmaOp>(cstCephesLogP0, x, cstCephesLogP1);
+call    0 never executed
+    #####:  655:  y1 = builder.create<math::FmaOp>(cstCephesLogP3, x, cstCephesLogP4);
+call    0 never executed
+    #####:  656:  y2 = builder.create<math::FmaOp>(cstCephesLogP6, x, cstCephesLogP7);
+call    0 never executed
+    #####:  657:  y0 = builder.create<math::FmaOp>(y0, x, cstCephesLogP2);
+call    0 never executed
+    #####:  658:  y1 = builder.create<math::FmaOp>(y1, x, cstCephesLogP5);
+call    0 never executed
+    #####:  659:  y2 = builder.create<math::FmaOp>(y2, x, cstCephesLogP8);
+call    0 never executed
+    #####:  660:  y0 = builder.create<math::FmaOp>(y0, x3, y1);
+call    0 never executed
+    #####:  661:  y0 = builder.create<math::FmaOp>(y0, x3, y2);
+call    0 never executed
+    #####:  662:  y0 = builder.create<arith::MulFOp>(y0, x3);
+call    0 never executed
+        -:  663:
+    #####:  664:  y0 = builder.create<math::FmaOp>(cstNegHalf, x2, y0);
+call    0 never executed
+    #####:  665:  x = builder.create<arith::AddFOp>(x, y0);
+branch  0 never executed
+branch  1 never executed
+        -:  666:
+    #####:  667:  if (base2) {
+branch  0 never executed
+branch  1 never executed
+    #####:  668:    Value cstLog2e = bcast(f32Cst(builder, static_cast<float>(LOG2E_VALUE)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  669:    x = builder.create<math::FmaOp>(x, cstLog2e, e);
+        -:  670:  } else {
+    #####:  671:    Value cstLn2 = bcast(f32Cst(builder, static_cast<float>(LN2_VALUE)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  672:    x = builder.create<math::FmaOp>(e, cstLn2, x);
+        -:  673:  }
+        -:  674:
+    #####:  675:  Value invalidMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::ULT,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  676:                                                    op.getOperand(), cstZero);
+    #####:  677:  Value zeroMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  678:                                                 op.getOperand(), cstZero);
+    #####:  679:  Value posInfMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  680:                                                   op.getOperand(), cstPosInf);
+        -:  681:
+        -:  682:  // Filter out invalid values:
+        -:  683:  //  • x == 0     -> -INF
+        -:  684:  //  • x < 0      ->  NAN
+        -:  685:  //  • x == +INF  -> +INF
+    #####:  686:  Value aproximation = builder.create<arith::SelectOp>(
+call    0 never executed
+        -:  687:      zeroMask, cstMinusInf,
+    #####:  688:      builder.create<arith::SelectOp>(
+call    0 never executed
+        -:  689:          invalidMask, cstNan,
+    #####:  690:          builder.create<arith::SelectOp>(posInfMask, cstPosInf, x)));
+call    0 never executed
+        -:  691:
+    #####:  692:  rewriter.replaceOp(op, aproximation);
+call    0 never executed
+call    1 never executed
+        -:  693:
+    #####:  694:  return success();
+        -:  695:}
+------------------
+        -:  696:
+        -:  697:namespace {
+        -:  698:struct LogApproximation : public LogApproximationBase<math::LogOp> {
+        -:  699:  using LogApproximationBase::LogApproximationBase;
+        -:  700:
+function _ZNK12_GLOBAL__N_116LogApproximation15matchAndRewriteEN4mlir4math5LogOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  701:  LogicalResult matchAndRewrite(math::LogOp op,
+        -:  702:                                PatternRewriter &rewriter) const final {
+    #####:  703:    return logMatchAndRewrite(op, rewriter, /*base2=*/false);
+call    0 never executed
+        -:  704:  }
+        -:  705:};
+        -:  706:} // namespace
+        -:  707:
+        -:  708:namespace {
+        -:  709:struct Log2Approximation : public LogApproximationBase<math::Log2Op> {
+        -:  710:  using LogApproximationBase::LogApproximationBase;
+        -:  711:
+function _ZNK12_GLOBAL__N_117Log2Approximation15matchAndRewriteEN4mlir4math6Log2OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  712:  LogicalResult matchAndRewrite(math::Log2Op op,
+        -:  713:                                PatternRewriter &rewriter) const final {
+    #####:  714:    return logMatchAndRewrite(op, rewriter, /*base2=*/true);
+call    0 never executed
+        -:  715:  }
+        -:  716:};
+        -:  717:} // namespace
+        -:  718:
+        -:  719://----------------------------------------------------------------------------//
+        -:  720:// Log1p approximation.
+        -:  721://----------------------------------------------------------------------------//
+        -:  722:
+        -:  723:namespace {
+        -:  724:struct Log1pApproximation : public OpRewritePattern<math::Log1pOp> {
+        -:  725:public:
+        -:  726:  using OpRewritePattern::OpRewritePattern;
+        -:  727:
+        -:  728:  LogicalResult matchAndRewrite(math::Log1pOp op,
+        -:  729:                                PatternRewriter &rewriter) const final;
+        -:  730:};
+        -:  731:} // namespace
+        -:  732:
+        -:  733:// Approximate log(1+x).
+        -:  734:LogicalResult
+function _ZNK12_GLOBAL__N_118Log1pApproximation15matchAndRewriteEN4mlir4math7Log1pOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  735:Log1pApproximation::matchAndRewrite(math::Log1pOp op,
+        -:  736:                                    PatternRewriter &rewriter) const {
+    #####:  737:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  738:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  739:
+    #####:  740:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  741:
+    #####:  742:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  743:  auto bcast = [&](Value value) -> Value {
+    #####:  744:    return broadcast(builder, value, shape);
+    #####:  745:  };
+        -:  746:
+        -:  747:  // Approximate log(1+x) using the following, due to W. Kahan:
+        -:  748:  //   u = x + 1.0;
+        -:  749:  //   if (u == 1.0 || u == inf) return x;
+        -:  750:  //   return x * log(u) / (u - 1.0);
+        -:  751:  //          ^^^^^^^^^^^^^^^^^^^^^^
+        -:  752:  //             "logLarge" below.
+    #####:  753:  Value cstOne = bcast(f32Cst(builder, 1.0f));
+call    0 never executed
+call    1 never executed
+    #####:  754:  Value x = op.getOperand();
+call    0 never executed
+    #####:  755:  Value u = builder.create<arith::AddFOp>(x, cstOne);
+call    0 never executed
+call    1 never executed
+    #####:  756:  Value uSmall =
+    #####:  757:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ, u, cstOne);
+call    0 never executed
+call    1 never executed
+    #####:  758:  Value logU = builder.create<math::LogOp>(u);
+call    0 never executed
+call    1 never executed
+    #####:  759:  Value uInf =
+    #####:  760:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ, u, logU);
+call    0 never executed
+call    1 never executed
+    #####:  761:  Value logLarge = builder.create<arith::MulFOp>(
+call    0 never executed
+    #####:  762:      x, builder.create<arith::DivFOp>(
+    #####:  763:             logU, builder.create<arith::SubFOp>(u, cstOne)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  764:  Value approximation = builder.create<arith::SelectOp>(
+call    0 never executed
+    #####:  765:      builder.create<arith::OrIOp>(uSmall, uInf), x, logLarge);
+call    0 never executed
+call    1 never executed
+    #####:  766:  rewriter.replaceOp(op, approximation);
+call    0 never executed
+call    1 never executed
+    #####:  767:  return success();
+        -:  768:}
+        -:  769:
+        -:  770://----------------------------------------------------------------------------//
+        -:  771:// Erf approximation.
+        -:  772://----------------------------------------------------------------------------//
+        -:  773:
+        -:  774:// Approximates erf(x) with
+        -:  775:// a - P(x)/Q(x)
+        -:  776:// where P and Q are polynomials of degree 4.
+        -:  777:// Different coefficients are chosen based on the value of x.
+        -:  778:// The approximation error is ~2.5e-07.
+        -:  779:// Boost's minimax tool that utilizes the Remez method was used to find the
+        -:  780:// coefficients.
+        -:  781:LogicalResult
+function _ZNK4mlir4math26ErfPolynomialApproximation15matchAndRewriteENS0_5ErfOpERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  782:ErfPolynomialApproximation::matchAndRewrite(math::ErfOp op,
+        -:  783:                                            PatternRewriter &rewriter) const {
+    #####:  784:  Value operand = op.getOperand();
+call    0 never executed
+    #####:  785:  Type elementType = getElementTypeOrSelf(operand);
+call    0 never executed
+        -:  786:
+    #####:  787:  if (!(elementType.isF32() || elementType.isF16()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  788:    return rewriter.notifyMatchFailure(op,
+    #####:  789:                                       "only f32 and f16 type is supported.");
+call    0 never executed
+    #####:  790:  ArrayRef<int64_t> shape = vectorShape(operand);
+call    0 never executed
+        -:  791:
+    #####:  792:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####:  793:  auto bcast = [&](Value value) -> Value {
+    #####:  794:    return broadcast(builder, value, shape);
+    #####:  795:  };
+        -:  796:
+    #####:  797:  const int intervalsCount = 3;
+    #####:  798:  const int polyDegree = 4;
+        -:  799:
+    #####:  800:  Value zero = bcast(floatCst(builder, 0, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  801:  Value one = bcast(floatCst(builder, 1, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  802:  Value pp[intervalsCount][polyDegree + 1];
+    #####:  803:  pp[0][0] = bcast(floatCst(builder, +0.00000000000000000e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  804:  pp[0][1] = bcast(floatCst(builder, +1.12837916222975858e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  805:  pp[0][2] = bcast(floatCst(builder, -5.23018562988006470e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  806:  pp[0][3] = bcast(floatCst(builder, +2.09741709609267072e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  807:  pp[0][4] = bcast(floatCst(builder, +2.58146801602987875e-02f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  808:  pp[1][0] = bcast(floatCst(builder, +0.00000000000000000e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  809:  pp[1][1] = bcast(floatCst(builder, +1.12750687816789140e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  810:  pp[1][2] = bcast(floatCst(builder, -3.64721408487825775e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  811:  pp[1][3] = bcast(floatCst(builder, +1.18407396425136952e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  812:  pp[1][4] = bcast(floatCst(builder, +3.70645533056476558e-02f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  813:  pp[2][0] = bcast(floatCst(builder, -3.30093071049483172e-03f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  814:  pp[2][1] = bcast(floatCst(builder, +3.51961938357697011e-03f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  815:  pp[2][2] = bcast(floatCst(builder, -1.41373622814988039e-03f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  816:  pp[2][3] = bcast(floatCst(builder, +2.53447094961941348e-04f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  817:  pp[2][4] = bcast(floatCst(builder, -1.71048029455037401e-05f, elementType));
+call    0 never executed
+call    1 never executed
+        -:  818:
+    #####:  819:  Value qq[intervalsCount][polyDegree + 1];
+    #####:  820:  qq[0][0] = bcast(floatCst(builder, +1.000000000000000000e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  821:  qq[0][1] = bcast(floatCst(builder, -4.635138185962547255e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  822:  qq[0][2] = bcast(floatCst(builder, +5.192301327279782447e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  823:  qq[0][3] = bcast(floatCst(builder, -1.318089722204810087e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  824:  qq[0][4] = bcast(floatCst(builder, +7.397964654672315005e-02f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  825:  qq[1][0] = bcast(floatCst(builder, +1.00000000000000000e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  826:  qq[1][1] = bcast(floatCst(builder, -3.27607011824493086e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  827:  qq[1][2] = bcast(floatCst(builder, +4.48369090658821977e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  828:  qq[1][3] = bcast(floatCst(builder, -8.83462621207857930e-02f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  829:  qq[1][4] = bcast(floatCst(builder, +5.72442770283176093e-02f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  830:  qq[2][0] = bcast(floatCst(builder, +1.00000000000000000e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  831:  qq[2][1] = bcast(floatCst(builder, -2.06069165953913769e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  832:  qq[2][2] = bcast(floatCst(builder, +1.62705939945477759e+00f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  833:  qq[2][3] = bcast(floatCst(builder, -5.83389859211130017e-01f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  834:  qq[2][4] = bcast(floatCst(builder, +8.21908939856640930e-02f, elementType));
+call    0 never executed
+call    1 never executed
+        -:  835:
+    #####:  836:  Value offsets[intervalsCount];
+    #####:  837:  offsets[0] = bcast(floatCst(builder, 0.0f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  838:  offsets[1] = bcast(floatCst(builder, 0.0f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  839:  offsets[2] = bcast(floatCst(builder, 1.0f, elementType));
+call    0 never executed
+call    1 never executed
+        -:  840:
+    #####:  841:  Value bounds[intervalsCount];
+    #####:  842:  bounds[0] = bcast(floatCst(builder, 0.8f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  843:  bounds[1] = bcast(floatCst(builder, 2.0f, elementType));
+call    0 never executed
+call    1 never executed
+    #####:  844:  bounds[2] = bcast(floatCst(builder, 3.75f, elementType));
+call    0 never executed
+call    1 never executed
+        -:  845:
+    #####:  846:  Value isNegativeArg =
+    #####:  847:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, operand, zero);
+call    0 never executed
+call    1 never executed
+    #####:  848:  Value negArg = builder.create<arith::NegFOp>(operand);
+call    0 never executed
+call    1 never executed
+    #####:  849:  Value x = builder.create<arith::SelectOp>(isNegativeArg, negArg, operand);
+call    0 never executed
+        -:  850:
+    #####:  851:  Value offset = offsets[0];
+    #####:  852:  Value p[polyDegree + 1];
+    #####:  853:  Value q[polyDegree + 1];
+    #####:  854:  for (int i = 0; i <= polyDegree; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  855:    p[i] = pp[0][i];
+    #####:  856:    q[i] = qq[0][i];
+        -:  857:  }
+        -:  858:
+        -:  859:  // TODO: maybe use vector stacking to reduce the number of selects.
+    #####:  860:  Value isLessThanBound[intervalsCount];
+    #####:  861:  for (int j = 0; j < intervalsCount - 1; ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  862:    isLessThanBound[j] =
+    #####:  863:        builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, x, bounds[j]);
+call    0 never executed
+    #####:  864:    for (int i = 0; i <= polyDegree; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  865:      p[i] = builder.create<arith::SelectOp>(isLessThanBound[j], p[i],
+    #####:  866:                                             pp[j + 1][i]);
+call    0 never executed
+call    1 never executed
+    #####:  867:      q[i] = builder.create<arith::SelectOp>(isLessThanBound[j], q[i],
+    #####:  868:                                             qq[j + 1][i]);
+call    0 never executed
+        -:  869:    }
+    #####:  870:    offset = builder.create<arith::SelectOp>(isLessThanBound[j], offset,
+    #####:  871:                                             offsets[j + 1]);
+call    0 never executed
+        -:  872:  }
+    #####:  873:  isLessThanBound[intervalsCount - 1] = builder.create<arith::CmpFOp>(
+    #####:  874:      arith::CmpFPredicate::ULT, x, bounds[intervalsCount - 1]);
+call    0 never executed
+call    1 never executed
+        -:  875:
+    #####:  876:  Value pPoly = makePolynomialCalculation(builder, p, x);
+call    0 never executed
+    #####:  877:  Value qPoly = makePolynomialCalculation(builder, q, x);
+call    0 never executed
+    #####:  878:  Value rationalPoly = builder.create<arith::DivFOp>(pPoly, qPoly);
+call    0 never executed
+call    1 never executed
+    #####:  879:  Value formula = builder.create<arith::AddFOp>(offset, rationalPoly);
+call    0 never executed
+call    1 never executed
+    #####:  880:  formula = builder.create<arith::SelectOp>(isLessThanBound[intervalsCount - 1],
+call    0 never executed
+    #####:  881:                                            formula, one);
+call    0 never executed
+        -:  882:
+        -:  883:  // erf is odd function: erf(x) = -erf(-x).
+    #####:  884:  Value negFormula = builder.create<arith::NegFOp>(formula);
+call    0 never executed
+call    1 never executed
+    #####:  885:  Value res =
+call    0 never executed
+    #####:  886:      builder.create<arith::SelectOp>(isNegativeArg, negFormula, formula);
+call    0 never executed
+        -:  887:
+    #####:  888:  rewriter.replaceOp(op, res);
+call    0 never executed
+call    1 never executed
+        -:  889:
+    #####:  890:  return success();
+        -:  891:}
+        -:  892:
+        -:  893://----------------------------------------------------------------------------//
+        -:  894:// Exp approximation.
+        -:  895://----------------------------------------------------------------------------//
+        -:  896:
+        -:  897:namespace {
+        -:  898:
+        -:  899:struct ExpApproximation : public OpRewritePattern<math::ExpOp> {
+        -:  900:public:
+        -:  901:  using OpRewritePattern::OpRewritePattern;
+        -:  902:
+        -:  903:  LogicalResult matchAndRewrite(math::ExpOp op,
+        -:  904:                                PatternRewriter &rewriter) const final;
+        -:  905:};
+        -:  906:} // namespace
+        -:  907:
+        -:  908:// Approximate exp(x) using its reduced range exp(y) where y is in the range
+        -:  909:// [0, ln(2)], let y = x - floor(x / ln(2)) * ln(2) = x - k * ln(2), exp(x)
+        -:  910:// = exp(y) * 2^k. exp(y).
+        -:  911:LogicalResult
+function _ZNK12_GLOBAL__N_116ExpApproximation15matchAndRewriteEN4mlir4math5ExpOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  912:ExpApproximation::matchAndRewrite(math::ExpOp op,
+        -:  913:                                  PatternRewriter &rewriter) const {
+    #####:  914:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  915:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -:  916:
+    #####:  917:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -:  918:
+    #####:  919:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+        -:  920:
+        -:  921:  // TODO: Consider a common pattern rewriter with all methods below to
+        -:  922:  // write the approximations.
+    #####:  923:  auto bcast = [&](Value value) -> Value {
+    #####:  924:    return broadcast(builder, value, shape);
+    #####:  925:  };
+    #####:  926:  auto fmla = [&](Value a, Value b, Value c) {
+    #####:  927:    return builder.create<math::FmaOp>(a, b, c);
+    #####:  928:  };
+    #####:  929:  auto mul = [&](Value a, Value b) -> Value {
+    #####:  930:    return builder.create<arith::MulFOp>(a, b);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  931:  };
+    #####:  932:  auto sub = [&](Value a, Value b) -> Value {
+    #####:  933:    return builder.create<arith::SubFOp>(a, b);
+call    0 never executed
+    #####:  934:  };
+    #####:  935:  auto floor = [&](Value a) { return builder.create<math::FloorOp>(a); };
+        -:  936:
+    #####:  937:  Value cstLn2 = bcast(f32Cst(builder, static_cast<float>(LN2_VALUE)));
+call    0 never executed
+call    1 never executed
+    #####:  938:  Value cstLog2E = bcast(f32Cst(builder, static_cast<float>(LOG2E_VALUE)));
+call    0 never executed
+call    1 never executed
+        -:  939:
+        -:  940:  // Polynomial coefficients.
+    #####:  941:  Value cstCephesExpP0 = bcast(f32Cst(builder, 1.0));
+call    0 never executed
+call    1 never executed
+    #####:  942:  Value cstCephesExpP1 = bcast(f32Cst(builder, 1.0));
+call    0 never executed
+call    1 never executed
+    #####:  943:  Value cstCephesExpP2 = bcast(f32Cst(builder, 0.49970514590562437052f));
+call    0 never executed
+call    1 never executed
+    #####:  944:  Value cstCephesExpP3 = bcast(f32Cst(builder, 0.16873890085469545053f));
+call    0 never executed
+call    1 never executed
+    #####:  945:  Value cstCephesExpP4 = bcast(f32Cst(builder, 0.03668965196652099192f));
+call    0 never executed
+call    1 never executed
+    #####:  946:  Value cstCephesExpP5 = bcast(f32Cst(builder, 0.01314350012789660196f));
+call    0 never executed
+call    1 never executed
+        -:  947:
+    #####:  948:  Value x = op.getOperand();
+call    0 never executed
+        -:  949:
+    #####:  950:  Value isNan = builder.create<arith::CmpFOp>(arith::CmpFPredicate::UNO, x, x);
+call    0 never executed
+call    1 never executed
+        -:  951:
+        -:  952:  // Reduced y = x - floor(x / ln(2)) * ln(2) = x - k * ln(2)
+    #####:  953:  Value xL2Inv = mul(x, cstLog2E);
+call    0 never executed
+    #####:  954:  Value kF32 = floor(xL2Inv);
+call    0 never executed
+call    1 never executed
+    #####:  955:  Value kLn2 = mul(kF32, cstLn2);
+call    0 never executed
+    #####:  956:  Value y = sub(x, kLn2);
+call    0 never executed
+        -:  957:
+        -:  958:  // Use Estrin's evaluation scheme with 3 independent parts:
+        -:  959:  // P(y)^y : (c0 + c1 y) + (c2 + c3 y) y^2 + (c4 + c5 y) y^4
+    #####:  960:  Value y2 = mul(y, y);
+call    0 never executed
+    #####:  961:  Value y4 = mul(y2, y2);
+call    0 never executed
+        -:  962:
+    #####:  963:  Value q0 = fmla(cstCephesExpP1, y, cstCephesExpP0);
+call    0 never executed
+call    1 never executed
+    #####:  964:  Value q1 = fmla(cstCephesExpP3, y, cstCephesExpP2);
+call    0 never executed
+call    1 never executed
+    #####:  965:  Value q2 = fmla(cstCephesExpP5, y, cstCephesExpP4);
+call    0 never executed
+call    1 never executed
+    #####:  966:  Value expY = fmla(q1, y2, q0);
+call    0 never executed
+call    1 never executed
+    #####:  967:  expY = fmla(q2, y4, expY);
+call    0 never executed
+call    1 never executed
+        -:  968:
+    #####:  969:  auto i32Vec = broadcast(builder.getI32Type(), shape);
+call    0 never executed
+call    1 never executed
+        -:  970:
+        -:  971:  // exp2(k)
+    #####:  972:  Value k = builder.create<arith::FPToSIOp>(i32Vec, kF32);
+call    0 never executed
+call    1 never executed
+    #####:  973:  Value exp2KValue = exp2I32(builder, k);
+call    0 never executed
+        -:  974:
+        -:  975:  // exp(x) = exp(y) * exp2(k)
+    #####:  976:  expY = mul(expY, exp2KValue);
+call    0 never executed
+        -:  977:
+        -:  978:  // Handle overflow, inf and underflow of exp(x). exp(x) range is [0, inf], its
+        -:  979:  // partitioned as the following:
+        -:  980:  // exp(x) = 0, x <= -inf
+        -:  981:  // exp(x) = underflow (min_float), x <= -88
+        -:  982:  // exp(x) = inf (min_float), x >= 88
+        -:  983:  // Note: |k| = 127 is the value where the 8-bits exponent saturates.
+    #####:  984:  Value zerof32Const = bcast(f32Cst(builder, 0));
+call    0 never executed
+call    1 never executed
+    #####:  985:  auto constPosInfinity =
+    #####:  986:      bcast(f32Cst(builder, std::numeric_limits<float>::infinity()));
+call    0 never executed
+call    1 never executed
+    #####:  987:  auto constNegIfinity =
+    #####:  988:      bcast(f32Cst(builder, -std::numeric_limits<float>::infinity()));
+call    0 never executed
+call    1 never executed
+    #####:  989:  auto underflow = bcast(f32Cst(builder, std::numeric_limits<float>::min()));
+call    0 never executed
+call    1 never executed
+        -:  990:
+    #####:  991:  Value kMaxConst = bcast(i32Cst(builder, 127));
+call    0 never executed
+call    1 never executed
+    #####:  992:  Value kMaxNegConst = bcast(i32Cst(builder, -127));
+call    0 never executed
+call    1 never executed
+    #####:  993:  Value rightBound =
+    #####:  994:      builder.create<arith::CmpIOp>(arith::CmpIPredicate::sle, k, kMaxConst);
+call    0 never executed
+call    1 never executed
+    #####:  995:  Value leftBound =
+    #####:  996:      builder.create<arith::CmpIOp>(arith::CmpIPredicate::sge, k, kMaxNegConst);
+call    0 never executed
+call    1 never executed
+        -:  997:
+    #####:  998:  Value isNegInfinityX = builder.create<arith::CmpFOp>(
+    #####:  999:      arith::CmpFPredicate::OEQ, x, constNegIfinity);
+call    0 never executed
+call    1 never executed
+    #####: 1000:  Value isPosInfinityX = builder.create<arith::CmpFOp>(
+    #####: 1001:      arith::CmpFPredicate::OEQ, x, constPosInfinity);
+call    0 never executed
+call    1 never executed
+    #####: 1002:  Value isPostiveX =
+    #####: 1003:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OGT, x, zerof32Const);
+call    0 never executed
+call    1 never executed
+    #####: 1004:  Value isComputable = builder.create<arith::AndIOp>(rightBound, leftBound);
+call    0 never executed
+call    1 never executed
+        -: 1005:
+    #####: 1006:  expY = builder.create<arith::SelectOp>(
+call    0 never executed
+        -: 1007:      isNan, x,
+    #####: 1008:      builder.create<arith::SelectOp>(
+        -: 1009:          isNegInfinityX, zerof32Const,
+    #####: 1010:          builder.create<arith::SelectOp>(
+        -: 1011:              isPosInfinityX, constPosInfinity,
+    #####: 1012:              builder.create<arith::SelectOp>(
+        -: 1013:                  isComputable, expY,
+    #####: 1014:                  builder.create<arith::SelectOp>(isPostiveX, constPosInfinity,
+    #####: 1015:                                                  underflow)))));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1016:
+    #####: 1017:  rewriter.replaceOp(op, expY);
+call    0 never executed
+call    1 never executed
+        -: 1018:
+    #####: 1019:  return success();
+        -: 1020:}
+        -: 1021:
+        -: 1022://----------------------------------------------------------------------------//
+        -: 1023:// ExpM1 approximation.
+        -: 1024://----------------------------------------------------------------------------//
+        -: 1025:
+        -: 1026:namespace {
+        -: 1027:
+        -: 1028:struct ExpM1Approximation : public OpRewritePattern<math::ExpM1Op> {
+        -: 1029:public:
+        -: 1030:  using OpRewritePattern::OpRewritePattern;
+        -: 1031:
+        -: 1032:  LogicalResult matchAndRewrite(math::ExpM1Op op,
+        -: 1033:                                PatternRewriter &rewriter) const final;
+        -: 1034:};
+        -: 1035:} // namespace
+        -: 1036:
+        -: 1037:LogicalResult
+function _ZNK12_GLOBAL__N_118ExpM1Approximation15matchAndRewriteEN4mlir4math7ExpM1OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1038:ExpM1Approximation::matchAndRewrite(math::ExpM1Op op,
+        -: 1039:                                    PatternRewriter &rewriter) const {
+    #####: 1040:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1041:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -: 1042:
+    #####: 1043:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -: 1044:
+    #####: 1045:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####: 1046:  auto bcast = [&](Value value) -> Value {
+    #####: 1047:    return broadcast(builder, value, shape);
+    #####: 1048:  };
+        -: 1049:
+        -: 1050:  // expm1(x) = exp(x) - 1 = u - 1.
+        -: 1051:  // We have to handle it carefully when x is near 0, i.e. u ~= 1,
+        -: 1052:  // and when the input is ~= -inf, i.e. u - 1 ~= -1.
+    #####: 1053:  Value cstOne = bcast(f32Cst(builder, 1.0f));
+call    0 never executed
+call    1 never executed
+    #####: 1054:  Value cstNegOne = bcast(f32Cst(builder, -1.0f));
+call    0 never executed
+call    1 never executed
+    #####: 1055:  Value x = op.getOperand();
+call    0 never executed
+    #####: 1056:  Value u = builder.create<math::ExpOp>(x);
+call    0 never executed
+call    1 never executed
+    #####: 1057:  Value uEqOneOrNaN =
+    #####: 1058:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::UEQ, u, cstOne);
+call    0 never executed
+call    1 never executed
+    #####: 1059:  Value uMinusOne = builder.create<arith::SubFOp>(u, cstOne);
+call    0 never executed
+call    1 never executed
+    #####: 1060:  Value uMinusOneEqNegOne = builder.create<arith::CmpFOp>(
+    #####: 1061:      arith::CmpFPredicate::OEQ, uMinusOne, cstNegOne);
+call    0 never executed
+call    1 never executed
+        -: 1062:  // logU = log(u) ~= x
+    #####: 1063:  Value logU = builder.create<math::LogOp>(u);
+call    0 never executed
+call    1 never executed
+        -: 1064:
+        -: 1065:  // Detect exp(x) = +inf; written this way to avoid having to form +inf.
+    #####: 1066:  Value isInf =
+    #####: 1067:      builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ, logU, u);
+call    0 never executed
+call    1 never executed
+        -: 1068:
+        -: 1069:  // (u - 1) * (x / ~x)
+    #####: 1070:  Value expm1 = builder.create<arith::MulFOp>(
+call    0 never executed
+    #####: 1071:      uMinusOne, builder.create<arith::DivFOp>(x, logU));
+call    0 never executed
+call    1 never executed
+    #####: 1072:  expm1 = builder.create<arith::SelectOp>(isInf, u, expm1);
+call    0 never executed
+call    1 never executed
+    #####: 1073:  Value approximation = builder.create<arith::SelectOp>(
+call    0 never executed
+        -: 1074:      uEqOneOrNaN, x,
+    #####: 1075:      builder.create<arith::SelectOp>(uMinusOneEqNegOne, cstNegOne, expm1));
+call    0 never executed
+call    1 never executed
+    #####: 1076:  rewriter.replaceOp(op, approximation);
+call    0 never executed
+call    1 never executed
+    #####: 1077:  return success();
+        -: 1078:}
+        -: 1079:
+        -: 1080://----------------------------------------------------------------------------//
+        -: 1081:// Sin and Cos approximation.
+        -: 1082://----------------------------------------------------------------------------//
+        -: 1083:
+        -: 1084:namespace {
+        -: 1085:
+        -: 1086:template <bool isSine, typename OpTy>
+        -: 1087:struct SinAndCosApproximation : public OpRewritePattern<OpTy> {
+        -: 1088:public:
+        -: 1089:  using OpRewritePattern<OpTy>::OpRewritePattern;
+        -: 1090:
+        -: 1091:  LogicalResult matchAndRewrite(OpTy op, PatternRewriter &rewriter) const final;
+        -: 1092:};
+        -: 1093:} // namespace
+        -: 1094:
+        -: 1095:#define TWO_OVER_PI                                                            \
+        -: 1096:  0.6366197723675813430755350534900574481378385829618257949906693762L
+        -: 1097:#define PI_OVER_2                                                              \
+        -: 1098:  1.5707963267948966192313216916397514420985846996875529104874722961L
+        -: 1099:
+        -: 1100:// Approximates sin(x) or cos(x) by finding the best approximation polynomial in
+        -: 1101:// the reduced range [0, pi/2] for both sin(x) and cos(x). Then given y in the
+        -: 1102:// reduced range sin(x) will be computed as sin(y), -sin(y), cos(y) or -cos(y).
+        -: 1103:template <bool isSine, typename OpTy>
+    #####: 1104:LogicalResult SinAndCosApproximation<isSine, OpTy>::matchAndRewrite(
+        -: 1105:    OpTy op, PatternRewriter &rewriter) const {
+        -: 1106:  static_assert(
+        -: 1107:      llvm::is_one_of<OpTy, math::SinOp, math::CosOp>::value,
+        -: 1108:      "SinAndCosApproximation pattern expects math::SinOp or math::CosOp");
+        -: 1109:
+    #####: 1110:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+    #####: 1111:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+        -: 1112:
+    #####: 1113:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+        -: 1114:
+    #####: 1115:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+    #####: 1116:  auto bcast = [&](Value value) -> Value {
+    #####: 1117:    return broadcast(builder, value, shape);
+        -: 1118:  };
+    #####: 1119:  auto mul = [&](Value a, Value b) -> Value {
+    #####: 1120:    return builder.create<arith::MulFOp>(a, b);
+        -: 1121:  };
+    #####: 1122:  auto sub = [&](Value a, Value b) -> Value {
+    #####: 1123:    return builder.create<arith::SubFOp>(a, b);
+        -: 1124:  };
+    #####: 1125:  auto floor = [&](Value a) { return builder.create<math::FloorOp>(a); };
+        -: 1126:
+    #####: 1127:  auto i32Vec = broadcast(builder.getI32Type(), shape);
+    #####: 1128:  auto fPToSingedInteger = [&](Value a) -> Value {
+    #####: 1129:    return builder.create<arith::FPToSIOp>(i32Vec, a);
+        -: 1130:  };
+        -: 1131:
+    #####: 1132:  auto modulo4 = [&](Value a) -> Value {
+    #####: 1133:    return builder.create<arith::AndIOp>(a, bcast(i32Cst(builder, 3)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -: 1134:  };
+        -: 1135:
+    #####: 1136:  auto isEqualTo = [&](Value a, Value b) -> Value {
+    #####: 1137:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, a, b);
+        -: 1138:  };
+        -: 1139:
+    #####: 1140:  auto isGreaterThan = [&](Value a, Value b) -> Value {
+    #####: 1141:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, a, b);
+        -: 1142:  };
+        -: 1143:
+    #####: 1144:  auto select = [&](Value cond, Value t, Value f) -> Value {
+    #####: 1145:    return builder.create<arith::SelectOp>(cond, t, f);
+        -: 1146:  };
+        -: 1147:
+    #####: 1148:  auto fmla = [&](Value a, Value b, Value c) {
+    #####: 1149:    return builder.create<math::FmaOp>(a, b, c);
+        -: 1150:  };
+        -: 1151:
+    #####: 1152:  auto bitwiseOr = [&](Value a, Value b) {
+    #####: 1153:    return builder.create<arith::OrIOp>(a, b);
+        -: 1154:  };
+        -: 1155:
+    #####: 1156:  Value twoOverPi = bcast(f32Cst(builder, (float)TWO_OVER_PI));
+    #####: 1157:  Value piOverTwo = bcast(f32Cst(builder, (float)PI_OVER_2));
+        -: 1158:
+    #####: 1159:  Value x = op.getOperand();
+        -: 1160:
+    #####: 1161:  Value k = floor(mul(x, twoOverPi));
+        -: 1162:
+    #####: 1163:  Value y = sub(x, mul(k, piOverTwo));
+        -: 1164:
+    #####: 1165:  Value cstOne = bcast(f32Cst(builder, 1.0));
+    #####: 1166:  Value cstNegativeOne = bcast(f32Cst(builder, -1.0));
+        -: 1167:
+    #####: 1168:  Value cstSC2 = bcast(f32Cst(builder, -0.16666667163372039794921875f));
+    #####: 1169:  Value cstSC4 = bcast(f32Cst(builder, 8.333347737789154052734375e-3f));
+    #####: 1170:  Value cstSC6 = bcast(f32Cst(builder, -1.9842604524455964565277099609375e-4f));
+        -: 1171:  Value cstSC8 =
+    #####: 1172:      bcast(f32Cst(builder, 2.760012648650445044040679931640625e-6f));
+        -: 1173:  Value cstSC10 =
+    #####: 1174:      bcast(f32Cst(builder, -2.50293279435709337121807038784027099609375e-8f));
+        -: 1175:
+    #####: 1176:  Value cstCC2 = bcast(f32Cst(builder, -0.5f));
+    #####: 1177:  Value cstCC4 = bcast(f32Cst(builder, 4.166664183139801025390625e-2f));
+    #####: 1178:  Value cstCC6 = bcast(f32Cst(builder, -1.388833043165504932403564453125e-3f));
+    #####: 1179:  Value cstCC8 = bcast(f32Cst(builder, 2.47562347794882953166961669921875e-5f));
+        -: 1180:  Value cstCC10 =
+    #####: 1181:      bcast(f32Cst(builder, -2.59630184018533327616751194000244140625e-7f));
+        -: 1182:
+    #####: 1183:  Value kMod4 = modulo4(fPToSingedInteger(k));
+        -: 1184:
+    #####: 1185:  Value kR0 = isEqualTo(kMod4, bcast(i32Cst(builder, 0)));
+    #####: 1186:  Value kR1 = isEqualTo(kMod4, bcast(i32Cst(builder, 1)));
+    #####: 1187:  Value kR2 = isEqualTo(kMod4, bcast(i32Cst(builder, 2)));
+    #####: 1188:  Value kR3 = isEqualTo(kMod4, bcast(i32Cst(builder, 3)));
+        -: 1189:
+    #####: 1190:  Value sinuseCos = isSine ? bitwiseOr(kR1, kR3) : bitwiseOr(kR0, kR2);
+    #####: 1191:  Value negativeRange = isSine ? isGreaterThan(kMod4, bcast(i32Cst(builder, 1)))
+    #####: 1192:                               : bitwiseOr(kR1, kR2);
+        -: 1193:
+    #####: 1194:  Value y2 = mul(y, y);
+        -: 1195:
+    #####: 1196:  Value base = select(sinuseCos, cstOne, y);
+    #####: 1197:  Value cstC2 = select(sinuseCos, cstCC2, cstSC2);
+    #####: 1198:  Value cstC4 = select(sinuseCos, cstCC4, cstSC4);
+    #####: 1199:  Value cstC6 = select(sinuseCos, cstCC6, cstSC6);
+    #####: 1200:  Value cstC8 = select(sinuseCos, cstCC8, cstSC8);
+    #####: 1201:  Value cstC10 = select(sinuseCos, cstCC10, cstSC10);
+        -: 1202:
+    #####: 1203:  Value v1 = fmla(y2, cstC10, cstC8);
+    #####: 1204:  Value v2 = fmla(y2, v1, cstC6);
+    #####: 1205:  Value v3 = fmla(y2, v2, cstC4);
+    #####: 1206:  Value v4 = fmla(y2, v3, cstC2);
+    #####: 1207:  Value v5 = fmla(y2, v4, cstOne);
+    #####: 1208:  Value v6 = mul(base, v5);
+        -: 1209:
+    #####: 1210:  Value approximation = select(negativeRange, mul(cstNegativeOne, v6), v6);
+        -: 1211:
+    #####: 1212:  rewriter.replaceOp(op, approximation);
+        -: 1213:
+    #####: 1214:  return success();
+        -: 1215:}
+------------------
+_ZNK12_GLOBAL__N_122SinAndCosApproximationILb1EN4mlir4math5SinOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_122SinAndCosApproximationILb1EN4mlir4math5SinOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1104:LogicalResult SinAndCosApproximation<isSine, OpTy>::matchAndRewrite(
+        -: 1105:    OpTy op, PatternRewriter &rewriter) const {
+        -: 1106:  static_assert(
+        -: 1107:      llvm::is_one_of<OpTy, math::SinOp, math::CosOp>::value,
+        -: 1108:      "SinAndCosApproximation pattern expects math::SinOp or math::CosOp");
+        -: 1109:
+    #####: 1110:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1111:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -: 1112:
+    #####: 1113:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -: 1114:
+    #####: 1115:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####: 1116:  auto bcast = [&](Value value) -> Value {
+    #####: 1117:    return broadcast(builder, value, shape);
+        -: 1118:  };
+    #####: 1119:  auto mul = [&](Value a, Value b) -> Value {
+    #####: 1120:    return builder.create<arith::MulFOp>(a, b);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1121:  };
+    #####: 1122:  auto sub = [&](Value a, Value b) -> Value {
+    #####: 1123:    return builder.create<arith::SubFOp>(a, b);
+call    0 never executed
+        -: 1124:  };
+    #####: 1125:  auto floor = [&](Value a) { return builder.create<math::FloorOp>(a); };
+        -: 1126:
+    #####: 1127:  auto i32Vec = broadcast(builder.getI32Type(), shape);
+call    0 never executed
+call    1 never executed
+    #####: 1128:  auto fPToSingedInteger = [&](Value a) -> Value {
+    #####: 1129:    return builder.create<arith::FPToSIOp>(i32Vec, a);
+call    0 never executed
+        -: 1130:  };
+        -: 1131:
+    #####: 1132:  auto modulo4 = [&](Value a) -> Value {
+        -: 1133:    return builder.create<arith::AndIOp>(a, bcast(i32Cst(builder, 3)));
+        -: 1134:  };
+        -: 1135:
+    #####: 1136:  auto isEqualTo = [&](Value a, Value b) -> Value {
+    #####: 1137:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, a, b);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1138:  };
+        -: 1139:
+    #####: 1140:  auto isGreaterThan = [&](Value a, Value b) -> Value {
+    #####: 1141:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, a, b);
+call    0 never executed
+        -: 1142:  };
+        -: 1143:
+    #####: 1144:  auto select = [&](Value cond, Value t, Value f) -> Value {
+    #####: 1145:    return builder.create<arith::SelectOp>(cond, t, f);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1146:  };
+        -: 1147:
+    #####: 1148:  auto fmla = [&](Value a, Value b, Value c) {
+    #####: 1149:    return builder.create<math::FmaOp>(a, b, c);
+        -: 1150:  };
+        -: 1151:
+    #####: 1152:  auto bitwiseOr = [&](Value a, Value b) {
+    #####: 1153:    return builder.create<arith::OrIOp>(a, b);
+        -: 1154:  };
+        -: 1155:
+    #####: 1156:  Value twoOverPi = bcast(f32Cst(builder, (float)TWO_OVER_PI));
+call    0 never executed
+call    1 never executed
+    #####: 1157:  Value piOverTwo = bcast(f32Cst(builder, (float)PI_OVER_2));
+call    0 never executed
+call    1 never executed
+        -: 1158:
+    #####: 1159:  Value x = op.getOperand();
+call    0 never executed
+        -: 1160:
+    #####: 1161:  Value k = floor(mul(x, twoOverPi));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1162:
+    #####: 1163:  Value y = sub(x, mul(k, piOverTwo));
+call    0 never executed
+call    1 never executed
+        -: 1164:
+    #####: 1165:  Value cstOne = bcast(f32Cst(builder, 1.0));
+call    0 never executed
+call    1 never executed
+    #####: 1166:  Value cstNegativeOne = bcast(f32Cst(builder, -1.0));
+call    0 never executed
+call    1 never executed
+        -: 1167:
+    #####: 1168:  Value cstSC2 = bcast(f32Cst(builder, -0.16666667163372039794921875f));
+call    0 never executed
+call    1 never executed
+    #####: 1169:  Value cstSC4 = bcast(f32Cst(builder, 8.333347737789154052734375e-3f));
+call    0 never executed
+call    1 never executed
+    #####: 1170:  Value cstSC6 = bcast(f32Cst(builder, -1.9842604524455964565277099609375e-4f));
+call    0 never executed
+call    1 never executed
+        -: 1171:  Value cstSC8 =
+    #####: 1172:      bcast(f32Cst(builder, 2.760012648650445044040679931640625e-6f));
+call    0 never executed
+call    1 never executed
+        -: 1173:  Value cstSC10 =
+    #####: 1174:      bcast(f32Cst(builder, -2.50293279435709337121807038784027099609375e-8f));
+call    0 never executed
+call    1 never executed
+        -: 1175:
+    #####: 1176:  Value cstCC2 = bcast(f32Cst(builder, -0.5f));
+call    0 never executed
+call    1 never executed
+    #####: 1177:  Value cstCC4 = bcast(f32Cst(builder, 4.166664183139801025390625e-2f));
+call    0 never executed
+call    1 never executed
+    #####: 1178:  Value cstCC6 = bcast(f32Cst(builder, -1.388833043165504932403564453125e-3f));
+call    0 never executed
+call    1 never executed
+    #####: 1179:  Value cstCC8 = bcast(f32Cst(builder, 2.47562347794882953166961669921875e-5f));
+call    0 never executed
+call    1 never executed
+        -: 1180:  Value cstCC10 =
+    #####: 1181:      bcast(f32Cst(builder, -2.59630184018533327616751194000244140625e-7f));
+call    0 never executed
+call    1 never executed
+        -: 1182:
+    #####: 1183:  Value kMod4 = modulo4(fPToSingedInteger(k));
+call    0 never executed
+call    1 never executed
+        -: 1184:
+    #####: 1185:  Value kR0 = isEqualTo(kMod4, bcast(i32Cst(builder, 0)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1186:  Value kR1 = isEqualTo(kMod4, bcast(i32Cst(builder, 1)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1187:  Value kR2 = isEqualTo(kMod4, bcast(i32Cst(builder, 2)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1188:  Value kR3 = isEqualTo(kMod4, bcast(i32Cst(builder, 3)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1189:
+    #####: 1190:  Value sinuseCos = isSine ? bitwiseOr(kR1, kR3) : bitwiseOr(kR0, kR2);
+call    0 never executed
+call    1 never executed
+    #####: 1191:  Value negativeRange = isSine ? isGreaterThan(kMod4, bcast(i32Cst(builder, 1)))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1192:                               : bitwiseOr(kR1, kR2);
+        -: 1193:
+    #####: 1194:  Value y2 = mul(y, y);
+call    0 never executed
+        -: 1195:
+    #####: 1196:  Value base = select(sinuseCos, cstOne, y);
+call    0 never executed
+    #####: 1197:  Value cstC2 = select(sinuseCos, cstCC2, cstSC2);
+call    0 never executed
+    #####: 1198:  Value cstC4 = select(sinuseCos, cstCC4, cstSC4);
+call    0 never executed
+    #####: 1199:  Value cstC6 = select(sinuseCos, cstCC6, cstSC6);
+call    0 never executed
+    #####: 1200:  Value cstC8 = select(sinuseCos, cstCC8, cstSC8);
+call    0 never executed
+    #####: 1201:  Value cstC10 = select(sinuseCos, cstCC10, cstSC10);
+call    0 never executed
+        -: 1202:
+    #####: 1203:  Value v1 = fmla(y2, cstC10, cstC8);
+call    0 never executed
+call    1 never executed
+    #####: 1204:  Value v2 = fmla(y2, v1, cstC6);
+call    0 never executed
+call    1 never executed
+    #####: 1205:  Value v3 = fmla(y2, v2, cstC4);
+call    0 never executed
+call    1 never executed
+    #####: 1206:  Value v4 = fmla(y2, v3, cstC2);
+call    0 never executed
+call    1 never executed
+    #####: 1207:  Value v5 = fmla(y2, v4, cstOne);
+call    0 never executed
+call    1 never executed
+    #####: 1208:  Value v6 = mul(base, v5);
+call    0 never executed
+        -: 1209:
+    #####: 1210:  Value approximation = select(negativeRange, mul(cstNegativeOne, v6), v6);
+call    0 never executed
+call    1 never executed
+        -: 1211:
+    #####: 1212:  rewriter.replaceOp(op, approximation);
+call    0 never executed
+call    1 never executed
+        -: 1213:
+    #####: 1214:  return success();
+        -: 1215:}
+------------------
+_ZNK12_GLOBAL__N_122SinAndCosApproximationILb0EN4mlir4math5CosOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_122SinAndCosApproximationILb0EN4mlir4math5CosOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1104:LogicalResult SinAndCosApproximation<isSine, OpTy>::matchAndRewrite(
+        -: 1105:    OpTy op, PatternRewriter &rewriter) const {
+        -: 1106:  static_assert(
+        -: 1107:      llvm::is_one_of<OpTy, math::SinOp, math::CosOp>::value,
+        -: 1108:      "SinAndCosApproximation pattern expects math::SinOp or math::CosOp");
+        -: 1109:
+    #####: 1110:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1111:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -: 1112:
+    #####: 1113:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -: 1114:
+    #####: 1115:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####: 1116:  auto bcast = [&](Value value) -> Value {
+    #####: 1117:    return broadcast(builder, value, shape);
+        -: 1118:  };
+    #####: 1119:  auto mul = [&](Value a, Value b) -> Value {
+    #####: 1120:    return builder.create<arith::MulFOp>(a, b);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -: 1121:  };
+    #####: 1122:  auto sub = [&](Value a, Value b) -> Value {
+    #####: 1123:    return builder.create<arith::SubFOp>(a, b);
+call    0 never executed
+        -: 1124:  };
+    #####: 1125:  auto floor = [&](Value a) { return builder.create<math::FloorOp>(a); };
+        -: 1126:
+    #####: 1127:  auto i32Vec = broadcast(builder.getI32Type(), shape);
+call    0 never executed
+call    1 never executed
+    #####: 1128:  auto fPToSingedInteger = [&](Value a) -> Value {
+    #####: 1129:    return builder.create<arith::FPToSIOp>(i32Vec, a);
+call    0 never executed
+        -: 1130:  };
+        -: 1131:
+    #####: 1132:  auto modulo4 = [&](Value a) -> Value {
+        -: 1133:    return builder.create<arith::AndIOp>(a, bcast(i32Cst(builder, 3)));
+        -: 1134:  };
+        -: 1135:
+    #####: 1136:  auto isEqualTo = [&](Value a, Value b) -> Value {
+    #####: 1137:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, a, b);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1138:  };
+        -: 1139:
+    #####: 1140:  auto isGreaterThan = [&](Value a, Value b) -> Value {
+        -: 1141:    return builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, a, b);
+        -: 1142:  };
+        -: 1143:
+    #####: 1144:  auto select = [&](Value cond, Value t, Value f) -> Value {
+    #####: 1145:    return builder.create<arith::SelectOp>(cond, t, f);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1146:  };
+        -: 1147:
+    #####: 1148:  auto fmla = [&](Value a, Value b, Value c) {
+    #####: 1149:    return builder.create<math::FmaOp>(a, b, c);
+        -: 1150:  };
+        -: 1151:
+    #####: 1152:  auto bitwiseOr = [&](Value a, Value b) {
+    #####: 1153:    return builder.create<arith::OrIOp>(a, b);
+        -: 1154:  };
+        -: 1155:
+    #####: 1156:  Value twoOverPi = bcast(f32Cst(builder, (float)TWO_OVER_PI));
+call    0 never executed
+call    1 never executed
+    #####: 1157:  Value piOverTwo = bcast(f32Cst(builder, (float)PI_OVER_2));
+call    0 never executed
+call    1 never executed
+        -: 1158:
+    #####: 1159:  Value x = op.getOperand();
+call    0 never executed
+        -: 1160:
+    #####: 1161:  Value k = floor(mul(x, twoOverPi));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1162:
+    #####: 1163:  Value y = sub(x, mul(k, piOverTwo));
+call    0 never executed
+call    1 never executed
+        -: 1164:
+    #####: 1165:  Value cstOne = bcast(f32Cst(builder, 1.0));
+call    0 never executed
+call    1 never executed
+    #####: 1166:  Value cstNegativeOne = bcast(f32Cst(builder, -1.0));
+call    0 never executed
+call    1 never executed
+        -: 1167:
+    #####: 1168:  Value cstSC2 = bcast(f32Cst(builder, -0.16666667163372039794921875f));
+call    0 never executed
+call    1 never executed
+    #####: 1169:  Value cstSC4 = bcast(f32Cst(builder, 8.333347737789154052734375e-3f));
+call    0 never executed
+call    1 never executed
+    #####: 1170:  Value cstSC6 = bcast(f32Cst(builder, -1.9842604524455964565277099609375e-4f));
+call    0 never executed
+call    1 never executed
+        -: 1171:  Value cstSC8 =
+    #####: 1172:      bcast(f32Cst(builder, 2.760012648650445044040679931640625e-6f));
+call    0 never executed
+call    1 never executed
+        -: 1173:  Value cstSC10 =
+    #####: 1174:      bcast(f32Cst(builder, -2.50293279435709337121807038784027099609375e-8f));
+call    0 never executed
+call    1 never executed
+        -: 1175:
+    #####: 1176:  Value cstCC2 = bcast(f32Cst(builder, -0.5f));
+call    0 never executed
+call    1 never executed
+    #####: 1177:  Value cstCC4 = bcast(f32Cst(builder, 4.166664183139801025390625e-2f));
+call    0 never executed
+call    1 never executed
+    #####: 1178:  Value cstCC6 = bcast(f32Cst(builder, -1.388833043165504932403564453125e-3f));
+call    0 never executed
+call    1 never executed
+    #####: 1179:  Value cstCC8 = bcast(f32Cst(builder, 2.47562347794882953166961669921875e-5f));
+call    0 never executed
+call    1 never executed
+        -: 1180:  Value cstCC10 =
+    #####: 1181:      bcast(f32Cst(builder, -2.59630184018533327616751194000244140625e-7f));
+call    0 never executed
+call    1 never executed
+        -: 1182:
+    #####: 1183:  Value kMod4 = modulo4(fPToSingedInteger(k));
+call    0 never executed
+call    1 never executed
+        -: 1184:
+    #####: 1185:  Value kR0 = isEqualTo(kMod4, bcast(i32Cst(builder, 0)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1186:  Value kR1 = isEqualTo(kMod4, bcast(i32Cst(builder, 1)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1187:  Value kR2 = isEqualTo(kMod4, bcast(i32Cst(builder, 2)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1188:  Value kR3 = isEqualTo(kMod4, bcast(i32Cst(builder, 3)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1189:
+    #####: 1190:  Value sinuseCos = isSine ? bitwiseOr(kR1, kR3) : bitwiseOr(kR0, kR2);
+call    0 never executed
+call    1 never executed
+    #####: 1191:  Value negativeRange = isSine ? isGreaterThan(kMod4, bcast(i32Cst(builder, 1)))
+    #####: 1192:                               : bitwiseOr(kR1, kR2);
+call    0 never executed
+call    1 never executed
+        -: 1193:
+    #####: 1194:  Value y2 = mul(y, y);
+call    0 never executed
+        -: 1195:
+    #####: 1196:  Value base = select(sinuseCos, cstOne, y);
+call    0 never executed
+    #####: 1197:  Value cstC2 = select(sinuseCos, cstCC2, cstSC2);
+call    0 never executed
+    #####: 1198:  Value cstC4 = select(sinuseCos, cstCC4, cstSC4);
+call    0 never executed
+    #####: 1199:  Value cstC6 = select(sinuseCos, cstCC6, cstSC6);
+call    0 never executed
+    #####: 1200:  Value cstC8 = select(sinuseCos, cstCC8, cstSC8);
+call    0 never executed
+    #####: 1201:  Value cstC10 = select(sinuseCos, cstCC10, cstSC10);
+call    0 never executed
+        -: 1202:
+    #####: 1203:  Value v1 = fmla(y2, cstC10, cstC8);
+call    0 never executed
+call    1 never executed
+    #####: 1204:  Value v2 = fmla(y2, v1, cstC6);
+call    0 never executed
+call    1 never executed
+    #####: 1205:  Value v3 = fmla(y2, v2, cstC4);
+call    0 never executed
+call    1 never executed
+    #####: 1206:  Value v4 = fmla(y2, v3, cstC2);
+call    0 never executed
+call    1 never executed
+    #####: 1207:  Value v5 = fmla(y2, v4, cstOne);
+call    0 never executed
+call    1 never executed
+    #####: 1208:  Value v6 = mul(base, v5);
+call    0 never executed
+        -: 1209:
+    #####: 1210:  Value approximation = select(negativeRange, mul(cstNegativeOne, v6), v6);
+call    0 never executed
+call    1 never executed
+        -: 1211:
+    #####: 1212:  rewriter.replaceOp(op, approximation);
+call    0 never executed
+call    1 never executed
+        -: 1213:
+    #####: 1214:  return success();
+        -: 1215:}
+------------------
+        -: 1216:
+        -: 1217://----------------------------------------------------------------------------//
+        -: 1218:// Rsqrt approximation.
+        -: 1219://----------------------------------------------------------------------------//
+        -: 1220:
+        -: 1221:namespace {
+        -: 1222:struct RsqrtApproximation : public OpRewritePattern<math::RsqrtOp> {
+        -: 1223:  using OpRewritePattern::OpRewritePattern;
+        -: 1224:
+        -: 1225:  LogicalResult matchAndRewrite(math::RsqrtOp op,
+        -: 1226:                                PatternRewriter &rewriter) const final;
+        -: 1227:};
+        -: 1228:} // namespace
+        -: 1229:
+        -: 1230:LogicalResult
+function _ZNK12_GLOBAL__N_118RsqrtApproximation15matchAndRewriteEN4mlir4math7RsqrtOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1231:RsqrtApproximation::matchAndRewrite(math::RsqrtOp op,
+        -: 1232:                                    PatternRewriter &rewriter) const {
+    #####: 1233:  if (!getElementTypeOrSelf(op.getOperand()).isF32())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1234:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -: 1235:
+    #####: 1236:  ArrayRef<int64_t> shape = vectorShape(op.getOperand());
+call    0 never executed
+        -: 1237:
+        -: 1238:  // Only support already-vectorized rsqrt's.
+    #####: 1239:  if (shape.empty() || shape.back() % 8 != 0)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1240:    return rewriter.notifyMatchFailure(op, "unsupported operand type");
+call    0 never executed
+        -: 1241:
+    #####: 1242:  ImplicitLocOpBuilder builder(op->getLoc(), rewriter);
+call    0 never executed
+    #####: 1243:  auto bcast = [&](Value value) -> Value {
+    #####: 1244:    return broadcast(builder, value, shape);
+    #####: 1245:  };
+        -: 1246:
+    #####: 1247:  Value cstPosInf = bcast(f32FromBits(builder, 0x7f800000u));
+call    0 never executed
+call    1 never executed
+    #####: 1248:  Value cstOnePointFive = bcast(f32Cst(builder, 1.5f));
+call    0 never executed
+call    1 never executed
+    #####: 1249:  Value cstNegHalf = bcast(f32Cst(builder, -0.5f));
+call    0 never executed
+call    1 never executed
+    #####: 1250:  Value cstMinNormPos = bcast(f32FromBits(builder, 0x00800000u));
+call    0 never executed
+call    1 never executed
+        -: 1251:
+    #####: 1252:  Value negHalf = builder.create<arith::MulFOp>(op.getOperand(), cstNegHalf);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1253:
+        -: 1254:  // Select only the inverse sqrt of positive normals (denormals are
+        -: 1255:  // flushed to zero).
+    #####: 1256:  Value ltMinMask = builder.create<arith::CmpFOp>(
+    #####: 1257:      arith::CmpFPredicate::OLT, op.getOperand(), cstMinNormPos);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1258:  Value infMask = builder.create<arith::CmpFOp>(arith::CmpFPredicate::OEQ,
+call    0 never executed
+    #####: 1259:                                                op.getOperand(), cstPosInf);
+call    0 never executed
+call    1 never executed
+    #####: 1260:  Value notNormalFiniteMask = builder.create<arith::OrIOp>(ltMinMask, infMask);
+call    0 never executed
+call    1 never executed
+        -: 1261:
+        -: 1262:  // Compute an approximate result.
+    #####: 1263:  Value yApprox = handleMultidimensionalVectors(
+    #####: 1264:      builder, op->getOperands(), 8, [&builder](ValueRange operands) -> Value {
+    #####: 1265:        return builder.create<x86vector::RsqrtOp>(operands);
+call    0 never executed
+    #####: 1266:      });
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1267:
+        -: 1268:  // Do a single step of Newton-Raphson iteration to improve the approximation.
+        -: 1269:  // This uses the formula y_{n+1} = y_n * (1.5 - y_n * (0.5 * x) * y_n).
+        -: 1270:  // It is essential to evaluate the inner term like this because forming
+        -: 1271:  // y_n^2 may over- or underflow.
+    #####: 1272:  Value inner = builder.create<arith::MulFOp>(negHalf, yApprox);
+call    0 never executed
+call    1 never executed
+    #####: 1273:  Value fma = builder.create<math::FmaOp>(yApprox, inner, cstOnePointFive);
+call    0 never executed
+call    1 never executed
+    #####: 1274:  Value yNewton = builder.create<arith::MulFOp>(yApprox, fma);
+call    0 never executed
+call    1 never executed
+        -: 1275:
+        -: 1276:  // Select the result of the Newton-Raphson step for positive normal arguments.
+        -: 1277:  // For other arguments, choose the output of the intrinsic. This will
+        -: 1278:  // return rsqrt(+inf) = 0, rsqrt(x) = NaN if x < 0, and rsqrt(x) = +inf if
+        -: 1279:  // x is zero or a positive denormalized float (equivalent to flushing positive
+        -: 1280:  // denormalized inputs to zero).
+    #####: 1281:  Value res =
+call    0 never executed
+    #####: 1282:      builder.create<arith::SelectOp>(notNormalFiniteMask, yApprox, yNewton);
+call    0 never executed
+    #####: 1283:  rewriter.replaceOp(op, res);
+call    0 never executed
+call    1 never executed
+        -: 1284:
+    #####: 1285:  return success();
+        -: 1286:}
+        -: 1287:
+        -: 1288://----------------------------------------------------------------------------//
+        -: 1289:
+function _ZN4mlir43populateMathPolynomialApproximationPatternsERNS_17RewritePatternSetERKNS_34MathPolynomialApproximationOptionsE called 857 returned 100% blocks executed 60%
+      857: 1290:void mlir::populateMathPolynomialApproximationPatterns(
+        -: 1291:    RewritePatternSet &patterns,
+        -: 1292:    const MathPolynomialApproximationOptions &options) {
+      857: 1293:  patterns.add<AtanApproximation, Atan2Approximation, TanhApproximation,
+        -: 1294:               LogApproximation, Log2Approximation, Log1pApproximation,
+        -: 1295:               ErfPolynomialApproximation, ExpApproximation, ExpM1Approximation,
+        -: 1296:               ReuseF32Expansion<math::Atan2Op>,
+        -: 1297:               SinAndCosApproximation<true, math::SinOp>,
+        -: 1298:               SinAndCosApproximation<false, math::CosOp>>(
+      857: 1299:      patterns.getContext());
+call    0 returned 100%
+      857: 1300:  if (options.enableAvx2)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####: 1301:    patterns.add<RsqrtApproximation>(patterns.getContext());
+call    0 never executed
+      857: 1302:}

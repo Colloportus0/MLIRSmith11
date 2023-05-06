@@ -1,0 +1,1994 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Conversion/GPUCommon/GPUToLLVMConversion.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/GPUCommon/CMakeFiles/obj.MLIRGPUToGPURuntimeTransforms.dir/GPUToLLVMConversion.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/GPUCommon/CMakeFiles/obj.MLIRGPUToGPURuntimeTransforms.dir/GPUToLLVMConversion.cpp.gcda
+        -:    0:Runs:128636
+        -:    1://===- ConvertLaunchFuncToGpuRuntimeCalls.cpp - MLIR GPU lowering passes --===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass to convert gpu.launch_func op into a sequence of
+        -:   10:// GPU runtime calls. As most of GPU runtimes does not have a stable published
+        -:   11:// ABI, this pass uses a slim runtime layer that builds on top of the public
+        -:   12:// API from GPU runtime headers.
+        -:   13://
+        -:   14://===----------------------------------------------------------------------===//
+        -:   15:
+        -:   16:#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
+        -:   17:
+        -:   18:#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+        -:   19:#include "mlir/Conversion/AsyncToLLVM/AsyncToLLVM.h"
+        -:   20:#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+        -:   21:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+        -:   22:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+        -:   23:#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+        -:   24:#include "mlir/Conversion/LLVMCommon/Pattern.h"
+        -:   25:#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+        -:   26:#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+        -:   27:#include "mlir/Dialect/Async/IR/Async.h"
+        -:   28:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   29:#include "mlir/Dialect/GPU/Transforms/Passes.h"
+        -:   30:#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+        -:   31:#include "mlir/IR/Attributes.h"
+        -:   32:#include "mlir/IR/Builders.h"
+        -:   33:#include "mlir/IR/BuiltinOps.h"
+        -:   34:#include "mlir/IR/BuiltinTypes.h"
+        -:   35:
+        -:   36:#include "llvm/ADT/STLExtras.h"
+        -:   37:#include "llvm/Support/Error.h"
+        -:   38:#include "llvm/Support/FormatVariadic.h"
+        -:   39:
+        -:   40:namespace mlir {
+        -:   41:#define GEN_PASS_DEF_GPUTOLLVMCONVERSIONPASS
+        -:   42:#include "mlir/Conversion/Passes.h.inc"
+        -:   43:} // namespace mlir
+        -:   44:
+        -:   45:using namespace mlir;
+        -:   46:
+        -:   47:static constexpr const char *kGpuBinaryStorageSuffix = "_gpubin_cst";
+        -:   48:
+        -:   49:namespace {
+        -:   50:
+        -:   51:class GpuToLLVMConversionPass
+        -:   52:    : public impl::GpuToLLVMConversionPassBase<GpuToLLVMConversionPass> {
+        -:   53:public:
+function _ZN12_GLOBAL__N_123GpuToLLVMConversionPassC2Ev called 129255 returned 100% blocks executed 75%
+   129255:   54:  GpuToLLVMConversionPass() = default;
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+call    5 returned 100%
+        -:   55:
+function _ZN12_GLOBAL__N_123GpuToLLVMConversionPassC2Eb called 129255 returned 100% blocks executed 86%
+   129255:   56:  GpuToLLVMConversionPass(bool kernelBarePtrCallConv)
+   129255:   57:      : GpuToLLVMConversionPass() {
+call    0 returned 100%
+   129255:   58:    if (this->kernelBarePtrCallConv.getNumOccurrences() == 0)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+   129255:   59:      this->kernelBarePtrCallConv = kernelBarePtrCallConv;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129255:   60:  }
+        -:   61:
+function _ZN12_GLOBAL__N_123GpuToLLVMConversionPassC2ERKS0_ called 0 returned 0% blocks executed 0%
+    #####:   62:  GpuToLLVMConversionPass(const GpuToLLVMConversionPass &other)
+    #####:   63:      : GpuToLLVMConversionPassBase(other) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:   64:
+        -:   65:  // Run the dialect converter on the module.
+        -:   66:  void runOnOperation() override;
+        -:   67:
+        -:   68:private:
+        -:   69:  Option<std::string> gpuBinaryAnnotation{
+        -:   70:      *this, "gpu-binary-annotation",
+        -:   71:      llvm::cl::desc("Annotation attribute string for GPU binary"),
+        -:   72:      llvm::cl::init(gpu::getDefaultGpuBinaryAnnotation())};
+        -:   73:  Option<bool> kernelBarePtrCallConv{
+        -:   74:      *this, "use-bare-pointers-for-kernels",
+        -:   75:      llvm::cl::desc("Use bare pointers to pass memref arguments to kernels. "
+        -:   76:                     "The kernel must use the same setting for this option."),
+        -:   77:      llvm::cl::init(false)};
+        -:   78:};
+        -:   79:
+        -:   80:struct FunctionCallBuilder {
+    95940:   81:  FunctionCallBuilder(StringRef functionName, Type returnType,
+        -:   82:                      ArrayRef<Type> argumentTypes)
+    95940:   83:      : functionName(functionName),
+     5330:   84:        functionType(LLVM::LLVMFunctionType::get(returnType, argumentTypes)) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+call   32 returned 100%
+call   33 returned 100%
+call   34 returned 100%
+call   35 returned 100%
+call   36 returned 100%
+call   37 returned 100%
+call   38 returned 100%
+call   39 returned 100%
+call   40 returned 100%
+call   41 returned 100%
+call   42 returned 100%
+call   43 returned 100%
+call   44 returned 100%
+call   45 returned 100%
+call   46 returned 100%
+call   47 returned 100%
+call   48 returned 100%
+call   49 returned 100%
+call   50 returned 100%
+call   51 returned 100%
+call   52 returned 100%
+call   53 returned 100%
+call   54 returned 100%
+call   55 returned 100%
+call   56 returned 100%
+call   57 returned 100%
+call   58 returned 100%
+call   59 returned 100%
+call   60 returned 100%
+call   61 returned 100%
+call   62 returned 100%
+call   63 returned 100%
+call   64 returned 100%
+call   65 returned 100%
+call   66 returned 100%
+call   67 returned 100%
+call   68 returned 100%
+call   69 returned 100%
+call   70 returned 100%
+call   71 returned 100%
+call   72 returned 100%
+call   73 returned 100%
+call   74 returned 100%
+call   75 returned 100%
+call   76 returned 100%
+call   77 returned 100%
+call   78 returned 100%
+call   79 returned 100%
+call   80 returned 100%
+call   81 returned 100%
+call   82 returned 100%
+call   83 returned 100%
+call   84 returned 100%
+call   85 returned 100%
+call   86 returned 100%
+call   87 returned 100%
+call   88 returned 100%
+call   89 returned 100%
+call   90 returned 100%
+call   91 returned 100%
+call   92 returned 100%
+call   93 returned 100%
+call   94 returned 100%
+call   95 returned 100%
+call   96 returned 100%
+call   97 returned 100%
+call   98 returned 100%
+call   99 returned 100%
+call   100 returned 100%
+call   101 returned 100%
+call   102 returned 100%
+call   103 returned 100%
+call   104 returned 100%
+call   105 returned 100%
+call   106 returned 100%
+call   107 returned 100%
+call   108 returned 100%
+call   109 returned 100%
+call   110 returned 100%
+call   111 returned 100%
+call   112 returned 100%
+call   113 returned 100%
+call   114 returned 100%
+call   115 returned 100%
+call   116 returned 100%
+call   117 returned 100%
+call   118 returned 100%
+call   119 returned 100%
+call   120 returned 100%
+call   121 returned 100%
+call   122 returned 100%
+call   123 returned 100%
+call   124 returned 100%
+call   125 returned 100%
+call   126 returned 100%
+call   127 returned 100%
+call   128 returned 100%
+call   129 returned 100%
+call   130 returned 100%
+call   131 returned 100%
+call   132 returned 100%
+call   133 returned 100%
+call   134 returned 100%
+call   135 returned 100%
+call   136 returned 100%
+call   137 returned 100%
+call   138 returned 100%
+call   139 returned 100%
+call   140 returned 100%
+call   141 returned 100%
+call   142 returned 100%
+call   143 returned 100%
+call   144 returned 100%
+call   145 returned 100%
+call   146 returned 100%
+call   147 returned 100%
+call   148 returned 100%
+call   149 returned 100%
+call   150 returned 100%
+call   151 returned 100%
+call   152 returned 100%
+call   153 returned 100%
+call   154 returned 100%
+call   155 returned 100%
+call   156 returned 100%
+call   157 returned 100%
+call   158 returned 100%
+call   159 returned 100%
+call   160 returned 100%
+call   161 returned 100%
+        -:   85:  LLVM::CallOp create(Location loc, OpBuilder &builder,
+        -:   86:                      ArrayRef<Value> arguments) const;
+        -:   87:
+        -:   88:  StringRef functionName;
+        -:   89:  LLVM::LLVMFunctionType functionType;
+        -:   90:};
+        -:   91:
+        -:   92:template <typename OpTy>
+        -:   93:class ConvertOpToGpuRuntimeCallPattern : public ConvertOpToLLVMPattern<OpTy> {
+        -:   94:public:
+     5330:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+     5330:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu18SetDefaultDeviceOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu18SetDefaultDeviceOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemsetOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemsetOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemcpyOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemcpyOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu12LaunchFuncOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu12LaunchFuncOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu6WaitOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu6WaitOpEEC2ERNS1_17LLVMTypeConverterE called 1066 returned 100% blocks executed 100%
+     1066:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+     1066:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir5async7YieldOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir5async7YieldOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu9DeallocOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu9DeallocOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu7AllocOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu7AllocOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+_ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu14HostRegisterOpEEC2ERNS1_17LLVMTypeConverterE:
+function _ZN12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu14HostRegisterOpEEC2ERNS1_17LLVMTypeConverterE called 533 returned 100% blocks executed 100%
+      533:   95:  explicit ConvertOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:   96:      : ConvertOpToLLVMPattern<OpTy>(typeConverter) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+call    5 returned 100%
+call    6 returned 100%
+call    7 returned 100%
+call    8 returned 100%
+call    9 returned 100%
+call   10 returned 100%
+call   11 returned 100%
+call   12 returned 100%
+call   13 returned 100%
+call   14 returned 100%
+call   15 returned 100%
+call   16 returned 100%
+call   17 returned 100%
+call   18 returned 100%
+call   19 returned 100%
+call   20 returned 100%
+call   21 returned 100%
+call   22 returned 100%
+call   23 returned 100%
+call   24 returned 100%
+call   25 returned 100%
+call   26 returned 100%
+call   27 returned 100%
+call   28 returned 100%
+call   29 returned 100%
+call   30 returned 100%
+call   31 returned 100%
+------------------
+        -:   97:
+        -:   98:protected:
+    #####:   99:  Value getNumElements(ConversionPatternRewriter &rewriter, Location loc,
+        -:  100:                       MemRefType type, MemRefDescriptor desc) const {
+    #####:  101:    return type.hasStaticShape()
+    #####:  102:               ? ConvertToLLVMPattern::createIndexConstant(
+    #####:  103:                     rewriter, loc, type.getNumElements())
+        -:  104:               // For identity maps (verified by caller), the number of
+        -:  105:               // elements is stride[0] * size[0].
+    #####:  106:               : rewriter.create<LLVM::MulOp>(loc,
+    #####:  107:                                              desc.stride(rewriter, loc, 0),
+    #####:  108:                                              desc.size(rewriter, loc, 0));
+        -:  109:  }
+------------------
+_ZNK12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemsetOpEE14getNumElementsERNS1_25ConversionPatternRewriterENS1_8LocationENS1_10MemRefTypeENS1_16MemRefDescriptorE:
+function _ZNK12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemsetOpEE14getNumElementsERNS1_25ConversionPatternRewriterENS1_8LocationENS1_10MemRefTypeENS1_16MemRefDescriptorE called 0 returned 0% blocks executed 0%
+    #####:   99:  Value getNumElements(ConversionPatternRewriter &rewriter, Location loc,
+        -:  100:                       MemRefType type, MemRefDescriptor desc) const {
+    #####:  101:    return type.hasStaticShape()
+call    0 never executed
+    #####:  102:               ? ConvertToLLVMPattern::createIndexConstant(
+call    0 never executed
+    #####:  103:                     rewriter, loc, type.getNumElements())
+call    0 never executed
+        -:  104:               // For identity maps (verified by caller), the number of
+        -:  105:               // elements is stride[0] * size[0].
+    #####:  106:               : rewriter.create<LLVM::MulOp>(loc,
+call    0 never executed
+    #####:  107:                                              desc.stride(rewriter, loc, 0),
+call    0 never executed
+    #####:  108:                                              desc.size(rewriter, loc, 0));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  109:  }
+------------------
+_ZNK12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemcpyOpEE14getNumElementsERNS1_25ConversionPatternRewriterENS1_8LocationENS1_10MemRefTypeENS1_16MemRefDescriptorE:
+function _ZNK12_GLOBAL__N_132ConvertOpToGpuRuntimeCallPatternIN4mlir3gpu8MemcpyOpEE14getNumElementsERNS1_25ConversionPatternRewriterENS1_8LocationENS1_10MemRefTypeENS1_16MemRefDescriptorE called 0 returned 0% blocks executed 0%
+    #####:   99:  Value getNumElements(ConversionPatternRewriter &rewriter, Location loc,
+        -:  100:                       MemRefType type, MemRefDescriptor desc) const {
+    #####:  101:    return type.hasStaticShape()
+call    0 never executed
+    #####:  102:               ? ConvertToLLVMPattern::createIndexConstant(
+call    0 never executed
+    #####:  103:                     rewriter, loc, type.getNumElements())
+call    0 never executed
+        -:  104:               // For identity maps (verified by caller), the number of
+        -:  105:               // elements is stride[0] * size[0].
+    #####:  106:               : rewriter.create<LLVM::MulOp>(loc,
+call    0 never executed
+    #####:  107:                                              desc.stride(rewriter, loc, 0),
+call    0 never executed
+    #####:  108:                                              desc.size(rewriter, loc, 0));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  109:  }
+------------------
+        -:  110:
+        -:  111:  MLIRContext *context = &this->getTypeConverter()->getContext();
+        -:  112:
+        -:  113:  Type llvmVoidType = LLVM::LLVMVoidType::get(context);
+        -:  114:  Type llvmPointerType =
+        -:  115:      LLVM::LLVMPointerType::get(IntegerType::get(context, 8));
+        -:  116:  Type llvmPointerPointerType = LLVM::LLVMPointerType::get(llvmPointerType);
+        -:  117:  Type llvmInt8Type = IntegerType::get(context, 8);
+        -:  118:  Type llvmInt32Type = IntegerType::get(context, 32);
+        -:  119:  Type llvmInt64Type = IntegerType::get(context, 64);
+        -:  120:  Type llvmIntPtrType = IntegerType::get(
+        -:  121:      context, this->getTypeConverter()->getPointerBitwidth(0));
+        -:  122:
+        -:  123:  FunctionCallBuilder moduleLoadCallBuilder = {
+        -:  124:      "mgpuModuleLoad",
+        -:  125:      llvmPointerType /* void *module */,
+        -:  126:      {llvmPointerType /* void *cubin */}};
+        -:  127:  FunctionCallBuilder moduleUnloadCallBuilder = {
+        -:  128:      "mgpuModuleUnload", llvmVoidType, {llvmPointerType /* void *module */}};
+        -:  129:  FunctionCallBuilder moduleGetFunctionCallBuilder = {
+        -:  130:      "mgpuModuleGetFunction",
+        -:  131:      llvmPointerType /* void *function */,
+        -:  132:      {
+        -:  133:          llvmPointerType, /* void *module */
+        -:  134:          llvmPointerType  /* char *name   */
+        -:  135:      }};
+        -:  136:  FunctionCallBuilder launchKernelCallBuilder = {
+        -:  137:      "mgpuLaunchKernel",
+        -:  138:      llvmVoidType,
+        -:  139:      {
+        -:  140:          llvmPointerType,        /* void* f */
+        -:  141:          llvmIntPtrType,         /* intptr_t gridXDim */
+        -:  142:          llvmIntPtrType,         /* intptr_t gridyDim */
+        -:  143:          llvmIntPtrType,         /* intptr_t gridZDim */
+        -:  144:          llvmIntPtrType,         /* intptr_t blockXDim */
+        -:  145:          llvmIntPtrType,         /* intptr_t blockYDim */
+        -:  146:          llvmIntPtrType,         /* intptr_t blockZDim */
+        -:  147:          llvmInt32Type,          /* unsigned int sharedMemBytes */
+        -:  148:          llvmPointerType,        /* void *hstream */
+        -:  149:          llvmPointerPointerType, /* void **kernelParams */
+        -:  150:          llvmPointerPointerType  /* void **extra */
+        -:  151:      }};
+        -:  152:  FunctionCallBuilder streamCreateCallBuilder = {
+        -:  153:      "mgpuStreamCreate", llvmPointerType /* void *stream */, {}};
+        -:  154:  FunctionCallBuilder streamDestroyCallBuilder = {
+        -:  155:      "mgpuStreamDestroy", llvmVoidType, {llvmPointerType /* void *stream */}};
+        -:  156:  FunctionCallBuilder streamSynchronizeCallBuilder = {
+        -:  157:      "mgpuStreamSynchronize",
+        -:  158:      llvmVoidType,
+        -:  159:      {llvmPointerType /* void *stream */}};
+        -:  160:  FunctionCallBuilder streamWaitEventCallBuilder = {
+        -:  161:      "mgpuStreamWaitEvent",
+        -:  162:      llvmVoidType,
+        -:  163:      {llvmPointerType /* void *stream */, llvmPointerType /* void *event */}};
+        -:  164:  FunctionCallBuilder eventCreateCallBuilder = {
+        -:  165:      "mgpuEventCreate", llvmPointerType /* void *event */, {}};
+        -:  166:  FunctionCallBuilder eventDestroyCallBuilder = {
+        -:  167:      "mgpuEventDestroy", llvmVoidType, {llvmPointerType /* void *event */}};
+        -:  168:  FunctionCallBuilder eventSynchronizeCallBuilder = {
+        -:  169:      "mgpuEventSynchronize",
+        -:  170:      llvmVoidType,
+        -:  171:      {llvmPointerType /* void *event */}};
+        -:  172:  FunctionCallBuilder eventRecordCallBuilder = {
+        -:  173:      "mgpuEventRecord",
+        -:  174:      llvmVoidType,
+        -:  175:      {llvmPointerType /* void *event */, llvmPointerType /* void *stream */}};
+        -:  176:  FunctionCallBuilder hostRegisterCallBuilder = {
+        -:  177:      "mgpuMemHostRegisterMemRef",
+        -:  178:      llvmVoidType,
+        -:  179:      {llvmIntPtrType /* intptr_t rank */,
+        -:  180:       llvmPointerType /* void *memrefDesc */,
+        -:  181:       llvmIntPtrType /* intptr_t elementSizeBytes */}};
+        -:  182:  FunctionCallBuilder allocCallBuilder = {
+        -:  183:      "mgpuMemAlloc",
+        -:  184:      llvmPointerType /* void * */,
+        -:  185:      {llvmIntPtrType /* intptr_t sizeBytes */,
+        -:  186:       llvmPointerType /* void *stream */}};
+        -:  187:  FunctionCallBuilder deallocCallBuilder = {
+        -:  188:      "mgpuMemFree",
+        -:  189:      llvmVoidType,
+        -:  190:      {llvmPointerType /* void *ptr */, llvmPointerType /* void *stream */}};
+        -:  191:  FunctionCallBuilder memcpyCallBuilder = {
+        -:  192:      "mgpuMemcpy",
+        -:  193:      llvmVoidType,
+        -:  194:      {llvmPointerType /* void *dst */, llvmPointerType /* void *src */,
+        -:  195:       llvmIntPtrType /* intptr_t sizeBytes */,
+        -:  196:       llvmPointerType /* void *stream */}};
+        -:  197:  FunctionCallBuilder memsetCallBuilder = {
+        -:  198:      "mgpuMemset32",
+        -:  199:      llvmVoidType,
+        -:  200:      {llvmPointerType /* void *dst */, llvmInt32Type /* unsigned int value */,
+        -:  201:       llvmIntPtrType /* intptr_t sizeBytes */,
+        -:  202:       llvmPointerType /* void *stream */}};
+        -:  203:  FunctionCallBuilder setDefaultDeviceCallBuilder = {
+        -:  204:      "mgpuSetDefaultDevice",
+        -:  205:      llvmVoidType,
+        -:  206:      {llvmInt32Type /* uint32_t devIndex */}};
+        -:  207:};
+        -:  208:
+        -:  209:/// A rewrite pattern to convert gpu.host_register operations into a GPU runtime
+        -:  210:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  211:class ConvertHostRegisterOpToGpuRuntimeCallPattern
+        -:  212:    : public ConvertOpToGpuRuntimeCallPattern<gpu::HostRegisterOp> {
+        -:  213:public:
+      533:  214:  ConvertHostRegisterOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  215:      : ConvertOpToGpuRuntimeCallPattern<gpu::HostRegisterOp>(typeConverter) {}
+call    0 returned 100%
+        -:  216:
+        -:  217:private:
+        -:  218:  LogicalResult
+        -:  219:  matchAndRewrite(gpu::HostRegisterOp hostRegisterOp, OpAdaptor adaptor,
+        -:  220:                  ConversionPatternRewriter &rewriter) const override;
+        -:  221:};
+        -:  222:
+        -:  223:/// A rewrite pattern to convert gpu.alloc operations into a GPU runtime
+        -:  224:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  225:class ConvertAllocOpToGpuRuntimeCallPattern
+        -:  226:    : public ConvertOpToGpuRuntimeCallPattern<gpu::AllocOp> {
+        -:  227:public:
+      533:  228:  ConvertAllocOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  229:      : ConvertOpToGpuRuntimeCallPattern<gpu::AllocOp>(typeConverter) {}
+call    0 returned 100%
+        -:  230:
+        -:  231:private:
+        -:  232:  LogicalResult
+        -:  233:  matchAndRewrite(gpu::AllocOp allocOp, OpAdaptor adaptor,
+        -:  234:                  ConversionPatternRewriter &rewriter) const override;
+        -:  235:};
+        -:  236:
+        -:  237:/// A rewrite pattern to convert gpu.dealloc operations into a GPU runtime
+        -:  238:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  239:class ConvertDeallocOpToGpuRuntimeCallPattern
+        -:  240:    : public ConvertOpToGpuRuntimeCallPattern<gpu::DeallocOp> {
+        -:  241:public:
+      533:  242:  ConvertDeallocOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  243:      : ConvertOpToGpuRuntimeCallPattern<gpu::DeallocOp>(typeConverter) {}
+call    0 returned 100%
+        -:  244:
+        -:  245:private:
+        -:  246:  LogicalResult
+        -:  247:  matchAndRewrite(gpu::DeallocOp deallocOp, OpAdaptor adaptor,
+        -:  248:                  ConversionPatternRewriter &rewriter) const override;
+        -:  249:};
+        -:  250:
+        -:  251:class ConvertAsyncYieldToGpuRuntimeCallPattern
+        -:  252:    : public ConvertOpToGpuRuntimeCallPattern<async::YieldOp> {
+        -:  253:public:
+      533:  254:  ConvertAsyncYieldToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  255:      : ConvertOpToGpuRuntimeCallPattern<async::YieldOp>(typeConverter) {}
+call    0 returned 100%
+        -:  256:
+        -:  257:private:
+        -:  258:  LogicalResult
+        -:  259:  matchAndRewrite(async::YieldOp yieldOp, OpAdaptor adaptor,
+        -:  260:                  ConversionPatternRewriter &rewriter) const override;
+        -:  261:};
+        -:  262:
+        -:  263:/// A rewrite pattern to convert gpu.wait operations into a GPU runtime
+        -:  264:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  265:class ConvertWaitOpToGpuRuntimeCallPattern
+        -:  266:    : public ConvertOpToGpuRuntimeCallPattern<gpu::WaitOp> {
+        -:  267:public:
+      533:  268:  ConvertWaitOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  269:      : ConvertOpToGpuRuntimeCallPattern<gpu::WaitOp>(typeConverter) {}
+call    0 returned 100%
+        -:  270:
+        -:  271:private:
+        -:  272:  LogicalResult
+        -:  273:  matchAndRewrite(gpu::WaitOp waitOp, OpAdaptor adaptor,
+        -:  274:                  ConversionPatternRewriter &rewriter) const override;
+        -:  275:};
+        -:  276:
+        -:  277:/// A rewrite pattern to convert gpu.wait async operations into a GPU runtime
+        -:  278:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  279:class ConvertWaitAsyncOpToGpuRuntimeCallPattern
+        -:  280:    : public ConvertOpToGpuRuntimeCallPattern<gpu::WaitOp> {
+        -:  281:public:
+      533:  282:  ConvertWaitAsyncOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  283:      : ConvertOpToGpuRuntimeCallPattern<gpu::WaitOp>(typeConverter) {}
+call    0 returned 100%
+        -:  284:
+        -:  285:private:
+        -:  286:  LogicalResult
+        -:  287:  matchAndRewrite(gpu::WaitOp waitOp, OpAdaptor adaptor,
+        -:  288:                  ConversionPatternRewriter &rewriter) const override;
+        -:  289:};
+        -:  290:
+        -:  291:/// A rewrite patter to convert gpu.launch_func operations into a sequence of
+        -:  292:/// GPU runtime calls. Currently it supports CUDA and ROCm (HIP).
+        -:  293:///
+        -:  294:/// In essence, a gpu.launch_func operations gets compiled into the following
+        -:  295:/// sequence of runtime calls:
+        -:  296:///
+        -:  297:/// * moduleLoad        -- loads the module given the cubin / hsaco data
+        -:  298:/// * moduleGetFunction -- gets a handle to the actual kernel function
+        -:  299:/// * getStreamHelper   -- initializes a new compute stream on GPU
+        -:  300:/// * launchKernel      -- launches the kernel on a stream
+        -:  301:/// * streamSynchronize -- waits for operations on the stream to finish
+        -:  302:///
+        -:  303:/// Intermediate data structures are allocated on the stack.
+        -:  304:class ConvertLaunchFuncOpToGpuRuntimeCallPattern
+        -:  305:    : public ConvertOpToGpuRuntimeCallPattern<gpu::LaunchFuncOp> {
+        -:  306:public:
+function _ZN12_GLOBAL__N_142ConvertLaunchFuncOpToGpuRuntimeCallPatternC2ERN4mlir17LLVMTypeConverterEN4llvm9StringRefEb called 533 returned 100% blocks executed 100%
+      533:  307:  ConvertLaunchFuncOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter,
+        -:  308:                                             StringRef gpuBinaryAnnotation,
+        -:  309:                                             bool kernelBarePtrCallConv)
+      533:  310:      : ConvertOpToGpuRuntimeCallPattern<gpu::LaunchFuncOp>(typeConverter),
+        -:  311:        gpuBinaryAnnotation(gpuBinaryAnnotation),
+      533:  312:        kernelBarePtrCallConv(kernelBarePtrCallConv) {}
+call    0 returned 100%
+call    1 returned 100%
+        -:  313:
+        -:  314:private:
+        -:  315:  Value generateParamsArray(gpu::LaunchFuncOp launchOp, OpAdaptor adaptor,
+        -:  316:                            OpBuilder &builder) const;
+        -:  317:  Value generateKernelNameConstant(StringRef moduleName, StringRef name,
+        -:  318:                                   Location loc, OpBuilder &builder) const;
+        -:  319:
+        -:  320:  LogicalResult
+        -:  321:  matchAndRewrite(gpu::LaunchFuncOp launchOp, OpAdaptor adaptor,
+        -:  322:                  ConversionPatternRewriter &rewriter) const override;
+        -:  323:
+        -:  324:  llvm::SmallString<32> gpuBinaryAnnotation;
+        -:  325:  bool kernelBarePtrCallConv;
+        -:  326:};
+        -:  327:
+        -:  328:class EraseGpuModuleOpPattern : public OpRewritePattern<gpu::GPUModuleOp> {
+        -:  329:  using OpRewritePattern<gpu::GPUModuleOp>::OpRewritePattern;
+        -:  330:
+function _ZNK12_GLOBAL__N_123EraseGpuModuleOpPattern15matchAndRewriteEN4mlir3gpu11GPUModuleOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  331:  LogicalResult matchAndRewrite(gpu::GPUModuleOp op,
+        -:  332:                                PatternRewriter &rewriter) const override {
+        -:  333:    // GPU kernel modules are no longer necessary since we have a global
+        -:  334:    // constant with the CUBIN, or HSACO data.
+    #####:  335:    rewriter.eraseOp(op);
+call    0 never executed
+    #####:  336:    return success();
+        -:  337:  }
+        -:  338:};
+        -:  339:
+        -:  340:/// A rewrite pattern to convert gpu.memcpy operations into a GPU runtime
+        -:  341:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  342:class ConvertMemcpyOpToGpuRuntimeCallPattern
+        -:  343:    : public ConvertOpToGpuRuntimeCallPattern<gpu::MemcpyOp> {
+        -:  344:public:
+      533:  345:  ConvertMemcpyOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  346:      : ConvertOpToGpuRuntimeCallPattern<gpu::MemcpyOp>(typeConverter) {}
+call    0 returned 100%
+        -:  347:
+        -:  348:private:
+        -:  349:  LogicalResult
+        -:  350:  matchAndRewrite(gpu::MemcpyOp memcpyOp, OpAdaptor adaptor,
+        -:  351:                  ConversionPatternRewriter &rewriter) const override;
+        -:  352:};
+        -:  353:
+        -:  354:/// A rewrite pattern to convert gpu.memset operations into a GPU runtime
+        -:  355:/// call. Currently it supports CUDA and ROCm (HIP).
+        -:  356:class ConvertMemsetOpToGpuRuntimeCallPattern
+        -:  357:    : public ConvertOpToGpuRuntimeCallPattern<gpu::MemsetOp> {
+        -:  358:public:
+      533:  359:  ConvertMemsetOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      533:  360:      : ConvertOpToGpuRuntimeCallPattern<gpu::MemsetOp>(typeConverter) {}
+call    0 returned 100%
+        -:  361:
+        -:  362:private:
+        -:  363:  LogicalResult
+        -:  364:  matchAndRewrite(gpu::MemsetOp memsetOp, OpAdaptor adaptor,
+        -:  365:                  ConversionPatternRewriter &rewriter) const override;
+        -:  366:};
+        -:  367:
+        -:  368:/// A rewrite pattern to convert gpu.set_default_device to a GPU runtime call.
+        -:  369:/// Currently supports CUDA and ROCm (HIP)
+        -:  370:class ConvertSetDefaultDeviceOpToGpuRuntimeCallPattern
+        -:  371:    : public ConvertOpToGpuRuntimeCallPattern<gpu::SetDefaultDeviceOp> {
+        -:  372:public:
+      533:  373:  ConvertSetDefaultDeviceOpToGpuRuntimeCallPattern(
+        -:  374:      LLVMTypeConverter &typeConverter)
+      533:  375:      : ConvertOpToGpuRuntimeCallPattern<gpu::SetDefaultDeviceOp>(
+      533:  376:            typeConverter) {}
+call    0 returned 100%
+        -:  377:
+        -:  378:  LogicalResult
+        -:  379:  matchAndRewrite(gpu::SetDefaultDeviceOp op, OpAdaptor adaptor,
+        -:  380:                  ConversionPatternRewriter &rewriter) const override;
+        -:  381:};
+        -:  382:} // namespace
+        -:  383:
+function _ZN12_GLOBAL__N_123GpuToLLVMConversionPass14runOnOperationEv called 533 returned 100% blocks executed 96%
+      533:  384:void GpuToLLVMConversionPass::runOnOperation() {
+      533:  385:  LLVMTypeConverter converter(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+     1066:  386:  RewritePatternSet patterns(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     1066:  387:  LLVMConversionTarget target(getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  388:
+      533:  389:  target.addIllegalDialect<gpu::GPUDialect>();
+call    0 returned 100%
+        -:  390:
+      533:  391:  mlir::arith::populateArithToLLVMConversionPatterns(converter, patterns);
+call    0 returned 100%
+      533:  392:  mlir::cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
+call    0 returned 100%
+      533:  393:  populateVectorToLLVMConversionPatterns(converter, patterns);
+call    0 returned 100%
+      533:  394:  populateMemRefToLLVMConversionPatterns(converter, patterns);
+call    0 returned 100%
+      533:  395:  populateFuncToLLVMConversionPatterns(converter, patterns);
+call    0 returned 100%
+      533:  396:  populateAsyncStructuralTypeConversionsAndLegality(converter, patterns,
+call    0 returned 100%
+        -:  397:                                                    target);
+     1066:  398:  populateGpuToLLVMConversionPatterns(converter, patterns, gpuBinaryAnnotation,
+      533:  399:                                      kernelBarePtrCallConv);
+call    0 returned 100%
+        -:  400:
+     1599:  401:  if (failed(
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+     1066:  402:          applyPartialConversion(getOperation(), target, std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    #####:  403:    signalPassFailure();
+call    0 never executed
+      533:  404:}
+        -:  405:
+function _ZNK12_GLOBAL__N_119FunctionCallBuilder6createEN4mlir8LocationERNS1_9OpBuilderEN4llvm8ArrayRefINS1_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  406:LLVM::CallOp FunctionCallBuilder::create(Location loc, OpBuilder &builder,
+        -:  407:                                         ArrayRef<Value> arguments) const {
+    #####:  408:  auto module = builder.getBlock()->getParent()->getParentOfType<ModuleOp>();
+call    0 never executed
+call    1 never executed
+function _ZZNK12_GLOBAL__N_119FunctionCallBuilder6createEN4mlir8LocationERNS1_9OpBuilderEN4llvm8ArrayRefINS1_5ValueEEEENKUlvE_clEv called 0 returned 0% blocks executed 0%
+    #####:  409:  auto function = [&] {
+    #####:  410:    if (auto function = module.lookupSymbol<LLVM::LLVMFuncOp>(functionName))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  411:      return function;
+    #####:  412:    return OpBuilder::atBlockEnd(module.getBody())
+call    0 never executed
+call    1 never executed
+    #####:  413:        .create<LLVM::LLVMFuncOp>(loc, functionName, functionType);
+call    0 never executed
+    #####:  414:  }();
+call    0 never executed
+    #####:  415:  return builder.create<LLVM::CallOp>(loc, function, arguments);
+call    0 never executed
+        -:  416:}
+        -:  417:
+        -:  418:// Returns whether all operands are of LLVM type.
+function _ZL15areAllLLVMTypesPN4mlir9OperationENS_10ValueRangeERNS_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  419:static LogicalResult areAllLLVMTypes(Operation *op, ValueRange operands,
+        -:  420:                                     ConversionPatternRewriter &rewriter) {
+    #####:  421:  if (!llvm::all_of(operands, [](Value value) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  422:        return LLVM::isCompatibleType(value.getType());
+        -:  423:      }))
+    #####:  424:    return rewriter.notifyMatchFailure(
+    #####:  425:        op, "Cannot convert if operands aren't of LLVM type.");
+call    0 never executed
+    #####:  426:  return success();
+        -:  427:}
+        -:  428:
+        -:  429:static LogicalResult
+function _ZL24isAsyncWithOneDependencyRN4mlir25ConversionPatternRewriterENS_3gpu16AsyncOpInterfaceE called 0 returned 0% blocks executed 0%
+    #####:  430:isAsyncWithOneDependency(ConversionPatternRewriter &rewriter,
+        -:  431:                         gpu::AsyncOpInterface op) {
+    #####:  432:  if (op.getAsyncDependencies().size() != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  433:    return rewriter.notifyMatchFailure(
+    #####:  434:        op, "Can only convert with exactly one async dependency.");
+call    0 never executed
+        -:  435:
+    #####:  436:  if (!op.getAsyncToken())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  437:    return rewriter.notifyMatchFailure(op, "Can convert only async version.");
+call    0 never executed
+        -:  438:
+    #####:  439:  return success();
+        -:  440:}
+        -:  441:
+function _ZNK12_GLOBAL__N_144ConvertHostRegisterOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu14HostRegisterOpENS2_21HostRegisterOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  442:LogicalResult ConvertHostRegisterOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  443:    gpu::HostRegisterOp hostRegisterOp, OpAdaptor adaptor,
+        -:  444:    ConversionPatternRewriter &rewriter) const {
+    #####:  445:  auto *op = hostRegisterOp.getOperation();
+call    0 never executed
+    #####:  446:  if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  447:    return failure();
+        -:  448:
+    #####:  449:  Location loc = op->getLoc();
+call    0 never executed
+        -:  450:
+    #####:  451:  auto memRefType = hostRegisterOp.getValue().getType();
+call    0 never executed
+call    1 never executed
+    #####:  452:  auto elementType = memRefType.cast<UnrankedMemRefType>().getElementType();
+call    0 never executed
+call    1 never executed
+    #####:  453:  auto elementSize = getSizeInBytes(loc, elementType, rewriter);
+call    0 never executed
+        -:  454:
+    #####:  455:  auto arguments = getTypeConverter()->promoteOperands(
+    #####:  456:      loc, op->getOperands(), adaptor.getOperands(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  457:  arguments.push_back(elementSize);
+call    0 never executed
+    #####:  458:  hostRegisterCallBuilder.create(loc, rewriter, arguments);
+call    0 never executed
+        -:  459:
+    #####:  460:  rewriter.eraseOp(op);
+call    0 never executed
+    #####:  461:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  462:}
+        -:  463:
+function _ZNK12_GLOBAL__N_137ConvertAllocOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu7AllocOpENS2_14AllocOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  464:LogicalResult ConvertAllocOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  465:    gpu::AllocOp allocOp, OpAdaptor adaptor,
+        -:  466:    ConversionPatternRewriter &rewriter) const {
+    #####:  467:  if (adaptor.getHostShared())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  468:    return rewriter.notifyMatchFailure(
+    #####:  469:        allocOp, "host_shared allocation is not supported");
+call    0 never executed
+        -:  470:
+    #####:  471:  MemRefType memRefType = allocOp.getType();
+call    0 never executed
+        -:  472:
+    #####:  473:  if (failed(areAllLLVMTypes(allocOp, adaptor.getOperands(), rewriter)) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  474:      !isConvertibleAndHasIdentityMaps(memRefType) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  475:      failed(isAsyncWithOneDependency(rewriter, allocOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  476:    return failure();
+        -:  477:
+    #####:  478:  auto loc = allocOp.getLoc();
+call    0 never executed
+        -:  479:
+        -:  480:  // Get shape of the memref as values: static sizes are constant
+        -:  481:  // values and dynamic sizes are passed to 'alloc' as operands.
+    #####:  482:  SmallVector<Value, 4> shape;
+call    0 never executed
+    #####:  483:  SmallVector<Value, 4> strides;
+branch  0 never executed
+branch  1 never executed
+    #####:  484:  Value sizeBytes;
+    #####:  485:  getMemRefDescriptorSizes(loc, memRefType, adaptor.getDynamicSizes(), rewriter,
+call    0 never executed
+call    1 never executed
+        -:  486:                           shape, strides, sizeBytes);
+        -:  487:
+        -:  488:  // Allocate the underlying buffer and store a pointer to it in the MemRef
+        -:  489:  // descriptor.
+    #####:  490:  Type elementPtrType = this->getElementPtrType(memRefType);
+call    0 never executed
+    #####:  491:  auto stream = adaptor.getAsyncDependencies().front();
+call    0 never executed
+call    1 never executed
+    #####:  492:  Value allocatedPtr =
+    #####:  493:      allocCallBuilder.create(loc, rewriter, {sizeBytes, stream}).getResult();
+call    0 never executed
+call    1 never executed
+    #####:  494:  allocatedPtr =
+    #####:  495:      rewriter.create<LLVM::BitcastOp>(loc, elementPtrType, allocatedPtr);
+call    0 never executed
+call    1 never executed
+        -:  496:
+        -:  497:  // No alignment.
+    #####:  498:  Value alignedPtr = allocatedPtr;
+        -:  499:
+        -:  500:  // Create the MemRef descriptor.
+    #####:  501:  auto memRefDescriptor = this->createMemRefDescriptor(
+    #####:  502:      loc, memRefType, allocatedPtr, alignedPtr, shape, strides, rewriter);
+call    0 never executed
+        -:  503:
+    #####:  504:  rewriter.replaceOp(allocOp, {memRefDescriptor, stream});
+call    0 never executed
+call    1 never executed
+        -:  505:
+    #####:  506:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  507:}
+        -:  508:
+function _ZNK12_GLOBAL__N_139ConvertDeallocOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu9DeallocOpENS2_16DeallocOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  509:LogicalResult ConvertDeallocOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  510:    gpu::DeallocOp deallocOp, OpAdaptor adaptor,
+        -:  511:    ConversionPatternRewriter &rewriter) const {
+    #####:  512:  if (failed(areAllLLVMTypes(deallocOp, adaptor.getOperands(), rewriter)) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  513:      failed(isAsyncWithOneDependency(rewriter, deallocOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  514:    return failure();
+        -:  515:
+    #####:  516:  Location loc = deallocOp.getLoc();
+call    0 never executed
+        -:  517:
+    #####:  518:  Value pointer =
+    #####:  519:      MemRefDescriptor(adaptor.getMemref()).allocatedPtr(rewriter, loc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  520:  auto casted = rewriter.create<LLVM::BitcastOp>(loc, llvmPointerType, pointer);
+call    0 never executed
+    #####:  521:  Value stream = adaptor.getAsyncDependencies().front();
+call    0 never executed
+call    1 never executed
+    #####:  522:  deallocCallBuilder.create(loc, rewriter, {casted, stream});
+call    0 never executed
+        -:  523:
+    #####:  524:  rewriter.replaceOp(deallocOp, {stream});
+call    0 never executed
+call    1 never executed
+    #####:  525:  return success();
+        -:  526:}
+        -:  527:
+function _ZL19isGpuAsyncTokenTypeN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  528:static bool isGpuAsyncTokenType(Value value) {
+    #####:  529:  return value.getType().isa<gpu::AsyncTokenType>();
+call    0 never executed
+call    1 never executed
+        -:  530:}
+        -:  531:
+        -:  532:// Converts !gpu.async.token operands of `async.yield` to runtime calls. The
+        -:  533:// !gpu.async.token are lowered to stream within the async.execute region, but
+        -:  534:// are passed as events between them. For each !gpu.async.token operand, we
+        -:  535:// create an event and record it on the stream.
+function _ZNK12_GLOBAL__N_140ConvertAsyncYieldToGpuRuntimeCallPattern15matchAndRewriteEN4mlir5async7YieldOpENS2_14YieldOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  536:LogicalResult ConvertAsyncYieldToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  537:    async::YieldOp yieldOp, OpAdaptor adaptor,
+        -:  538:    ConversionPatternRewriter &rewriter) const {
+    #####:  539:  if (llvm::none_of(yieldOp.operands(), isGpuAsyncTokenType))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  540:    return rewriter.notifyMatchFailure(yieldOp, "no gpu async token operand");
+call    0 never executed
+        -:  541:
+    #####:  542:  Location loc = yieldOp.getLoc();
+call    0 never executed
+    #####:  543:  SmallVector<Value, 4> newOperands(adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####:  544:  llvm::SmallDenseSet<Value> streams;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  545:  for (auto &operand : yieldOp->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  546:    if (!isGpuAsyncTokenType(operand.get()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  547:      continue;
+    #####:  548:    auto idx = operand.getOperandNumber();
+call    0 never executed
+    #####:  549:    auto stream = adaptor.getOperands()[idx];
+call    0 never executed
+call    1 never executed
+    #####:  550:    auto event = eventCreateCallBuilder.create(loc, rewriter, {}).getResult();
+call    0 never executed
+call    1 never executed
+    #####:  551:    eventRecordCallBuilder.create(loc, rewriter, {event, stream});
+call    0 never executed
+    #####:  552:    newOperands[idx] = event;
+branch  0 never executed
+branch  1 never executed
+    #####:  553:    streams.insert(stream);
+call    0 never executed
+        -:  554:  }
+    #####:  555:  for (auto stream : streams)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  556:    streamDestroyCallBuilder.create(loc, rewriter, {stream});
+call    0 never executed
+call    1 never executed
+        -:  557:
+    #####:  558:  rewriter.updateRootInPlace(yieldOp,
+call    0 never executed
+function _ZZNK12_GLOBAL__N_140ConvertAsyncYieldToGpuRuntimeCallPattern15matchAndRewriteEN4mlir5async7YieldOpENS2_14YieldOpAdaptorERNS1_25ConversionPatternRewriterEENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  559:                             [&] { yieldOp->setOperands(newOperands); });
+call    0 never executed
+call    1 never executed
+    #####:  560:  return success();
+call    0 never executed
+        -:  561:}
+        -:  562:
+        -:  563:// Returns whether `value` is the result of an LLVM::CallOp to `functionName`.
+function _ZL17isDefinedByCallToN4mlir5ValueEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  564:static bool isDefinedByCallTo(Value value, StringRef functionName) {
+    #####:  565:  assert(value.getType().isa<LLVM::LLVMPointerType>());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  566:  if (auto defOp = value.getDefiningOp<LLVM::CallOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  567:    return defOp.getCallee()->equals(functionName);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  568:  return false;
+        -:  569:}
+        -:  570:
+        -:  571:// Converts `gpu.wait` to runtime calls. The converted op synchronizes the host
+        -:  572:// with the stream/event operands. The operands are destroyed. That is, it
+        -:  573:// assumes that it is not used afterwards or elsewhere. Otherwise we will get a
+        -:  574:// runtime error. Eventually, we should guarantee this property.
+function _ZNK12_GLOBAL__N_136ConvertWaitOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu6WaitOpENS2_13WaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  575:LogicalResult ConvertWaitOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  576:    gpu::WaitOp waitOp, OpAdaptor adaptor,
+        -:  577:    ConversionPatternRewriter &rewriter) const {
+    #####:  578:  if (waitOp.getAsyncToken())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  579:    return rewriter.notifyMatchFailure(waitOp, "Cannot convert async op.");
+call    0 never executed
+        -:  580:
+    #####:  581:  Location loc = waitOp.getLoc();
+call    0 never executed
+        -:  582:
+    #####:  583:  for (auto operand : adaptor.getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  584:    if (isDefinedByCallTo(operand, streamCreateCallBuilder.functionName)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  585:      // The converted operand's definition created a stream.
+    #####:  586:      streamSynchronizeCallBuilder.create(loc, rewriter, {operand});
+call    0 never executed
+    #####:  587:      streamDestroyCallBuilder.create(loc, rewriter, {operand});
+call    0 never executed
+        -:  588:    } else {
+        -:  589:      // Otherwise the converted operand is an event. This assumes that we use
+        -:  590:      // events in control flow code as well.
+    #####:  591:      eventSynchronizeCallBuilder.create(loc, rewriter, {operand});
+call    0 never executed
+    #####:  592:      eventDestroyCallBuilder.create(loc, rewriter, {operand});
+call    0 never executed
+        -:  593:    }
+        -:  594:  }
+        -:  595:
+    #####:  596:  rewriter.eraseOp(waitOp);
+call    0 never executed
+    #####:  597:  return success();
+        -:  598:}
+        -:  599:
+        -:  600:// Converts `gpu.wait async` to runtime calls. The converted op creates a new
+        -:  601:// stream that is synchronized with stream/event operands. The operands are
+        -:  602:// destroyed. That is, it assumes that it is not used afterwards or elsewhere.
+        -:  603:// Otherwise we will get a runtime error. Eventually, we should guarantee this
+        -:  604:// property.
+function _ZNK12_GLOBAL__N_141ConvertWaitAsyncOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu6WaitOpENS2_13WaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  605:LogicalResult ConvertWaitAsyncOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  606:    gpu::WaitOp waitOp, OpAdaptor adaptor,
+        -:  607:    ConversionPatternRewriter &rewriter) const {
+    #####:  608:  if (!waitOp.getAsyncToken())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  609:    return rewriter.notifyMatchFailure(waitOp, "Can only convert async op.");
+call    0 never executed
+        -:  610:
+    #####:  611:  Location loc = waitOp.getLoc();
+call    0 never executed
+        -:  612:
+    #####:  613:  auto insertionPoint = rewriter.saveInsertionPoint();
+call    0 never executed
+    #####:  614:  SmallVector<Value, 1> events;
+call    0 never executed
+    #####:  615:  for (auto pair :
+    #####:  616:       llvm::zip(waitOp.getAsyncDependencies(), adaptor.getOperands())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  617:    auto operand = std::get<1>(pair);
+call    0 never executed
+    #####:  618:    if (isDefinedByCallTo(operand, streamCreateCallBuilder.functionName)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  619:      // The converted operand's definition created a stream. Insert an event
+        -:  620:      // into the stream just after the last use of the original token operand.
+    #####:  621:      auto *defOp = std::get<0>(pair).getDefiningOp();
+call    0 never executed
+    #####:  622:      rewriter.setInsertionPointAfter(defOp);
+call    0 never executed
+    #####:  623:      auto event = eventCreateCallBuilder.create(loc, rewriter, {}).getResult();
+call    0 never executed
+call    1 never executed
+    #####:  624:      eventRecordCallBuilder.create(loc, rewriter, {event, operand});
+call    0 never executed
+    #####:  625:      events.push_back(event);
+call    0 never executed
+        -:  626:    } else {
+        -:  627:      // Otherwise the converted operand is an event. This assumes that we use
+        -:  628:      // events in control flow code as well.
+    #####:  629:      events.push_back(operand);
+call    0 never executed
+        -:  630:    }
+        -:  631:  }
+    #####:  632:  rewriter.restoreInsertionPoint(insertionPoint);
+branch  0 never executed
+branch  1 never executed
+    #####:  633:  auto stream = streamCreateCallBuilder.create(loc, rewriter, {}).getResult();
+call    0 never executed
+call    1 never executed
+    #####:  634:  for (auto event : events)
+branch  0 never executed
+branch  1 never executed
+    #####:  635:    streamWaitEventCallBuilder.create(loc, rewriter, {stream, event});
+call    0 never executed
+    #####:  636:  for (auto event : events)
+branch  0 never executed
+branch  1 never executed
+    #####:  637:    eventDestroyCallBuilder.create(loc, rewriter, {event});
+call    0 never executed
+    #####:  638:  rewriter.replaceOp(waitOp, {stream});
+call    0 never executed
+call    1 never executed
+        -:  639:
+    #####:  640:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  641:}
+        -:  642:
+        -:  643:// Creates a struct containing all kernel parameters on the stack and returns
+        -:  644:// an array of type-erased pointers to the fields of the struct. The array can
+        -:  645:// then be passed to the CUDA / ROCm (HIP) kernel launch calls.
+        -:  646:// The generated code is essentially as follows:
+        -:  647://
+        -:  648:// %struct = alloca(sizeof(struct { Parameters... }))
+        -:  649:// %array = alloca(NumParameters * sizeof(void *))
+        -:  650:// for (i : [0, NumParameters))
+        -:  651://   %fieldPtr = llvm.getelementptr %struct[0, i]
+        -:  652://   llvm.store parameters[i], %fieldPtr
+        -:  653://   %elementPtr = llvm.getelementptr %array[i]
+        -:  654://   llvm.store %fieldPtr, %elementPtr
+        -:  655:// return %array
+function _ZNK12_GLOBAL__N_142ConvertLaunchFuncOpToGpuRuntimeCallPattern19generateParamsArrayEN4mlir3gpu12LaunchFuncOpENS2_19LaunchFuncOpAdaptorERNS1_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:  656:Value ConvertLaunchFuncOpToGpuRuntimeCallPattern::generateParamsArray(
+        -:  657:    gpu::LaunchFuncOp launchOp, OpAdaptor adaptor, OpBuilder &builder) const {
+    #####:  658:  auto loc = launchOp.getLoc();
+call    0 never executed
+    #####:  659:  auto numKernelOperands = launchOp.getNumKernelOperands();
+call    0 never executed
+    #####:  660:  SmallVector<Value, 4> arguments;
+branch  0 never executed
+branch  1 never executed
+    #####:  661:  if (kernelBarePtrCallConv) {
+branch  0 never executed
+branch  1 never executed
+        -:  662:    // Hack the bare pointer value on just for the argument promotion
+    #####:  663:    LLVMTypeConverter *converter = getTypeConverter();
+call    0 never executed
+    #####:  664:    LowerToLLVMOptions options = converter->getOptions();
+call    0 never executed
+    #####:  665:    LowerToLLVMOptions overrideToMatchKernelOpts = options;
+call    0 never executed
+call    1 never executed
+    #####:  666:    overrideToMatchKernelOpts.useBarePtrCallConv = true;
+    #####:  667:    converter->dangerousSetOptions(overrideToMatchKernelOpts);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  668:    arguments = converter->promoteOperands(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  669:        loc, launchOp.getOperands().take_back(numKernelOperands),
+branch  0 never executed
+branch  1 never executed
+    #####:  670:        adaptor.getOperands().take_back(numKernelOperands), builder);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  671:    converter->dangerousSetOptions(options);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  672:  } else {
+    #####:  673:    arguments = getTypeConverter()->promoteOperands(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  674:        loc, launchOp.getOperands().take_back(numKernelOperands),
+branch  0 never executed
+branch  1 never executed
+    #####:  675:        adaptor.getOperands().take_back(numKernelOperands), builder);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  676:  }
+        -:  677:
+    #####:  678:  auto numArguments = arguments.size();
+branch  0 never executed
+branch  1 never executed
+    #####:  679:  SmallVector<Type, 4> argumentTypes;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  680:  argumentTypes.reserve(numArguments);
+branch  0 never executed
+branch  1 never executed
+    #####:  681:  for (auto argument : arguments)
+branch  0 never executed
+branch  1 never executed
+    #####:  682:    argumentTypes.push_back(argument.getType());
+call    0 never executed
+    #####:  683:  auto structType = LLVM::LLVMStructType::getNewIdentified(context, StringRef(),
+call    0 never executed
+    #####:  684:                                                           argumentTypes);
+call    0 never executed
+    #####:  685:  auto one = builder.create<LLVM::ConstantOp>(loc, llvmInt32Type, 1);
+call    0 never executed
+    #####:  686:  auto structPtr = builder.create<LLVM::AllocaOp>(
+    #####:  687:      loc, LLVM::LLVMPointerType::get(structType), one, /*alignment=*/0);
+call    0 never executed
+call    1 never executed
+    #####:  688:  auto arraySize =
+    #####:  689:      builder.create<LLVM::ConstantOp>(loc, llvmInt32Type, numArguments);
+call    0 never executed
+    #####:  690:  auto arrayPtr = builder.create<LLVM::AllocaOp>(loc, llvmPointerPointerType,
+    #####:  691:                                                 arraySize, /*alignment=*/0);
+call    0 never executed
+    #####:  692:  for (const auto &en : llvm::enumerate(arguments)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  693:    auto fieldPtr = builder.create<LLVM::GEPOp>(
+    #####:  694:        loc, LLVM::LLVMPointerType::get(argumentTypes[en.index()]), structPtr,
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  695:        ArrayRef<LLVM::GEPArg>{0, en.index()});
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  696:    builder.create<LLVM::StoreOp>(loc, en.value(), fieldPtr);
+call    0 never executed
+    #####:  697:    auto elementPtr =
+        -:  698:        builder.create<LLVM::GEPOp>(loc, llvmPointerPointerType, arrayPtr,
+    #####:  699:                                    ArrayRef<LLVM::GEPArg>{en.index()});
+call    0 never executed
+call    1 never executed
+    #####:  700:    auto casted =
+    #####:  701:        builder.create<LLVM::BitcastOp>(loc, llvmPointerType, fieldPtr);
+call    0 never executed
+    #####:  702:    builder.create<LLVM::StoreOp>(loc, casted, elementPtr);
+call    0 never executed
+        -:  703:  }
+    #####:  704:  return arrayPtr;
+branch  0 never executed
+branch  1 never executed
+        -:  705:}
+        -:  706:
+        -:  707:// Generates an LLVM IR dialect global that contains the name of the given
+        -:  708:// kernel function as a C string, and returns a pointer to its beginning.
+        -:  709:// The code is essentially:
+        -:  710://
+        -:  711:// llvm.global constant @kernel_name("function_name\00")
+        -:  712:// func(...) {
+        -:  713://   %0 = llvm.addressof @kernel_name
+        -:  714://   %1 = llvm.constant (0 : index)
+        -:  715://   %2 = llvm.getelementptr %0[%1, %1] : !llvm<"i8*">
+        -:  716:// }
+        -:  717:Value ConvertLaunchFuncOpToGpuRuntimeCallPattern::generateKernelNameConstant(
+        -:  718:    StringRef moduleName, StringRef name, Location loc,
+        -:  719:    OpBuilder &builder) const {
+        -:  720:  // Make sure the trailing zero is included in the constant.
+        -:  721:  std::vector<char> kernelName(name.begin(), name.end());
+        -:  722:  kernelName.push_back('\0');
+        -:  723:
+        -:  724:  std::string globalName =
+        -:  725:      std::string(llvm::formatv("{0}_{1}_kernel_name", moduleName, name));
+        -:  726:  return LLVM::createGlobalString(
+        -:  727:      loc, builder, globalName, StringRef(kernelName.data(), kernelName.size()),
+        -:  728:      LLVM::Linkage::Internal);
+        -:  729:}
+        -:  730:
+        -:  731:// Emits LLVM IR to launch a kernel function. Expects the module that contains
+        -:  732:// the compiled kernel function as a cubin in the 'nvvm.cubin' attribute, or a
+        -:  733:// hsaco in the 'rocdl.hsaco' attribute of the kernel function in the IR.
+        -:  734://
+        -:  735:// %0 = call %binarygetter
+        -:  736:// %1 = call %moduleLoad(%0)
+        -:  737:// %2 = <see generateKernelNameConstant>
+        -:  738:// %3 = call %moduleGetFunction(%1, %2)
+        -:  739:// %4 = call %streamCreate()
+        -:  740:// %5 = <see generateParamsArray>
+        -:  741:// call %launchKernel(%3, <launchOp operands 0..5>, 0, %4, %5, nullptr)
+        -:  742:// call %streamSynchronize(%4)
+        -:  743:// call %streamDestroy(%4)
+        -:  744:// call %moduleUnload(%1)
+        -:  745://
+        -:  746:// If the op is async, the stream corresponds to the (single) async dependency
+        -:  747:// as well as the async token the op produces.
+function _ZNK12_GLOBAL__N_142ConvertLaunchFuncOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu12LaunchFuncOpENS2_19LaunchFuncOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  748:LogicalResult ConvertLaunchFuncOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  749:    gpu::LaunchFuncOp launchOp, OpAdaptor adaptor,
+        -:  750:    ConversionPatternRewriter &rewriter) const {
+    #####:  751:  if (failed(areAllLLVMTypes(launchOp, adaptor.getOperands(), rewriter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  752:    return failure();
+        -:  753:
+    #####:  754:  if (launchOp.getAsyncDependencies().size() > 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  755:    return rewriter.notifyMatchFailure(
+    #####:  756:        launchOp, "Cannot convert with more than one async dependency.");
+call    0 never executed
+        -:  757:
+        -:  758:  // Fail when the synchronous version of the op has async dependencies. The
+        -:  759:  // lowering destroys the stream, and we do not want to check that there is no
+        -:  760:  // use of the stream after this op.
+    #####:  761:  if (!launchOp.getAsyncToken() && !launchOp.getAsyncDependencies().empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  762:    return rewriter.notifyMatchFailure(
+    #####:  763:        launchOp, "Cannot convert non-async op with async dependencies.");
+call    0 never executed
+        -:  764:
+    #####:  765:  Location loc = launchOp.getLoc();
+call    0 never executed
+        -:  766:
+        -:  767:  // Create an LLVM global with CUBIN extracted from the kernel annotation and
+        -:  768:  // obtain a pointer to the first byte in it.
+    #####:  769:  auto kernelModule = SymbolTable::lookupNearestSymbolFrom<gpu::GPUModuleOp>(
+    #####:  770:      launchOp, launchOp.getKernelModuleName());
+call    0 never executed
+call    1 never executed
+    #####:  771:  assert(kernelModule && "expected a kernel module");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  772:
+    #####:  773:  auto binaryAttr =
+    #####:  774:      kernelModule->getAttrOfType<StringAttr>(gpuBinaryAnnotation);
+call    0 never executed
+    #####:  775:  if (!binaryAttr) {
+branch  0 never executed
+branch  1 never executed
+    #####:  776:    kernelModule.emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  777:        << "missing " << gpuBinaryAnnotation << " attribute";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  778:    return failure();
+        -:  779:  }
+        -:  780:
+    #####:  781:  SmallString<128> nameBuffer(kernelModule.getName());
+call    0 never executed
+call    1 never executed
+    #####:  782:  nameBuffer.append(kGpuBinaryStorageSuffix);
+call    0 never executed
+    #####:  783:  Value data =
+        -:  784:      LLVM::createGlobalString(loc, rewriter, nameBuffer.str(),
+    #####:  785:                               binaryAttr.getValue(), LLVM::Linkage::Internal);
+call    0 never executed
+call    1 never executed
+        -:  786:
+    #####:  787:  auto module = moduleLoadCallBuilder.create(loc, rewriter, data);
+call    0 never executed
+        -:  788:  // Get the function from the module. The name corresponds to the name of
+        -:  789:  // the kernel function.
+    #####:  790:  auto kernelName = generateKernelNameConstant(
+    #####:  791:      launchOp.getKernelModuleName().getValue(),
+call    0 never executed
+    #####:  792:      launchOp.getKernelName().getValue(), loc, rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  793:  auto function = moduleGetFunctionCallBuilder.create(
+    #####:  794:      loc, rewriter, {module.getResult(), kernelName});
+call    0 never executed
+call    1 never executed
+    #####:  795:  Value zero = rewriter.create<LLVM::ConstantOp>(loc, llvmInt32Type, 0);
+call    0 never executed
+call    1 never executed
+    #####:  796:  Value stream =
+    #####:  797:      adaptor.getAsyncDependencies().empty()
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  798:          ? streamCreateCallBuilder.create(loc, rewriter, {}).getResult()
+call    0 never executed
+call    1 never executed
+    #####:  799:          : adaptor.getAsyncDependencies().front();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  800:  // Create array of pointers to kernel arguments.
+    #####:  801:  auto kernelParams = generateParamsArray(launchOp, adaptor, rewriter);
+call    0 never executed
+    #####:  802:  auto nullpointer = rewriter.create<LLVM::NullOp>(loc, llvmPointerPointerType);
+call    0 never executed
+    #####:  803:  Value dynamicSharedMemorySize = launchOp.getDynamicSharedMemorySize()
+call    0 never executed
+    #####:  804:                                      ? launchOp.getDynamicSharedMemorySize()
+call    0 never executed
+    #####:  805:                                      : zero;
+branch  0 never executed
+branch  1 never executed
+    #####:  806:  launchKernelCallBuilder.create(
+        -:  807:      loc, rewriter,
+    #####:  808:      {function.getResult(), adaptor.getGridSizeX(), adaptor.getGridSizeY(),
+call    0 never executed
+call    1 never executed
+    #####:  809:       adaptor.getGridSizeZ(), adaptor.getBlockSizeX(), adaptor.getBlockSizeY(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  810:       adaptor.getBlockSizeZ(), dynamicSharedMemorySize, stream, kernelParams,
+call    0 never executed
+    #####:  811:       /*extra=*/nullpointer});
+call    0 never executed
+call    1 never executed
+        -:  812:
+    #####:  813:  if (launchOp.getAsyncToken()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  814:    // Async launch: make dependent ops use the same stream.
+    #####:  815:    rewriter.replaceOp(launchOp, {stream});
+call    0 never executed
+call    1 never executed
+        -:  816:  } else {
+        -:  817:    // Synchronize with host and destroy stream. This must be the stream created
+        -:  818:    // above (with no other uses) because we check that the synchronous version
+        -:  819:    // does not have any async dependencies.
+    #####:  820:    streamSynchronizeCallBuilder.create(loc, rewriter, stream);
+call    0 never executed
+    #####:  821:    streamDestroyCallBuilder.create(loc, rewriter, stream);
+call    0 never executed
+    #####:  822:    rewriter.eraseOp(launchOp);
+call    0 never executed
+        -:  823:  }
+    #####:  824:  moduleUnloadCallBuilder.create(loc, rewriter, module.getResult());
+call    0 never executed
+call    1 never executed
+        -:  825:
+    #####:  826:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  827:}
+        -:  828:
+function _ZNK12_GLOBAL__N_138ConvertMemcpyOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu8MemcpyOpENS2_15MemcpyOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  829:LogicalResult ConvertMemcpyOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  830:    gpu::MemcpyOp memcpyOp, OpAdaptor adaptor,
+        -:  831:    ConversionPatternRewriter &rewriter) const {
+    #####:  832:  auto memRefType = memcpyOp.getSrc().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  833:
+    #####:  834:  if (failed(areAllLLVMTypes(memcpyOp, adaptor.getOperands(), rewriter)) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  835:      !isConvertibleAndHasIdentityMaps(memRefType) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  836:      failed(isAsyncWithOneDependency(rewriter, memcpyOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  837:    return failure();
+        -:  838:
+    #####:  839:  auto loc = memcpyOp.getLoc();
+call    0 never executed
+        -:  840:
+    #####:  841:  MemRefDescriptor srcDesc(adaptor.getSrc());
+call    0 never executed
+call    1 never executed
+    #####:  842:  Value numElements = getNumElements(rewriter, loc, memRefType, srcDesc);
+call    0 never executed
+        -:  843:
+    #####:  844:  Type elementPtrType = getElementPtrType(memRefType);
+call    0 never executed
+    #####:  845:  Value nullPtr = rewriter.create<LLVM::NullOp>(loc, elementPtrType);
+call    0 never executed
+call    1 never executed
+    #####:  846:  Value gepPtr =
+    #####:  847:      rewriter.create<LLVM::GEPOp>(loc, elementPtrType, nullPtr, numElements);
+call    0 never executed
+call    1 never executed
+    #####:  848:  auto sizeBytes =
+    #####:  849:      rewriter.create<LLVM::PtrToIntOp>(loc, getIndexType(), gepPtr);
+call    0 never executed
+call    1 never executed
+        -:  850:
+    #####:  851:  auto src = rewriter.create<LLVM::BitcastOp>(
+    #####:  852:      loc, llvmPointerType, srcDesc.alignedPtr(rewriter, loc));
+call    0 never executed
+call    1 never executed
+    #####:  853:  auto dst = rewriter.create<LLVM::BitcastOp>(
+        -:  854:      loc, llvmPointerType,
+    #####:  855:      MemRefDescriptor(adaptor.getDst()).alignedPtr(rewriter, loc));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  856:
+    #####:  857:  auto stream = adaptor.getAsyncDependencies().front();
+call    0 never executed
+call    1 never executed
+    #####:  858:  memcpyCallBuilder.create(loc, rewriter, {dst, src, sizeBytes, stream});
+call    0 never executed
+        -:  859:
+    #####:  860:  rewriter.replaceOp(memcpyOp, {stream});
+call    0 never executed
+call    1 never executed
+        -:  861:
+    #####:  862:  return success();
+        -:  863:}
+        -:  864:
+function _ZNK12_GLOBAL__N_138ConvertMemsetOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu8MemsetOpENS2_15MemsetOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  865:LogicalResult ConvertMemsetOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  866:    gpu::MemsetOp memsetOp, OpAdaptor adaptor,
+        -:  867:    ConversionPatternRewriter &rewriter) const {
+    #####:  868:  auto memRefType = memsetOp.getDst().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  869:
+    #####:  870:  if (failed(areAllLLVMTypes(memsetOp, adaptor.getOperands(), rewriter)) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  871:      !isConvertibleAndHasIdentityMaps(memRefType) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  872:      failed(isAsyncWithOneDependency(rewriter, memsetOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  873:    return failure();
+        -:  874:
+    #####:  875:  auto loc = memsetOp.getLoc();
+call    0 never executed
+        -:  876:
+    #####:  877:  Type valueType = adaptor.getValue().getType();
+call    0 never executed
+call    1 never executed
+    #####:  878:  if (!valueType.isIntOrFloat() || valueType.getIntOrFloatBitWidth() != 32) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  879:    return rewriter.notifyMatchFailure(memsetOp,
+    #####:  880:                                       "value must be a 32 bit scalar");
+call    0 never executed
+        -:  881:  }
+        -:  882:
+    #####:  883:  MemRefDescriptor dstDesc(adaptor.getDst());
+call    0 never executed
+call    1 never executed
+    #####:  884:  Value numElements = getNumElements(rewriter, loc, memRefType, dstDesc);
+call    0 never executed
+        -:  885:
+    #####:  886:  auto value =
+    #####:  887:      rewriter.create<LLVM::BitcastOp>(loc, llvmInt32Type, adaptor.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  888:  auto dst = rewriter.create<LLVM::BitcastOp>(
+    #####:  889:      loc, llvmPointerType, dstDesc.alignedPtr(rewriter, loc));
+call    0 never executed
+call    1 never executed
+        -:  890:
+    #####:  891:  auto stream = adaptor.getAsyncDependencies().front();
+call    0 never executed
+call    1 never executed
+    #####:  892:  memsetCallBuilder.create(loc, rewriter, {dst, value, numElements, stream});
+call    0 never executed
+        -:  893:
+    #####:  894:  rewriter.replaceOp(memsetOp, {stream});
+call    0 never executed
+call    1 never executed
+    #####:  895:  return success();
+        -:  896:}
+        -:  897:
+function _ZNK12_GLOBAL__N_148ConvertSetDefaultDeviceOpToGpuRuntimeCallPattern15matchAndRewriteEN4mlir3gpu18SetDefaultDeviceOpENS2_25SetDefaultDeviceOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  898:LogicalResult ConvertSetDefaultDeviceOpToGpuRuntimeCallPattern::matchAndRewrite(
+        -:  899:    gpu::SetDefaultDeviceOp op, OpAdaptor adaptor,
+        -:  900:    ConversionPatternRewriter &rewriter) const {
+    #####:  901:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  902:  setDefaultDeviceCallBuilder.create(loc, rewriter, {adaptor.getDevIndex()});
+call    0 never executed
+call    1 never executed
+    #####:  903:  rewriter.replaceOp(op, {});
+call    0 never executed
+call    1 never executed
+    #####:  904:  return success();
+        -:  905:}
+        -:  906:
+        -:  907:std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+function _ZN4mlir29createGpuToLLVMConversionPassEb called 129255 returned 100% blocks executed 100%
+   129255:  908:mlir::createGpuToLLVMConversionPass(bool kernelBarePtrCallConv) {
+   129255:  909:  return std::make_unique<GpuToLLVMConversionPass>(kernelBarePtrCallConv);
+call    0 returned 100%
+        -:  910:}
+        -:  911:
+function _ZN4mlir35populateGpuToLLVMConversionPatternsERNS_17LLVMTypeConverterERNS_17RewritePatternSetEN4llvm9StringRefEb called 533 returned 100% blocks executed 100%
+      533:  912:void mlir::populateGpuToLLVMConversionPatterns(LLVMTypeConverter &converter,
+        -:  913:                                               RewritePatternSet &patterns,
+        -:  914:                                               StringRef gpuBinaryAnnotation,
+        -:  915:                                               bool kernelBarePtrCallConv) {
+      533:  916:  converter.addConversion(
+call    0 returned 100%
+function _ZZN4mlir35populateGpuToLLVMConversionPatternsERNS_17LLVMTypeConverterERNS_17RewritePatternSetEN4llvm9StringRefEbENKUlNS_3gpu14AsyncTokenTypeEE_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+     533*:  917:      [context = &converter.getContext()](gpu::AsyncTokenType type) -> Type {
+call    0 returned 100%
+    #####:  918:        return LLVM::LLVMPointerType::get(IntegerType::get(context, 8));
+call    0 never executed
+call    1 never executed
+        -:  919:      });
+      533:  920:  patterns.add<ConvertAllocOpToGpuRuntimeCallPattern,
+        -:  921:               ConvertDeallocOpToGpuRuntimeCallPattern,
+        -:  922:               ConvertHostRegisterOpToGpuRuntimeCallPattern,
+        -:  923:               ConvertMemcpyOpToGpuRuntimeCallPattern,
+        -:  924:               ConvertMemsetOpToGpuRuntimeCallPattern,
+        -:  925:               ConvertSetDefaultDeviceOpToGpuRuntimeCallPattern,
+        -:  926:               ConvertWaitAsyncOpToGpuRuntimeCallPattern,
+        -:  927:               ConvertWaitOpToGpuRuntimeCallPattern,
+      533:  928:               ConvertAsyncYieldToGpuRuntimeCallPattern>(converter);
+call    0 returned 100%
+      533:  929:  patterns.add<ConvertLaunchFuncOpToGpuRuntimeCallPattern>(
+      533:  930:      converter, gpuBinaryAnnotation, kernelBarePtrCallConv);
+call    0 returned 100%
+      533:  931:  patterns.add<EraseGpuModuleOpPattern>(&converter.getContext());
+call    0 returned 100%
+call    1 returned 100%
+      533:  932:}

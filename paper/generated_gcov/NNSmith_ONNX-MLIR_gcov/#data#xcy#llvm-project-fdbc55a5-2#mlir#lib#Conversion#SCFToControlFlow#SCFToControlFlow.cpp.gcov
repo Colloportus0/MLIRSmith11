@@ -1,0 +1,1104 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Conversion/SCFToControlFlow/SCFToControlFlow.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/SCFToControlFlow/CMakeFiles/obj.MLIRSCFToControlFlow.dir/SCFToControlFlow.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/SCFToControlFlow/CMakeFiles/obj.MLIRSCFToControlFlow.dir/SCFToControlFlow.cpp.gcda
+        -:    0:Runs:128636
+        -:    1://===- SCFToControlFlow.cpp - SCF to CF conversion ------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass to convert scf.for, scf.if and loop.terminator
+        -:   10:// ops into standard CFG ops.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+        -:   15:
+        -:   16:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   17:#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+        -:   18:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   19:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   20:#include "mlir/IR/Builders.h"
+        -:   21:#include "mlir/IR/BuiltinOps.h"
+        -:   22:#include "mlir/IR/MLIRContext.h"
+        -:   23:#include "mlir/IR/PatternMatch.h"
+        -:   24:#include "mlir/Transforms/DialectConversion.h"
+        -:   25:#include "mlir/Transforms/Passes.h"
+        -:   26:
+        -:   27:namespace mlir {
+        -:   28:#define GEN_PASS_DEF_SCFTOCONTROLFLOW
+        -:   29:#include "mlir/Conversion/Passes.h.inc"
+        -:   30:} // namespace mlir
+        -:   31:
+        -:   32:using namespace mlir;
+        -:   33:using namespace mlir::scf;
+        -:   34:
+        -:   35:namespace {
+        -:   36:
+   165749:   37:struct SCFToControlFlowPass
+call    0 returned 100%
+call    1 returned 100%
+        -:   38:    : public impl::SCFToControlFlowBase<SCFToControlFlowPass> {
+        -:   39:  void runOnOperation() override;
+        -:   40:};
+        -:   41:
+        -:   42:// Create a CFG subgraph for the loop around its body blocks (if the body
+        -:   43:// contained other loops, they have been already lowered to a flow of blocks).
+        -:   44:// Maintain the invariants that a CFG subgraph created for any loop has a single
+        -:   45:// entry and a single exit, and that the entry/exit blocks are respectively
+        -:   46:// first/last blocks in the parent region.  The original loop operation is
+        -:   47:// replaced by the initialization operations that set up the initial value of
+        -:   48:// the loop induction variable (%iv) and computes the loop bounds that are loop-
+        -:   49:// invariant for affine loops.  The operations following the original scf.for
+        -:   50:// are split out into a separate continuation (exit) block. A condition block is
+        -:   51:// created before the continuation block. It checks the exit condition of the
+        -:   52:// loop and branches either to the continuation block, or to the first block of
+        -:   53:// the body. The condition block takes as arguments the values of the induction
+        -:   54:// variable followed by loop-carried values. Since it dominates both the body
+        -:   55:// blocks and the continuation block, loop-carried values are visible in all of
+        -:   56:// those blocks. Induction variable modification is appended to the last block
+        -:   57:// of the body (which is the exit block from the body subgraph thanks to the
+        -:   58:// invariant we maintain) along with a branch that loops back to the condition
+        -:   59:// block. Loop-carried values are the loop terminator operands, which are
+        -:   60:// forwarded to the branch.
+        -:   61://
+        -:   62://      +---------------------------------+
+        -:   63://      |   <code before the ForOp>       |
+        -:   64://      |   <definitions of %init...>     |
+        -:   65://      |   <compute initial %iv value>   |
+        -:   66://      |   cf.br cond(%iv, %init...)        |
+        -:   67://      +---------------------------------+
+        -:   68://             |
+        -:   69://  -------|   |
+        -:   70://  |      v   v
+        -:   71://  |   +--------------------------------+
+        -:   72://  |   | cond(%iv, %init...):           |
+        -:   73://  |   |   <compare %iv to upper bound> |
+        -:   74://  |   |   cf.cond_br %r, body, end        |
+        -:   75://  |   +--------------------------------+
+        -:   76://  |          |               |
+        -:   77://  |          |               -------------|
+        -:   78://  |          v                            |
+        -:   79://  |   +--------------------------------+  |
+        -:   80://  |   | body-first:                    |  |
+        -:   81://  |   |   <%init visible by dominance> |  |
+        -:   82://  |   |   <body contents>              |  |
+        -:   83://  |   +--------------------------------+  |
+        -:   84://  |                   |                   |
+        -:   85://  |                  ...                  |
+        -:   86://  |                   |                   |
+        -:   87://  |   +--------------------------------+  |
+        -:   88://  |   | body-last:                     |  |
+        -:   89://  |   |   <body contents>              |  |
+        -:   90://  |   |   <operands of yield = %yields>|  |
+        -:   91://  |   |   %new_iv =<add step to %iv>   |  |
+        -:   92://  |   |   cf.br cond(%new_iv, %yields)    |  |
+        -:   93://  |   +--------------------------------+  |
+        -:   94://  |          |                            |
+        -:   95://  |-----------        |--------------------
+        -:   96://                      v
+        -:   97://      +--------------------------------+
+        -:   98://      | end:                           |
+        -:   99://      |   <code after the ForOp>       |
+        -:  100://      |   <%init visible by dominance> |
+        -:  101://      +--------------------------------+
+        -:  102://
+        -:  103:struct ForLowering : public OpRewritePattern<ForOp> {
+        -:  104:  using OpRewritePattern<ForOp>::OpRewritePattern;
+        -:  105:
+        -:  106:  LogicalResult matchAndRewrite(ForOp forOp,
+        -:  107:                                PatternRewriter &rewriter) const override;
+        -:  108:};
+        -:  109:
+        -:  110:// Create a CFG subgraph for the scf.if operation (including its "then" and
+        -:  111:// optional "else" operation blocks).  We maintain the invariants that the
+        -:  112:// subgraph has a single entry and a single exit point, and that the entry/exit
+        -:  113:// blocks are respectively the first/last block of the enclosing region. The
+        -:  114:// operations following the scf.if are split into a continuation (subgraph
+        -:  115:// exit) block. The condition is lowered to a chain of blocks that implement the
+        -:  116:// short-circuit scheme. The "scf.if" operation is replaced with a conditional
+        -:  117:// branch to either the first block of the "then" region, or to the first block
+        -:  118:// of the "else" region. In these blocks, "scf.yield" is unconditional branches
+        -:  119:// to the post-dominating block. When the "scf.if" does not return values, the
+        -:  120:// post-dominating block is the same as the continuation block. When it returns
+        -:  121:// values, the post-dominating block is a new block with arguments that
+        -:  122:// correspond to the values returned by the "scf.if" that unconditionally
+        -:  123:// branches to the continuation block. This allows block arguments to dominate
+        -:  124:// any uses of the hitherto "scf.if" results that they replaced. (Inserting a
+        -:  125:// new block allows us to avoid modifying the argument list of an existing
+        -:  126:// block, which is illegal in a conversion pattern). When the "else" region is
+        -:  127:// empty, which is only allowed for "scf.if"s that don't return values, the
+        -:  128:// condition branches directly to the continuation block.
+        -:  129://
+        -:  130:// CFG for a scf.if with else and without results.
+        -:  131://
+        -:  132://      +--------------------------------+
+        -:  133://      | <code before the IfOp>         |
+        -:  134://      | cf.cond_br %cond, %then, %else    |
+        -:  135://      +--------------------------------+
+        -:  136://             |              |
+        -:  137://             |              --------------|
+        -:  138://             v                            |
+        -:  139://      +--------------------------------+  |
+        -:  140://      | then:                          |  |
+        -:  141://      |   <then contents>              |  |
+        -:  142://      |   cf.br continue                  |  |
+        -:  143://      +--------------------------------+  |
+        -:  144://             |                            |
+        -:  145://   |----------               |-------------
+        -:  146://   |                         V
+        -:  147://   |  +--------------------------------+
+        -:  148://   |  | else:                          |
+        -:  149://   |  |   <else contents>              |
+        -:  150://   |  |   cf.br continue                  |
+        -:  151://   |  +--------------------------------+
+        -:  152://   |         |
+        -:  153://   ------|   |
+        -:  154://         v   v
+        -:  155://      +--------------------------------+
+        -:  156://      | continue:                      |
+        -:  157://      |   <code after the IfOp>        |
+        -:  158://      +--------------------------------+
+        -:  159://
+        -:  160:// CFG for a scf.if with results.
+        -:  161://
+        -:  162://      +--------------------------------+
+        -:  163://      | <code before the IfOp>         |
+        -:  164://      | cf.cond_br %cond, %then, %else    |
+        -:  165://      +--------------------------------+
+        -:  166://             |              |
+        -:  167://             |              --------------|
+        -:  168://             v                            |
+        -:  169://      +--------------------------------+  |
+        -:  170://      | then:                          |  |
+        -:  171://      |   <then contents>              |  |
+        -:  172://      |   cf.br dom(%args...)             |  |
+        -:  173://      +--------------------------------+  |
+        -:  174://             |                            |
+        -:  175://   |----------               |-------------
+        -:  176://   |                         V
+        -:  177://   |  +--------------------------------+
+        -:  178://   |  | else:                          |
+        -:  179://   |  |   <else contents>              |
+        -:  180://   |  |   cf.br dom(%args...)             |
+        -:  181://   |  +--------------------------------+
+        -:  182://   |         |
+        -:  183://   ------|   |
+        -:  184://         v   v
+        -:  185://      +--------------------------------+
+        -:  186://      | dom(%args...):                 |
+        -:  187://      |   cf.br continue                  |
+        -:  188://      +--------------------------------+
+        -:  189://             |
+        -:  190://             v
+        -:  191://      +--------------------------------+
+        -:  192://      | continue:                      |
+        -:  193://      | <code after the IfOp>          |
+        -:  194://      +--------------------------------+
+        -:  195://
+        -:  196:struct IfLowering : public OpRewritePattern<IfOp> {
+        -:  197:  using OpRewritePattern<IfOp>::OpRewritePattern;
+        -:  198:
+        -:  199:  LogicalResult matchAndRewrite(IfOp ifOp,
+        -:  200:                                PatternRewriter &rewriter) const override;
+        -:  201:};
+        -:  202:
+        -:  203:struct ExecuteRegionLowering : public OpRewritePattern<ExecuteRegionOp> {
+        -:  204:  using OpRewritePattern<ExecuteRegionOp>::OpRewritePattern;
+        -:  205:
+        -:  206:  LogicalResult matchAndRewrite(ExecuteRegionOp op,
+        -:  207:                                PatternRewriter &rewriter) const override;
+        -:  208:};
+        -:  209:
+        -:  210:struct ParallelLowering : public OpRewritePattern<mlir::scf::ParallelOp> {
+        -:  211:  using OpRewritePattern<mlir::scf::ParallelOp>::OpRewritePattern;
+        -:  212:
+        -:  213:  LogicalResult matchAndRewrite(mlir::scf::ParallelOp parallelOp,
+        -:  214:                                PatternRewriter &rewriter) const override;
+        -:  215:};
+        -:  216:
+        -:  217:/// Create a CFG subgraph for this loop construct. The regions of the loop need
+        -:  218:/// not be a single block anymore (for example, if other SCF constructs that
+        -:  219:/// they contain have been already converted to CFG), but need to be single-exit
+        -:  220:/// from the last block of each region. The operations following the original
+        -:  221:/// WhileOp are split into a new continuation block. Both regions of the WhileOp
+        -:  222:/// are inlined, and their terminators are rewritten to organize the control
+        -:  223:/// flow implementing the loop as follows.
+        -:  224:///
+        -:  225:///      +---------------------------------+
+        -:  226:///      |   <code before the WhileOp>     |
+        -:  227:///      |   cf.br ^before(%operands...)      |
+        -:  228:///      +---------------------------------+
+        -:  229:///             |
+        -:  230:///  -------|   |
+        -:  231:///  |      v   v
+        -:  232:///  |   +--------------------------------+
+        -:  233:///  |   | ^before(%bargs...):            |
+        -:  234:///  |   |   %vals... = <some payload>    |
+        -:  235:///  |   +--------------------------------+
+        -:  236:///  |                   |
+        -:  237:///  |                  ...
+        -:  238:///  |                   |
+        -:  239:///  |   +--------------------------------+
+        -:  240:///  |   | ^before-last:
+        -:  241:///  |   |   %cond = <compute condition>  |
+        -:  242:///  |   |   cf.cond_br %cond,               |
+        -:  243:///  |   |        ^after(%vals...), ^cont |
+        -:  244:///  |   +--------------------------------+
+        -:  245:///  |          |               |
+        -:  246:///  |          |               -------------|
+        -:  247:///  |          v                            |
+        -:  248:///  |   +--------------------------------+  |
+        -:  249:///  |   | ^after(%aargs...):             |  |
+        -:  250:///  |   |   <body contents>              |  |
+        -:  251:///  |   +--------------------------------+  |
+        -:  252:///  |                   |                   |
+        -:  253:///  |                  ...                  |
+        -:  254:///  |                   |                   |
+        -:  255:///  |   +--------------------------------+  |
+        -:  256:///  |   | ^after-last:                   |  |
+        -:  257:///  |   |   %yields... = <some payload>  |  |
+        -:  258:///  |   |   cf.br ^before(%yields...)       |  |
+        -:  259:///  |   +--------------------------------+  |
+        -:  260:///  |          |                            |
+        -:  261:///  |-----------        |--------------------
+        -:  262:///                      v
+        -:  263:///      +--------------------------------+
+        -:  264:///      | ^cont:                         |
+        -:  265:///      |   <code after the WhileOp>     |
+        -:  266:///      |   <%vals from 'before' region  |
+        -:  267:///      |          visible by dominance> |
+        -:  268:///      +--------------------------------+
+        -:  269:///
+        -:  270:/// Values are communicated between ex-regions (the groups of blocks that used
+        -:  271:/// to form a region before inlining) through block arguments of their
+        -:  272:/// entry blocks, which are visible in all other dominated blocks. Similarly,
+        -:  273:/// the results of the WhileOp are defined in the 'before' region, which is
+        -:  274:/// required to have a single existing block, and are therefore accessible in
+        -:  275:/// the continuation block due to dominance.
+        -:  276:struct WhileLowering : public OpRewritePattern<WhileOp> {
+        -:  277:  using OpRewritePattern<WhileOp>::OpRewritePattern;
+        -:  278:
+        -:  279:  LogicalResult matchAndRewrite(WhileOp whileOp,
+        -:  280:                                PatternRewriter &rewriter) const override;
+        -:  281:};
+        -:  282:
+        -:  283:/// Optimized version of the above for the case of the "after" region merely
+        -:  284:/// forwarding its arguments back to the "before" region (i.e., a "do-while"
+        -:  285:/// loop). This avoid inlining the "after" region completely and branches back
+        -:  286:/// to the "before" entry instead.
+        -:  287:struct DoWhileLowering : public OpRewritePattern<WhileOp> {
+        -:  288:  using OpRewritePattern<WhileOp>::OpRewritePattern;
+        -:  289:
+        -:  290:  LogicalResult matchAndRewrite(WhileOp whileOp,
+        -:  291:                                PatternRewriter &rewriter) const override;
+        -:  292:};
+        -:  293:
+        -:  294:/// Lower an `scf.index_switch` operation to a `cf.switch` operation.
+        -:  295:struct IndexSwitchLowering : public OpRewritePattern<IndexSwitchOp> {
+        -:  296:  using OpRewritePattern::OpRewritePattern;
+        -:  297:
+        -:  298:  LogicalResult matchAndRewrite(IndexSwitchOp op,
+        -:  299:                                PatternRewriter &rewriter) const override;
+        -:  300:};
+        -:  301:} // namespace
+        -:  302:
+function _ZNK12_GLOBAL__N_111ForLowering15matchAndRewriteEN4mlir3scf5ForOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  303:LogicalResult ForLowering::matchAndRewrite(ForOp forOp,
+        -:  304:                                           PatternRewriter &rewriter) const {
+    #####:  305:  Location loc = forOp.getLoc();
+call    0 never executed
+        -:  306:
+        -:  307:  // Start by splitting the block containing the 'scf.for' into two parts.
+        -:  308:  // The part before will get the init code, the part after will be the end
+        -:  309:  // point.
+    #####:  310:  auto *initBlock = rewriter.getInsertionBlock();
+call    0 never executed
+    #####:  311:  auto initPosition = rewriter.getInsertionPoint();
+call    0 never executed
+    #####:  312:  auto *endBlock = rewriter.splitBlock(initBlock, initPosition);
+call    0 never executed
+        -:  313:
+        -:  314:  // Use the first block of the loop body as the condition block since it is the
+        -:  315:  // block that has the induction variable and loop-carried values as arguments.
+        -:  316:  // Split out all operations from the first block into a new block. Move all
+        -:  317:  // body blocks from the loop body region to the region containing the loop.
+    #####:  318:  auto *conditionBlock = &forOp.getRegion().front();
+call    0 never executed
+call    1 never executed
+    #####:  319:  auto *firstBodyBlock =
+    #####:  320:      rewriter.splitBlock(conditionBlock, conditionBlock->begin());
+call    0 never executed
+    #####:  321:  auto *lastBodyBlock = &forOp.getRegion().back();
+call    0 never executed
+call    1 never executed
+    #####:  322:  rewriter.inlineRegionBefore(forOp.getRegion(), endBlock);
+call    0 never executed
+call    1 never executed
+    #####:  323:  auto iv = conditionBlock->getArgument(0);
+call    0 never executed
+        -:  324:
+        -:  325:  // Append the induction variable stepping logic to the last body block and
+        -:  326:  // branch back to the condition block. Loop-carried values are taken from
+        -:  327:  // operands of the loop terminator.
+    #####:  328:  Operation *terminator = lastBodyBlock->getTerminator();
+call    0 never executed
+    #####:  329:  rewriter.setInsertionPointToEnd(lastBodyBlock);
+call    0 never executed
+    #####:  330:  auto step = forOp.getStep();
+call    0 never executed
+    #####:  331:  auto stepped = rewriter.create<arith::AddIOp>(loc, iv, step).getResult();
+call    0 never executed
+call    1 never executed
+    #####:  332:  if (!stepped)
+branch  0 never executed
+branch  1 never executed
+    #####:  333:    return failure();
+        -:  334:
+    #####:  335:  SmallVector<Value, 8> loopCarried;
+call    0 never executed
+    #####:  336:  loopCarried.push_back(stepped);
+call    0 never executed
+    #####:  337:  loopCarried.append(terminator->operand_begin(), terminator->operand_end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  338:  rewriter.create<cf::BranchOp>(loc, conditionBlock, loopCarried);
+call    0 never executed
+    #####:  339:  rewriter.eraseOp(terminator);
+call    0 never executed
+        -:  340:
+        -:  341:  // Compute loop bounds before branching to the condition.
+    #####:  342:  rewriter.setInsertionPointToEnd(initBlock);
+call    0 never executed
+    #####:  343:  Value lowerBound = forOp.getLowerBound();
+call    0 never executed
+    #####:  344:  Value upperBound = forOp.getUpperBound();
+call    0 never executed
+    #####:  345:  if (!lowerBound || !upperBound)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  346:    return failure();
+        -:  347:
+        -:  348:  // The initial values of loop-carried values is obtained from the operands
+        -:  349:  // of the loop operation.
+    #####:  350:  SmallVector<Value, 8> destOperands;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  351:  destOperands.push_back(lowerBound);
+call    0 never executed
+    #####:  352:  auto iterOperands = forOp.getIterOperands();
+call    0 never executed
+    #####:  353:  destOperands.append(iterOperands.begin(), iterOperands.end());
+call    0 never executed
+    #####:  354:  rewriter.create<cf::BranchOp>(loc, conditionBlock, destOperands);
+call    0 never executed
+        -:  355:
+        -:  356:  // With the body block done, we can fill in the condition block.
+    #####:  357:  rewriter.setInsertionPointToEnd(conditionBlock);
+call    0 never executed
+    #####:  358:  auto comparison = rewriter.create<arith::CmpIOp>(
+    #####:  359:      loc, arith::CmpIPredicate::slt, iv, upperBound);
+call    0 never executed
+        -:  360:
+    #####:  361:  rewriter.create<cf::CondBranchOp>(loc, comparison, firstBodyBlock,
+    #####:  362:                                    ArrayRef<Value>(), endBlock,
+call    0 never executed
+    #####:  363:                                    ArrayRef<Value>());
+call    0 never executed
+        -:  364:  // The result of the loop operation is the values of the condition block
+        -:  365:  // arguments except the induction variable on the last iteration.
+    #####:  366:  rewriter.replaceOp(forOp, conditionBlock->getArguments().drop_front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  367:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  368:}
+        -:  369:
+function _ZNK12_GLOBAL__N_110IfLowering15matchAndRewriteEN4mlir3scf4IfOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  370:LogicalResult IfLowering::matchAndRewrite(IfOp ifOp,
+        -:  371:                                          PatternRewriter &rewriter) const {
+    #####:  372:  auto loc = ifOp.getLoc();
+call    0 never executed
+        -:  373:
+        -:  374:  // Start by splitting the block containing the 'scf.if' into two parts.
+        -:  375:  // The part before will contain the condition, the part after will be the
+        -:  376:  // continuation point.
+    #####:  377:  auto *condBlock = rewriter.getInsertionBlock();
+call    0 never executed
+    #####:  378:  auto opPosition = rewriter.getInsertionPoint();
+call    0 never executed
+    #####:  379:  auto *remainingOpsBlock = rewriter.splitBlock(condBlock, opPosition);
+call    0 never executed
+    #####:  380:  Block *continueBlock;
+    #####:  381:  if (ifOp.getNumResults() == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  382:    continueBlock = remainingOpsBlock;
+        -:  383:  } else {
+    #####:  384:    continueBlock =
+    #####:  385:        rewriter.createBlock(remainingOpsBlock, ifOp.getResultTypes(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  386:                             SmallVector<Location>(ifOp.getNumResults(), loc));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  387:    rewriter.create<cf::BranchOp>(loc, remainingOpsBlock);
+call    0 never executed
+        -:  388:  }
+        -:  389:
+        -:  390:  // Move blocks from the "then" region to the region containing 'scf.if',
+        -:  391:  // place it before the continuation block, and branch to it.
+    #####:  392:  auto &thenRegion = ifOp.getThenRegion();
+call    0 never executed
+    #####:  393:  auto *thenBlock = &thenRegion.front();
+call    0 never executed
+    #####:  394:  Operation *thenTerminator = thenRegion.back().getTerminator();
+call    0 never executed
+call    1 never executed
+    #####:  395:  ValueRange thenTerminatorOperands = thenTerminator->getOperands();
+call    0 never executed
+call    1 never executed
+    #####:  396:  rewriter.setInsertionPointToEnd(&thenRegion.back());
+call    0 never executed
+call    1 never executed
+    #####:  397:  rewriter.create<cf::BranchOp>(loc, continueBlock, thenTerminatorOperands);
+call    0 never executed
+    #####:  398:  rewriter.eraseOp(thenTerminator);
+call    0 never executed
+    #####:  399:  rewriter.inlineRegionBefore(thenRegion, continueBlock);
+call    0 never executed
+        -:  400:
+        -:  401:  // Move blocks from the "else" region (if present) to the region containing
+        -:  402:  // 'scf.if', place it before the continuation block and branch to it.  It
+        -:  403:  // will be placed after the "then" regions.
+    #####:  404:  auto *elseBlock = continueBlock;
+    #####:  405:  auto &elseRegion = ifOp.getElseRegion();
+call    0 never executed
+    #####:  406:  if (!elseRegion.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  407:    elseBlock = &elseRegion.front();
+call    0 never executed
+    #####:  408:    Operation *elseTerminator = elseRegion.back().getTerminator();
+call    0 never executed
+call    1 never executed
+    #####:  409:    ValueRange elseTerminatorOperands = elseTerminator->getOperands();
+call    0 never executed
+call    1 never executed
+    #####:  410:    rewriter.setInsertionPointToEnd(&elseRegion.back());
+call    0 never executed
+call    1 never executed
+    #####:  411:    rewriter.create<cf::BranchOp>(loc, continueBlock, elseTerminatorOperands);
+call    0 never executed
+    #####:  412:    rewriter.eraseOp(elseTerminator);
+call    0 never executed
+    #####:  413:    rewriter.inlineRegionBefore(elseRegion, continueBlock);
+call    0 never executed
+        -:  414:  }
+        -:  415:
+    #####:  416:  rewriter.setInsertionPointToEnd(condBlock);
+call    0 never executed
+    #####:  417:  rewriter.create<cf::CondBranchOp>(loc, ifOp.getCondition(), thenBlock,
+    #####:  418:                                    /*trueArgs=*/ArrayRef<Value>(), elseBlock,
+call    0 never executed
+    #####:  419:                                    /*falseArgs=*/ArrayRef<Value>());
+call    0 never executed
+call    1 never executed
+        -:  420:
+        -:  421:  // Ok, we're done!
+    #####:  422:  rewriter.replaceOp(ifOp, continueBlock->getArguments());
+call    0 never executed
+call    1 never executed
+    #####:  423:  return success();
+        -:  424:}
+        -:  425:
+        -:  426:LogicalResult
+function _ZNK12_GLOBAL__N_121ExecuteRegionLowering15matchAndRewriteEN4mlir3scf15ExecuteRegionOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  427:ExecuteRegionLowering::matchAndRewrite(ExecuteRegionOp op,
+        -:  428:                                       PatternRewriter &rewriter) const {
+    #####:  429:  auto loc = op.getLoc();
+call    0 never executed
+        -:  430:
+    #####:  431:  auto *condBlock = rewriter.getInsertionBlock();
+call    0 never executed
+    #####:  432:  auto opPosition = rewriter.getInsertionPoint();
+call    0 never executed
+    #####:  433:  auto *remainingOpsBlock = rewriter.splitBlock(condBlock, opPosition);
+call    0 never executed
+        -:  434:
+    #####:  435:  auto &region = op.getRegion();
+call    0 never executed
+    #####:  436:  rewriter.setInsertionPointToEnd(condBlock);
+call    0 never executed
+    #####:  437:  rewriter.create<cf::BranchOp>(loc, &region.front());
+call    0 never executed
+call    1 never executed
+        -:  438:
+    #####:  439:  for (Block &block : region) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  440:    if (auto terminator = dyn_cast<scf::YieldOp>(block.getTerminator())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  441:      ValueRange terminatorOperands = terminator->getOperands();
+call    0 never executed
+call    1 never executed
+    #####:  442:      rewriter.setInsertionPointToEnd(&block);
+call    0 never executed
+    #####:  443:      rewriter.create<cf::BranchOp>(loc, remainingOpsBlock, terminatorOperands);
+call    0 never executed
+    #####:  444:      rewriter.eraseOp(terminator);
+call    0 never executed
+        -:  445:    }
+        -:  446:  }
+        -:  447:
+    #####:  448:  rewriter.inlineRegionBefore(region, remainingOpsBlock);
+call    0 never executed
+        -:  449:
+    #####:  450:  SmallVector<Value> vals;
+call    0 never executed
+    #####:  451:  SmallVector<Location> argLocs(op.getNumResults(), op->getLoc());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  452:  for (auto arg :
+    #####:  453:       remainingOpsBlock->addArguments(op->getResultTypes(), argLocs))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  454:    vals.push_back(arg);
+call    0 never executed
+    #####:  455:  rewriter.replaceOp(op, vals);
+call    0 never executed
+call    1 never executed
+    #####:  456:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  457:}
+        -:  458:
+        -:  459:LogicalResult
+function _ZNK12_GLOBAL__N_116ParallelLowering15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  460:ParallelLowering::matchAndRewrite(ParallelOp parallelOp,
+        -:  461:                                  PatternRewriter &rewriter) const {
+    #####:  462:  Location loc = parallelOp.getLoc();
+call    0 never executed
+        -:  463:
+        -:  464:  // For a parallel loop, we essentially need to create an n-dimensional loop
+        -:  465:  // nest. We do this by translating to scf.for ops and have those lowered in
+        -:  466:  // a further rewrite. If a parallel loop contains reductions (and thus returns
+        -:  467:  // values), forward the initial values for the reductions down the loop
+        -:  468:  // hierarchy and bubble up the results by modifying the "yield" terminator.
+    #####:  469:  SmallVector<Value, 4> iterArgs = llvm::to_vector<4>(parallelOp.getInitVals());
+call    0 never executed
+call    1 never executed
+    #####:  470:  SmallVector<Value, 4> ivs;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  471:  ivs.reserve(parallelOp.getNumLoops());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  472:  bool first = true;
+    #####:  473:  SmallVector<Value, 4> loopResults(iterArgs);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  474:  for (auto [iv, lower, upper, step] :
+call    0 never executed
+    #####:  475:       llvm::zip(parallelOp.getInductionVars(), parallelOp.getLowerBound(),
+call    0 never executed
+call    1 never executed
+    #####:  476:                 parallelOp.getUpperBound(), parallelOp.getStep())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  477:    ForOp forOp = rewriter.create<ForOp>(loc, lower, upper, step, iterArgs);
+call    0 never executed
+    #####:  478:    ivs.push_back(forOp.getInductionVar());
+call    0 never executed
+call    1 never executed
+    #####:  479:    auto iterRange = forOp.getRegionIterArgs();
+call    0 never executed
+    #####:  480:    iterArgs.assign(iterRange.begin(), iterRange.end());
+call    0 never executed
+        -:  481:
+    #####:  482:    if (first) {
+branch  0 never executed
+branch  1 never executed
+        -:  483:      // Store the results of the outermost loop that will be used to replace
+        -:  484:      // the results of the parallel loop when it is fully rewritten.
+    #####:  485:      loopResults.assign(forOp.result_begin(), forOp.result_end());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  486:      first = false;
+    #####:  487:    } else if (!forOp.getResults().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  488:      // A loop is constructed with an empty "yield" terminator if there are
+        -:  489:      // no results.
+    #####:  490:      rewriter.setInsertionPointToEnd(rewriter.getInsertionBlock());
+call    0 never executed
+    #####:  491:      rewriter.create<scf::YieldOp>(loc, forOp.getResults());
+call    0 never executed
+call    1 never executed
+        -:  492:    }
+        -:  493:
+    #####:  494:    rewriter.setInsertionPointToStart(forOp.getBody());
+call    0 never executed
+        -:  495:  }
+        -:  496:
+        -:  497:  // First, merge reduction blocks into the main region.
+    #####:  498:  SmallVector<Value, 4> yieldOperands;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  499:  yieldOperands.reserve(parallelOp.getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  500:  for (auto &op : *parallelOp.getBody()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  501:    auto reduce = dyn_cast<ReduceOp>(op);
+call    0 never executed
+    #####:  502:    if (!reduce)
+branch  0 never executed
+branch  1 never executed
+    #####:  503:      continue;
+        -:  504:
+    #####:  505:    Block &reduceBlock = reduce.getReductionOperator().front();
+call    0 never executed
+call    1 never executed
+    #####:  506:    Value arg = iterArgs[yieldOperands.size()];
+branch  0 never executed
+branch  1 never executed
+    #####:  507:    yieldOperands.push_back(reduceBlock.getTerminator()->getOperand(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  508:    rewriter.eraseOp(reduceBlock.getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  509:    rewriter.mergeBlockBefore(&reduceBlock, &op, {arg, reduce.getOperand()});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  510:    rewriter.eraseOp(reduce);
+call    0 never executed
+        -:  511:  }
+        -:  512:
+        -:  513:  // Then merge the loop body without the terminator.
+    #####:  514:  rewriter.eraseOp(parallelOp.getBody()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  515:  Block *newBody = rewriter.getInsertionBlock();
+branch  0 never executed
+branch  1 never executed
+    #####:  516:  if (newBody->empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  517:    rewriter.mergeBlocks(parallelOp.getBody(), newBody, ivs);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  518:  else
+    #####:  519:    rewriter.mergeBlockBefore(parallelOp.getBody(), newBody->getTerminator(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  520:                              ivs);
+        -:  521:
+        -:  522:  // Finally, create the terminator if required (for loops with no results, it
+        -:  523:  // has been already created in loop construction).
+    #####:  524:  if (!yieldOperands.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  525:    rewriter.setInsertionPointToEnd(rewriter.getInsertionBlock());
+call    0 never executed
+    #####:  526:    rewriter.create<scf::YieldOp>(loc, yieldOperands);
+call    0 never executed
+        -:  527:  }
+        -:  528:
+    #####:  529:  rewriter.replaceOp(parallelOp, loopResults);
+call    0 never executed
+call    1 never executed
+        -:  530:
+    #####:  531:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  532:}
+        -:  533:
+function _ZNK12_GLOBAL__N_113WhileLowering15matchAndRewriteEN4mlir3scf7WhileOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  534:LogicalResult WhileLowering::matchAndRewrite(WhileOp whileOp,
+        -:  535:                                             PatternRewriter &rewriter) const {
+    #####:  536:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  537:  Location loc = whileOp.getLoc();
+call    0 never executed
+        -:  538:
+        -:  539:  // Split the current block before the WhileOp to create the inlining point.
+    #####:  540:  Block *currentBlock = rewriter.getInsertionBlock();
+    #####:  541:  Block *continuation =
+    #####:  542:      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+call    0 never executed
+        -:  543:
+        -:  544:  // Inline both regions.
+    #####:  545:  Block *after = &whileOp.getAfter().front();
+call    0 never executed
+call    1 never executed
+    #####:  546:  Block *afterLast = &whileOp.getAfter().back();
+call    0 never executed
+call    1 never executed
+    #####:  547:  Block *before = &whileOp.getBefore().front();
+call    0 never executed
+call    1 never executed
+    #####:  548:  Block *beforeLast = &whileOp.getBefore().back();
+call    0 never executed
+call    1 never executed
+    #####:  549:  rewriter.inlineRegionBefore(whileOp.getAfter(), continuation);
+call    0 never executed
+call    1 never executed
+    #####:  550:  rewriter.inlineRegionBefore(whileOp.getBefore(), after);
+call    0 never executed
+call    1 never executed
+        -:  551:
+        -:  552:  // Branch to the "before" region.
+    #####:  553:  rewriter.setInsertionPointToEnd(currentBlock);
+call    0 never executed
+    #####:  554:  rewriter.create<cf::BranchOp>(loc, before, whileOp.getInits());
+call    0 never executed
+call    1 never executed
+        -:  555:
+        -:  556:  // Replace terminators with branches. Assuming bodies are SESE, which holds
+        -:  557:  // given only the patterns from this file, we only need to look at the last
+        -:  558:  // block. This should be reconsidered if we allow break/continue in SCF.
+    #####:  559:  rewriter.setInsertionPointToEnd(beforeLast);
+call    0 never executed
+    #####:  560:  auto condOp = cast<ConditionOp>(beforeLast->getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  561:  rewriter.replaceOpWithNewOp<cf::CondBranchOp>(condOp, condOp.getCondition(),
+call    0 never executed
+    #####:  562:                                                after, condOp.getArgs(),
+call    0 never executed
+    #####:  563:                                                continuation, ValueRange());
+call    0 never executed
+call    1 never executed
+        -:  564:
+    #####:  565:  rewriter.setInsertionPointToEnd(afterLast);
+call    0 never executed
+    #####:  566:  auto yieldOp = cast<scf::YieldOp>(afterLast->getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  567:  rewriter.replaceOpWithNewOp<cf::BranchOp>(yieldOp, before,
+    #####:  568:                                            yieldOp.getResults());
+call    0 never executed
+call    1 never executed
+        -:  569:
+        -:  570:  // Replace the op with values "yielded" from the "before" region, which are
+        -:  571:  // visible by dominance.
+    #####:  572:  rewriter.replaceOp(whileOp, condOp.getArgs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  573:
+    #####:  574:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  575:}
+        -:  576:
+        -:  577:LogicalResult
+function _ZNK12_GLOBAL__N_115DoWhileLowering15matchAndRewriteEN4mlir3scf7WhileOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  578:DoWhileLowering::matchAndRewrite(WhileOp whileOp,
+        -:  579:                                 PatternRewriter &rewriter) const {
+    #####:  580:  if (!llvm::hasSingleElement(whileOp.getAfter()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  581:    return rewriter.notifyMatchFailure(whileOp,
+        -:  582:                                       "do-while simplification applicable to "
+    #####:  583:                                       "single-block 'after' region only");
+call    0 never executed
+        -:  584:
+    #####:  585:  Block &afterBlock = whileOp.getAfter().front();
+call    0 never executed
+call    1 never executed
+    #####:  586:  if (!llvm::hasSingleElement(afterBlock))
+branch  0 never executed
+branch  1 never executed
+    #####:  587:    return rewriter.notifyMatchFailure(whileOp,
+        -:  588:                                       "do-while simplification applicable "
+    #####:  589:                                       "only if 'after' region has no payload");
+call    0 never executed
+        -:  590:
+    #####:  591:  auto yield = dyn_cast<scf::YieldOp>(&afterBlock.front());
+call    0 never executed
+call    1 never executed
+    #####:  592:  if (!yield || yield.getResults() != afterBlock.getArguments())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  593:    return rewriter.notifyMatchFailure(whileOp,
+        -:  594:                                       "do-while simplification applicable "
+    #####:  595:                                       "only to forwarding 'after' regions");
+call    0 never executed
+        -:  596:
+        -:  597:  // Split the current block before the WhileOp to create the inlining point.
+    #####:  598:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  599:  Block *currentBlock = rewriter.getInsertionBlock();
+    #####:  600:  Block *continuation =
+    #####:  601:      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+call    0 never executed
+        -:  602:
+        -:  603:  // Only the "before" region should be inlined.
+    #####:  604:  Block *before = &whileOp.getBefore().front();
+call    0 never executed
+call    1 never executed
+    #####:  605:  Block *beforeLast = &whileOp.getBefore().back();
+call    0 never executed
+call    1 never executed
+    #####:  606:  rewriter.inlineRegionBefore(whileOp.getBefore(), continuation);
+call    0 never executed
+call    1 never executed
+        -:  607:
+        -:  608:  // Branch to the "before" region.
+    #####:  609:  rewriter.setInsertionPointToEnd(currentBlock);
+call    0 never executed
+    #####:  610:  rewriter.create<cf::BranchOp>(whileOp.getLoc(), before, whileOp.getInits());
+call    0 never executed
+call    1 never executed
+        -:  611:
+        -:  612:  // Loop around the "before" region based on condition.
+    #####:  613:  rewriter.setInsertionPointToEnd(beforeLast);
+call    0 never executed
+    #####:  614:  auto condOp = cast<ConditionOp>(beforeLast->getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  615:  rewriter.replaceOpWithNewOp<cf::CondBranchOp>(condOp, condOp.getCondition(),
+call    0 never executed
+    #####:  616:                                                before, condOp.getArgs(),
+call    0 never executed
+    #####:  617:                                                continuation, ValueRange());
+call    0 never executed
+call    1 never executed
+        -:  618:
+        -:  619:  // Replace the op with values "yielded" from the "before" region, which are
+        -:  620:  // visible by dominance.
+    #####:  621:  rewriter.replaceOp(whileOp, condOp.getArgs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  622:
+    #####:  623:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  624:}
+        -:  625:
+        -:  626:LogicalResult
+function _ZNK12_GLOBAL__N_119IndexSwitchLowering15matchAndRewriteEN4mlir3scf13IndexSwitchOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  627:IndexSwitchLowering::matchAndRewrite(IndexSwitchOp op,
+        -:  628:                                     PatternRewriter &rewriter) const {
+        -:  629:  // Split the block at the op.
+    #####:  630:  Block *condBlock = rewriter.getInsertionBlock();
+call    0 never executed
+    #####:  631:  Block *continueBlock = rewriter.splitBlock(condBlock, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+        -:  632:
+        -:  633:  // Create the arguments on the continue block with which to replace the
+        -:  634:  // results of the op.
+    #####:  635:  SmallVector<Value> results;
+branch  0 never executed
+branch  1 never executed
+    #####:  636:  results.reserve(op.getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  637:  for (Type resultType : op.getResultTypes())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  638:    results.push_back(continueBlock->addArgument(resultType, op.getLoc()));
+call    0 never executed
+call    1 never executed
+        -:  639:
+        -:  640:  // Handle the regions.
+function _ZZNK12_GLOBAL__N_119IndexSwitchLowering15matchAndRewriteEN4mlir3scf13IndexSwitchOpERNS1_15PatternRewriterEENKUlRNS1_6RegionEE_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  641:  auto convertRegion = [&](Region &region) -> FailureOr<Block *> {
+    #####:  642:    Block *block = &region.front();
+call    0 never executed
+        -:  643:
+        -:  644:    // Convert the yield terminator to a branch to the continue block.
+    #####:  645:    auto yield = cast<scf::YieldOp>(block->getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  646:    rewriter.setInsertionPoint(yield);
+call    0 never executed
+    #####:  647:    rewriter.replaceOpWithNewOp<cf::BranchOp>(yield, continueBlock,
+    #####:  648:                                              yield.getOperands());
+call    0 never executed
+call    1 never executed
+        -:  649:
+        -:  650:    // Inline the region.
+    #####:  651:    rewriter.inlineRegionBefore(region, continueBlock);
+call    0 never executed
+    #####:  652:    return block;
+    #####:  653:  };
+        -:  654:
+        -:  655:  // Convert the case regions.
+    #####:  656:  SmallVector<Block *> caseSuccessors;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  657:  SmallVector<int32_t> caseValues;
+branch  0 never executed
+branch  1 never executed
+    #####:  658:  caseSuccessors.reserve(op.getCases().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  659:  caseValues.reserve(op.getCases().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  660:  for (auto [region, value] : llvm::zip(op.getCaseRegions(), op.getCases())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  661:    FailureOr<Block *> block = convertRegion(region);
+call    0 never executed
+    #####:  662:    if (failed(block))
+branch  0 never executed
+branch  1 never executed
+    #####:  663:      return failure();
+    #####:  664:    caseSuccessors.push_back(*block);
+call    0 never executed
+    #####:  665:    caseValues.push_back(value);
+call    0 never executed
+        -:  666:  }
+        -:  667:
+        -:  668:  // Convert the default region.
+    #####:  669:  FailureOr<Block *> defaultBlock = convertRegion(op.getDefaultRegion());
+call    0 never executed
+call    1 never executed
+    #####:  670:  if (failed(defaultBlock))
+branch  0 never executed
+branch  1 never executed
+    #####:  671:    return failure();
+        -:  672:
+        -:  673:  // Create the switch.
+    #####:  674:  rewriter.setInsertionPointToEnd(condBlock);
+call    0 never executed
+    #####:  675:  SmallVector<ValueRange> caseOperands(caseSuccessors.size(), {});
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  676:  rewriter.create<cf::SwitchOp>(
+    #####:  677:      op.getLoc(), op.getArg(), *defaultBlock, ValueRange(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  678:      rewriter.getDenseI32ArrayAttr(caseValues), caseSuccessors, caseOperands);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  679:  rewriter.replaceOp(op, continueBlock->getArguments());
+call    0 never executed
+call    1 never executed
+    #####:  680:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  681:}
+        -:  682:
+function _ZN4mlir42populateSCFToControlFlowConversionPatternsERNS_17RewritePatternSetE called 1079 returned 100% blocks executed 100%
+     1079:  683:void mlir::populateSCFToControlFlowConversionPatterns(
+        -:  684:    RewritePatternSet &patterns) {
+     1079:  685:  patterns.add<ForLowering, IfLowering, ParallelLowering, WhileLowering,
+        -:  686:               ExecuteRegionLowering, IndexSwitchLowering>(
+     1079:  687:      patterns.getContext());
+call    0 returned 100%
+     1079:  688:  patterns.add<DoWhileLowering>(patterns.getContext(), /*benefit=*/2);
+call    0 returned 100%
+     1079:  689:}
+        -:  690:
+function _ZN12_GLOBAL__N_120SCFToControlFlowPass14runOnOperationEv called 546 returned 100% blocks executed 89%
+      546:  691:void SCFToControlFlowPass::runOnOperation() {
+      546:  692:  RewritePatternSet patterns(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+      546:  693:  populateSCFToControlFlowConversionPatterns(patterns);
+call    0 returned 100%
+        -:  694:
+        -:  695:  // Configure conversion to lower out SCF operations.
+     1092:  696:  ConversionTarget target(getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+      546:  697:  target.addIllegalOp<scf::ForOp, scf::IfOp, scf::ParallelOp, scf::WhileOp,
+      546:  698:                      scf::ExecuteRegionOp>();
+call    0 returned 100%
+      546:  699:  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+      546:  700:  if (failed(
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+call    4 returned 100%
+branch  5 taken 0% (fallthrough)
+branch  6 taken 100%
+      546:  701:          applyPartialConversion(getOperation(), target, std::move(patterns))))
+call    0 returned 100%
+    #####:  702:    signalPassFailure();
+call    0 never executed
+      546:  703:}
+        -:  704:
+function _ZN4mlir24createConvertSCFToCFPassEv called 129893 returned 100% blocks executed 100%
+   129893:  705:std::unique_ptr<Pass> mlir::createConvertSCFToCFPass() {
+   129893:  706:  return std::make_unique<SCFToControlFlowPass>();
+call    0 returned 100%
+        -:  707:}

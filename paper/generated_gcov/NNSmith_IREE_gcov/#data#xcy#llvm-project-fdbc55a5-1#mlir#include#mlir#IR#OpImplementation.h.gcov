@@ -1,0 +1,1667 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/IR/OpImplementation.h
+        -:    0:Graph:../tools/mlir/lib/Interfaces/CMakeFiles/obj.MLIRViewLikeInterface.dir/ViewLikeInterface.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Interfaces/CMakeFiles/obj.MLIRViewLikeInterface.dir/ViewLikeInterface.cpp.gcda
+        -:    0:Runs:325597
+        -:    1://===- OpImplementation.h - Classes for implementing Op types ---*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This classes used by the implementation details of Op types.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef MLIR_IR_OPIMPLEMENTATION_H
+        -:   14:#define MLIR_IR_OPIMPLEMENTATION_H
+        -:   15:
+        -:   16:#include "mlir/IR/BuiltinTypes.h"
+        -:   17:#include "mlir/IR/DialectInterface.h"
+        -:   18:#include "mlir/IR/OpDefinition.h"
+        -:   19:#include "llvm/ADT/Twine.h"
+        -:   20:#include "llvm/Support/SMLoc.h"
+        -:   21:
+        -:   22:namespace mlir {
+        -:   23:class AsmParsedResourceEntry;
+        -:   24:class AsmResourceBuilder;
+        -:   25:class Builder;
+        -:   26:
+        -:   27://===----------------------------------------------------------------------===//
+        -:   28:// AsmDialectResourceHandle
+        -:   29://===----------------------------------------------------------------------===//
+        -:   30:
+        -:   31:/// This class represents an opaque handle to a dialect resource entry.
+        -:   32:class AsmDialectResourceHandle {
+        -:   33:public:
+        -:   34:  AsmDialectResourceHandle() = default;
+        -:   35:  AsmDialectResourceHandle(void *resource, TypeID resourceID, Dialect *dialect)
+        -:   36:      : resource(resource), opaqueID(resourceID), dialect(dialect) {}
+        -:   37:  bool operator==(const AsmDialectResourceHandle &other) const {
+        -:   38:    return resource == other.resource;
+        -:   39:  }
+        -:   40:
+        -:   41:  /// Return an opaque pointer to the referenced resource.
+        -:   42:  void *getResource() const { return resource; }
+        -:   43:
+        -:   44:  /// Return the type ID of the resource.
+        -:   45:  TypeID getTypeID() const { return opaqueID; }
+        -:   46:
+        -:   47:  /// Return the dialect that owns the resource.
+        -:   48:  Dialect *getDialect() const { return dialect; }
+        -:   49:
+        -:   50:private:
+        -:   51:  /// The opaque handle to the dialect resource.
+        -:   52:  void *resource = nullptr;
+        -:   53:  /// The type of the resource referenced.
+        -:   54:  TypeID opaqueID;
+        -:   55:  /// The dialect owning the given resource.
+        -:   56:  Dialect *dialect;
+        -:   57:};
+        -:   58:
+        -:   59:/// This class represents a CRTP base class for dialect resource handles. It
+        -:   60:/// abstracts away various utilities necessary for defined derived resource
+        -:   61:/// handles.
+        -:   62:template <typename DerivedT, typename ResourceT, typename DialectT>
+        -:   63:class AsmDialectResourceHandleBase : public AsmDialectResourceHandle {
+        -:   64:public:
+        -:   65:  using Dialect = DialectT;
+        -:   66:
+        -:   67:  /// Construct a handle from a pointer to the resource. The given pointer
+        -:   68:  /// should be guaranteed to live beyond the life of this handle.
+        -:   69:  AsmDialectResourceHandleBase(ResourceT *resource, DialectT *dialect)
+        -:   70:      : AsmDialectResourceHandle(resource, TypeID::get<DerivedT>(), dialect) {}
+        -:   71:  AsmDialectResourceHandleBase(AsmDialectResourceHandle handle)
+        -:   72:      : AsmDialectResourceHandle(handle) {
+        -:   73:    assert(handle.getTypeID() == TypeID::get<DerivedT>());
+        -:   74:  }
+        -:   75:
+        -:   76:  /// Return the resource referenced by this handle.
+        -:   77:  ResourceT *getResource() {
+        -:   78:    return static_cast<ResourceT *>(AsmDialectResourceHandle::getResource());
+        -:   79:  }
+        -:   80:  const ResourceT *getResource() const {
+        -:   81:    return const_cast<AsmDialectResourceHandleBase *>(this)->getResource();
+        -:   82:  }
+        -:   83:
+        -:   84:  /// Return the dialect that owns the resource.
+        -:   85:  DialectT *getDialect() const {
+        -:   86:    return static_cast<DialectT *>(AsmDialectResourceHandle::getDialect());
+        -:   87:  }
+        -:   88:
+        -:   89:  /// Support llvm style casting.
+        -:   90:  static bool classof(const AsmDialectResourceHandle *handle) {
+        -:   91:    return handle->getTypeID() == TypeID::get<DerivedT>();
+        -:   92:  }
+        -:   93:};
+        -:   94:
+        -:   95:inline llvm::hash_code hash_value(const AsmDialectResourceHandle &param) {
+        -:   96:  return llvm::hash_value(param.getResource());
+        -:   97:}
+        -:   98:
+        -:   99://===----------------------------------------------------------------------===//
+        -:  100:// AsmPrinter
+        -:  101://===----------------------------------------------------------------------===//
+        -:  102:
+        -:  103:/// This base class exposes generic asm printer hooks, usable across the various
+        -:  104:/// derived printers.
+        -:  105:class AsmPrinter {
+        -:  106:public:
+        -:  107:  /// This class contains the internal default implementation of the base
+        -:  108:  /// printer methods.
+        -:  109:  class Impl;
+        -:  110:
+        -:  111:  /// Initialize the printer with the given internal implementation.
+        -:  112:  AsmPrinter(Impl &impl) : impl(&impl) {}
+        -:  113:  virtual ~AsmPrinter();
+        -:  114:
+        -:  115:  /// Return the raw output stream used by this printer.
+        -:  116:  virtual raw_ostream &getStream() const;
+        -:  117:
+        -:  118:  /// Print the given floating point value in a stabilized form that can be
+        -:  119:  /// roundtripped through the IR. This is the companion to the 'parseFloat'
+        -:  120:  /// hook on the AsmParser.
+        -:  121:  virtual void printFloat(const APFloat &value);
+        -:  122:
+        -:  123:  virtual void printType(Type type);
+        -:  124:  virtual void printAttribute(Attribute attr);
+        -:  125:
+        -:  126:  /// Trait to check if `AttrType` provides a `print` method.
+        -:  127:  template <typename AttrOrType>
+        -:  128:  using has_print_method =
+        -:  129:      decltype(std::declval<AttrOrType>().print(std::declval<AsmPrinter &>()));
+        -:  130:  template <typename AttrOrType>
+        -:  131:  using detect_has_print_method =
+        -:  132:      llvm::is_detected<has_print_method, AttrOrType>;
+        -:  133:
+        -:  134:  /// Print the provided attribute in the context of an operation custom
+        -:  135:  /// printer/parser: this will invoke directly the print method on the
+        -:  136:  /// attribute class and skip the `#dialect.mnemonic` prefix in most cases.
+        -:  137:  template <typename AttrOrType,
+        -:  138:            std::enable_if_t<detect_has_print_method<AttrOrType>::value>
+        -:  139:                *sfinae = nullptr>
+        -:  140:  void printStrippedAttrOrType(AttrOrType attrOrType) {
+        -:  141:    if (succeeded(printAlias(attrOrType)))
+        -:  142:      return;
+        -:  143:    attrOrType.print(*this);
+        -:  144:  }
+        -:  145:
+        -:  146:  /// Print the provided array of attributes or types in the context of an
+        -:  147:  /// operation custom printer/parser: this will invoke directly the print
+        -:  148:  /// method on the attribute class and skip the `#dialect.mnemonic` prefix in
+        -:  149:  /// most cases.
+        -:  150:  template <typename AttrOrType,
+        -:  151:            std::enable_if_t<detect_has_print_method<AttrOrType>::value>
+        -:  152:                *sfinae = nullptr>
+        -:  153:  void printStrippedAttrOrType(ArrayRef<AttrOrType> attrOrTypes) {
+        -:  154:    llvm::interleaveComma(
+        -:  155:        attrOrTypes, getStream(),
+        -:  156:        [this](AttrOrType attrOrType) { printStrippedAttrOrType(attrOrType); });
+        -:  157:  }
+        -:  158:
+        -:  159:  /// SFINAE for printing the provided attribute in the context of an operation
+        -:  160:  /// custom printer in the case where the attribute does not define a print
+        -:  161:  /// method.
+        -:  162:  template <typename AttrOrType,
+        -:  163:            std::enable_if_t<!detect_has_print_method<AttrOrType>::value>
+        -:  164:                *sfinae = nullptr>
+        -:  165:  void printStrippedAttrOrType(AttrOrType attrOrType) {
+        -:  166:    *this << attrOrType;
+        -:  167:  }
+        -:  168:
+        -:  169:  /// Print the given attribute without its type. The corresponding parser must
+        -:  170:  /// provide a valid type for the attribute.
+        -:  171:  virtual void printAttributeWithoutType(Attribute attr);
+        -:  172:
+        -:  173:  /// Print the given string as a keyword, or a quoted and escaped string if it
+        -:  174:  /// has any special or non-printable characters in it.
+        -:  175:  virtual void printKeywordOrString(StringRef keyword);
+        -:  176:
+        -:  177:  /// Print the given string as a symbol reference, i.e. a form representable by
+        -:  178:  /// a SymbolRefAttr. A symbol reference is represented as a string prefixed
+        -:  179:  /// with '@'. The reference is surrounded with ""'s and escaped if it has any
+        -:  180:  /// special or non-printable characters in it.
+        -:  181:  virtual void printSymbolName(StringRef symbolRef);
+        -:  182:
+        -:  183:  /// Print a handle to the given dialect resource.
+        -:  184:  void printResourceHandle(const AsmDialectResourceHandle &resource);
+        -:  185:
+        -:  186:  /// Print an optional arrow followed by a type list.
+        -:  187:  template <typename TypeRange>
+        -:  188:  void printOptionalArrowTypeList(TypeRange &&types) {
+        -:  189:    if (types.begin() != types.end())
+        -:  190:      printArrowTypeList(types);
+        -:  191:  }
+        -:  192:  template <typename TypeRange>
+        -:  193:  void printArrowTypeList(TypeRange &&types) {
+        -:  194:    auto &os = getStream() << " -> ";
+        -:  195:
+        -:  196:    bool wrapped = !llvm::hasSingleElement(types) ||
+        -:  197:                   (*types.begin()).template isa<FunctionType>();
+        -:  198:    if (wrapped)
+        -:  199:      os << '(';
+        -:  200:    llvm::interleaveComma(types, *this);
+        -:  201:    if (wrapped)
+        -:  202:      os << ')';
+        -:  203:  }
+        -:  204:
+        -:  205:  /// Print the two given type ranges in a functional form.
+        -:  206:  template <typename InputRangeT, typename ResultRangeT>
+        -:  207:  void printFunctionalType(InputRangeT &&inputs, ResultRangeT &&results) {
+        -:  208:    auto &os = getStream();
+        -:  209:    os << '(';
+        -:  210:    llvm::interleaveComma(inputs, *this);
+        -:  211:    os << ')';
+        -:  212:    printArrowTypeList(results);
+        -:  213:  }
+        -:  214:
+        -:  215:protected:
+        -:  216:  /// Initialize the printer with no internal implementation. In this case, all
+        -:  217:  /// virtual methods of this class must be overriden.
+        -:  218:  AsmPrinter() = default;
+        -:  219:
+        -:  220:private:
+        -:  221:  AsmPrinter(const AsmPrinter &) = delete;
+        -:  222:  void operator=(const AsmPrinter &) = delete;
+        -:  223:
+        -:  224:  /// Print the alias for the given attribute, return failure if no alias could
+        -:  225:  /// be printed.
+        -:  226:  virtual LogicalResult printAlias(Attribute attr);
+        -:  227:
+        -:  228:  /// Print the alias for the given type, return failure if no alias could
+        -:  229:  /// be printed.
+        -:  230:  virtual LogicalResult printAlias(Type type);
+        -:  231:
+        -:  232:  /// The internal implementation of the printer.
+        -:  233:  Impl *impl{nullptr};
+        -:  234:};
+        -:  235:
+        -:  236:template <typename AsmPrinterT>
+        -:  237:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  238:                        AsmPrinterT &>
+        -:  239:operator<<(AsmPrinterT &p, Type type) {
+        -:  240:  p.printType(type);
+        -:  241:  return p;
+        -:  242:}
+        -:  243:
+        -:  244:template <typename AsmPrinterT>
+        -:  245:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  246:                        AsmPrinterT &>
+        -:  247:operator<<(AsmPrinterT &p, Attribute attr) {
+        -:  248:  p.printAttribute(attr);
+        -:  249:  return p;
+        -:  250:}
+        -:  251:
+        -:  252:template <typename AsmPrinterT>
+        -:  253:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  254:                        AsmPrinterT &>
+        -:  255:operator<<(AsmPrinterT &p, const APFloat &value) {
+        -:  256:  p.printFloat(value);
+        -:  257:  return p;
+        -:  258:}
+        -:  259:template <typename AsmPrinterT>
+        -:  260:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  261:                        AsmPrinterT &>
+        -:  262:operator<<(AsmPrinterT &p, float value) {
+        -:  263:  return p << APFloat(value);
+        -:  264:}
+        -:  265:template <typename AsmPrinterT>
+        -:  266:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  267:                        AsmPrinterT &>
+        -:  268:operator<<(AsmPrinterT &p, double value) {
+        -:  269:  return p << APFloat(value);
+        -:  270:}
+        -:  271:
+        -:  272:// Support printing anything that isn't convertible to one of the other
+        -:  273:// streamable types, even if it isn't exactly one of them. For example, we want
+        -:  274:// to print FunctionType with the Type version above, not have it match this.
+        -:  275:template <typename AsmPrinterT, typename T,
+        -:  276:          std::enable_if_t<!std::is_convertible<T &, Value &>::value &&
+        -:  277:                               !std::is_convertible<T &, Type &>::value &&
+        -:  278:                               !std::is_convertible<T &, Attribute &>::value &&
+        -:  279:                               !std::is_convertible<T &, ValueRange>::value &&
+        -:  280:                               !std::is_convertible<T &, APFloat &>::value &&
+        -:  281:                               !llvm::is_one_of<T, bool, float, double>::value,
+        -:  282:                           T> * = nullptr>
+        -:  283:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  284:                        AsmPrinterT &>
+function _ZN4mlirlsINS_12OpAsmPrinterEcLPc0EEENSt9enable_ifIXsrSt10is_base_ofINS_10AsmPrinterET_E5valueERS6_E4typeES8_RKT0_ called 0 returned 0% blocks executed 0%
+    #####:  285:operator<<(AsmPrinterT &p, const T &other) {
+    #####:  286:  p.getStream() << other;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  287:  return p;
+        -:  288:}
+        -:  289:
+        -:  290:template <typename AsmPrinterT>
+        -:  291:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  292:                        AsmPrinterT &>
+        -:  293:operator<<(AsmPrinterT &p, bool value) {
+        -:  294:  return p << (value ? StringRef("true") : "false");
+        -:  295:}
+        -:  296:
+        -:  297:template <typename AsmPrinterT, typename ValueRangeT>
+        -:  298:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  299:                        AsmPrinterT &>
+        -:  300:operator<<(AsmPrinterT &p, const ValueTypeRange<ValueRangeT> &types) {
+        -:  301:  llvm::interleaveComma(types, p);
+        -:  302:  return p;
+        -:  303:}
+        -:  304:template <typename AsmPrinterT>
+        -:  305:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  306:                        AsmPrinterT &>
+        -:  307:operator<<(AsmPrinterT &p, const TypeRange &types) {
+        -:  308:  llvm::interleaveComma(types, p);
+        -:  309:  return p;
+        -:  310:}
+        -:  311:template <typename AsmPrinterT, typename ElementT>
+        -:  312:inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
+        -:  313:                        AsmPrinterT &>
+        -:  314:operator<<(AsmPrinterT &p, ArrayRef<ElementT> types) {
+        -:  315:  llvm::interleaveComma(types, p);
+        -:  316:  return p;
+        -:  317:}
+        -:  318:
+        -:  319://===----------------------------------------------------------------------===//
+        -:  320:// OpAsmPrinter
+        -:  321://===----------------------------------------------------------------------===//
+        -:  322:
+        -:  323:/// This is a pure-virtual base class that exposes the asmprinter hooks
+        -:  324:/// necessary to implement a custom print() method.
+        -:  325:class OpAsmPrinter : public AsmPrinter {
+        -:  326:public:
+        -:  327:  using AsmPrinter::AsmPrinter;
+        -:  328:  ~OpAsmPrinter() override;
+        -:  329:
+        -:  330:  /// Print a loc(...) specifier if printing debug info is enabled.
+        -:  331:  virtual void printOptionalLocationSpecifier(Location loc) = 0;
+        -:  332:
+        -:  333:  /// Print a newline and indent the printer to the start of the current
+        -:  334:  /// operation.
+        -:  335:  virtual void printNewline() = 0;
+        -:  336:
+        -:  337:  /// Increase indentation.
+        -:  338:  virtual void increaseIndent() = 0;
+        -:  339:
+        -:  340:  /// Decrease indentation.
+        -:  341:  virtual void decreaseIndent() = 0;
+        -:  342:
+        -:  343:  /// Print a block argument in the usual format of:
+        -:  344:  ///   %ssaName : type {attr1=42} loc("here")
+        -:  345:  /// where location printing is controlled by the standard internal option.
+        -:  346:  /// You may pass omitType=true to not print a type, and pass an empty
+        -:  347:  /// attribute list if you don't care for attributes.
+        -:  348:  virtual void printRegionArgument(BlockArgument arg,
+        -:  349:                                   ArrayRef<NamedAttribute> argAttrs = {},
+        -:  350:                                   bool omitType = false) = 0;
+        -:  351:
+        -:  352:  /// Print implementations for various things an operation contains.
+        -:  353:  virtual void printOperand(Value value) = 0;
+        -:  354:  virtual void printOperand(Value value, raw_ostream &os) = 0;
+        -:  355:
+        -:  356:  /// Print a comma separated list of operands.
+        -:  357:  template <typename ContainerType>
+        -:  358:  void printOperands(const ContainerType &container) {
+        -:  359:    printOperands(container.begin(), container.end());
+        -:  360:  }
+        -:  361:
+        -:  362:  /// Print a comma separated list of operands.
+        -:  363:  template <typename IteratorType>
+        -:  364:  void printOperands(IteratorType it, IteratorType end) {
+        -:  365:    llvm::interleaveComma(llvm::make_range(it, end), getStream(),
+        -:  366:                          [this](Value value) { printOperand(value); });
+        -:  367:  }
+        -:  368:
+        -:  369:  /// Print the given successor.
+        -:  370:  virtual void printSuccessor(Block *successor) = 0;
+        -:  371:
+        -:  372:  /// Print the successor and its operands.
+        -:  373:  virtual void printSuccessorAndUseList(Block *successor,
+        -:  374:                                        ValueRange succOperands) = 0;
+        -:  375:
+        -:  376:  /// If the specified operation has attributes, print out an attribute
+        -:  377:  /// dictionary with their values.  elidedAttrs allows the client to ignore
+        -:  378:  /// specific well known attributes, commonly used if the attribute value is
+        -:  379:  /// printed some other way (like as a fixed operand).
+        -:  380:  virtual void printOptionalAttrDict(ArrayRef<NamedAttribute> attrs,
+        -:  381:                                     ArrayRef<StringRef> elidedAttrs = {}) = 0;
+        -:  382:
+        -:  383:  /// If the specified operation has attributes, print out an attribute
+        -:  384:  /// dictionary prefixed with 'attributes'.
+        -:  385:  virtual void
+        -:  386:  printOptionalAttrDictWithKeyword(ArrayRef<NamedAttribute> attrs,
+        -:  387:                                   ArrayRef<StringRef> elidedAttrs = {}) = 0;
+        -:  388:
+        -:  389:  /// Prints the entire operation with the custom assembly form, if available,
+        -:  390:  /// or the generic assembly form, otherwise.
+        -:  391:  virtual void printCustomOrGenericOp(Operation *op) = 0;
+        -:  392:
+        -:  393:  /// Print the entire operation with the default generic assembly form.
+        -:  394:  /// If `printOpName` is true, then the operation name is printed (the default)
+        -:  395:  /// otherwise it is omitted and the print will start with the operand list.
+        -:  396:  virtual void printGenericOp(Operation *op, bool printOpName = true) = 0;
+        -:  397:
+        -:  398:  /// Prints a region.
+        -:  399:  /// If 'printEntryBlockArgs' is false, the arguments of the
+        -:  400:  /// block are not printed. If 'printBlockTerminator' is false, the terminator
+        -:  401:  /// operation of the block is not printed. If printEmptyBlock is true, then
+        -:  402:  /// the block header is printed even if the block is empty.
+        -:  403:  virtual void printRegion(Region &blocks, bool printEntryBlockArgs = true,
+        -:  404:                           bool printBlockTerminators = true,
+        -:  405:                           bool printEmptyBlock = false) = 0;
+        -:  406:
+        -:  407:  /// Renumber the arguments for the specified region to the same names as the
+        -:  408:  /// SSA values in namesToUse.  This may only be used for IsolatedFromAbove
+        -:  409:  /// operations.  If any entry in namesToUse is null, the corresponding
+        -:  410:  /// argument name is left alone.
+        -:  411:  virtual void shadowRegionArgs(Region &region, ValueRange namesToUse) = 0;
+        -:  412:
+        -:  413:  /// Prints an affine map of SSA ids, where SSA id names are used in place
+        -:  414:  /// of dims/symbols.
+        -:  415:  /// Operand values must come from single-result sources, and be valid
+        -:  416:  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+        -:  417:  virtual void printAffineMapOfSSAIds(AffineMapAttr mapAttr,
+        -:  418:                                      ValueRange operands) = 0;
+        -:  419:
+        -:  420:  /// Prints an affine expression of SSA ids with SSA id names used instead of
+        -:  421:  /// dims and symbols.
+        -:  422:  /// Operand values must come from single-result sources, and be valid
+        -:  423:  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+        -:  424:  virtual void printAffineExprOfSSAIds(AffineExpr expr, ValueRange dimOperands,
+        -:  425:                                       ValueRange symOperands) = 0;
+        -:  426:
+        -:  427:  /// Print the complete type of an operation in functional form.
+        -:  428:  void printFunctionalType(Operation *op);
+        -:  429:  using AsmPrinter::printFunctionalType;
+        -:  430:};
+        -:  431:
+        -:  432:// Make the implementations convenient to use.
+    #####:  433:inline OpAsmPrinter &operator<<(OpAsmPrinter &p, Value value) {
+    #####:  434:  p.printOperand(value);
+call    0 never executed
+    #####:  435:  return p;
+        -:  436:}
+        -:  437:
+        -:  438:template <typename T,
+        -:  439:          std::enable_if_t<std::is_convertible<T &, ValueRange>::value &&
+        -:  440:                               !std::is_convertible<T &, Value &>::value,
+        -:  441:                           T> * = nullptr>
+        -:  442:inline OpAsmPrinter &operator<<(OpAsmPrinter &p, const T &values) {
+        -:  443:  p.printOperands(values);
+        -:  444:  return p;
+        -:  445:}
+        -:  446:
+        -:  447:inline OpAsmPrinter &operator<<(OpAsmPrinter &p, Block *value) {
+        -:  448:  p.printSuccessor(value);
+        -:  449:  return p;
+        -:  450:}
+        -:  451:
+        -:  452://===----------------------------------------------------------------------===//
+        -:  453:// AsmParser
+        -:  454://===----------------------------------------------------------------------===//
+        -:  455:
+        -:  456:/// This base class exposes generic asm parser hooks, usable across the various
+        -:  457:/// derived parsers.
+        -:  458:class AsmParser {
+        -:  459:public:
+        -:  460:  AsmParser() = default;
+        -:  461:  virtual ~AsmParser();
+        -:  462:
+        -:  463:  MLIRContext *getContext() const;
+        -:  464:
+        -:  465:  /// Return the location of the original name token.
+        -:  466:  virtual SMLoc getNameLoc() const = 0;
+        -:  467:
+        -:  468:  //===--------------------------------------------------------------------===//
+        -:  469:  // Utilities
+        -:  470:  //===--------------------------------------------------------------------===//
+        -:  471:
+        -:  472:  /// Emit a diagnostic at the specified location and return failure.
+        -:  473:  virtual InFlightDiagnostic emitError(SMLoc loc,
+        -:  474:                                       const Twine &message = {}) = 0;
+        -:  475:
+        -:  476:  /// Return a builder which provides useful access to MLIRContext, global
+        -:  477:  /// objects like types and attributes.
+        -:  478:  virtual Builder &getBuilder() const = 0;
+        -:  479:
+        -:  480:  /// Get the location of the next token and store it into the argument.  This
+        -:  481:  /// always succeeds.
+        -:  482:  virtual SMLoc getCurrentLocation() = 0;
+        -:  483:  ParseResult getCurrentLocation(SMLoc *loc) {
+        -:  484:    *loc = getCurrentLocation();
+        -:  485:    return success();
+        -:  486:  }
+        -:  487:
+        -:  488:  /// Re-encode the given source location as an MLIR location and return it.
+        -:  489:  /// Note: This method should only be used when a `Location` is necessary, as
+        -:  490:  /// the encoding process is not efficient.
+        -:  491:  virtual Location getEncodedSourceLoc(SMLoc loc) = 0;
+        -:  492:
+        -:  493:  //===--------------------------------------------------------------------===//
+        -:  494:  // Token Parsing
+        -:  495:  //===--------------------------------------------------------------------===//
+        -:  496:
+        -:  497:  /// Parse a '->' token.
+        -:  498:  virtual ParseResult parseArrow() = 0;
+        -:  499:
+        -:  500:  /// Parse a '->' token if present
+        -:  501:  virtual ParseResult parseOptionalArrow() = 0;
+        -:  502:
+        -:  503:  /// Parse a `{` token.
+        -:  504:  virtual ParseResult parseLBrace() = 0;
+        -:  505:
+        -:  506:  /// Parse a `{` token if present.
+        -:  507:  virtual ParseResult parseOptionalLBrace() = 0;
+        -:  508:
+        -:  509:  /// Parse a `}` token.
+        -:  510:  virtual ParseResult parseRBrace() = 0;
+        -:  511:
+        -:  512:  /// Parse a `}` token if present.
+        -:  513:  virtual ParseResult parseOptionalRBrace() = 0;
+        -:  514:
+        -:  515:  /// Parse a `:` token.
+        -:  516:  virtual ParseResult parseColon() = 0;
+        -:  517:
+        -:  518:  /// Parse a `:` token if present.
+        -:  519:  virtual ParseResult parseOptionalColon() = 0;
+        -:  520:
+        -:  521:  /// Parse a `,` token.
+        -:  522:  virtual ParseResult parseComma() = 0;
+        -:  523:
+        -:  524:  /// Parse a `,` token if present.
+        -:  525:  virtual ParseResult parseOptionalComma() = 0;
+        -:  526:
+        -:  527:  /// Parse a `=` token.
+        -:  528:  virtual ParseResult parseEqual() = 0;
+        -:  529:
+        -:  530:  /// Parse a `=` token if present.
+        -:  531:  virtual ParseResult parseOptionalEqual() = 0;
+        -:  532:
+        -:  533:  /// Parse a '<' token.
+        -:  534:  virtual ParseResult parseLess() = 0;
+        -:  535:
+        -:  536:  /// Parse a '<' token if present.
+        -:  537:  virtual ParseResult parseOptionalLess() = 0;
+        -:  538:
+        -:  539:  /// Parse a '>' token.
+        -:  540:  virtual ParseResult parseGreater() = 0;
+        -:  541:
+        -:  542:  /// Parse a '>' token if present.
+        -:  543:  virtual ParseResult parseOptionalGreater() = 0;
+        -:  544:
+        -:  545:  /// Parse a '?' token.
+        -:  546:  virtual ParseResult parseQuestion() = 0;
+        -:  547:
+        -:  548:  /// Parse a '?' token if present.
+        -:  549:  virtual ParseResult parseOptionalQuestion() = 0;
+        -:  550:
+        -:  551:  /// Parse a '+' token.
+        -:  552:  virtual ParseResult parsePlus() = 0;
+        -:  553:
+        -:  554:  /// Parse a '+' token if present.
+        -:  555:  virtual ParseResult parseOptionalPlus() = 0;
+        -:  556:
+        -:  557:  /// Parse a '*' token.
+        -:  558:  virtual ParseResult parseStar() = 0;
+        -:  559:
+        -:  560:  /// Parse a '*' token if present.
+        -:  561:  virtual ParseResult parseOptionalStar() = 0;
+        -:  562:
+        -:  563:  /// Parse a '|' token.
+        -:  564:  virtual ParseResult parseVerticalBar() = 0;
+        -:  565:
+        -:  566:  /// Parse a '|' token if present.
+        -:  567:  virtual ParseResult parseOptionalVerticalBar() = 0;
+        -:  568:
+        -:  569:  /// Parse a quoted string token.
+        -:  570:  ParseResult parseString(std::string *string) {
+        -:  571:    auto loc = getCurrentLocation();
+        -:  572:    if (parseOptionalString(string))
+        -:  573:      return emitError(loc, "expected string");
+        -:  574:    return success();
+        -:  575:  }
+        -:  576:
+        -:  577:  /// Parse a quoted string token if present.
+        -:  578:  virtual ParseResult parseOptionalString(std::string *string) = 0;
+        -:  579:
+        -:  580:  /// Parse a `(` token.
+        -:  581:  virtual ParseResult parseLParen() = 0;
+        -:  582:
+        -:  583:  /// Parse a `(` token if present.
+        -:  584:  virtual ParseResult parseOptionalLParen() = 0;
+        -:  585:
+        -:  586:  /// Parse a `)` token.
+        -:  587:  virtual ParseResult parseRParen() = 0;
+        -:  588:
+        -:  589:  /// Parse a `)` token if present.
+        -:  590:  virtual ParseResult parseOptionalRParen() = 0;
+        -:  591:
+        -:  592:  /// Parse a `[` token.
+        -:  593:  virtual ParseResult parseLSquare() = 0;
+        -:  594:
+        -:  595:  /// Parse a `[` token if present.
+        -:  596:  virtual ParseResult parseOptionalLSquare() = 0;
+        -:  597:
+        -:  598:  /// Parse a `]` token.
+        -:  599:  virtual ParseResult parseRSquare() = 0;
+        -:  600:
+        -:  601:  /// Parse a `]` token if present.
+        -:  602:  virtual ParseResult parseOptionalRSquare() = 0;
+        -:  603:
+        -:  604:  /// Parse a `...` token.
+        -:  605:  virtual ParseResult parseEllipsis() = 0;
+        -:  606:
+        -:  607:  /// Parse a `...` token if present;
+        -:  608:  virtual ParseResult parseOptionalEllipsis() = 0;
+        -:  609:
+        -:  610:  /// Parse a floating point value from the stream.
+        -:  611:  virtual ParseResult parseFloat(double &result) = 0;
+        -:  612:
+        -:  613:  /// Parse an integer value from the stream.
+        -:  614:  template <typename IntT>
+        -:  615:  ParseResult parseInteger(IntT &result) {
+        -:  616:    auto loc = getCurrentLocation();
+        -:  617:    OptionalParseResult parseResult = parseOptionalInteger(result);
+        -:  618:    if (!parseResult.has_value())
+        -:  619:      return emitError(loc, "expected integer value");
+        -:  620:    return *parseResult;
+        -:  621:  }
+        -:  622:
+        -:  623:  /// Parse an optional integer value from the stream.
+        -:  624:  virtual OptionalParseResult parseOptionalInteger(APInt &result) = 0;
+        -:  625:
+        -:  626:  template <typename IntT>
+        -:  627:  OptionalParseResult parseOptionalInteger(IntT &result) {
+        -:  628:    auto loc = getCurrentLocation();
+        -:  629:
+        -:  630:    // Parse the unsigned variant.
+        -:  631:    APInt uintResult;
+        -:  632:    OptionalParseResult parseResult = parseOptionalInteger(uintResult);
+        -:  633:    if (!parseResult.has_value() || failed(*parseResult))
+        -:  634:      return parseResult;
+        -:  635:
+        -:  636:    // Try to convert to the provided integer type.  sextOrTrunc is correct even
+        -:  637:    // for unsigned types because parseOptionalInteger ensures the sign bit is
+        -:  638:    // zero for non-negated integers.
+        -:  639:    result =
+        -:  640:        (IntT)uintResult.sextOrTrunc(sizeof(IntT) * CHAR_BIT).getLimitedValue();
+        -:  641:    if (APInt(uintResult.getBitWidth(), result) != uintResult)
+        -:  642:      return emitError(loc, "integer value too large");
+        -:  643:    return success();
+        -:  644:  }
+        -:  645:
+        -:  646:  /// These are the supported delimiters around operand lists and region
+        -:  647:  /// argument lists, used by parseOperandList.
+        -:  648:  enum class Delimiter {
+        -:  649:    /// Zero or more operands with no delimiters.
+        -:  650:    None,
+        -:  651:    /// Parens surrounding zero or more operands.
+        -:  652:    Paren,
+        -:  653:    /// Square brackets surrounding zero or more operands.
+        -:  654:    Square,
+        -:  655:    /// <> brackets surrounding zero or more operands.
+        -:  656:    LessGreater,
+        -:  657:    /// {} brackets surrounding zero or more operands.
+        -:  658:    Braces,
+        -:  659:    /// Parens supporting zero or more operands, or nothing.
+        -:  660:    OptionalParen,
+        -:  661:    /// Square brackets supporting zero or more ops, or nothing.
+        -:  662:    OptionalSquare,
+        -:  663:    /// <> brackets supporting zero or more ops, or nothing.
+        -:  664:    OptionalLessGreater,
+        -:  665:    /// {} brackets surrounding zero or more operands, or nothing.
+        -:  666:    OptionalBraces,
+        -:  667:  };
+        -:  668:
+        -:  669:  /// Parse a list of comma-separated items with an optional delimiter.  If a
+        -:  670:  /// delimiter is provided, then an empty list is allowed.  If not, then at
+        -:  671:  /// least one element will be parsed.
+        -:  672:  ///
+        -:  673:  /// contextMessage is an optional message appended to "expected '('" sorts of
+        -:  674:  /// diagnostics when parsing the delimeters.
+        -:  675:  virtual ParseResult
+        -:  676:  parseCommaSeparatedList(Delimiter delimiter,
+        -:  677:                          function_ref<ParseResult()> parseElementFn,
+        -:  678:                          StringRef contextMessage = StringRef()) = 0;
+        -:  679:
+        -:  680:  /// Parse a comma separated list of elements that must have at least one entry
+        -:  681:  /// in it.
+        -:  682:  ParseResult
+        -:  683:  parseCommaSeparatedList(function_ref<ParseResult()> parseElementFn) {
+        -:  684:    return parseCommaSeparatedList(Delimiter::None, parseElementFn);
+        -:  685:  }
+        -:  686:
+        -:  687:  //===--------------------------------------------------------------------===//
+        -:  688:  // Keyword Parsing
+        -:  689:  //===--------------------------------------------------------------------===//
+        -:  690:
+        -:  691:  /// This class represents a StringSwitch like class that is useful for parsing
+        -:  692:  /// expected keywords. On construction, it invokes `parseKeyword` and
+        -:  693:  /// processes each of the provided cases statements until a match is hit. The
+        -:  694:  /// provided `ResultT` must be assignable from `failure()`.
+        -:  695:  template <typename ResultT = ParseResult>
+        -:  696:  class KeywordSwitch {
+        -:  697:  public:
+        -:  698:    KeywordSwitch(AsmParser &parser)
+        -:  699:        : parser(parser), loc(parser.getCurrentLocation()) {
+        -:  700:      if (failed(parser.parseKeywordOrCompletion(&keyword)))
+        -:  701:        result = failure();
+        -:  702:    }
+        -:  703:
+        -:  704:    /// Case that uses the provided value when true.
+        -:  705:    KeywordSwitch &Case(StringLiteral str, ResultT value) {
+        -:  706:      return Case(str, [&](StringRef, SMLoc) { return std::move(value); });
+        -:  707:    }
+        -:  708:    KeywordSwitch &Default(ResultT value) {
+        -:  709:      return Default([&](StringRef, SMLoc) { return std::move(value); });
+        -:  710:    }
+        -:  711:    /// Case that invokes the provided functor when true. The parameters passed
+        -:  712:    /// to the functor are the keyword, and the location of the keyword (in case
+        -:  713:    /// any errors need to be emitted).
+        -:  714:    template <typename FnT>
+        -:  715:    std::enable_if_t<!std::is_convertible<FnT, ResultT>::value, KeywordSwitch &>
+        -:  716:    Case(StringLiteral str, FnT &&fn) {
+        -:  717:      if (result)
+        -:  718:        return *this;
+        -:  719:
+        -:  720:      // If the word was empty, record this as a completion.
+        -:  721:      if (keyword.empty())
+        -:  722:        parser.codeCompleteExpectedTokens(str);
+        -:  723:      else if (keyword == str)
+        -:  724:        result.emplace(std::move(fn(keyword, loc)));
+        -:  725:      return *this;
+        -:  726:    }
+        -:  727:    template <typename FnT>
+        -:  728:    std::enable_if_t<!std::is_convertible<FnT, ResultT>::value, KeywordSwitch &>
+        -:  729:    Default(FnT &&fn) {
+        -:  730:      if (!result)
+        -:  731:        result.emplace(fn(keyword, loc));
+        -:  732:      return *this;
+        -:  733:    }
+        -:  734:
+        -:  735:    /// Returns true if this switch has a value yet.
+        -:  736:    bool hasValue() const { return result.has_value(); }
+        -:  737:
+        -:  738:    /// Return the result of the switch.
+        -:  739:    [[nodiscard]] operator ResultT() {
+        -:  740:      if (!result)
+        -:  741:        return parser.emitError(loc, "unexpected keyword: ") << keyword;
+        -:  742:      return std::move(*result);
+        -:  743:    }
+        -:  744:
+        -:  745:  private:
+        -:  746:    /// The parser used to construct this switch.
+        -:  747:    AsmParser &parser;
+        -:  748:
+        -:  749:    /// The location of the keyword, used to emit errors as necessary.
+        -:  750:    SMLoc loc;
+        -:  751:
+        -:  752:    /// The parsed keyword itself.
+        -:  753:    StringRef keyword;
+        -:  754:
+        -:  755:    /// The result of the switch statement or none if currently unknown.
+        -:  756:    Optional<ResultT> result;
+        -:  757:  };
+        -:  758:
+        -:  759:  /// Parse a given keyword.
+        -:  760:  ParseResult parseKeyword(StringRef keyword) {
+        -:  761:    return parseKeyword(keyword, "");
+        -:  762:  }
+        -:  763:  virtual ParseResult parseKeyword(StringRef keyword, const Twine &msg) = 0;
+        -:  764:
+        -:  765:  /// Parse a keyword into 'keyword'.
+        -:  766:  ParseResult parseKeyword(StringRef *keyword) {
+        -:  767:    auto loc = getCurrentLocation();
+        -:  768:    if (parseOptionalKeyword(keyword))
+        -:  769:      return emitError(loc, "expected valid keyword");
+        -:  770:    return success();
+        -:  771:  }
+        -:  772:
+        -:  773:  /// Parse the given keyword if present.
+        -:  774:  virtual ParseResult parseOptionalKeyword(StringRef keyword) = 0;
+        -:  775:
+        -:  776:  /// Parse a keyword, if present, into 'keyword'.
+        -:  777:  virtual ParseResult parseOptionalKeyword(StringRef *keyword) = 0;
+        -:  778:
+        -:  779:  /// Parse a keyword, if present, and if one of the 'allowedValues',
+        -:  780:  /// into 'keyword'
+        -:  781:  virtual ParseResult
+        -:  782:  parseOptionalKeyword(StringRef *keyword,
+        -:  783:                       ArrayRef<StringRef> allowedValues) = 0;
+        -:  784:
+        -:  785:  /// Parse a keyword or a quoted string.
+        -:  786:  ParseResult parseKeywordOrString(std::string *result) {
+        -:  787:    if (failed(parseOptionalKeywordOrString(result)))
+        -:  788:      return emitError(getCurrentLocation())
+        -:  789:             << "expected valid keyword or string";
+        -:  790:    return success();
+        -:  791:  }
+        -:  792:
+        -:  793:  /// Parse an optional keyword or string.
+        -:  794:  virtual ParseResult parseOptionalKeywordOrString(std::string *result) = 0;
+        -:  795:
+        -:  796:  //===--------------------------------------------------------------------===//
+        -:  797:  // Attribute/Type Parsing
+        -:  798:  //===--------------------------------------------------------------------===//
+        -:  799:
+        -:  800:  /// Invoke the `getChecked` method of the given Attribute or Type class, using
+        -:  801:  /// the provided location to emit errors in the case of failure. Note that
+        -:  802:  /// unlike `OpBuilder::getType`, this method does not implicitly insert a
+        -:  803:  /// context parameter.
+        -:  804:  template <typename T, typename... ParamsT>
+        -:  805:  auto getChecked(SMLoc loc, ParamsT &&...params) {
+        -:  806:    return T::getChecked([&] { return emitError(loc); },
+        -:  807:                         std::forward<ParamsT>(params)...);
+        -:  808:  }
+        -:  809:  /// A variant of `getChecked` that uses the result of `getNameLoc` to emit
+        -:  810:  /// errors.
+        -:  811:  template <typename T, typename... ParamsT>
+        -:  812:  auto getChecked(ParamsT &&...params) {
+        -:  813:    return T::getChecked([&] { return emitError(getNameLoc()); },
+        -:  814:                         std::forward<ParamsT>(params)...);
+        -:  815:  }
+        -:  816:
+        -:  817:  //===--------------------------------------------------------------------===//
+        -:  818:  // Attribute Parsing
+        -:  819:  //===--------------------------------------------------------------------===//
+        -:  820:
+        -:  821:  /// Parse an arbitrary attribute of a given type and return it in result.
+        -:  822:  virtual ParseResult parseAttribute(Attribute &result, Type type = {}) = 0;
+        -:  823:
+        -:  824:  /// Parse a custom attribute with the provided callback, unless the next
+        -:  825:  /// token is `#`, in which case the generic parser is invoked.
+        -:  826:  virtual ParseResult parseCustomAttributeWithFallback(
+        -:  827:      Attribute &result, Type type,
+        -:  828:      function_ref<ParseResult(Attribute &result, Type type)>
+        -:  829:          parseAttribute) = 0;
+        -:  830:
+        -:  831:  /// Parse an attribute of a specific kind and type.
+        -:  832:  template <typename AttrType>
+function _ZN4mlir9AsmParser14parseAttributeINS_11IntegerAttrEEENS_11ParseResultERT_NS_4TypeE called 0 returned 0% blocks executed 0%
+    #####:  833:  ParseResult parseAttribute(AttrType &result, Type type = {}) {
+    #####:  834:    SMLoc loc = getCurrentLocation();
+call    0 never executed
+        -:  835:
+        -:  836:    // Parse any kind of attribute.
+    #####:  837:    Attribute attr;
+    #####:  838:    if (parseAttribute(attr, type))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  839:      return failure();
+        -:  840:
+        -:  841:    // Check for the right kind of attribute.
+    #####:  842:    if (!(result = attr.dyn_cast<AttrType>()))
+branch  0 never executed
+branch  1 never executed
+    #####:  843:      return emitError(loc, "invalid kind of attribute specified");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  844:
+    #####:  845:    return success();
+        -:  846:  }
+        -:  847:
+        -:  848:  /// Parse an arbitrary attribute and return it in result.  This also adds the
+        -:  849:  /// attribute to the specified attribute list with the specified name.
+        -:  850:  ParseResult parseAttribute(Attribute &result, StringRef attrName,
+        -:  851:                             NamedAttrList &attrs) {
+        -:  852:    return parseAttribute(result, Type(), attrName, attrs);
+        -:  853:  }
+        -:  854:
+        -:  855:  /// Parse an attribute of a specific kind and type.
+        -:  856:  template <typename AttrType>
+        -:  857:  ParseResult parseAttribute(AttrType &result, StringRef attrName,
+        -:  858:                             NamedAttrList &attrs) {
+        -:  859:    return parseAttribute(result, Type(), attrName, attrs);
+        -:  860:  }
+        -:  861:
+        -:  862:  /// Parse an arbitrary attribute of a given type and populate it in `result`.
+        -:  863:  /// This also adds the attribute to the specified attribute list with the
+        -:  864:  /// specified name.
+        -:  865:  template <typename AttrType>
+        -:  866:  ParseResult parseAttribute(AttrType &result, Type type, StringRef attrName,
+        -:  867:                             NamedAttrList &attrs) {
+        -:  868:    SMLoc loc = getCurrentLocation();
+        -:  869:
+        -:  870:    // Parse any kind of attribute.
+        -:  871:    Attribute attr;
+        -:  872:    if (parseAttribute(attr, type))
+        -:  873:      return failure();
+        -:  874:
+        -:  875:    // Check for the right kind of attribute.
+        -:  876:    result = attr.dyn_cast<AttrType>();
+        -:  877:    if (!result)
+        -:  878:      return emitError(loc, "invalid kind of attribute specified");
+        -:  879:
+        -:  880:    attrs.append(attrName, result);
+        -:  881:    return success();
+        -:  882:  }
+        -:  883:
+        -:  884:  /// Trait to check if `AttrType` provides a `parse` method.
+        -:  885:  template <typename AttrType>
+        -:  886:  using has_parse_method = decltype(AttrType::parse(std::declval<AsmParser &>(),
+        -:  887:                                                    std::declval<Type>()));
+        -:  888:  template <typename AttrType>
+        -:  889:  using detect_has_parse_method = llvm::is_detected<has_parse_method, AttrType>;
+        -:  890:
+        -:  891:  /// Parse a custom attribute of a given type unless the next token is `#`, in
+        -:  892:  /// which case the generic parser is invoked. The parsed attribute is
+        -:  893:  /// populated in `result` and also added to the specified attribute list with
+        -:  894:  /// the specified name.
+        -:  895:  template <typename AttrType>
+        -:  896:  std::enable_if_t<detect_has_parse_method<AttrType>::value, ParseResult>
+        -:  897:  parseCustomAttributeWithFallback(AttrType &result, Type type,
+        -:  898:                                   StringRef attrName, NamedAttrList &attrs) {
+        -:  899:    SMLoc loc = getCurrentLocation();
+        -:  900:
+        -:  901:    // Parse any kind of attribute.
+        -:  902:    Attribute attr;
+        -:  903:    if (parseCustomAttributeWithFallback(
+        -:  904:            attr, type, [&](Attribute &result, Type type) -> ParseResult {
+        -:  905:              result = AttrType::parse(*this, type);
+        -:  906:              if (!result)
+        -:  907:                return failure();
+        -:  908:              return success();
+        -:  909:            }))
+        -:  910:      return failure();
+        -:  911:
+        -:  912:    // Check for the right kind of attribute.
+        -:  913:    result = attr.dyn_cast<AttrType>();
+        -:  914:    if (!result)
+        -:  915:      return emitError(loc, "invalid kind of attribute specified");
+        -:  916:
+        -:  917:    attrs.append(attrName, result);
+        -:  918:    return success();
+        -:  919:  }
+        -:  920:
+        -:  921:  /// SFINAE parsing method for Attribute that don't implement a parse method.
+        -:  922:  template <typename AttrType>
+        -:  923:  std::enable_if_t<!detect_has_parse_method<AttrType>::value, ParseResult>
+        -:  924:  parseCustomAttributeWithFallback(AttrType &result, Type type,
+        -:  925:                                   StringRef attrName, NamedAttrList &attrs) {
+        -:  926:    return parseAttribute(result, type, attrName, attrs);
+        -:  927:  }
+        -:  928:
+        -:  929:  /// Parse a custom attribute of a given type unless the next token is `#`, in
+        -:  930:  /// which case the generic parser is invoked. The parsed attribute is
+        -:  931:  /// populated in `result`.
+        -:  932:  template <typename AttrType>
+        -:  933:  std::enable_if_t<detect_has_parse_method<AttrType>::value, ParseResult>
+        -:  934:  parseCustomAttributeWithFallback(AttrType &result) {
+        -:  935:    SMLoc loc = getCurrentLocation();
+        -:  936:
+        -:  937:    // Parse any kind of attribute.
+        -:  938:    Attribute attr;
+        -:  939:    if (parseCustomAttributeWithFallback(
+        -:  940:            attr, {}, [&](Attribute &result, Type type) -> ParseResult {
+        -:  941:              result = AttrType::parse(*this, type);
+        -:  942:              return success(!!result);
+        -:  943:            }))
+        -:  944:      return failure();
+        -:  945:
+        -:  946:    // Check for the right kind of attribute.
+        -:  947:    result = attr.dyn_cast<AttrType>();
+        -:  948:    if (!result)
+        -:  949:      return emitError(loc, "invalid kind of attribute specified");
+        -:  950:    return success();
+        -:  951:  }
+        -:  952:
+        -:  953:  /// SFINAE parsing method for Attribute that don't implement a parse method.
+        -:  954:  template <typename AttrType>
+        -:  955:  std::enable_if_t<!detect_has_parse_method<AttrType>::value, ParseResult>
+        -:  956:  parseCustomAttributeWithFallback(AttrType &result) {
+        -:  957:    return parseAttribute(result);
+        -:  958:  }
+        -:  959:
+        -:  960:  /// Parse an arbitrary optional attribute of a given type and return it in
+        -:  961:  /// result.
+        -:  962:  virtual OptionalParseResult parseOptionalAttribute(Attribute &result,
+        -:  963:                                                     Type type = {}) = 0;
+        -:  964:
+        -:  965:  /// Parse an optional array attribute and return it in result.
+        -:  966:  virtual OptionalParseResult parseOptionalAttribute(ArrayAttr &result,
+        -:  967:                                                     Type type = {}) = 0;
+        -:  968:
+        -:  969:  /// Parse an optional string attribute and return it in result.
+        -:  970:  virtual OptionalParseResult parseOptionalAttribute(StringAttr &result,
+        -:  971:                                                     Type type = {}) = 0;
+        -:  972:
+        -:  973:  /// Parse an optional attribute of a specific type and add it to the list with
+        -:  974:  /// the specified name.
+        -:  975:  template <typename AttrType>
+        -:  976:  OptionalParseResult parseOptionalAttribute(AttrType &result,
+        -:  977:                                             StringRef attrName,
+        -:  978:                                             NamedAttrList &attrs) {
+        -:  979:    return parseOptionalAttribute(result, Type(), attrName, attrs);
+        -:  980:  }
+        -:  981:
+        -:  982:  /// Parse an optional attribute of a specific type and add it to the list with
+        -:  983:  /// the specified name.
+        -:  984:  template <typename AttrType>
+        -:  985:  OptionalParseResult parseOptionalAttribute(AttrType &result, Type type,
+        -:  986:                                             StringRef attrName,
+        -:  987:                                             NamedAttrList &attrs) {
+        -:  988:    OptionalParseResult parseResult = parseOptionalAttribute(result, type);
+        -:  989:    if (parseResult.has_value() && succeeded(*parseResult))
+        -:  990:      attrs.append(attrName, result);
+        -:  991:    return parseResult;
+        -:  992:  }
+        -:  993:
+        -:  994:  /// Parse a named dictionary into 'result' if it is present.
+        -:  995:  virtual ParseResult parseOptionalAttrDict(NamedAttrList &result) = 0;
+        -:  996:
+        -:  997:  /// Parse a named dictionary into 'result' if the `attributes` keyword is
+        -:  998:  /// present.
+        -:  999:  virtual ParseResult
+        -: 1000:  parseOptionalAttrDictWithKeyword(NamedAttrList &result) = 0;
+        -: 1001:
+        -: 1002:  /// Parse an affine map instance into 'map'.
+        -: 1003:  virtual ParseResult parseAffineMap(AffineMap &map) = 0;
+        -: 1004:
+        -: 1005:  /// Parse an integer set instance into 'set'.
+        -: 1006:  virtual ParseResult printIntegerSet(IntegerSet &set) = 0;
+        -: 1007:
+        -: 1008:  //===--------------------------------------------------------------------===//
+        -: 1009:  // Identifier Parsing
+        -: 1010:  //===--------------------------------------------------------------------===//
+        -: 1011:
+        -: 1012:  /// Parse an @-identifier and store it (without the '@' symbol) in a string
+        -: 1013:  /// attribute.
+        -: 1014:  ParseResult parseSymbolName(StringAttr &result) {
+        -: 1015:    if (failed(parseOptionalSymbolName(result)))
+        -: 1016:      return emitError(getCurrentLocation())
+        -: 1017:             << "expected valid '@'-identifier for symbol name";
+        -: 1018:    return success();
+        -: 1019:  }
+        -: 1020:
+        -: 1021:  /// Parse an @-identifier and store it (without the '@' symbol) in a string
+        -: 1022:  /// attribute named 'attrName'.
+        -: 1023:  ParseResult parseSymbolName(StringAttr &result, StringRef attrName,
+        -: 1024:                              NamedAttrList &attrs) {
+        -: 1025:    if (parseSymbolName(result))
+        -: 1026:      return failure();
+        -: 1027:    attrs.append(attrName, result);
+        -: 1028:    return success();
+        -: 1029:  }
+        -: 1030:
+        -: 1031:  /// Parse an optional @-identifier and store it (without the '@' symbol) in a
+        -: 1032:  /// string attribute.
+        -: 1033:  virtual ParseResult parseOptionalSymbolName(StringAttr &result) = 0;
+        -: 1034:
+        -: 1035:  /// Parse an optional @-identifier and store it (without the '@' symbol) in a
+        -: 1036:  /// string attribute named 'attrName'.
+        -: 1037:  ParseResult parseOptionalSymbolName(StringAttr &result, StringRef attrName,
+        -: 1038:                                      NamedAttrList &attrs) {
+        -: 1039:    if (succeeded(parseOptionalSymbolName(result))) {
+        -: 1040:      attrs.append(attrName, result);
+        -: 1041:      return success();
+        -: 1042:    }
+        -: 1043:    return failure();
+        -: 1044:  }
+        -: 1045:
+        -: 1046:  //===--------------------------------------------------------------------===//
+        -: 1047:  // Resource Parsing
+        -: 1048:  //===--------------------------------------------------------------------===//
+        -: 1049:
+        -: 1050:  /// Parse a handle to a resource within the assembly format.
+        -: 1051:  template <typename ResourceT>
+        -: 1052:  FailureOr<ResourceT> parseResourceHandle() {
+        -: 1053:    SMLoc handleLoc = getCurrentLocation();
+        -: 1054:
+        -: 1055:    // Try to load the dialect that owns the handle.
+        -: 1056:    auto *dialect =
+        -: 1057:        getContext()->getOrLoadDialect<typename ResourceT::Dialect>();
+        -: 1058:    if (!dialect) {
+        -: 1059:      return emitError(handleLoc)
+        -: 1060:             << "dialect '" << ResourceT::Dialect::getDialectNamespace()
+        -: 1061:             << "' is unknown";
+        -: 1062:    }
+        -: 1063:
+        -: 1064:    FailureOr<AsmDialectResourceHandle> handle = parseResourceHandle(dialect);
+        -: 1065:    if (failed(handle))
+        -: 1066:      return failure();
+        -: 1067:    if (auto *result = dyn_cast<ResourceT>(&*handle))
+        -: 1068:      return std::move(*result);
+        -: 1069:    return emitError(handleLoc) << "provided resource handle differs from the "
+        -: 1070:                                   "expected resource type";
+        -: 1071:  }
+        -: 1072:
+        -: 1073:  //===--------------------------------------------------------------------===//
+        -: 1074:  // Type Parsing
+        -: 1075:  //===--------------------------------------------------------------------===//
+        -: 1076:
+        -: 1077:  /// Parse a type.
+        -: 1078:  virtual ParseResult parseType(Type &result) = 0;
+        -: 1079:
+        -: 1080:  /// Parse a custom type with the provided callback, unless the next
+        -: 1081:  /// token is `#`, in which case the generic parser is invoked.
+        -: 1082:  virtual ParseResult parseCustomTypeWithFallback(
+        -: 1083:      Type &result, function_ref<ParseResult(Type &result)> parseType) = 0;
+        -: 1084:
+        -: 1085:  /// Parse an optional type.
+        -: 1086:  virtual OptionalParseResult parseOptionalType(Type &result) = 0;
+        -: 1087:
+        -: 1088:  /// Parse a type of a specific type.
+        -: 1089:  template <typename TypeT>
+        -: 1090:  ParseResult parseType(TypeT &result) {
+        -: 1091:    SMLoc loc = getCurrentLocation();
+        -: 1092:
+        -: 1093:    // Parse any kind of type.
+        -: 1094:    Type type;
+        -: 1095:    if (parseType(type))
+        -: 1096:      return failure();
+        -: 1097:
+        -: 1098:    // Check for the right kind of type.
+        -: 1099:    result = type.dyn_cast<TypeT>();
+        -: 1100:    if (!result)
+        -: 1101:      return emitError(loc, "invalid kind of type specified");
+        -: 1102:
+        -: 1103:    return success();
+        -: 1104:  }
+        -: 1105:
+        -: 1106:  /// Trait to check if `TypeT` provides a `parse` method.
+        -: 1107:  template <typename TypeT>
+        -: 1108:  using type_has_parse_method =
+        -: 1109:      decltype(TypeT::parse(std::declval<AsmParser &>()));
+        -: 1110:  template <typename TypeT>
+        -: 1111:  using detect_type_has_parse_method =
+        -: 1112:      llvm::is_detected<type_has_parse_method, TypeT>;
+        -: 1113:
+        -: 1114:  /// Parse a custom Type of a given type unless the next token is `#`, in
+        -: 1115:  /// which case the generic parser is invoked. The parsed Type is
+        -: 1116:  /// populated in `result`.
+        -: 1117:  template <typename TypeT>
+        -: 1118:  std::enable_if_t<detect_type_has_parse_method<TypeT>::value, ParseResult>
+        -: 1119:  parseCustomTypeWithFallback(TypeT &result) {
+        -: 1120:    SMLoc loc = getCurrentLocation();
+        -: 1121:
+        -: 1122:    // Parse any kind of Type.
+        -: 1123:    Type type;
+        -: 1124:    if (parseCustomTypeWithFallback(type, [&](Type &result) -> ParseResult {
+        -: 1125:          result = TypeT::parse(*this);
+        -: 1126:          return success(!!result);
+        -: 1127:        }))
+        -: 1128:      return failure();
+        -: 1129:
+        -: 1130:    // Check for the right kind of Type.
+        -: 1131:    result = type.dyn_cast<TypeT>();
+        -: 1132:    if (!result)
+        -: 1133:      return emitError(loc, "invalid kind of Type specified");
+        -: 1134:    return success();
+        -: 1135:  }
+        -: 1136:
+        -: 1137:  /// SFINAE parsing method for Type that don't implement a parse method.
+        -: 1138:  template <typename TypeT>
+        -: 1139:  std::enable_if_t<!detect_type_has_parse_method<TypeT>::value, ParseResult>
+        -: 1140:  parseCustomTypeWithFallback(TypeT &result) {
+        -: 1141:    return parseType(result);
+        -: 1142:  }
+        -: 1143:
+        -: 1144:  /// Parse a type list.
+        -: 1145:  ParseResult parseTypeList(SmallVectorImpl<Type> &result) {
+        -: 1146:    return parseCommaSeparatedList(
+        -: 1147:        [&]() { return parseType(result.emplace_back()); });
+        -: 1148:  }
+        -: 1149:
+        -: 1150:  /// Parse an arrow followed by a type list.
+        -: 1151:  virtual ParseResult parseArrowTypeList(SmallVectorImpl<Type> &result) = 0;
+        -: 1152:
+        -: 1153:  /// Parse an optional arrow followed by a type list.
+        -: 1154:  virtual ParseResult
+        -: 1155:  parseOptionalArrowTypeList(SmallVectorImpl<Type> &result) = 0;
+        -: 1156:
+        -: 1157:  /// Parse a colon followed by a type.
+        -: 1158:  virtual ParseResult parseColonType(Type &result) = 0;
+        -: 1159:
+        -: 1160:  /// Parse a colon followed by a type of a specific kind, e.g. a FunctionType.
+        -: 1161:  template <typename TypeType>
+        -: 1162:  ParseResult parseColonType(TypeType &result) {
+        -: 1163:    SMLoc loc = getCurrentLocation();
+        -: 1164:
+        -: 1165:    // Parse any kind of type.
+        -: 1166:    Type type;
+        -: 1167:    if (parseColonType(type))
+        -: 1168:      return failure();
+        -: 1169:
+        -: 1170:    // Check for the right kind of type.
+        -: 1171:    result = type.dyn_cast<TypeType>();
+        -: 1172:    if (!result)
+        -: 1173:      return emitError(loc, "invalid kind of type specified");
+        -: 1174:
+        -: 1175:    return success();
+        -: 1176:  }
+        -: 1177:
+        -: 1178:  /// Parse a colon followed by a type list, which must have at least one type.
+        -: 1179:  virtual ParseResult parseColonTypeList(SmallVectorImpl<Type> &result) = 0;
+        -: 1180:
+        -: 1181:  /// Parse an optional colon followed by a type list, which if present must
+        -: 1182:  /// have at least one type.
+        -: 1183:  virtual ParseResult
+        -: 1184:  parseOptionalColonTypeList(SmallVectorImpl<Type> &result) = 0;
+        -: 1185:
+        -: 1186:  /// Parse a keyword followed by a type.
+        -: 1187:  ParseResult parseKeywordType(const char *keyword, Type &result) {
+        -: 1188:    return failure(parseKeyword(keyword) || parseType(result));
+        -: 1189:  }
+        -: 1190:
+        -: 1191:  /// Add the specified type to the end of the specified type list and return
+        -: 1192:  /// success.  This is a helper designed to allow parse methods to be simple
+        -: 1193:  /// and chain through || operators.
+        -: 1194:  ParseResult addTypeToList(Type type, SmallVectorImpl<Type> &result) {
+        -: 1195:    result.push_back(type);
+        -: 1196:    return success();
+        -: 1197:  }
+        -: 1198:
+        -: 1199:  /// Add the specified types to the end of the specified type list and return
+        -: 1200:  /// success.  This is a helper designed to allow parse methods to be simple
+        -: 1201:  /// and chain through || operators.
+        -: 1202:  ParseResult addTypesToList(ArrayRef<Type> types,
+        -: 1203:                             SmallVectorImpl<Type> &result) {
+        -: 1204:    result.append(types.begin(), types.end());
+        -: 1205:    return success();
+        -: 1206:  }
+        -: 1207:
+        -: 1208:  /// Parse a dimension list of a tensor or memref type.  This populates the
+        -: 1209:  /// dimension list, using -1 for the `?` dimensions if `allowDynamic` is set
+        -: 1210:  /// and errors out on `?` otherwise. Parsing the trailing `x` is configurable.
+        -: 1211:  ///
+        -: 1212:  ///   dimension-list ::= eps | dimension (`x` dimension)*
+        -: 1213:  ///   dimension-list-with-trailing-x ::= (dimension `x`)*
+        -: 1214:  ///   dimension ::= `?` | decimal-literal
+        -: 1215:  ///
+        -: 1216:  /// When `allowDynamic` is not set, this is used to parse:
+        -: 1217:  ///
+        -: 1218:  ///   static-dimension-list ::= eps | decimal-literal (`x` decimal-literal)*
+        -: 1219:  ///   static-dimension-list-with-trailing-x ::= (dimension `x`)*
+        -: 1220:  virtual ParseResult parseDimensionList(SmallVectorImpl<int64_t> &dimensions,
+        -: 1221:                                         bool allowDynamic = true,
+        -: 1222:                                         bool withTrailingX = true) = 0;
+        -: 1223:
+        -: 1224:  /// Parse an 'x' token in a dimension list, handling the case where the x is
+        -: 1225:  /// juxtaposed with an element type, as in "xf32", leaving the "f32" as the
+        -: 1226:  /// next token.
+        -: 1227:  virtual ParseResult parseXInDimensionList() = 0;
+        -: 1228:
+        -: 1229:protected:
+        -: 1230:  /// Parse a handle to a resource within the assembly format for the given
+        -: 1231:  /// dialect.
+        -: 1232:  virtual FailureOr<AsmDialectResourceHandle>
+        -: 1233:  parseResourceHandle(Dialect *dialect) = 0;
+        -: 1234:
+        -: 1235:  //===--------------------------------------------------------------------===//
+        -: 1236:  // Code Completion
+        -: 1237:  //===--------------------------------------------------------------------===//
+        -: 1238:
+        -: 1239:  /// Parse a keyword, or an empty string if the current location signals a code
+        -: 1240:  /// completion.
+        -: 1241:  virtual ParseResult parseKeywordOrCompletion(StringRef *keyword) = 0;
+        -: 1242:
+        -: 1243:  /// Signal the code completion of a set of expected tokens.
+        -: 1244:  virtual void codeCompleteExpectedTokens(ArrayRef<StringRef> tokens) = 0;
+        -: 1245:
+        -: 1246:private:
+        -: 1247:  AsmParser(const AsmParser &) = delete;
+        -: 1248:  void operator=(const AsmParser &) = delete;
+        -: 1249:};
+        -: 1250:
+        -: 1251://===----------------------------------------------------------------------===//
+        -: 1252:// OpAsmParser
+        -: 1253://===----------------------------------------------------------------------===//
+        -: 1254:
+        -: 1255:/// The OpAsmParser has methods for interacting with the asm parser: parsing
+        -: 1256:/// things from it, emitting errors etc.  It has an intentionally high-level API
+        -: 1257:/// that is designed to reduce/constrain syntax innovation in individual
+        -: 1258:/// operations.
+        -: 1259:///
+        -: 1260:/// For example, consider an op like this:
+        -: 1261:///
+        -: 1262:///    %x = load %p[%1, %2] : memref<...>
+        -: 1263:///
+        -: 1264:/// The "%x = load" tokens are already parsed and therefore invisible to the
+        -: 1265:/// custom op parser.  This can be supported by calling `parseOperandList` to
+        -: 1266:/// parse the %p, then calling `parseOperandList` with a `SquareDelimiter` to
+        -: 1267:/// parse the indices, then calling `parseColonTypeList` to parse the result
+        -: 1268:/// type.
+        -: 1269:///
+        -: 1270:class OpAsmParser : public AsmParser {
+        -: 1271:public:
+        -: 1272:  using AsmParser::AsmParser;
+        -: 1273:  ~OpAsmParser() override;
+        -: 1274:
+        -: 1275:  /// Parse a loc(...) specifier if present, filling in result if so.
+        -: 1276:  /// Location for BlockArgument and Operation may be deferred with an alias, in
+        -: 1277:  /// which case an OpaqueLoc is set and will be resolved when parsing
+        -: 1278:  /// completes.
+        -: 1279:  virtual ParseResult
+        -: 1280:  parseOptionalLocationSpecifier(Optional<Location> &result) = 0;
+        -: 1281:
+        -: 1282:  /// Return the name of the specified result in the specified syntax, as well
+        -: 1283:  /// as the sub-element in the name.  It returns an empty string and ~0U for
+        -: 1284:  /// invalid result numbers.  For example, in this operation:
+        -: 1285:  ///
+        -: 1286:  ///  %x, %y:2, %z = foo.op
+        -: 1287:  ///
+        -: 1288:  ///    getResultName(0) == {"x", 0 }
+        -: 1289:  ///    getResultName(1) == {"y", 0 }
+        -: 1290:  ///    getResultName(2) == {"y", 1 }
+        -: 1291:  ///    getResultName(3) == {"z", 0 }
+        -: 1292:  ///    getResultName(4) == {"", ~0U }
+        -: 1293:  virtual std::pair<StringRef, unsigned>
+        -: 1294:  getResultName(unsigned resultNo) const = 0;
+        -: 1295:
+        -: 1296:  /// Return the number of declared SSA results.  This returns 4 for the foo.op
+        -: 1297:  /// example in the comment for `getResultName`.
+        -: 1298:  virtual size_t getNumResults() const = 0;
+        -: 1299:
+        -: 1300:  // These methods emit an error and return failure or success. This allows
+        -: 1301:  // these to be chained together into a linear sequence of || expressions in
+        -: 1302:  // many cases.
+        -: 1303:
+        -: 1304:  /// Parse an operation in its generic form.
+        -: 1305:  /// The parsed operation is parsed in the current context and inserted in the
+        -: 1306:  /// provided block and insertion point. The results produced by this operation
+        -: 1307:  /// aren't mapped to any named value in the parser. Returns nullptr on
+        -: 1308:  /// failure.
+        -: 1309:  virtual Operation *parseGenericOperation(Block *insertBlock,
+        -: 1310:                                           Block::iterator insertPt) = 0;
+        -: 1311:
+        -: 1312:  /// Parse the name of an operation, in the custom form. On success, return a
+        -: 1313:  /// an object of type 'OperationName'. Otherwise, failure is returned.
+        -: 1314:  virtual FailureOr<OperationName> parseCustomOperationName() = 0;
+        -: 1315:
+        -: 1316:  //===--------------------------------------------------------------------===//
+        -: 1317:  // Operand Parsing
+        -: 1318:  //===--------------------------------------------------------------------===//
+        -: 1319:
+        -: 1320:  /// This is the representation of an operand reference.
+    #####: 1321:  struct UnresolvedOperand {
+call    0 never executed
+        -: 1322:    SMLoc location;  // Location of the token.
+        -: 1323:    StringRef name;  // Value name, e.g. %42 or %abc
+        -: 1324:    unsigned number; // Number, e.g. 12 for an operand like %xyz#12
+        -: 1325:  };
+        -: 1326:
+        -: 1327:  /// Parse different components, viz., use-info of operand(s), successor(s),
+        -: 1328:  /// region(s), attribute(s) and function-type, of the generic form of an
+        -: 1329:  /// operation instance and populate the input operation-state 'result' with
+        -: 1330:  /// those components. If any of the components is explicitly provided, then
+        -: 1331:  /// skip parsing that component.
+        -: 1332:  virtual ParseResult parseGenericOperationAfterOpName(
+        -: 1333:      OperationState &result,
+        -: 1334:      Optional<ArrayRef<UnresolvedOperand>> parsedOperandType = llvm::None,
+        -: 1335:      Optional<ArrayRef<Block *>> parsedSuccessors = llvm::None,
+        -: 1336:      Optional<MutableArrayRef<std::unique_ptr<Region>>> parsedRegions =
+        -: 1337:          llvm::None,
+        -: 1338:      Optional<ArrayRef<NamedAttribute>> parsedAttributes = llvm::None,
+        -: 1339:      Optional<FunctionType> parsedFnType = llvm::None) = 0;
+        -: 1340:
+        -: 1341:  /// Parse a single SSA value operand name along with a result number if
+        -: 1342:  /// `allowResultNumber` is true.
+        -: 1343:  virtual ParseResult parseOperand(UnresolvedOperand &result,
+        -: 1344:                                   bool allowResultNumber = true) = 0;
+        -: 1345:
+        -: 1346:  /// Parse a single operand if present.
+        -: 1347:  virtual OptionalParseResult
+        -: 1348:  parseOptionalOperand(UnresolvedOperand &result,
+        -: 1349:                       bool allowResultNumber = true) = 0;
+        -: 1350:
+        -: 1351:  /// Parse zero or more SSA comma-separated operand references with a specified
+        -: 1352:  /// surrounding delimiter, and an optional required operand count.
+        -: 1353:  virtual ParseResult
+        -: 1354:  parseOperandList(SmallVectorImpl<UnresolvedOperand> &result,
+        -: 1355:                   Delimiter delimiter = Delimiter::None,
+        -: 1356:                   bool allowResultNumber = true,
+        -: 1357:                   int requiredOperandCount = -1) = 0;
+        -: 1358:
+        -: 1359:  /// Parse a specified number of comma separated operands.
+        -: 1360:  ParseResult parseOperandList(SmallVectorImpl<UnresolvedOperand> &result,
+        -: 1361:                               int requiredOperandCount,
+        -: 1362:                               Delimiter delimiter = Delimiter::None) {
+        -: 1363:    return parseOperandList(result, delimiter,
+        -: 1364:                            /*allowResultNumber=*/true, requiredOperandCount);
+        -: 1365:  }
+        -: 1366:
+        -: 1367:  /// Parse zero or more trailing SSA comma-separated trailing operand
+        -: 1368:  /// references with a specified surrounding delimiter, and an optional
+        -: 1369:  /// required operand count. A leading comma is expected before the
+        -: 1370:  /// operands.
+        -: 1371:  ParseResult
+        -: 1372:  parseTrailingOperandList(SmallVectorImpl<UnresolvedOperand> &result,
+        -: 1373:                           Delimiter delimiter = Delimiter::None) {
+        -: 1374:    if (failed(parseOptionalComma()))
+        -: 1375:      return success(); // The comma is optional.
+        -: 1376:    return parseOperandList(result, delimiter);
+        -: 1377:  }
+        -: 1378:
+        -: 1379:  /// Resolve an operand to an SSA value, emitting an error on failure.
+        -: 1380:  virtual ParseResult resolveOperand(const UnresolvedOperand &operand,
+        -: 1381:                                     Type type,
+        -: 1382:                                     SmallVectorImpl<Value> &result) = 0;
+        -: 1383:
+        -: 1384:  /// Resolve a list of operands to SSA values, emitting an error on failure, or
+        -: 1385:  /// appending the results to the list on success. This method should be used
+        -: 1386:  /// when all operands have the same type.
+        -: 1387:  template <typename Operands = ArrayRef<UnresolvedOperand>>
+        -: 1388:  ParseResult resolveOperands(Operands &&operands, Type type,
+        -: 1389:                              SmallVectorImpl<Value> &result) {
+        -: 1390:    for (const UnresolvedOperand &operand : operands)
+        -: 1391:      if (resolveOperand(operand, type, result))
+        -: 1392:        return failure();
+        -: 1393:    return success();
+        -: 1394:  }
+        -: 1395:  template <typename Operands = ArrayRef<UnresolvedOperand>>
+        -: 1396:  ParseResult resolveOperands(Operands &&operands, Type type, SMLoc loc,
+        -: 1397:                              SmallVectorImpl<Value> &result) {
+        -: 1398:    return resolveOperands(std::forward<Operands>(operands), type, result);
+        -: 1399:  }
+        -: 1400:
+        -: 1401:  /// Resolve a list of operands and a list of operand types to SSA values,
+        -: 1402:  /// emitting an error and returning failure, or appending the results
+        -: 1403:  /// to the list on success.
+        -: 1404:  template <typename Operands = ArrayRef<UnresolvedOperand>,
+        -: 1405:            typename Types = ArrayRef<Type>>
+        -: 1406:  std::enable_if_t<!std::is_convertible<Types, Type>::value, ParseResult>
+        -: 1407:  resolveOperands(Operands &&operands, Types &&types, SMLoc loc,
+        -: 1408:                  SmallVectorImpl<Value> &result) {
+        -: 1409:    size_t operandSize = std::distance(operands.begin(), operands.end());
+        -: 1410:    size_t typeSize = std::distance(types.begin(), types.end());
+        -: 1411:    if (operandSize != typeSize)
+        -: 1412:      return emitError(loc)
+        -: 1413:             << operandSize << " operands present, but expected " << typeSize;
+        -: 1414:
+        -: 1415:    for (auto [operand, type] : llvm::zip(operands, types))
+        -: 1416:      if (resolveOperand(operand, type, result))
+        -: 1417:        return failure();
+        -: 1418:    return success();
+        -: 1419:  }
+        -: 1420:
+        -: 1421:  /// Parses an affine map attribute where dims and symbols are SSA operands.
+        -: 1422:  /// Operand values must come from single-result sources, and be valid
+        -: 1423:  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+        -: 1424:  virtual ParseResult
+        -: 1425:  parseAffineMapOfSSAIds(SmallVectorImpl<UnresolvedOperand> &operands,
+        -: 1426:                         Attribute &map, StringRef attrName,
+        -: 1427:                         NamedAttrList &attrs,
+        -: 1428:                         Delimiter delimiter = Delimiter::Square) = 0;
+        -: 1429:
+        -: 1430:  /// Parses an affine expression where dims and symbols are SSA operands.
+        -: 1431:  /// Operand values must come from single-result sources, and be valid
+        -: 1432:  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+        -: 1433:  virtual ParseResult
+        -: 1434:  parseAffineExprOfSSAIds(SmallVectorImpl<UnresolvedOperand> &dimOperands,
+        -: 1435:                          SmallVectorImpl<UnresolvedOperand> &symbOperands,
+        -: 1436:                          AffineExpr &expr) = 0;
+        -: 1437:
+        -: 1438:  //===--------------------------------------------------------------------===//
+        -: 1439:  // Argument Parsing
+        -: 1440:  //===--------------------------------------------------------------------===//
+        -: 1441:
+        -: 1442:  struct Argument {
+        -: 1443:    UnresolvedOperand ssaName;    // SourceLoc, SSA name, result #.
+        -: 1444:    Type type;                    // Type.
+        -: 1445:    DictionaryAttr attrs;         // Attributes if present.
+        -: 1446:    Optional<Location> sourceLoc; // Source location specifier if present.
+        -: 1447:  };
+        -: 1448:
+        -: 1449:  /// Parse a single argument with the following syntax:
+        -: 1450:  ///
+        -: 1451:  ///   `%ssaName : !type { optionalAttrDict} loc(optionalSourceLoc)`
+        -: 1452:  ///
+        -: 1453:  /// If `allowType` is false or `allowAttrs` are false then the respective
+        -: 1454:  /// parts of the grammar are not parsed.
+        -: 1455:  virtual ParseResult parseArgument(Argument &result, bool allowType = false,
+        -: 1456:                                    bool allowAttrs = false) = 0;
+        -: 1457:
+        -: 1458:  /// Parse a single argument if present.
+        -: 1459:  virtual OptionalParseResult
+        -: 1460:  parseOptionalArgument(Argument &result, bool allowType = false,
+        -: 1461:                        bool allowAttrs = false) = 0;
+        -: 1462:
+        -: 1463:  /// Parse zero or more arguments with a specified surrounding delimiter.
+        -: 1464:  virtual ParseResult parseArgumentList(SmallVectorImpl<Argument> &result,
+        -: 1465:                                        Delimiter delimiter = Delimiter::None,
+        -: 1466:                                        bool allowType = false,
+        -: 1467:                                        bool allowAttrs = false) = 0;
+        -: 1468:
+        -: 1469:  //===--------------------------------------------------------------------===//
+        -: 1470:  // Region Parsing
+        -: 1471:  //===--------------------------------------------------------------------===//
+        -: 1472:
+        -: 1473:  /// Parses a region. Any parsed blocks are appended to 'region' and must be
+        -: 1474:  /// moved to the op regions after the op is created. The first block of the
+        -: 1475:  /// region takes 'arguments'.
+        -: 1476:  ///
+        -: 1477:  /// If 'enableNameShadowing' is set to true, the argument names are allowed to
+        -: 1478:  /// shadow the names of other existing SSA values defined above the region
+        -: 1479:  /// scope. 'enableNameShadowing' can only be set to true for regions attached
+        -: 1480:  /// to operations that are 'IsolatedFromAbove'.
+        -: 1481:  virtual ParseResult parseRegion(Region &region,
+        -: 1482:                                  ArrayRef<Argument> arguments = {},
+        -: 1483:                                  bool enableNameShadowing = false) = 0;
+        -: 1484:
+        -: 1485:  /// Parses a region if present.
+        -: 1486:  virtual OptionalParseResult
+        -: 1487:  parseOptionalRegion(Region &region, ArrayRef<Argument> arguments = {},
+        -: 1488:                      bool enableNameShadowing = false) = 0;
+        -: 1489:
+        -: 1490:  /// Parses a region if present. If the region is present, a new region is
+        -: 1491:  /// allocated and placed in `region`. If no region is present or on failure,
+        -: 1492:  /// `region` remains untouched.
+        -: 1493:  virtual OptionalParseResult
+        -: 1494:  parseOptionalRegion(std::unique_ptr<Region> &region,
+        -: 1495:                      ArrayRef<Argument> arguments = {},
+        -: 1496:                      bool enableNameShadowing = false) = 0;
+        -: 1497:
+        -: 1498:  //===--------------------------------------------------------------------===//
+        -: 1499:  // Successor Parsing
+        -: 1500:  //===--------------------------------------------------------------------===//
+        -: 1501:
+        -: 1502:  /// Parse a single operation successor.
+        -: 1503:  virtual ParseResult parseSuccessor(Block *&dest) = 0;
+        -: 1504:
+        -: 1505:  /// Parse an optional operation successor.
+        -: 1506:  virtual OptionalParseResult parseOptionalSuccessor(Block *&dest) = 0;
+        -: 1507:
+        -: 1508:  /// Parse a single operation successor and its operand list.
+        -: 1509:  virtual ParseResult
+        -: 1510:  parseSuccessorAndUseList(Block *&dest, SmallVectorImpl<Value> &operands) = 0;
+        -: 1511:
+        -: 1512:  //===--------------------------------------------------------------------===//
+        -: 1513:  // Type Parsing
+        -: 1514:  //===--------------------------------------------------------------------===//
+        -: 1515:
+        -: 1516:  /// Parse a list of assignments of the form
+        -: 1517:  ///   (%x1 = %y1, %x2 = %y2, ...)
+        -: 1518:  ParseResult parseAssignmentList(SmallVectorImpl<Argument> &lhs,
+        -: 1519:                                  SmallVectorImpl<UnresolvedOperand> &rhs) {
+        -: 1520:    OptionalParseResult result = parseOptionalAssignmentList(lhs, rhs);
+        -: 1521:    if (!result.has_value())
+        -: 1522:      return emitError(getCurrentLocation(), "expected '('");
+        -: 1523:    return result.value();
+        -: 1524:  }
+        -: 1525:
+        -: 1526:  virtual OptionalParseResult
+        -: 1527:  parseOptionalAssignmentList(SmallVectorImpl<Argument> &lhs,
+        -: 1528:                              SmallVectorImpl<UnresolvedOperand> &rhs) = 0;
+        -: 1529:};
+        -: 1530:
+        -: 1531://===--------------------------------------------------------------------===//
+        -: 1532:// Dialect OpAsm interface.
+        -: 1533://===--------------------------------------------------------------------===//
+        -: 1534:
+        -: 1535:/// A functor used to set the name of the start of a result group of an
+        -: 1536:/// operation. See 'getAsmResultNames' below for more details.
+        -: 1537:using OpAsmSetValueNameFn = function_ref<void(Value, StringRef)>;
+        -: 1538:
+        -: 1539:/// A functor used to set the name of blocks in regions directly nested under
+        -: 1540:/// an operation.
+        -: 1541:using OpAsmSetBlockNameFn = function_ref<void(Block *, StringRef)>;
+        -: 1542:
+        -: 1543:class OpAsmDialectInterface
+        -: 1544:    : public DialectInterface::Base<OpAsmDialectInterface> {
+        -: 1545:public:
+        -: 1546:  OpAsmDialectInterface(Dialect *dialect) : Base(dialect) {}
+        -: 1547:
+        -: 1548:  //===------------------------------------------------------------------===//
+        -: 1549:  // Aliases
+        -: 1550:  //===------------------------------------------------------------------===//
+        -: 1551:
+        -: 1552:  /// Holds the result of `getAlias` hook call.
+        -: 1553:  enum class AliasResult {
+        -: 1554:    /// The object (type or attribute) is not supported by the hook
+        -: 1555:    /// and an alias was not provided.
+        -: 1556:    NoAlias,
+        -: 1557:    /// An alias was provided, but it might be overriden by other hook.
+        -: 1558:    OverridableAlias,
+        -: 1559:    /// An alias was provided and it should be used
+        -: 1560:    /// (no other hooks will be checked).
+        -: 1561:    FinalAlias
+        -: 1562:  };
+        -: 1563:
+        -: 1564:  /// Hooks for getting an alias identifier alias for a given symbol, that is
+        -: 1565:  /// not necessarily a part of this dialect. The identifier is used in place of
+        -: 1566:  /// the symbol when printing textual IR. These aliases must not contain `.` or
+        -: 1567:  /// end with a numeric digit([0-9]+).
+        -: 1568:  virtual AliasResult getAlias(Attribute attr, raw_ostream &os) const {
+        -: 1569:    return AliasResult::NoAlias;
+        -: 1570:  }
+        -: 1571:  virtual AliasResult getAlias(Type type, raw_ostream &os) const {
+        -: 1572:    return AliasResult::NoAlias;
+        -: 1573:  }
+        -: 1574:
+        -: 1575:  //===--------------------------------------------------------------------===//
+        -: 1576:  // Resources
+        -: 1577:  //===--------------------------------------------------------------------===//
+        -: 1578:
+        -: 1579:  /// Declare a resource with the given key, returning a handle to use for any
+        -: 1580:  /// references of this resource key within the IR during parsing. The result
+        -: 1581:  /// of `getResourceKey` on the returned handle is permitted to be different
+        -: 1582:  /// than `key`.
+        -: 1583:  virtual FailureOr<AsmDialectResourceHandle>
+        -: 1584:  declareResource(StringRef key) const {
+        -: 1585:    return failure();
+        -: 1586:  }
+        -: 1587:
+        -: 1588:  /// Return a key to use for the given resource. This key should uniquely
+        -: 1589:  /// identify this resource within the dialect.
+        -: 1590:  virtual std::string
+        -: 1591:  getResourceKey(const AsmDialectResourceHandle &handle) const {
+        -: 1592:    llvm_unreachable(
+        -: 1593:        "Dialect must implement `getResourceKey` when defining resources");
+        -: 1594:  }
+        -: 1595:
+        -: 1596:  /// Hook for parsing resource entries. Returns failure if the entry was not
+        -: 1597:  /// valid, or could otherwise not be processed correctly. Any necessary errors
+        -: 1598:  /// can be emitted via the provided entry.
+        -: 1599:  virtual LogicalResult parseResource(AsmParsedResourceEntry &entry) const;
+        -: 1600:
+        -: 1601:  /// Hook for building resources to use during printing. The given `op` may be
+        -: 1602:  /// inspected to help determine what information to include.
+        -: 1603:  /// `referencedResources` contains all of the resources detected when printing
+        -: 1604:  /// 'op'.
+        -: 1605:  virtual void
+        -: 1606:  buildResources(Operation *op,
+        -: 1607:                 const SetVector<AsmDialectResourceHandle> &referencedResources,
+        -: 1608:                 AsmResourceBuilder &builder) const {}
+        -: 1609:};
+        -: 1610:} // namespace mlir
+        -: 1611:
+        -: 1612://===--------------------------------------------------------------------===//
+        -: 1613:// Operation OpAsm interface.
+        -: 1614://===--------------------------------------------------------------------===//
+        -: 1615:
+        -: 1616:/// The OpAsmOpInterface, see OpAsmInterface.td for more details.
+        -: 1617:#include "mlir/IR/OpAsmInterface.h.inc"
+        -: 1618:
+        -: 1619:namespace llvm {
+        -: 1620:template <>
+        -: 1621:struct DenseMapInfo<mlir::AsmDialectResourceHandle> {
+        -: 1622:  static inline mlir::AsmDialectResourceHandle getEmptyKey() {
+        -: 1623:    return {DenseMapInfo<void *>::getEmptyKey(),
+        -: 1624:            DenseMapInfo<mlir::TypeID>::getEmptyKey(), nullptr};
+        -: 1625:  }
+        -: 1626:  static inline mlir::AsmDialectResourceHandle getTombstoneKey() {
+        -: 1627:    return {DenseMapInfo<void *>::getTombstoneKey(),
+        -: 1628:            DenseMapInfo<mlir::TypeID>::getTombstoneKey(), nullptr};
+        -: 1629:  }
+        -: 1630:  static unsigned getHashValue(const mlir::AsmDialectResourceHandle &handle) {
+        -: 1631:    return DenseMapInfo<void *>::getHashValue(handle.getResource());
+        -: 1632:  }
+        -: 1633:  static bool isEqual(const mlir::AsmDialectResourceHandle &lhs,
+        -: 1634:                      const mlir::AsmDialectResourceHandle &rhs) {
+        -: 1635:    return lhs.getResource() == rhs.getResource();
+        -: 1636:  }
+        -: 1637:};
+        -: 1638:} // namespace llvm
+        -: 1639:
+        -: 1640:#endif

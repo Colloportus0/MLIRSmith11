@@ -1,0 +1,1114 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Transforms/Utils/GreedyPatternRewriteDriver.cpp
+        -:    0:Graph:../tools/mlir/lib/Transforms/Utils/CMakeFiles/obj.MLIRTransformUtils.dir/GreedyPatternRewriteDriver.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Transforms/Utils/CMakeFiles/obj.MLIRTransformUtils.dir/GreedyPatternRewriteDriver.cpp.gcda
+        -:    0:Runs:325564
+        -:    1://===- GreedyPatternRewriteDriver.cpp - A greedy rewriter -----------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements mlir::applyPatternsAndFoldGreedily.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   14:#include "mlir/IR/Matchers.h"
+        -:   15:#include "mlir/Interfaces/SideEffectInterfaces.h"
+        -:   16:#include "mlir/Rewrite/PatternApplicator.h"
+        -:   17:#include "mlir/Transforms/FoldUtils.h"
+        -:   18:#include "mlir/Transforms/RegionUtils.h"
+        -:   19:#include "llvm/ADT/DenseMap.h"
+        -:   20:#include "llvm/Support/CommandLine.h"
+        -:   21:#include "llvm/Support/Debug.h"
+        -:   22:#include "llvm/Support/ScopedPrinter.h"
+        -:   23:#include "llvm/Support/raw_ostream.h"
+        -:   24:
+        -:   25:using namespace mlir;
+        -:   26:
+        -:   27:#define DEBUG_TYPE "greedy-rewriter"
+        -:   28:
+        -:   29://===----------------------------------------------------------------------===//
+        -:   30:// GreedyPatternRewriteDriver
+        -:   31://===----------------------------------------------------------------------===//
+        -:   32:
+        -:   33:namespace {
+        -:   34:/// This is a worklist-driven driver for the PatternMatcher, which repeatedly
+        -:   35:/// applies the locally optimal patterns in a roughly "bottom up" way.
+        -:   36:class GreedyPatternRewriteDriver : public PatternRewriter {
+        -:   37:public:
+        -:   38:  explicit GreedyPatternRewriteDriver(MLIRContext *ctx,
+        -:   39:                                      const FrozenRewritePatternSet &patterns,
+        -:   40:                                      const GreedyRewriteConfig &config);
+        -:   41:
+        -:   42:  /// Simplify the operations within the given regions.
+        -:   43:  bool simplify(MutableArrayRef<Region> regions);
+        -:   44:
+        -:   45:  /// Add the given operation to the worklist.
+        -:   46:  virtual void addToWorklist(Operation *op);
+        -:   47:
+        -:   48:  /// Pop the next operation from the worklist.
+        -:   49:  Operation *popFromWorklist();
+        -:   50:
+        -:   51:  /// If the specified operation is in the worklist, remove it.
+        -:   52:  void removeFromWorklist(Operation *op);
+        -:   53:
+        -:   54:protected:
+        -:   55:  // Implement the hook for inserting operations, and make sure that newly
+        -:   56:  // inserted ops are added to the worklist for processing.
+        -:   57:  void notifyOperationInserted(Operation *op) override;
+        -:   58:
+        -:   59:  // Look over the provided operands for any defining operations that should
+        -:   60:  // be re-added to the worklist. This function should be called when an
+        -:   61:  // operation is modified or removed, as it may trigger further
+        -:   62:  // simplifications.
+        -:   63:  void addOperandsToWorklist(ValueRange operands);
+        -:   64:
+        -:   65:  // If an operation is about to be removed, make sure it is not in our
+        -:   66:  // worklist anymore because we'd get dangling references to it.
+        -:   67:  void notifyOperationRemoved(Operation *op) override;
+        -:   68:
+        -:   69:  // When the root of a pattern is about to be replaced, it can trigger
+        -:   70:  // simplifications to its users - make sure to add them to the worklist
+        -:   71:  // before the root is changed.
+        -:   72:  void notifyRootReplaced(Operation *op, ValueRange replacement) override;
+        -:   73:
+        -:   74:  /// PatternRewriter hook for erasing a dead operation.
+        -:   75:  void eraseOp(Operation *op) override;
+        -:   76:
+        -:   77:  /// PatternRewriter hook for notifying match failure reasons.
+        -:   78:  LogicalResult
+        -:   79:  notifyMatchFailure(Location loc,
+        -:   80:                     function_ref<void(Diagnostic &)> reasonCallback) override;
+        -:   81:
+        -:   82:  /// The low-level pattern applicator.
+        -:   83:  PatternApplicator matcher;
+        -:   84:
+        -:   85:  /// The worklist for this transformation keeps track of the operations that
+        -:   86:  /// need to be revisited, plus their index in the worklist.  This allows us to
+        -:   87:  /// efficiently remove operations from the worklist when they are erased, even
+        -:   88:  /// if they aren't the root of a pattern.
+        -:   89:  std::vector<Operation *> worklist;
+        -:   90:  DenseMap<Operation *, unsigned> worklistMap;
+        -:   91:
+        -:   92:  /// Non-pattern based folder for operations.
+        -:   93:  OperationFolder folder;
+        -:   94:
+        -:   95:private:
+        -:   96:  /// Configuration information for how to simplify.
+        -:   97:  GreedyRewriteConfig config;
+        -:   98:
+        -:   99:#ifndef NDEBUG
+        -:  100:  /// A logger used to emit information during the application process.
+        -:  101:  llvm::ScopedPrinter logger{llvm::dbgs()};
+        -:  102:#endif
+        -:  103:};
+        -:  104:} // namespace
+        -:  105:
+        -:  106:GreedyPatternRewriteDriver::GreedyPatternRewriteDriver(
+        -:  107:    MLIRContext *ctx, const FrozenRewritePatternSet &patterns,
+        -:  108:    const GreedyRewriteConfig &config)
+        -:  109:    : PatternRewriter(ctx), matcher(patterns), folder(ctx), config(config) {
+        -:  110:  worklist.reserve(64);
+        -:  111:
+        -:  112:  // Apply a simple cost model based solely on pattern benefit.
+        -:  113:  matcher.applyDefaultCostModel();
+        -:  114:}
+        -:  115:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEE called 60382 returned 100% blocks executed 54%
+    60382:  116:bool GreedyPatternRewriteDriver::simplify(MutableArrayRef<Region> regions) {
+        -:  117:#ifndef NDEBUG
+    60382:  118:  const char *logLineComment =
+        -:  119:      "//===-------------------------------------------===//\n";
+        -:  120:
+        -:  121:  /// A utility function to log a process result for the given reason.
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlNS1_9StringRefERKNS1_5TwineEE_clES6_S9_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  122:  auto logResult = [&](StringRef result, const llvm::Twine &msg = {}) {
+    #####:  123:    logger.unindent();
+branch  0 never executed
+branch  1 never executed
+    #####:  124:    logger.startLine() << "} -> " << result;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  125:    if (!msg.isTriviallyEmpty())
+branch  0 never executed
+branch  1 never executed
+    #####:  126:      logger.getOStream() << " : " << msg;
+call    0 never executed
+call    1 never executed
+    #####:  127:    logger.getOStream() << "\n";
+call    0 never executed
+   60382*:  128:  };
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlNS1_9StringRefERKNS1_5TwineEE0_clES6_S9_ called 0 returned 0% blocks executed 0%
+   60382*:  129:  auto logResultWithLine = [&](StringRef result, const llvm::Twine &msg = {}) {
+    #####:  130:    logResult(result, msg);
+call    0 never executed
+    #####:  131:    logger.startLine() << logLineComment;
+call    0 never executed
+call    1 never executed
+   60382*:  132:  };
+        -:  133:#endif
+        -:  134:
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlPNS3_9OperationEE1_clES7_.isra.0 called 702420 returned 100% blocks executed 100%
+   762802:  135:  auto insertKnownConstant = [&](Operation *op) {
+        -:  136:    // Check for existing constants when populating the worklist. This avoids
+        -:  137:    // accidentally reversing the constant order during processing.
+   702420:  138:    Attribute constValue;
+   702420:  139:    if (matchPattern(op, m_Constant(&constValue)))
+call    0 returned 100%
+branch  1 taken 26% (fallthrough)
+branch  2 taken 74%
+   179936:  140:      if (!folder.insertKnownConstant(op, constValue))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+     1287:  141:        return true;
+        -:  142:    return false;
+    60382:  143:  };
+        -:  144:
+    60382:  145:  bool changed = false;
+    60382:  146:  unsigned iteration = 0;
+    62200:  147:  do {
+    62200:  148:    worklist.clear();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    62200:  149:    worklistMap.clear();
+call    0 returned 100%
+        -:  150:
+    62198:  151:    if (!config.useTopDownTraversal) {
+branch  0 taken 94% (fallthrough)
+branch  1 taken 6%
+        -:  152:      // Add operations to the worklist in postorder.
+   117124:  153:      for (auto &region : regions) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlPNS3_9OperationEE2_clES7_.isra.0 called 661193 returned 100% blocks executed 100%
+   719749:  154:        region.walk([&](Operation *op) {
+call    0 returned 100%
+   661193:  155:          if (!insertKnownConstant(op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+   659955:  156:            addToWorklist(op);
+call    0 returned 100%
+   661193:  157:        });
+        -:  158:      }
+        -:  159:    } else {
+        -:  160:      // Add all nested operations to the worklist in preorder.
+     7309:  161:      for (auto &region : regions) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlPNS3_9OperationEE3_clES7_.isra.0 called 41227 returned 100% blocks executed 100%
+    41227:  162:        region.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    41227:  163:          if (!insertKnownConstant(op)) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+    41178:  164:            worklist.push_back(op);
+call    0 returned 100%
+    41178:  165:            return WalkResult::advance();
+        -:  166:          }
+       49:  167:          return WalkResult::skip();
+     3655:  168:        });
+call    0 returned 100%
+        -:  169:      }
+        -:  170:
+        -:  171:      // Reverse the list so our pop-back loop processes them in-order.
+     3654:  172:      std::reverse(worklist.begin(), worklist.end());
+branch  0 taken 97% (fallthrough)
+branch  1 taken 3%
+        -:  173:      // Remember the reverse index.
+    44829:  174:      for (size_t i = 0, e = worklist.size(); i != e; ++i)
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+    41178:  175:        worklistMap[worklist[i]] = i;
+call    0 returned 100%
+        -:  176:    }
+        -:  177:
+        -:  178:    // These are scratch vectors used in the folding loop below.
+   124474:  179:    SmallVector<Value, 8> originalOperands, resultValues;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  180:
+    62219:  181:    changed = false;
+   763352:  182:    while (!worklist.empty()) {
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+  1402260:  183:      auto *op = popFromWorklist();
+        -:  184:
+        -:  185:      // Nulls get added to the worklist when operations are removed, ignore
+        -:  186:      // them.
+  701133*:  187:      if (op == nullptr)
+    4605*:  188:        continue;
+        -:  189:
+  701133*:  190:      LLVM_DEBUG({
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+branch 14 never executed
+branch 15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+call   19 never executed
+call   20 never executed
+call   21 never executed
+        -:  191:        logger.getOStream() << "\n";
+        -:  192:        logger.startLine() << logLineComment;
+        -:  193:        logger.startLine() << "Processing operation : '" << op->getName()
+        -:  194:                           << "'(" << op << ") {\n";
+        -:  195:        logger.indent();
+        -:  196:
+        -:  197:        // If the operation has no regions, just print it here.
+        -:  198:        if (op->getNumRegions() == 0) {
+        -:  199:          op->print(
+        -:  200:              logger.startLine(),
+        -:  201:              OpPrintingFlags().printGenericOpForm().elideLargeElementsAttrs());
+        -:  202:          logger.getOStream() << "\n\n";
+        -:  203:        }
+        -:  204:      });
+        -:  205:
+        -:  206:      // If the operation is trivially dead - remove it.
+   701133:  207:      if (isOpTriviallyDead(op)) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+     4605:  208:        notifyOperationRemoved(op);
+call    0 returned 100%
+     4605:  209:        op->erase();
+call    0 returned 100%
+     4605:  210:        changed = true;
+        -:  211:
+    4605*:  212:        LLVM_DEBUG(logResultWithLine("success", "operation is trivially dead"));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+     4605:  213:        continue;
+        -:  214:      }
+        -:  215:
+        -:  216:      // Collects all the operands and result uses of the given `op` into work
+        -:  217:      // list. Also remove `op` and nested ops from worklist.
+   696528:  218:      originalOperands.assign(op->operand_begin(), op->operand_end());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlPNS3_9OperationEE4_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  219:      auto preReplaceAction = [&](Operation *op) {
+        -:  220:        // Add the operands to the worklist for visitation.
+    #####:  221:        addOperandsToWorklist(originalOperands);
+call    0 never executed
+call    1 never executed
+        -:  222:
+        -:  223:        // Add all the users of the result to the worklist so we make sure
+        -:  224:        // to revisit them.
+    #####:  225:        for (auto result : op->getResults())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  226:          for (auto *userOp : result.getUsers())
+branch  0 never executed
+branch  1 never executed
+    #####:  227:            addToWorklist(userOp);
+call    0 never executed
+        -:  228:
+    #####:  229:        notifyOperationRemoved(op);
+call    0 never executed
+    #####:  230:      };
+        -:  231:
+        -:  232:      // Add the given operation to the worklist.
+    #####:  233:      auto collectOps = [this](Operation *op) { addToWorklist(op); };
+call    0 never executed
+        -:  234:
+        -:  235:      // Try to fold this op.
+   696528:  236:      bool inPlaceUpdate;
+   696528:  237:      if ((succeeded(folder.tryToFold(op, collectOps, preReplaceAction,
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  238:                                      &inPlaceUpdate)))) {
+    #####:  239:        LLVM_DEBUG(logResultWithLine("success", "operation was folded"));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  240:
+    #####:  241:        changed = true;
+    #####:  242:        if (!inPlaceUpdate)
+branch  0 never executed
+branch  1 never executed
+    #####:  243:          continue;
+        -:  244:      }
+        -:  245:
+        -:  246:      // Try to match one of the patterns. The rewriter is automatically
+        -:  247:      // notified of any necessary changes, so there is nothing else to do
+        -:  248:      // here.
+        -:  249:#ifndef NDEBUG
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlRKNS3_7PatternEE6_clES8_.isra.0 called 133080 returned 100% blocks executed 20%
+   133080:  250:      auto canApply = [&](const Pattern &pattern) {
+  133080*:  251:        LLVM_DEBUG({
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+        -:  252:          logger.getOStream() << "\n";
+        -:  253:          logger.startLine() << "* Pattern " << pattern.getDebugName() << " : '"
+        -:  254:                             << op->getName() << " -> (";
+        -:  255:          llvm::interleaveComma(pattern.getGeneratedOps(), logger.getOStream());
+        -:  256:          logger.getOStream() << ")' {\n";
+        -:  257:          logger.indent();
+        -:  258:        });
+   133080:  259:        return true;
+   696528:  260:      };
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlRKNS3_7PatternEE7_clES8_.isra.0 called 132866 returned 100% blocks executed 38%
+   132866:  261:      auto onFailure = [&](const Pattern &pattern) {
+  132866*:  262:        LLVM_DEBUG(logResult("failure", "pattern failed to match"));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+   829394:  263:      };
+function _ZZN12_GLOBAL__N_126GreedyPatternRewriteDriver8simplifyEN4llvm15MutableArrayRefIN4mlir6RegionEEEENKUlRKNS3_7PatternEE8_clES8_.isra.0 called 214 returned 100% blocks executed 38%
+      214:  264:      auto onSuccess = [&](const Pattern &pattern) {
+     214*:  265:        LLVM_DEBUG(logResult("success", "pattern applied successfully"));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+      214:  266:        return success();
+   696528:  267:      };
+        -:  268:
+   696528:  269:      LogicalResult matchResult =
+   696528:  270:          matcher.matchAndRewrite(op, *this, canApply, onFailure, onSuccess);
+call    0 returned 100%
+   696528:  271:      if (succeeded(matchResult))
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+     214*:  272:        LLVM_DEBUG(logResultWithLine("success", "pattern matched"));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  273:      else
+  696314*:  274:        LLVM_DEBUG(logResultWithLine("failure", "pattern failed to match"));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  275:#else
+        -:  276:      LogicalResult matchResult = matcher.matchAndRewrite(op, *this);
+        -:  277:#endif
+   696528:  278:      changed |= succeeded(matchResult);
+        -:  279:    }
+        -:  280:
+        -:  281:    // After applying patterns, make sure that the CFG of each of the regions
+        -:  282:    // is kept up to date.
+    62225:  283:    if (config.enableRegionSimplification)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+    62220:  284:      changed |= succeeded(simplifyRegions(*this, regions));
+call    0 returned 100%
+    62255:  285:  } while (changed &&
+branch  0 taken 3% (fallthrough)
+branch  1 taken 97%
+    1818*:  286:           (iteration++ < config.maxIterations ||
+branch  0 taken 100%
+branch  1 taken 0% (fallthrough)
+branch  2 never executed
+branch  3 never executed
+        -:  287:            config.maxIterations == GreedyRewriteConfig::kNoIterationLimit));
+        -:  288:
+        -:  289:  // Whether the rewrite converges, i.e. wasn't changed in the last iteration.
+    60437:  290:  return !changed;
+        -:  291:}
+        -:  292:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver13addToWorklistEPN4mlir9OperationE called 659955 returned 100% blocks executed 83%
+   659955:  293:void GreedyPatternRewriteDriver::addToWorklist(Operation *op) {
+        -:  294:  // Check to see if the worklist already contains this op.
+  659955*:  295:  if (worklistMap.count(op))
+call    0 returned 100%
+    #####:  296:    return;
+        -:  297:
+   659955:  298:  worklistMap[op] = worklist.size();
+call    0 returned 100%
+   659955:  299:  worklist.push_back(op);
+call    0 returned 100%
+        -:  300:}
+        -:  301:
+  701127*:  302:Operation *GreedyPatternRewriteDriver::popFromWorklist() {
+  701127*:  303:  auto *op = worklist.back();
+branch  0 taken 100% (fallthrough)
+branch  1 taken -0%
+  701127*:  304:  worklist.pop_back();
+branch  0 never executed
+branch  1 never executed
+branch  2 taken 100% (fallthrough)
+branch  3 taken -0%
+        -:  305:
+        -:  306:  // This operation is no longer in the worklist, keep worklistMap up to date.
+  701127*:  307:  if (op)
+branch  0 never executed
+branch  1 never executed
+branch  2 taken 100% (fallthrough)
+branch  3 taken -0%
+  701133*:  308:    worklistMap.erase(op);
+call    0 never executed
+call    1 returned 100%
+  701133*:  309:  return op;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  310:}
+        -:  311:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver18removeFromWorklistEPN4mlir9OperationE called 4605 returned 100% blocks executed 50%
+     4605:  312:void GreedyPatternRewriteDriver::removeFromWorklist(Operation *op) {
+     4605:  313:  auto it = worklistMap.find(op);
+call    0 returned 100%
+     4605:  314:  if (it != worklistMap.end()) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  315:    assert(worklist[it->second] == op && "malformed worklist data structure");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  316:    worklist[it->second] = nullptr;
+call    0 never executed
+    #####:  317:    worklistMap.erase(it);
+call    0 never executed
+        -:  318:  }
+     4605:  319:}
+        -:  320:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver23notifyOperationInsertedEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  321:void GreedyPatternRewriteDriver::notifyOperationInserted(Operation *op) {
+    #####:  322:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  323:    logger.startLine() << "** Insert  : '" << op->getName() << "'(" << op
+        -:  324:                       << ")\n";
+        -:  325:  });
+    #####:  326:  addToWorklist(op);
+call    0 never executed
+    #####:  327:}
+        -:  328:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver21addOperandsToWorklistEN4mlir10ValueRangeE called 4605 returned 100% blocks executed 77%
+     4605:  329:void GreedyPatternRewriteDriver::addOperandsToWorklist(ValueRange operands) {
+    14773:  330:  for (Value operand : operands) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+        -:  331:    // If the use count of this operand is now < 2, we re-add the defining
+        -:  332:    // operation to the worklist.
+        -:  333:    // TODO: This is based on the fact that zero use operations
+        -:  334:    // may be deleted, and that single use values often have more
+        -:  335:    // canonicalization opportunities.
+     5084:  336:    if (!operand || (!operand.use_empty() && !operand.hasOneUse()))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 taken 100% (fallthrough)
+branch  5 taken 0%
+     5084:  337:      continue;
+    #####:  338:    if (auto *defOp = operand.getDefiningOp())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  339:      addToWorklist(defOp);
+call    0 never executed
+        -:  340:  }
+     4605:  341:}
+        -:  342:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver22notifyOperationRemovedEPN4mlir9OperationE called 4605 returned 100% blocks executed 100%
+     4605:  343:void GreedyPatternRewriteDriver::notifyOperationRemoved(Operation *op) {
+     4605:  344:  addOperandsToWorklist(op->getOperands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     4605:  345:  op->walk([this](Operation *operation) {
+call    0 returned 100%
+     4605:  346:    removeFromWorklist(operation);
+call    0 returned 100%
+     4605:  347:    folder.notifyRemoval(operation);
+call    0 returned 100%
+        -:  348:  });
+     4605:  349:}
+        -:  350:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver18notifyRootReplacedEPN4mlir9OperationENS1_10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####:  351:void GreedyPatternRewriteDriver::notifyRootReplaced(Operation *op,
+        -:  352:                                                    ValueRange replacement) {
+    #####:  353:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  354:    logger.startLine() << "** Replace : '" << op->getName() << "'(" << op
+        -:  355:                       << ")\n";
+        -:  356:  });
+    #####:  357:  for (auto result : op->getResults())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  358:    for (auto *user : result.getUsers())
+branch  0 never executed
+branch  1 never executed
+    #####:  359:      addToWorklist(user);
+call    0 never executed
+    #####:  360:}
+        -:  361:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver7eraseOpEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  362:void GreedyPatternRewriteDriver::eraseOp(Operation *op) {
+    #####:  363:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  364:    logger.startLine() << "** Erase   : '" << op->getName() << "'(" << op
+        -:  365:                       << ")\n";
+        -:  366:  });
+    #####:  367:  PatternRewriter::eraseOp(op);
+call    0 never executed
+    #####:  368:}
+        -:  369:
+function _ZN12_GLOBAL__N_126GreedyPatternRewriteDriver18notifyMatchFailureEN4mlir8LocationEN4llvm12function_refIFvRNS1_10DiagnosticEEEE called 0 returned 0% blocks executed 0%
+    #####:  370:LogicalResult GreedyPatternRewriteDriver::notifyMatchFailure(
+        -:  371:    Location loc, function_ref<void(Diagnostic &)> reasonCallback) {
+    #####:  372:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+branch 11 never executed
+branch 12 never executed
+call   13 never executed
+        -:  373:    Diagnostic diag(loc, DiagnosticSeverity::Remark);
+        -:  374:    reasonCallback(diag);
+        -:  375:    logger.startLine() << "** Failure : " << diag.str() << "\n";
+        -:  376:  });
+    #####:  377:  return failure();
+        -:  378:}
+        -:  379:
+        -:  380:/// Rewrite the regions of the specified operation, which must be isolated from
+        -:  381:/// above, by repeatedly applying the highest benefit patterns in a greedy
+        -:  382:/// work-list driven manner. Return success if no more patterns can be matched
+        -:  383:/// in the result operation regions. Note: This does not apply patterns to the
+        -:  384:/// top-level operation itself.
+        -:  385:///
+        -:  386:LogicalResult
+function _ZN4mlir28applyPatternsAndFoldGreedilyEN4llvm15MutableArrayRefINS_6RegionEEERKNS_23FrozenRewritePatternSetENS_19GreedyRewriteConfigE called 60449 returned 100% blocks executed 50%
+    60449:  387:mlir::applyPatternsAndFoldGreedily(MutableArrayRef<Region> regions,
+        -:  388:                                   const FrozenRewritePatternSet &patterns,
+        -:  389:                                   GreedyRewriteConfig config) {
+    60449:  390:  if (regions.empty())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  391:    return success();
+        -:  392:
+        -:  393:  // The top-level operation must be known to be isolated from above to
+        -:  394:  // prevent performing canonicalizations on operations defined at or above
+        -:  395:  // the region containing 'op'.
+    60449:  396:  auto regionIsIsolated = [](Region &region) {
+        -:  397:    return region.getParentOp()->hasTrait<OpTrait::IsIsolatedFromAbove>();
+        -:  398:  };
+    60449:  399:  (void)regionIsIsolated;
+   60449*:  400:  assert(llvm::all_of(regions, regionIsIsolated) &&
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+        -:  401:         "patterns can only be applied to operations IsolatedFromAbove");
+        -:  402:
+        -:  403:  // Start the pattern driver.
+   120758:  404:  GreedyPatternRewriteDriver driver(regions[0].getContext(), patterns, config);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    60372:  405:  bool converged = driver.simplify(regions);
+call    0 returned 100%
+   60434*:  406:  LLVM_DEBUG(if (!converged) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  407:    llvm::dbgs() << "The pattern rewrite doesn't converge after scanning "
+        -:  408:                 << config.maxIterations << " times\n";
+        -:  409:  });
+    60434:  410:  return success(converged);
+call    0 returned 100%
+        -:  411:}
+        -:  412:
+        -:  413://===----------------------------------------------------------------------===//
+        -:  414:// OpPatternRewriteDriver
+        -:  415://===----------------------------------------------------------------------===//
+        -:  416:
+        -:  417:namespace {
+        -:  418:/// This is a simple driver for the PatternMatcher to apply patterns and perform
+        -:  419:/// folding on a single op. It repeatedly applies locally optimal patterns.
+        -:  420:class OpPatternRewriteDriver : public PatternRewriter {
+        -:  421:public:
+function _ZN12_GLOBAL__N_122OpPatternRewriteDriverC2EPN4mlir11MLIRContextERKNS1_23FrozenRewritePatternSetE called 0 returned 0% blocks executed 0%
+    #####:  422:  explicit OpPatternRewriteDriver(MLIRContext *ctx,
+        -:  423:                                  const FrozenRewritePatternSet &patterns)
+    #####:  424:      : PatternRewriter(ctx), matcher(patterns), folder(ctx) {
+call    0 never executed
+call    1 never executed
+        -:  425:    // Apply a simple cost model based solely on pattern benefit.
+    #####:  426:    matcher.applyDefaultCostModel();
+call    0 never executed
+    #####:  427:  }
+        -:  428:
+        -:  429:  LogicalResult simplifyLocally(Operation *op, int maxIterations, bool &erased);
+        -:  430:
+        -:  431:  // These are hooks implemented for PatternRewriter.
+        -:  432:protected:
+        -:  433:  /// If an operation is about to be removed, mark it so that we can let clients
+        -:  434:  /// know.
+function _ZN12_GLOBAL__N_122OpPatternRewriteDriver22notifyOperationRemovedEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  435:  void notifyOperationRemoved(Operation *op) override {
+    #####:  436:    opErasedViaPatternRewrites = true;
+    #####:  437:  }
+        -:  438:
+        -:  439:  // When a root is going to be replaced, its removal will be notified as well.
+        -:  440:  // So there is nothing to do here.
+function _ZN12_GLOBAL__N_122OpPatternRewriteDriver18notifyRootReplacedEPN4mlir9OperationENS1_10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####:  441:  void notifyRootReplaced(Operation *op, ValueRange replacement) override {}
+        -:  442:
+        -:  443:private:
+        -:  444:  /// The low-level pattern applicator.
+        -:  445:  PatternApplicator matcher;
+        -:  446:
+        -:  447:  /// Non-pattern based folder for operations.
+        -:  448:  OperationFolder folder;
+        -:  449:
+        -:  450:  /// Set to true if the operation has been erased via pattern rewrites.
+        -:  451:  bool opErasedViaPatternRewrites = false;
+        -:  452:};
+        -:  453:
+        -:  454:} // namespace
+        -:  455:
+        -:  456:/// Performs the rewrites and folding only on `op`. The simplification
+        -:  457:/// converges if the op is erased as a result of being folded, replaced, or
+        -:  458:/// becoming dead, or no more changes happen in an iteration. Returns success if
+        -:  459:/// the rewrite converges in `maxIterations`. `erased` is set to true if `op`
+        -:  460:/// gets erased.
+function _ZN12_GLOBAL__N_122OpPatternRewriteDriver15simplifyLocallyEPN4mlir9OperationEiRb called 0 returned 0% blocks executed 0%
+    #####:  461:LogicalResult OpPatternRewriteDriver::simplifyLocally(Operation *op,
+        -:  462:                                                      int maxIterations,
+        -:  463:                                                      bool &erased) {
+    #####:  464:  bool changed = false;
+    #####:  465:  erased = false;
+    #####:  466:  opErasedViaPatternRewrites = false;
+    #####:  467:  int iterations = 0;
+        -:  468:  // Iterate until convergence or until maxIterations. Deletion of the op as
+        -:  469:  // a result of being dead or folded is convergence.
+    #####:  470:  do {
+    #####:  471:    changed = false;
+        -:  472:
+        -:  473:    // If the operation is trivially dead - remove it.
+    #####:  474:    if (isOpTriviallyDead(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  475:      op->erase();
+call    0 never executed
+    #####:  476:      erased = true;
+    #####:  477:      return success();
+        -:  478:    }
+        -:  479:
+        -:  480:    // Try to fold this op.
+    #####:  481:    bool inPlaceUpdate;
+    #####:  482:    if (succeeded(folder.tryToFold(op, /*processGeneratedConstants=*/nullptr,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  483:                                   /*preReplaceAction=*/nullptr,
+        -:  484:                                   &inPlaceUpdate))) {
+    #####:  485:      changed = true;
+    #####:  486:      if (!inPlaceUpdate) {
+branch  0 never executed
+branch  1 never executed
+    #####:  487:        erased = true;
+    #####:  488:        return success();
+        -:  489:      }
+        -:  490:    }
+        -:  491:
+        -:  492:    // Try to match one of the patterns. The rewriter is automatically
+        -:  493:    // notified of any necessary changes, so there is nothing else to do here.
+    #####:  494:    changed |= succeeded(matcher.matchAndRewrite(op, *this));
+call    0 never executed
+    #####:  495:    if ((erased = opErasedViaPatternRewrites))
+branch  0 never executed
+branch  1 never executed
+    #####:  496:      return success();
+    #####:  497:  } while (changed &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  498:           (++iterations < maxIterations ||
+branch  0 never executed
+branch  1 never executed
+        -:  499:            maxIterations == GreedyRewriteConfig::kNoIterationLimit));
+        -:  500:
+        -:  501:  // Whether the rewrite converges, i.e. wasn't changed in the last iteration.
+    #####:  502:  return failure(changed);
+        -:  503:}
+        -:  504:
+        -:  505://===----------------------------------------------------------------------===//
+        -:  506:// MultiOpPatternRewriteDriver
+        -:  507://===----------------------------------------------------------------------===//
+        -:  508:
+        -:  509:namespace {
+        -:  510:
+        -:  511:/// This is a specialized GreedyPatternRewriteDriver to apply patterns and
+        -:  512:/// perform folding for a supplied set of ops. It repeatedly simplifies while
+        -:  513:/// restricting the rewrites to only the provided set of ops or optionally
+        -:  514:/// to those directly affected by it (result users or operand providers).
+    #####:  515:class MultiOpPatternRewriteDriver : public GreedyPatternRewriteDriver {
+call    0 never executed
+        -:  516:public:
+function _ZN12_GLOBAL__N_127MultiOpPatternRewriteDriverC2EPN4mlir11MLIRContextERKNS1_23FrozenRewritePatternSetEb called 0 returned 0% blocks executed 0%
+    #####:  517:  explicit MultiOpPatternRewriteDriver(MLIRContext *ctx,
+        -:  518:                                       const FrozenRewritePatternSet &patterns,
+        -:  519:                                       bool strict)
+    #####:  520:      : GreedyPatternRewriteDriver(ctx, patterns, GreedyRewriteConfig()),
+    #####:  521:        strictMode(strict) {}
+call    0 never executed
+call    1 never executed
+        -:  522:
+        -:  523:  bool simplifyLocally(ArrayRef<Operation *> op);
+        -:  524:
+function _ZN12_GLOBAL__N_127MultiOpPatternRewriteDriver13addToWorklistEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  525:  void addToWorklist(Operation *op) override {
+    #####:  526:    if (!strictMode || strictModeFilteredOps.contains(op))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  527:      GreedyPatternRewriteDriver::addToWorklist(op);
+call    0 never executed
+    #####:  528:  }
+        -:  529:
+        -:  530:private:
+function _ZN12_GLOBAL__N_127MultiOpPatternRewriteDriver23notifyOperationInsertedEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  531:  void notifyOperationInserted(Operation *op) override {
+    #####:  532:    GreedyPatternRewriteDriver::notifyOperationInserted(op);
+call    0 never executed
+    #####:  533:    if (strictMode)
+branch  0 never executed
+branch  1 never executed
+    #####:  534:      strictModeFilteredOps.insert(op);
+call    0 never executed
+    #####:  535:  }
+        -:  536:
+function _ZN12_GLOBAL__N_127MultiOpPatternRewriteDriver22notifyOperationRemovedEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  537:  void notifyOperationRemoved(Operation *op) override {
+    #####:  538:    GreedyPatternRewriteDriver::notifyOperationRemoved(op);
+call    0 never executed
+    #####:  539:    if (strictMode)
+branch  0 never executed
+branch  1 never executed
+    #####:  540:      strictModeFilteredOps.erase(op);
+call    0 never executed
+    #####:  541:  }
+        -:  542:
+        -:  543:  /// If `strictMode` is true, any pre-existing ops outside of
+        -:  544:  /// `strictModeFilteredOps` remain completely untouched by the rewrite driver.
+        -:  545:  /// If `strictMode` is false, operations that use results of (or supply
+        -:  546:  /// operands to) any rewritten ops stemming from the simplification of the
+        -:  547:  /// provided ops are in turn simplified; any other ops still remain untouched
+        -:  548:  /// (i.e., regardless of `strictMode`).
+        -:  549:  bool strictMode = false;
+        -:  550:
+        -:  551:  /// The list of ops we are restricting our rewrites to if `strictMode` is on.
+        -:  552:  /// These include the supplied set of ops as well as new ops created while
+        -:  553:  /// rewriting those ops. This set is not maintained when strictMode is off.
+        -:  554:  llvm::SmallDenseSet<Operation *, 4> strictModeFilteredOps;
+        -:  555:};
+        -:  556:
+        -:  557:} // namespace
+        -:  558:
+        -:  559:/// Performs the specified rewrites on `ops` while also trying to fold these ops
+        -:  560:/// as well as any other ops that were in turn created due to these rewrite
+        -:  561:/// patterns. Any pre-existing ops outside of `ops` remain completely
+        -:  562:/// unmodified if `strictMode` is true. If `strictMode` is false, other
+        -:  563:/// operations that use results of rewritten ops or supply operands to such ops
+        -:  564:/// are in turn simplified; any other ops still remain unmodified (i.e.,
+        -:  565:/// regardless of `strictMode`). Note that ops in `ops` could be erased as a
+        -:  566:/// result of folding, becoming dead, or via pattern rewrites. Returns true if
+        -:  567:/// at all any changes happened.
+        -:  568:// Unlike `OpPatternRewriteDriver::simplifyLocally` which works on a single op
+        -:  569:// or GreedyPatternRewriteDriver::simplify, this method just iterates until
+        -:  570:// the worklist is empty. As our objective is to keep simplification "local",
+        -:  571:// there is no strong rationale to re-add all operations into the worklist and
+        -:  572:// rerun until an iteration changes nothing. If more widereaching simplification
+        -:  573:// is desired, GreedyPatternRewriteDriver should be used.
+function _ZN12_GLOBAL__N_127MultiOpPatternRewriteDriver15simplifyLocallyEN4llvm8ArrayRefIPN4mlir9OperationEEE called 0 returned 0% blocks executed 0%
+    #####:  574:bool MultiOpPatternRewriteDriver::simplifyLocally(ArrayRef<Operation *> ops) {
+    #####:  575:  if (strictMode) {
+branch  0 never executed
+branch  1 never executed
+    #####:  576:    strictModeFilteredOps.clear();
+call    0 never executed
+    #####:  577:    strictModeFilteredOps.insert(ops.begin(), ops.end());
+        -:  578:  }
+        -:  579:
+    #####:  580:  bool changed = false;
+    #####:  581:  worklist.clear();
+branch  0 never executed
+branch  1 never executed
+    #####:  582:  worklistMap.clear();
+call    0 never executed
+    #####:  583:  for (Operation *op : ops)
+branch  0 never executed
+branch  1 never executed
+    #####:  584:    addToWorklist(op);
+call    0 never executed
+        -:  585:
+        -:  586:  // These are scratch vectors used in the folding loop below.
+    #####:  587:  SmallVector<Value, 8> originalOperands, resultValues;
+branch  0 never executed
+branch  1 never executed
+    #####:  588:  while (!worklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  589:    Operation *op = popFromWorklist();
+branch  0 never executed
+branch  1 never executed
+        -:  590:
+        -:  591:    // Nulls get added to the worklist when operations are removed, ignore
+        -:  592:    // them.
+    #####:  593:    if (op == nullptr)
+branch  0 never executed
+branch  1 never executed
+    #####:  594:      continue;
+        -:  595:
+    #####:  596:    assert((!strictMode || strictModeFilteredOps.contains(op)) &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  597:           "unexpected op was inserted under strict mode");
+        -:  598:
+        -:  599:    // If the operation is trivially dead - remove it.
+    #####:  600:    if (isOpTriviallyDead(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  601:      notifyOperationRemoved(op);
+call    0 never executed
+    #####:  602:      op->erase();
+call    0 never executed
+    #####:  603:      changed = true;
+    #####:  604:      continue;
+        -:  605:    }
+        -:  606:
+        -:  607:    // Collects all the operands and result uses of the given `op` into work
+        -:  608:    // list. Also remove `op` and nested ops from worklist.
+    #####:  609:    originalOperands.assign(op->operand_begin(), op->operand_end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+function _ZZN12_GLOBAL__N_127MultiOpPatternRewriteDriver15simplifyLocallyEN4llvm8ArrayRefIPN4mlir9OperationEEEENKUlS5_E_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  610:    auto preReplaceAction = [&](Operation *op) {
+        -:  611:      // Add the operands to the worklist for visitation.
+    #####:  612:      addOperandsToWorklist(originalOperands);
+call    0 never executed
+call    1 never executed
+        -:  613:
+        -:  614:      // Add all the users of the result to the worklist so we make sure
+        -:  615:      // to revisit them.
+    #####:  616:      for (Value result : op->getResults()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  617:        for (Operation *userOp : result.getUsers())
+branch  0 never executed
+branch  1 never executed
+    #####:  618:          addToWorklist(userOp);
+call    0 never executed
+        -:  619:      }
+        -:  620:
+    #####:  621:      notifyOperationRemoved(op);
+call    0 never executed
+    #####:  622:    };
+        -:  623:
+        -:  624:    // Add the given operation generated by the folder to the worklist.
+    #####:  625:    auto processGeneratedConstants = [this](Operation *op) {
+    #####:  626:      notifyOperationInserted(op);
+call    0 never executed
+    #####:  627:    };
+        -:  628:
+        -:  629:    // Try to fold this op.
+    #####:  630:    bool inPlaceUpdate;
+    #####:  631:    if (succeeded(folder.tryToFold(op, processGeneratedConstants,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  632:                                   preReplaceAction, &inPlaceUpdate))) {
+    #####:  633:      changed = true;
+    #####:  634:      if (!inPlaceUpdate) {
+branch  0 never executed
+branch  1 never executed
+        -:  635:        // Op has been erased.
+    #####:  636:        continue;
+        -:  637:      }
+        -:  638:    }
+        -:  639:
+        -:  640:    // Try to match one of the patterns. The rewriter is automatically
+        -:  641:    // notified of any necessary changes, so there is nothing else to do
+        -:  642:    // here.
+    #####:  643:    changed |= succeeded(matcher.matchAndRewrite(op, *this));
+call    0 never executed
+        -:  644:  }
+        -:  645:
+    #####:  646:  return changed;
+branch  0 never executed
+branch  1 never executed
+        -:  647:}
+        -:  648:
+        -:  649:/// Rewrites only `op` using the supplied canonicalization patterns and
+        -:  650:/// folding. `erased` is set to true if the op is erased as a result of being
+        -:  651:/// folded, replaced, or dead.
+function _ZN4mlir22applyOpPatternsAndFoldEPNS_9OperationERKNS_23FrozenRewritePatternSetEPb called 0 returned 0% blocks executed 0%
+    #####:  652:LogicalResult mlir::applyOpPatternsAndFold(
+        -:  653:    Operation *op, const FrozenRewritePatternSet &patterns, bool *erased) {
+        -:  654:  // Start the pattern driver.
+    #####:  655:  GreedyRewriteConfig config;
+    #####:  656:  OpPatternRewriteDriver driver(op->getContext(), patterns);
+call    0 never executed
+call    1 never executed
+    #####:  657:  bool opErased;
+    #####:  658:  LogicalResult converged =
+    #####:  659:      driver.simplifyLocally(op, config.maxIterations, opErased);
+call    0 never executed
+    #####:  660:  if (erased)
+branch  0 never executed
+branch  1 never executed
+    #####:  661:    *erased = opErased;
+    #####:  662:  LLVM_DEBUG(if (failed(converged)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  663:    llvm::dbgs() << "The pattern rewrite doesn't converge after scanning "
+        -:  664:                 << config.maxIterations << " times";
+        -:  665:  });
+    #####:  666:  return converged;
+call    0 never executed
+        -:  667:}
+        -:  668:
+function _ZN4mlir22applyOpPatternsAndFoldEN4llvm8ArrayRefIPNS_9OperationEEERKNS_23FrozenRewritePatternSetEb called 5829 returned 100% blocks executed 29%
+     5829:  669:bool mlir::applyOpPatternsAndFold(ArrayRef<Operation *> ops,
+        -:  670:                                  const FrozenRewritePatternSet &patterns,
+        -:  671:                                  bool strict) {
+     5829:  672:  if (ops.empty())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  673:    return false;
+        -:  674:
+        -:  675:  // Start the pattern driver.
+    #####:  676:  MultiOpPatternRewriteDriver driver(ops.front()->getContext(), patterns,
+    #####:  677:                                     strict);
+call    0 never executed
+call    1 never executed
+    #####:  678:  return driver.simplifyLocally(ops);
+call    0 never executed
+call    1 never executed
+        -:  679:}

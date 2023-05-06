@@ -1,0 +1,471 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/include/mlir/Pass/PassManager.h
+        -:    0:Graph:../tools/mlir/lib/Tools/mlir-opt/CMakeFiles/obj.MLIROptLib.dir/MlirOptMain.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Tools/mlir-opt/CMakeFiles/obj.MLIROptLib.dir/MlirOptMain.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===- PassManager.h - Pass Management Interface ----------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#ifndef MLIR_PASS_PASSMANAGER_H
+        -:   10:#define MLIR_PASS_PASSMANAGER_H
+        -:   11:
+        -:   12:#include "mlir/IR/Dialect.h"
+        -:   13:#include "mlir/IR/OperationSupport.h"
+        -:   14:#include "mlir/Support/LogicalResult.h"
+        -:   15:#include "mlir/Support/Timing.h"
+        -:   16:#include "llvm/ADT/Optional.h"
+        -:   17:#include "llvm/ADT/SmallVector.h"
+        -:   18:#include "llvm/ADT/iterator.h"
+        -:   19:#include "llvm/Support/raw_ostream.h"
+        -:   20:
+        -:   21:#include <functional>
+        -:   22:#include <vector>
+        -:   23:
+        -:   24:namespace llvm {
+        -:   25:class Any;
+        -:   26:} // namespace llvm
+        -:   27:
+        -:   28:namespace mlir {
+        -:   29:class AnalysisManager;
+        -:   30:class MLIRContext;
+        -:   31:class Operation;
+        -:   32:class Pass;
+        -:   33:class PassInstrumentation;
+        -:   34:class PassInstrumentor;
+        -:   35:
+        -:   36:namespace detail {
+        -:   37:struct OpPassManagerImpl;
+        -:   38:class OpToOpPassAdaptor;
+        -:   39:class PassCrashReproducerGenerator;
+        -:   40:struct PassExecutionState;
+        -:   41:} // namespace detail
+        -:   42:
+        -:   43://===----------------------------------------------------------------------===//
+        -:   44:// OpPassManager
+        -:   45://===----------------------------------------------------------------------===//
+        -:   46:
+        -:   47:/// This class represents a pass manager that runs passes on either a specific
+        -:   48:/// operation type, or any isolated operation. This pass manager can not be run
+        -:   49:/// on an operation directly, but must be run either as part of a top-level
+        -:   50:/// `PassManager`(e.g. when constructed via `nest` calls), or dynamically within
+        -:   51:/// a pass by using the `Pass::runPipeline` API.
+        -:   52:class OpPassManager {
+        -:   53:public:
+        -:   54:  /// This enum represents the nesting behavior of the pass manager.
+        -:   55:  enum class Nesting {
+        -:   56:    /// Implicit nesting behavior. This allows for adding passes operating on
+        -:   57:    /// operations different from this pass manager, in which case a new pass
+        -:   58:    /// manager is implicitly nested for the operation type of the new pass.
+        -:   59:    Implicit,
+        -:   60:    /// Explicit nesting behavior. This requires that any passes added to this
+        -:   61:    /// pass manager support its operation type.
+        -:   62:    Explicit
+        -:   63:  };
+        -:   64:
+        -:   65:  /// Construct a new op-agnostic ("any") pass manager with the given operation
+        -:   66:  /// type and nesting behavior. This is the same as invoking:
+        -:   67:  /// `OpPassManager(getAnyOpAnchorName(), nesting)`.
+        -:   68:  OpPassManager(Nesting nesting = Nesting::Explicit);
+        -:   69:
+        -:   70:  /// Construct a new pass manager with the given anchor operation type and
+        -:   71:  /// nesting behavior.
+        -:   72:  OpPassManager(StringRef name, Nesting nesting = Nesting::Explicit);
+        -:   73:  OpPassManager(OperationName name, Nesting nesting = Nesting::Explicit);
+        -:   74:  OpPassManager(OpPassManager &&rhs);
+        -:   75:  OpPassManager(const OpPassManager &rhs);
+        -:   76:  ~OpPassManager();
+        -:   77:  OpPassManager &operator=(const OpPassManager &rhs);
+        -:   78:
+        -:   79:  /// Iterator over the passes in this pass manager.
+        -:   80:  using pass_iterator =
+        -:   81:      llvm::pointee_iterator<MutableArrayRef<std::unique_ptr<Pass>>::iterator>;
+        -:   82:  pass_iterator begin();
+        -:   83:  pass_iterator end();
+        -:   84:  iterator_range<pass_iterator> getPasses() { return {begin(), end()}; }
+        -:   85:
+        -:   86:  using const_pass_iterator =
+        -:   87:      llvm::pointee_iterator<ArrayRef<std::unique_ptr<Pass>>::const_iterator>;
+        -:   88:  const_pass_iterator begin() const;
+        -:   89:  const_pass_iterator end() const;
+        -:   90:  iterator_range<const_pass_iterator> getPasses() const {
+        -:   91:    return {begin(), end()};
+        -:   92:  }
+        -:   93:
+        -:   94:  /// Returns true if the pass manager has no passes.
+        -:   95:  bool empty() const { return begin() == end(); }
+        -:   96:
+        -:   97:  /// Nest a new operation pass manager for the given operation kind under this
+        -:   98:  /// pass manager.
+        -:   99:  OpPassManager &nest(OperationName nestedName);
+        -:  100:  OpPassManager &nest(StringRef nestedName);
+        -:  101:  template <typename OpT>
+        -:  102:  OpPassManager &nest() {
+        -:  103:    return nest(OpT::getOperationName());
+        -:  104:  }
+        -:  105:
+        -:  106:  /// Nest a new op-agnostic ("any") pass manager under this pass manager.
+        -:  107:  /// Note: This is the same as invoking `nest(getAnyOpAnchorName())`.
+        -:  108:  OpPassManager &nestAny();
+        -:  109:
+        -:  110:  /// Add the given pass to this pass manager. If this pass has a concrete
+        -:  111:  /// operation type, it must be the same type as this pass manager.
+        -:  112:  void addPass(std::unique_ptr<Pass> pass);
+        -:  113:
+        -:  114:  /// Clear the pipeline, but not the other options set on this OpPassManager.
+        -:  115:  void clear();
+        -:  116:
+        -:  117:  /// Add the given pass to a nested pass manager for the given operation kind
+        -:  118:  /// `OpT`.
+        -:  119:  template <typename OpT>
+        -:  120:  void addNestedPass(std::unique_ptr<Pass> pass) {
+        -:  121:    nest<OpT>().addPass(std::move(pass));
+        -:  122:  }
+        -:  123:
+        -:  124:  /// Returns the number of passes held by this manager.
+        -:  125:  size_t size() const;
+        -:  126:
+        -:  127:  /// Return the operation name that this pass manager operates on, or None if
+        -:  128:  /// this is an op-agnostic pass manager.
+        -:  129:  Optional<OperationName> getOpName(MLIRContext &context) const;
+        -:  130:
+        -:  131:  /// Return the operation name that this pass manager operates on, or None if
+        -:  132:  /// this is an op-agnostic pass manager.
+        -:  133:  Optional<StringRef> getOpName() const;
+        -:  134:
+        -:  135:  /// Return the name used to anchor this pass manager. This is either the name
+        -:  136:  /// of an operation, or the result of `getAnyOpAnchorName()` in the case of an
+        -:  137:  /// op-agnostic pass manager.
+        -:  138:  StringRef getOpAnchorName() const;
+        -:  139:
+        -:  140:  /// Return the string name used to anchor op-agnostic pass managers that
+        -:  141:  /// operate generically on any viable operation.
+        -:  142:  static StringRef getAnyOpAnchorName() { return "any"; }
+        -:  143:
+        -:  144:  /// Returns the internal implementation instance.
+        -:  145:  detail::OpPassManagerImpl &getImpl();
+        -:  146:
+        -:  147:  /// Prints out the passes of the pass manager as the textual representation
+        -:  148:  /// of pipelines.
+        -:  149:  /// Note: The quality of the string representation depends entirely on the
+        -:  150:  /// the correctness of per-pass overrides of Pass::printAsTextualPipeline.
+        -:  151:  void printAsTextualPipeline(raw_ostream &os) const;
+        -:  152:
+        -:  153:  /// Raw dump of the pass manager to llvm::errs().
+        -:  154:  void dump();
+        -:  155:
+        -:  156:  /// Merge the pass statistics of this class into 'other'.
+        -:  157:  void mergeStatisticsInto(OpPassManager &other);
+        -:  158:
+        -:  159:  /// Register dependent dialects for the current pass manager.
+        -:  160:  /// This is forwarding to every pass in this PassManager, see the
+        -:  161:  /// documentation for the same method on the Pass class.
+        -:  162:  void getDependentDialects(DialectRegistry &dialects) const;
+        -:  163:
+        -:  164:  /// Enable or disable the implicit nesting on this particular PassManager.
+        -:  165:  /// This will also apply to any newly nested PassManager built from this
+        -:  166:  /// instance.
+        -:  167:  void setNesting(Nesting nesting);
+        -:  168:
+        -:  169:  /// Return the current nesting mode.
+        -:  170:  Nesting getNesting();
+        -:  171:
+        -:  172:private:
+        -:  173:  /// Initialize all of the passes within this pass manager with the given
+        -:  174:  /// initialization generation. The initialization generation is used to detect
+        -:  175:  /// if a pass manager has already been initialized.
+        -:  176:  LogicalResult initialize(MLIRContext *context, unsigned newInitGeneration);
+        -:  177:
+        -:  178:  /// A pointer to an internal implementation instance.
+        -:  179:  std::unique_ptr<detail::OpPassManagerImpl> impl;
+        -:  180:
+        -:  181:  /// Allow access to initialize.
+        -:  182:  friend detail::OpToOpPassAdaptor;
+        -:  183:
+        -:  184:  /// Allow access to the constructor.
+        -:  185:  friend class PassManager;
+        -:  186:  friend class Pass;
+        -:  187:
+        -:  188:  /// Allow access.
+        -:  189:  friend detail::OpPassManagerImpl;
+        -:  190:};
+        -:  191:
+        -:  192://===----------------------------------------------------------------------===//
+        -:  193:// PassManager
+        -:  194://===----------------------------------------------------------------------===//
+        -:  195:
+        -:  196:/// An enum describing the different display modes for the information within
+        -:  197:/// the pass manager.
+        -:  198:enum class PassDisplayMode {
+        -:  199:  // In this mode the results are displayed in a list sorted by total,
+        -:  200:  // with each pass/analysis instance aggregated into one unique result.
+        -:  201:  List,
+        -:  202:
+        -:  203:  // In this mode the results are displayed in a nested pipeline view that
+        -:  204:  // mirrors the internal pass pipeline that is being executed in the pass
+        -:  205:  // manager.
+        -:  206:  Pipeline,
+        -:  207:};
+        -:  208:
+        -:  209:/// The main pass manager and pipeline builder.
+        -:  210:class PassManager : public OpPassManager {
+        -:  211:public:
+        -:  212:  /// Create a new pass manager under the given context with a specific nesting
+        -:  213:  /// style. The created pass manager can schedule operations that match
+        -:  214:  /// `operationName`.
+        -:  215:  /// FIXME: We should make the specification of `builtin.module` explicit here,
+        -:  216:  /// so that we can have top-level op-agnostic pass managers.
+        -:  217:  PassManager(MLIRContext *ctx, Nesting nesting = Nesting::Explicit,
+        -:  218:              StringRef operationName = "builtin.module");
+        -:  219:  PassManager(MLIRContext *ctx, StringRef operationName)
+        -:  220:      : PassManager(ctx, Nesting::Explicit, operationName) {}
+        -:  221:  ~PassManager();
+        -:  222:
+        -:  223:  /// Run the passes within this manager on the provided operation. The
+        -:  224:  /// specified operation must have the same name as the one provided the pass
+        -:  225:  /// manager on construction.
+        -:  226:  LogicalResult run(Operation *op);
+        -:  227:
+        -:  228:  /// Return an instance of the context.
+    #####:  229:  MLIRContext *getContext() const { return context; }
+call    0 never executed
+        -:  230:
+        -:  231:  /// Enable support for the pass manager to generate a reproducer on the event
+        -:  232:  /// of a crash or a pass failure. `outputFile` is a .mlir filename used to
+        -:  233:  /// write the generated reproducer. If `genLocalReproducer` is true, the pass
+        -:  234:  /// manager will attempt to generate a local reproducer that contains the
+        -:  235:  /// smallest pipeline.
+        -:  236:  void enableCrashReproducerGeneration(StringRef outputFile,
+        -:  237:                                       bool genLocalReproducer = false);
+        -:  238:
+        -:  239:  /// Streams on which to output crash reproducer.
+        -:  240:  struct ReproducerStream {
+        -:  241:    virtual ~ReproducerStream() = default;
+        -:  242:
+        -:  243:    /// Description of the reproducer stream.
+        -:  244:    virtual StringRef description() = 0;
+        -:  245:
+        -:  246:    /// Stream on which to output reproducer.
+        -:  247:    virtual raw_ostream &os() = 0;
+        -:  248:  };
+        -:  249:
+        -:  250:  /// Method type for constructing ReproducerStream.
+        -:  251:  using ReproducerStreamFactory =
+        -:  252:      std::function<std::unique_ptr<ReproducerStream>(std::string &error)>;
+        -:  253:
+        -:  254:  /// Enable support for the pass manager to generate a reproducer on the event
+        -:  255:  /// of a crash or a pass failure. `factory` is used to construct the streams
+        -:  256:  /// to write the generated reproducer to. If `genLocalReproducer` is true, the
+        -:  257:  /// pass manager will attempt to generate a local reproducer that contains the
+        -:  258:  /// smallest pipeline.
+        -:  259:  void enableCrashReproducerGeneration(ReproducerStreamFactory factory,
+        -:  260:                                       bool genLocalReproducer = false);
+        -:  261:
+        -:  262:  /// Runs the verifier after each individual pass.
+        -:  263:  void enableVerifier(bool enabled = true);
+        -:  264:
+        -:  265:  //===--------------------------------------------------------------------===//
+        -:  266:  // Instrumentations
+        -:  267:  //===--------------------------------------------------------------------===//
+        -:  268:
+        -:  269:  /// Add the provided instrumentation to the pass manager.
+        -:  270:  void addInstrumentation(std::unique_ptr<PassInstrumentation> pi);
+        -:  271:
+        -:  272:  //===--------------------------------------------------------------------===//
+        -:  273:  // IR Printing
+        -:  274:
+        -:  275:  /// A configuration struct provided to the IR printer instrumentation.
+        -:  276:  class IRPrinterConfig {
+        -:  277:  public:
+        -:  278:    using PrintCallbackFn = function_ref<void(raw_ostream &)>;
+        -:  279:
+        -:  280:    /// Initialize the configuration.
+        -:  281:    /// * 'printModuleScope' signals if the top-level module IR should always be
+        -:  282:    ///   printed. This should only be set to true when multi-threading is
+        -:  283:    ///   disabled, otherwise we may try to print IR that is being modified
+        -:  284:    ///   asynchronously.
+        -:  285:    /// * 'printAfterOnlyOnChange' signals that when printing the IR after a
+        -:  286:    ///   pass, in the case of a non-failure, we should first check if any
+        -:  287:    ///   potential mutations were made. This allows for reducing the number of
+        -:  288:    ///   logs that don't contain meaningful changes.
+        -:  289:    /// * 'printAfterOnlyOnFailure' signals that when printing the IR after a
+        -:  290:    ///   pass, we only print in the case of a failure.
+        -:  291:    ///     - This option should *not* be used with the other `printAfter` flags
+        -:  292:    ///       above.
+        -:  293:    /// * 'opPrintingFlags' sets up the printing flags to use when printing the
+        -:  294:    ///   IR.
+        -:  295:    explicit IRPrinterConfig(
+        -:  296:        bool printModuleScope = false, bool printAfterOnlyOnChange = false,
+        -:  297:        bool printAfterOnlyOnFailure = false,
+        -:  298:        OpPrintingFlags opPrintingFlags = OpPrintingFlags());
+        -:  299:    virtual ~IRPrinterConfig();
+        -:  300:
+        -:  301:    /// A hook that may be overridden by a derived config that checks if the IR
+        -:  302:    /// of 'operation' should be dumped *before* the pass 'pass' has been
+        -:  303:    /// executed. If the IR should be dumped, 'printCallback' should be invoked
+        -:  304:    /// with the stream to dump into.
+        -:  305:    virtual void printBeforeIfEnabled(Pass *pass, Operation *operation,
+        -:  306:                                      PrintCallbackFn printCallback);
+        -:  307:
+        -:  308:    /// A hook that may be overridden by a derived config that checks if the IR
+        -:  309:    /// of 'operation' should be dumped *after* the pass 'pass' has been
+        -:  310:    /// executed. If the IR should be dumped, 'printCallback' should be invoked
+        -:  311:    /// with the stream to dump into.
+        -:  312:    virtual void printAfterIfEnabled(Pass *pass, Operation *operation,
+        -:  313:                                     PrintCallbackFn printCallback);
+        -:  314:
+        -:  315:    /// Returns true if the IR should always be printed at the top-level scope.
+        -:  316:    bool shouldPrintAtModuleScope() const { return printModuleScope; }
+        -:  317:
+        -:  318:    /// Returns true if the IR should only printed after a pass if the IR
+        -:  319:    /// "changed".
+        -:  320:    bool shouldPrintAfterOnlyOnChange() const { return printAfterOnlyOnChange; }
+        -:  321:
+        -:  322:    /// Returns true if the IR should only printed after a pass if the pass
+        -:  323:    /// "failed".
+        -:  324:    bool shouldPrintAfterOnlyOnFailure() const {
+        -:  325:      return printAfterOnlyOnFailure;
+        -:  326:    }
+        -:  327:
+        -:  328:    /// Returns the printing flags to be used to print the IR.
+        -:  329:    OpPrintingFlags getOpPrintingFlags() const { return opPrintingFlags; }
+        -:  330:
+        -:  331:  private:
+        -:  332:    /// A flag that indicates if the IR should be printed at module scope.
+        -:  333:    bool printModuleScope;
+        -:  334:
+        -:  335:    /// A flag that indicates that the IR after a pass should only be printed if
+        -:  336:    /// a change is detected.
+        -:  337:    bool printAfterOnlyOnChange;
+        -:  338:
+        -:  339:    /// A flag that indicates that the IR after a pass should only be printed if
+        -:  340:    /// the pass failed.
+        -:  341:    bool printAfterOnlyOnFailure;
+        -:  342:
+        -:  343:    /// Flags to control printing behavior.
+        -:  344:    OpPrintingFlags opPrintingFlags;
+        -:  345:  };
+        -:  346:
+        -:  347:  /// Add an instrumentation to print the IR before and after pass execution,
+        -:  348:  /// using the provided configuration.
+        -:  349:  void enableIRPrinting(std::unique_ptr<IRPrinterConfig> config);
+        -:  350:
+        -:  351:  /// Add an instrumentation to print the IR before and after pass execution,
+        -:  352:  /// using the provided fields to generate a default configuration:
+        -:  353:  /// * 'shouldPrintBeforePass' and 'shouldPrintAfterPass' correspond to filter
+        -:  354:  ///   functions that take a 'Pass *' and `Operation *`. These function should
+        -:  355:  ///   return true if the IR should be printed or not.
+        -:  356:  /// * 'printModuleScope' signals if the module IR should be printed, even
+        -:  357:  ///   for non module passes.
+        -:  358:  /// * 'printAfterOnlyOnChange' signals that when printing the IR after a
+        -:  359:  ///   pass, in the case of a non-failure, we should first check if any
+        -:  360:  ///   potential mutations were made.
+        -:  361:  /// * 'printAfterOnlyOnFailure' signals that when printing the IR after a
+        -:  362:  ///   pass, we only print in the case of a failure.
+        -:  363:  ///     - This option should *not* be used with the other `printAfter` flags
+        -:  364:  ///       above.
+        -:  365:  /// * 'out' corresponds to the stream to output the printed IR to.
+        -:  366:  /// * 'opPrintingFlags' sets up the printing flags to use when printing the
+        -:  367:  ///   IR.
+        -:  368:  void enableIRPrinting(
+        -:  369:      std::function<bool(Pass *, Operation *)> shouldPrintBeforePass =
+        -:  370:          [](Pass *, Operation *) { return true; },
+        -:  371:      std::function<bool(Pass *, Operation *)> shouldPrintAfterPass =
+        -:  372:          [](Pass *, Operation *) { return true; },
+        -:  373:      bool printModuleScope = true, bool printAfterOnlyOnChange = true,
+        -:  374:      bool printAfterOnlyOnFailure = false, raw_ostream &out = llvm::errs(),
+        -:  375:      OpPrintingFlags opPrintingFlags = OpPrintingFlags());
+        -:  376:
+        -:  377:  //===--------------------------------------------------------------------===//
+        -:  378:  // Pass Timing
+        -:  379:
+        -:  380:  /// Add an instrumentation to time the execution of passes and the computation
+        -:  381:  /// of analyses. Timing will be reported by nesting timers into the provided
+        -:  382:  /// `timingScope`.
+        -:  383:  ///
+        -:  384:  /// Note: Timing should be enabled after all other instrumentations to avoid
+        -:  385:  /// any potential "ghost" timing from other instrumentations being
+        -:  386:  /// unintentionally included in the timing results.
+        -:  387:  void enableTiming(TimingScope &timingScope);
+        -:  388:
+        -:  389:  /// Add an instrumentation to time the execution of passes and the computation
+        -:  390:  /// of analyses. The pass manager will take ownership of the timing manager
+        -:  391:  /// passed to the function and timing will be reported by nesting timers into
+        -:  392:  /// the timing manager's root scope.
+        -:  393:  ///
+        -:  394:  /// Note: Timing should be enabled after all other instrumentations to avoid
+        -:  395:  /// any potential "ghost" timing from other instrumentations being
+        -:  396:  /// unintentionally included in the timing results.
+        -:  397:  void enableTiming(std::unique_ptr<TimingManager> tm);
+        -:  398:
+        -:  399:  /// Add an instrumentation to time the execution of passes and the computation
+        -:  400:  /// of analyses. Creates a temporary TimingManager owned by this PassManager
+        -:  401:  /// which will be used to report timing.
+        -:  402:  ///
+        -:  403:  /// Note: Timing should be enabled after all other instrumentations to avoid
+        -:  404:  /// any potential "ghost" timing from other instrumentations being
+        -:  405:  /// unintentionally included in the timing results.
+        -:  406:  void enableTiming();
+        -:  407:
+        -:  408:  //===--------------------------------------------------------------------===//
+        -:  409:  // Pass Statistics
+        -:  410:
+        -:  411:  /// Prompts the pass manager to print the statistics collected for each of the
+        -:  412:  /// held passes after each call to 'run'.
+        -:  413:  void
+        -:  414:  enableStatistics(PassDisplayMode displayMode = PassDisplayMode::Pipeline);
+        -:  415:
+        -:  416:private:
+        -:  417:  /// Dump the statistics of the passes within this pass manager.
+        -:  418:  void dumpStatistics();
+        -:  419:
+        -:  420:  /// Run the pass manager with crash recovery enabled.
+        -:  421:  LogicalResult runWithCrashRecovery(Operation *op, AnalysisManager am);
+        -:  422:
+        -:  423:  /// Run the passes of the pass manager, and return the result.
+        -:  424:  LogicalResult runPasses(Operation *op, AnalysisManager am);
+        -:  425:
+        -:  426:  /// Context this PassManager was initialized with.
+        -:  427:  MLIRContext *context;
+        -:  428:
+        -:  429:  /// Flag that specifies if pass statistics should be dumped.
+        -:  430:  Optional<PassDisplayMode> passStatisticsMode;
+        -:  431:
+        -:  432:  /// A manager for pass instrumentations.
+        -:  433:  std::unique_ptr<PassInstrumentor> instrumentor;
+        -:  434:
+        -:  435:  /// An optional crash reproducer generator, if this pass manager is setup to
+        -:  436:  /// generate reproducers.
+        -:  437:  std::unique_ptr<detail::PassCrashReproducerGenerator> crashReproGenerator;
+        -:  438:
+        -:  439:  /// A hash key used to detect when reinitialization is necessary.
+        -:  440:  llvm::hash_code initializationKey;
+        -:  441:
+        -:  442:  /// Flag that specifies if pass timing is enabled.
+        -:  443:  bool passTiming : 1;
+        -:  444:
+        -:  445:  /// A flag that indicates if the IR should be verified in between passes.
+        -:  446:  bool verifyPasses : 1;
+        -:  447:};
+        -:  448:
+        -:  449:/// Register a set of useful command-line options that can be used to configure
+        -:  450:/// a pass manager. The values of these options can be applied via the
+        -:  451:/// 'applyPassManagerCLOptions' method below.
+        -:  452:void registerPassManagerCLOptions();
+        -:  453:
+        -:  454:/// Apply any values provided to the pass manager options that were registered
+        -:  455:/// with 'registerPassManagerOptions'.
+        -:  456:void applyPassManagerCLOptions(PassManager &pm);
+        -:  457:
+        -:  458:/// Apply any values provided to the timing manager options that were registered
+        -:  459:/// with `registerDefaultTimingManagerOptions`. This is a handy helper function
+        -:  460:/// if you do not want to bother creating your own timing manager and passing it
+        -:  461:/// to the pass manager.
+        -:  462:void applyDefaultTimingPassManagerCLOptions(PassManager &pm);
+        -:  463:
+        -:  464:} // namespace mlir
+        -:  465:
+        -:  466:#endif // MLIR_PASS_PASSMANAGER_H

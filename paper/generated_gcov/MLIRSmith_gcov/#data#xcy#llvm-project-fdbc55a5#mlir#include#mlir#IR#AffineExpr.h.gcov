@@ -1,0 +1,377 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/include/mlir/IR/AffineExpr.h
+        -:    0:Graph:../tools/mlir/lib/Interfaces/CMakeFiles/obj.MLIRVectorInterfaces.dir/VectorInterfaces.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Interfaces/CMakeFiles/obj.MLIRVectorInterfaces.dir/VectorInterfaces.cpp.gcda
+        -:    0:Runs:116177
+        -:    1://===- AffineExpr.h - MLIR Affine Expr Class --------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// An affine expression is an affine combination of dimension identifiers and
+        -:   10:// symbols, including ceildiv/floordiv/mod by a constant integer.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_IR_AFFINEEXPR_H
+        -:   15:#define MLIR_IR_AFFINEEXPR_H
+        -:   16:
+        -:   17:#include "mlir/Support/LLVM.h"
+        -:   18:#include "llvm/ADT/DenseMapInfo.h"
+        -:   19:#include "llvm/ADT/Hashing.h"
+        -:   20:#include "llvm/Support/Casting.h"
+        -:   21:#include <functional>
+        -:   22:#include <type_traits>
+        -:   23:
+        -:   24:namespace mlir {
+        -:   25:
+        -:   26:class MLIRContext;
+        -:   27:class AffineMap;
+        -:   28:class IntegerSet;
+        -:   29:
+        -:   30:namespace detail {
+        -:   31:
+        -:   32:struct AffineExprStorage;
+        -:   33:struct AffineBinaryOpExprStorage;
+        -:   34:struct AffineDimExprStorage;
+        -:   35:struct AffineSymbolExprStorage;
+        -:   36:struct AffineConstantExprStorage;
+        -:   37:
+        -:   38:} // namespace detail
+        -:   39:
+        -:   40:enum class AffineExprKind {
+        -:   41:  Add,
+        -:   42:  /// RHS of mul is always a constant or a symbolic expression.
+        -:   43:  Mul,
+        -:   44:  /// RHS of mod is always a constant or a symbolic expression with a positive
+        -:   45:  /// value.
+        -:   46:  Mod,
+        -:   47:  /// RHS of floordiv is always a constant or a symbolic expression.
+        -:   48:  FloorDiv,
+        -:   49:  /// RHS of ceildiv is always a constant or a symbolic expression.
+        -:   50:  CeilDiv,
+        -:   51:
+        -:   52:  /// This is a marker for the last affine binary op. The range of binary
+        -:   53:  /// op's is expected to be this element and earlier.
+        -:   54:  LAST_AFFINE_BINARY_OP = CeilDiv,
+        -:   55:
+        -:   56:  /// Constant integer.
+        -:   57:  Constant,
+        -:   58:  /// Dimensional identifier.
+        -:   59:  DimId,
+        -:   60:  /// Symbolic identifier.
+        -:   61:  SymbolId,
+        -:   62:};
+        -:   63:
+        -:   64:/// Base type for affine expression.
+        -:   65:/// AffineExpr's are immutable value types with intuitive operators to
+        -:   66:/// operate on chainable, lightweight compositions.
+        -:   67:/// An AffineExpr is an interface to the underlying storage type pointer.
+        -:   68:class AffineExpr {
+        -:   69:public:
+        -:   70:  using ImplType = detail::AffineExprStorage;
+        -:   71:
+        -:   72:  constexpr AffineExpr() {}
+        -:   73:  /* implicit */ AffineExpr(const ImplType *expr)
+        -:   74:      : expr(const_cast<ImplType *>(expr)) {}
+        -:   75:
+        -:   76:  bool operator==(AffineExpr other) const { return expr == other.expr; }
+        -:   77:  bool operator!=(AffineExpr other) const { return !(*this == other); }
+        -:   78:  bool operator==(int64_t v) const;
+        -:   79:  bool operator!=(int64_t v) const { return !(*this == v); }
+        -:   80:  explicit operator bool() const { return expr; }
+        -:   81:
+        -:   82:  bool operator!() const { return expr == nullptr; }
+        -:   83:
+        -:   84:  template <typename U>
+        -:   85:  bool isa() const;
+        -:   86:  template <typename U>
+        -:   87:  U dyn_cast() const;
+        -:   88:  template <typename U>
+        -:   89:  U dyn_cast_or_null() const;
+        -:   90:  template <typename U>
+        -:   91:  U cast() const;
+        -:   92:
+        -:   93:  MLIRContext *getContext() const;
+        -:   94:
+        -:   95:  /// Return the classification for this type.
+        -:   96:  AffineExprKind getKind() const;
+        -:   97:
+        -:   98:  void print(raw_ostream &os) const;
+        -:   99:  void dump() const;
+        -:  100:
+        -:  101:  /// Returns true if this expression is made out of only symbols and
+        -:  102:  /// constants, i.e., it does not involve dimensional identifiers.
+        -:  103:  bool isSymbolicOrConstant() const;
+        -:  104:
+        -:  105:  /// Returns true if this is a pure affine expression, i.e., multiplication,
+        -:  106:  /// floordiv, ceildiv, and mod is only allowed w.r.t constants.
+        -:  107:  bool isPureAffine() const;
+        -:  108:
+        -:  109:  /// Returns the greatest known integral divisor of this affine expression. The
+        -:  110:  /// result is always positive.
+        -:  111:  int64_t getLargestKnownDivisor() const;
+        -:  112:
+        -:  113:  /// Return true if the affine expression is a multiple of 'factor'.
+        -:  114:  bool isMultipleOf(int64_t factor) const;
+        -:  115:
+        -:  116:  /// Return true if the affine expression involves AffineDimExpr `position`.
+        -:  117:  bool isFunctionOfDim(unsigned position) const;
+        -:  118:
+        -:  119:  /// Return true if the affine expression involves AffineSymbolExpr `position`.
+        -:  120:  bool isFunctionOfSymbol(unsigned position) const;
+        -:  121:
+        -:  122:  /// Walk all of the AffineExpr's in this expression in postorder.
+        -:  123:  void walk(std::function<void(AffineExpr)> callback) const;
+        -:  124:
+        -:  125:  /// This method substitutes any uses of dimensions and symbols (e.g.
+        -:  126:  /// dim#0 with dimReplacements[0]) and returns the modified expression tree.
+        -:  127:  /// This is a dense replacement method: a replacement must be specified for
+        -:  128:  /// every single dim and symbol.
+        -:  129:  AffineExpr replaceDimsAndSymbols(ArrayRef<AffineExpr> dimReplacements,
+        -:  130:                                   ArrayRef<AffineExpr> symReplacements) const;
+        -:  131:
+        -:  132:  /// Dim-only version of replaceDimsAndSymbols.
+        -:  133:  AffineExpr replaceDims(ArrayRef<AffineExpr> dimReplacements) const;
+        -:  134:
+        -:  135:  /// Symbol-only version of replaceDimsAndSymbols.
+        -:  136:  AffineExpr replaceSymbols(ArrayRef<AffineExpr> symReplacements) const;
+        -:  137:
+        -:  138:  /// Sparse replace method. Replace `expr` by `replacement` and return the
+        -:  139:  /// modified expression tree.
+        -:  140:  AffineExpr replace(AffineExpr expr, AffineExpr replacement) const;
+        -:  141:
+        -:  142:  /// Sparse replace method. If `*this` appears in `map` replaces it by
+        -:  143:  /// `map[*this]` and return the modified expression tree. Otherwise traverse
+        -:  144:  /// `*this` and apply replace with `map` on its subexpressions.
+        -:  145:  AffineExpr replace(const DenseMap<AffineExpr, AffineExpr> &map) const;
+        -:  146:
+        -:  147:  /// Replace dims[offset ... numDims)
+        -:  148:  /// by dims[offset + shift ... shift + numDims).
+        -:  149:  AffineExpr shiftDims(unsigned numDims, unsigned shift,
+        -:  150:                       unsigned offset = 0) const;
+        -:  151:
+        -:  152:  /// Replace symbols[offset ... numSymbols)
+        -:  153:  /// by symbols[offset + shift ... shift + numSymbols).
+        -:  154:  AffineExpr shiftSymbols(unsigned numSymbols, unsigned shift,
+        -:  155:                          unsigned offset = 0) const;
+        -:  156:
+        -:  157:  AffineExpr operator+(int64_t v) const;
+        -:  158:  AffineExpr operator+(AffineExpr other) const;
+        -:  159:  AffineExpr operator-() const;
+        -:  160:  AffineExpr operator-(int64_t v) const;
+        -:  161:  AffineExpr operator-(AffineExpr other) const;
+        -:  162:  AffineExpr operator*(int64_t v) const;
+        -:  163:  AffineExpr operator*(AffineExpr other) const;
+        -:  164:  AffineExpr floorDiv(uint64_t v) const;
+        -:  165:  AffineExpr floorDiv(AffineExpr other) const;
+        -:  166:  AffineExpr ceilDiv(uint64_t v) const;
+        -:  167:  AffineExpr ceilDiv(AffineExpr other) const;
+        -:  168:  AffineExpr operator%(uint64_t v) const;
+        -:  169:  AffineExpr operator%(AffineExpr other) const;
+        -:  170:
+        -:  171:  /// Compose with an AffineMap.
+        -:  172:  /// Returns the composition of this AffineExpr with `map`.
+        -:  173:  ///
+        -:  174:  /// Prerequisites:
+        -:  175:  /// `this` and `map` are composable, i.e. that the number of AffineDimExpr of
+        -:  176:  /// `this` is smaller than the number of results of `map`. If a result of a
+        -:  177:  /// map does not have a corresponding AffineDimExpr, that result simply does
+        -:  178:  /// not appear in the produced AffineExpr.
+        -:  179:  ///
+        -:  180:  /// Example:
+        -:  181:  ///   expr: `d0 + d2`
+        -:  182:  ///   map:  `(d0, d1, d2)[s0, s1] -> (d0 + s1, d1 + s0, d0 + d1 + d2)`
+        -:  183:  ///   returned expr: `d0 * 2 + d1 + d2 + s1`
+        -:  184:  AffineExpr compose(AffineMap map) const;
+        -:  185:
+        -:  186:  friend ::llvm::hash_code hash_value(AffineExpr arg);
+        -:  187:
+        -:  188:  /// Methods supporting C API.
+        -:  189:  const void *getAsOpaquePointer() const {
+        -:  190:    return static_cast<const void *>(expr);
+        -:  191:  }
+        -:  192:  static AffineExpr getFromOpaquePointer(const void *pointer) {
+        -:  193:    return AffineExpr(
+        -:  194:        reinterpret_cast<ImplType *>(const_cast<void *>(pointer)));
+        -:  195:  }
+        -:  196:
+        -:  197:protected:
+        -:  198:  ImplType *expr{nullptr};
+        -:  199:};
+        -:  200:
+        -:  201:/// Affine binary operation expression. An affine binary operation could be an
+        -:  202:/// add, mul, floordiv, ceildiv, or a modulo operation. (Subtraction is
+        -:  203:/// represented through a multiply by -1 and add.) These expressions are always
+        -:  204:/// constructed in a simplified form. For eg., the LHS and RHS operands can't
+        -:  205:/// both be constants. There are additional canonicalizing rules depending on
+        -:  206:/// the op type: see checks in the constructor.
+        -:  207:class AffineBinaryOpExpr : public AffineExpr {
+        -:  208:public:
+        -:  209:  using ImplType = detail::AffineBinaryOpExprStorage;
+        -:  210:  /* implicit */ AffineBinaryOpExpr(AffineExpr::ImplType *ptr);
+        -:  211:  AffineExpr getLHS() const;
+        -:  212:  AffineExpr getRHS() const;
+        -:  213:};
+        -:  214:
+        -:  215:/// A dimensional identifier appearing in an affine expression.
+        -:  216:class AffineDimExpr : public AffineExpr {
+        -:  217:public:
+        -:  218:  using ImplType = detail::AffineDimExprStorage;
+        -:  219:  /* implicit */ AffineDimExpr(AffineExpr::ImplType *ptr);
+        -:  220:  unsigned getPosition() const;
+        -:  221:};
+        -:  222:
+        -:  223:/// A symbolic identifier appearing in an affine expression.
+        -:  224:class AffineSymbolExpr : public AffineExpr {
+        -:  225:public:
+        -:  226:  using ImplType = detail::AffineDimExprStorage;
+        -:  227:  /* implicit */ AffineSymbolExpr(AffineExpr::ImplType *ptr);
+        -:  228:  unsigned getPosition() const;
+        -:  229:};
+        -:  230:
+        -:  231:/// An integer constant appearing in affine expression.
+        -:  232:class AffineConstantExpr : public AffineExpr {
+        -:  233:public:
+        -:  234:  using ImplType = detail::AffineConstantExprStorage;
+        -:  235:  /* implicit */ AffineConstantExpr(AffineExpr::ImplType *ptr = nullptr);
+        -:  236:  int64_t getValue() const;
+        -:  237:};
+        -:  238:
+        -:  239:/// Make AffineExpr hashable.
+        -:  240:inline ::llvm::hash_code hash_value(AffineExpr arg) {
+        -:  241:  return ::llvm::hash_value(arg.expr);
+        -:  242:}
+        -:  243:
+        -:  244:inline AffineExpr operator+(int64_t val, AffineExpr expr) { return expr + val; }
+        -:  245:inline AffineExpr operator*(int64_t val, AffineExpr expr) { return expr * val; }
+        -:  246:inline AffineExpr operator-(int64_t val, AffineExpr expr) {
+        -:  247:  return expr * (-1) + val;
+        -:  248:}
+        -:  249:
+        -:  250:/// These free functions allow clients of the API to not use classes in detail.
+        -:  251:AffineExpr getAffineDimExpr(unsigned position, MLIRContext *context);
+        -:  252:AffineExpr getAffineSymbolExpr(unsigned position, MLIRContext *context);
+        -:  253:AffineExpr getAffineConstantExpr(int64_t constant, MLIRContext *context);
+        -:  254:AffineExpr getAffineBinaryOpExpr(AffineExprKind kind, AffineExpr lhs,
+        -:  255:                                 AffineExpr rhs);
+        -:  256:
+        -:  257:/// Constructs an affine expression from a flat ArrayRef. If there are local
+        -:  258:/// identifiers (neither dimensional nor symbolic) that appear in the sum of
+        -:  259:/// products expression, 'localExprs' is expected to have the AffineExpr
+        -:  260:/// for it, and is substituted into. The ArrayRef 'eq' is expected to be in the
+        -:  261:/// format [dims, symbols, locals, constant term].
+        -:  262:AffineExpr getAffineExprFromFlatForm(ArrayRef<int64_t> flatExprs,
+        -:  263:                                     unsigned numDims, unsigned numSymbols,
+        -:  264:                                     ArrayRef<AffineExpr> localExprs,
+        -:  265:                                     MLIRContext *context);
+        -:  266:
+        -:  267:raw_ostream &operator<<(raw_ostream &os, AffineExpr expr);
+        -:  268:
+        -:  269:template <typename U>
+ 55778999:  270:bool AffineExpr::isa() const {
+        -:  271:  if (std::is_same<U, AffineBinaryOpExpr>::value)
+        -:  272:    return getKind() <= AffineExprKind::LAST_AFFINE_BINARY_OP;
+        -:  273:  if (std::is_same<U, AffineDimExpr>::value)
+ 55778999:  274:    return getKind() == AffineExprKind::DimId;
+call    0 returned 100%
+        -:  275:  if (std::is_same<U, AffineSymbolExpr>::value)
+        -:  276:    return getKind() == AffineExprKind::SymbolId;
+        -:  277:  if (std::is_same<U, AffineConstantExpr>::value)
+        -:  278:    return getKind() == AffineExprKind::Constant;
+        -:  279:}
+        -:  280:template <typename U>
+        -:  281:U AffineExpr::dyn_cast() const {
+        -:  282:  if (isa<U>())
+        -:  283:    return U(expr);
+        -:  284:  return U(nullptr);
+        -:  285:}
+        -:  286:template <typename U>
+        -:  287:U AffineExpr::dyn_cast_or_null() const {
+        -:  288:  return (!*this || !isa<U>()) ? U(nullptr) : U(expr);
+        -:  289:}
+        -:  290:template <typename U>
+        -:  291:U AffineExpr::cast() const {
+        -:  292:  assert(isa<U>());
+        -:  293:  return U(expr);
+        -:  294:}
+        -:  295:
+        -:  296:/// Simplify an affine expression by flattening and some amount of simple
+        -:  297:/// analysis. This has complexity linear in the number of nodes in 'expr'.
+        -:  298:/// Returns the simplified expression, which is the same as the input expression
+        -:  299:/// if it can't be simplified. When `expr` is semi-affine, a simplified
+        -:  300:/// semi-affine expression is constructed in the sorted order of dimension and
+        -:  301:/// symbol positions.
+        -:  302:AffineExpr simplifyAffineExpr(AffineExpr expr, unsigned numDims,
+        -:  303:                              unsigned numSymbols);
+        -:  304:
+        -:  305:namespace detail {
+        -:  306:template <int N>
+        -:  307:void bindDims(MLIRContext *ctx) {}
+        -:  308:
+        -:  309:template <int N, typename AffineExprTy, typename... AffineExprTy2>
+        -:  310:void bindDims(MLIRContext *ctx, AffineExprTy &e, AffineExprTy2 &...exprs) {
+        -:  311:  e = getAffineDimExpr(N, ctx);
+        -:  312:  bindDims<N + 1, AffineExprTy2 &...>(ctx, exprs...);
+        -:  313:}
+        -:  314:
+        -:  315:template <int N>
+        -:  316:void bindSymbols(MLIRContext *ctx) {}
+        -:  317:
+        -:  318:template <int N, typename AffineExprTy, typename... AffineExprTy2>
+        -:  319:void bindSymbols(MLIRContext *ctx, AffineExprTy &e, AffineExprTy2 &...exprs) {
+        -:  320:  e = getAffineSymbolExpr(N, ctx);
+        -:  321:  bindSymbols<N + 1, AffineExprTy2 &...>(ctx, exprs...);
+        -:  322:}
+        -:  323:
+        -:  324:template <typename AffineExprTy>
+        -:  325:void bindSymbolsList(MLIRContext *ctx, SmallVectorImpl<AffineExprTy> &exprs) {
+        -:  326:  int idx = 0;
+        -:  327:  for (AffineExprTy &e : exprs)
+        -:  328:    e = getAffineSymbolExpr(idx++, ctx);
+        -:  329:}
+        -:  330:
+        -:  331:} // namespace detail
+        -:  332:
+        -:  333:/// Bind a list of AffineExpr references to DimExpr at positions:
+        -:  334:///   [0 .. sizeof...(exprs)]
+        -:  335:template <typename... AffineExprTy>
+        -:  336:void bindDims(MLIRContext *ctx, AffineExprTy &...exprs) {
+        -:  337:  detail::bindDims<0>(ctx, exprs...);
+        -:  338:}
+        -:  339:
+        -:  340:/// Bind a list of AffineExpr references to SymbolExpr at positions:
+        -:  341:///   [0 .. sizeof...(exprs)]
+        -:  342:template <typename... AffineExprTy>
+        -:  343:void bindSymbols(MLIRContext *ctx, AffineExprTy &...exprs) {
+        -:  344:  detail::bindSymbols<0>(ctx, exprs...);
+        -:  345:}
+        -:  346:
+        -:  347:} // namespace mlir
+        -:  348:
+        -:  349:namespace llvm {
+        -:  350:
+        -:  351:// AffineExpr hash just like pointers
+        -:  352:template <>
+        -:  353:struct DenseMapInfo<mlir::AffineExpr> {
+        -:  354:  static mlir::AffineExpr getEmptyKey() {
+        -:  355:    auto *pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
+        -:  356:    return mlir::AffineExpr(static_cast<mlir::AffineExpr::ImplType *>(pointer));
+        -:  357:  }
+        -:  358:  static mlir::AffineExpr getTombstoneKey() {
+        -:  359:    auto *pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
+        -:  360:    return mlir::AffineExpr(static_cast<mlir::AffineExpr::ImplType *>(pointer));
+        -:  361:  }
+        -:  362:  static unsigned getHashValue(mlir::AffineExpr val) {
+        -:  363:    return mlir::hash_value(val);
+        -:  364:  }
+        -:  365:  static bool isEqual(mlir::AffineExpr LHS, mlir::AffineExpr RHS) {
+        -:  366:    return LHS == RHS;
+        -:  367:  }
+        -:  368:};
+        -:  369:
+        -:  370:} // namespace llvm
+        -:  371:
+        -:  372:#endif // MLIR_IR_AFFINEEXPR_H

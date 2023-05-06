@@ -1,0 +1,1141 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/SparseTensor/Transforms/SparseBufferRewriting.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/SparseBufferRewriting.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SparseTensor/Transforms/CMakeFiles/obj.MLIRSparseTensorTransforms.dir/SparseBufferRewriting.cpp.gcda
+        -:    0:Runs:325552
+        -:    1://===- SparseBufferRewriting.cpp - Sparse buffer rewriting rules ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements rewriting rules that are specific to sparse tensor
+        -:   10:// primitives with memref operands.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "CodegenUtils.h"
+        -:   15:
+        -:   16:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   17:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   18:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   19:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   20:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   21:#include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
+        -:   22:#include "mlir/Dialect/SparseTensor/Transforms/Passes.h"
+        -:   23:#include "mlir/Support/LLVM.h"
+        -:   24:
+        -:   25:using namespace mlir;
+        -:   26:using namespace mlir::sparse_tensor;
+        -:   27:
+        -:   28://===---------------------------------------------------------------------===//
+        -:   29:// Helper methods for the actual rewriting rules.
+        -:   30://===---------------------------------------------------------------------===//
+        -:   31:
+        -:   32:static constexpr uint64_t loIdx = 0;
+        -:   33:static constexpr uint64_t hiIdx = 1;
+        -:   34:static constexpr uint64_t xStartIdx = 2;
+        -:   35:
+        -:   36:static constexpr const char kMaySwapFuncNamePrefix[] = "_sparse_may_swap_";
+        -:   37:static constexpr const char kLessThanFuncNamePrefix[] = "_sparse_less_than_";
+        -:   38:static constexpr const char kPartitionFuncNamePrefix[] = "_sparse_partition_";
+        -:   39:static constexpr const char kBinarySearchFuncNamePrefix[] =
+        -:   40:    "_sparse_binary_search_";
+        -:   41:static constexpr const char kSortNonstableFuncNamePrefix[] =
+        -:   42:    "_sparse_sort_nonstable_";
+        -:   43:static constexpr const char kSortStableFuncNamePrefix[] =
+        -:   44:    "_sparse_sort_stable_";
+        -:   45:
+        -:   46:using FuncGeneratorType =
+        -:   47:    function_ref<void(OpBuilder &, ModuleOp, func::FuncOp, size_t)>;
+        -:   48:
+        -:   49:/// Constructs a function name with this format to facilitate quick sort:
+        -:   50:///   <namePrefix><dim>_<x type>_<y0 type>..._<yn type>
+function _ZL28getMangledSortHelperFuncNameRN4llvm19raw_svector_ostreamENS_9StringRefEmN4mlir10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####:   51:static void getMangledSortHelperFuncName(llvm::raw_svector_ostream &nameOstream,
+        -:   52:                                         StringRef namePrefix, size_t dim,
+        -:   53:                                         ValueRange operands) {
+    #####:   54:  nameOstream
+    #####:   55:      << namePrefix << dim << "_"
+call    0 never executed
+call    1 never executed
+    #####:   56:      << operands[xStartIdx].getType().cast<MemRefType>().getElementType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:   57:
+    #####:   58:  for (Value v : operands.drop_front(xStartIdx + dim))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   59:    nameOstream << "_" << v.getType().cast<MemRefType>().getElementType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   60:}
+        -:   61:
+        -:   62:/// Looks up a function that is appropriate for the given operands being
+        -:   63:/// sorted, and creates such a function if it doesn't exist yet.
+        -:   64:static FlatSymbolRefAttr
+function _ZL24getMangledSortHelperFuncRN4mlir9OpBuilderENS_4func6FuncOpENS_9TypeRangeEN4llvm9StringRefEmNS_10ValueRangeENS5_12function_refIFvS1_NS_8ModuleOpES3_mEEE called 0 returned 0% blocks executed 0%
+    #####:   65:getMangledSortHelperFunc(OpBuilder &builder, func::FuncOp insertPoint,
+        -:   66:                         TypeRange resultTypes, StringRef namePrefix,
+        -:   67:                         size_t dim, ValueRange operands,
+        -:   68:                         FuncGeneratorType createFunc) {
+    #####:   69:  SmallString<32> nameBuffer;
+call    0 never executed
+    #####:   70:  llvm::raw_svector_ostream nameOstream(nameBuffer);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   71:  getMangledSortHelperFuncName(nameOstream, namePrefix, dim, operands);
+call    0 never executed
+        -:   72:
+    #####:   73:  ModuleOp module = insertPoint->getParentOfType<ModuleOp>();
+call    0 never executed
+    #####:   74:  MLIRContext *context = module.getContext();
+call    0 never executed
+    #####:   75:  auto result = SymbolRefAttr::get(context, nameOstream.str());
+call    0 never executed
+    #####:   76:  auto func = module.lookupSymbol<func::FuncOp>(result.getAttr());
+call    0 never executed
+call    1 never executed
+        -:   77:
+    #####:   78:  if (!func) {
+branch  0 never executed
+branch  1 never executed
+        -:   79:    // Create the function.
+    #####:   80:    OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+    #####:   81:    builder.setInsertionPoint(insertPoint);
+call    0 never executed
+    #####:   82:    Location loc = insertPoint.getLoc();
+call    0 never executed
+    #####:   83:    func = builder.create<func::FuncOp>(
+    #####:   84:        loc, nameOstream.str(),
+call    0 never executed
+    #####:   85:        FunctionType::get(context, operands.getTypes(), resultTypes));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:   86:    func.setPrivate();
+call    0 never executed
+    #####:   87:    createFunc(builder, module, func, dim);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   88:  }
+        -:   89:
+    #####:   90:  return result;
+call    0 never executed
+        -:   91:}
+        -:   92:
+        -:   93:/// Creates a function for swapping the values in index i and j for all the
+        -:   94:/// buffers.
+        -:   95://
+        -:   96:// The generate IR corresponds to this C like algorithm:
+        -:   97://   if (i != j) {
+        -:   98://     swap(x0[i], x0[j]);
+        -:   99://     swap(x1[i], x1[j]);
+        -:  100://     ...
+        -:  101://     swap(xn[i], xn[j]);
+        -:  102://     swap(y0[i], y0[j]);
+        -:  103://     ...
+        -:  104://     swap(yn[i], yn[j]);
+        -:  105://   }
+function _ZL17createMaySwapFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  106:static void createMaySwapFunc(OpBuilder &builder, ModuleOp unused,
+        -:  107:                              func::FuncOp func, size_t dim) {
+    #####:  108:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+        -:  109:
+    #####:  110:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  111:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+        -:  112:
+    #####:  113:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  114:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+    #####:  115:  Value i = args[0];
+call    0 never executed
+    #####:  116:  Value j = args[1];
+call    0 never executed
+    #####:  117:  Value cond =
+    #####:  118:      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, i, j);
+call    0 never executed
+call    1 never executed
+    #####:  119:  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, cond, /*else=*/false);
+call    0 never executed
+        -:  120:
+        -:  121:  // If i!=j swap values in the buffers.
+    #####:  122:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  123:  for (auto arg : args.drop_front(xStartIdx)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  124:    Value vi = builder.create<memref::LoadOp>(loc, arg, i);
+call    0 never executed
+call    1 never executed
+    #####:  125:    Value vj = builder.create<memref::LoadOp>(loc, arg, j);
+call    0 never executed
+call    1 never executed
+    #####:  126:    builder.create<memref::StoreOp>(loc, vj, arg, i);
+call    0 never executed
+    #####:  127:    builder.create<memref::StoreOp>(loc, vi, arg, j);
+call    0 never executed
+        -:  128:  }
+        -:  129:
+    #####:  130:  builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  131:  builder.create<func::ReturnOp>(loc);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  132:}
+        -:  133:
+        -:  134:/// Generates an if-statement to compare x[i] and x[j].
+function _ZL21createLessThanCompareRN4mlir9OpBuilderENS_8LocationENS_5ValueES3_S3_b called 0 returned 0% blocks executed 0%
+    #####:  135:static scf::IfOp createLessThanCompare(OpBuilder &builder, Location loc,
+        -:  136:                                       Value i, Value j, Value x,
+        -:  137:                                       bool isLastDim) {
+    #####:  138:  Value f = constantI1(builder, loc, false);
+call    0 never executed
+    #####:  139:  Value t = constantI1(builder, loc, true);
+call    0 never executed
+    #####:  140:  Value vi = builder.create<memref::LoadOp>(loc, x, i);
+call    0 never executed
+call    1 never executed
+    #####:  141:  Value vj = builder.create<memref::LoadOp>(loc, x, j);
+call    0 never executed
+call    1 never executed
+        -:  142:
+    #####:  143:  Value cond =
+    #####:  144:      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, vi, vj);
+call    0 never executed
+call    1 never executed
+    #####:  145:  scf::IfOp ifOp =
+    #####:  146:      builder.create<scf::IfOp>(loc, f.getType(), cond, /*else=*/true);
+call    0 never executed
+        -:  147:  // If (x[i] < x[j]).
+    #####:  148:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  149:  builder.create<scf::YieldOp>(loc, t);
+call    0 never executed
+        -:  150:
+    #####:  151:  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  152:  if (isLastDim == 1) {
+branch  0 never executed
+branch  1 never executed
+        -:  153:    // Finish checking all dimensions.
+    #####:  154:    builder.create<scf::YieldOp>(loc, f);
+call    0 never executed
+        -:  155:  } else {
+    #####:  156:    cond =
+    #####:  157:        builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, vj, vi);
+call    0 never executed
+call    1 never executed
+    #####:  158:    scf::IfOp ifOp2 =
+    #####:  159:        builder.create<scf::IfOp>(loc, f.getType(), cond, /*else=*/true);
+call    0 never executed
+        -:  160:    // Otherwise if (x[j] < x[i]).
+    #####:  161:    builder.setInsertionPointToStart(&ifOp2.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  162:    builder.create<scf::YieldOp>(loc, f);
+call    0 never executed
+        -:  163:
+        -:  164:    // Otherwise check the remaining dimensions.
+    #####:  165:    builder.setInsertionPointAfter(ifOp2);
+call    0 never executed
+    #####:  166:    builder.create<scf::YieldOp>(loc, ifOp2.getResult(0));
+call    0 never executed
+        -:  167:    // Set up the insertion point for the nested if-stmt that checks the
+        -:  168:    // remaining dimensions.
+    #####:  169:    builder.setInsertionPointToStart(&ifOp2.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+        -:  170:  }
+        -:  171:
+    #####:  172:  return ifOp;
+        -:  173:}
+        -:  174:
+        -:  175:/// Creates a function to compare the xs values in index i and j for all the
+        -:  176:/// dimensions. The function returns true iff xs[i] < xs[j].
+        -:  177://
+        -:  178:// The generate IR corresponds to this C like algorithm:
+        -:  179://   if (x0[i] < x0[j])
+        -:  180://     return true;
+        -:  181://   else if (x0[j] < x0[i])
+        -:  182://     return false;
+        -:  183://   else
+        -:  184://     if (x1[i] < x1[j])
+        -:  185://       return true;
+        -:  186://     else if (x1[j] < x1[i]))
+        -:  187://       and so on ...
+function _ZL18createLessThanFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  188:static void createLessThanFunc(OpBuilder &builder, ModuleOp unused,
+        -:  189:                               func::FuncOp func, size_t dim) {
+    #####:  190:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+        -:  191:
+    #####:  192:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  193:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+    #####:  194:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  195:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+        -:  196:
+    #####:  197:  scf::IfOp topIfOp;
+call    0 never executed
+    #####:  198:  for (const auto &item : llvm::enumerate(args.slice(xStartIdx, dim))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  199:    scf::IfOp ifOp =
+        -:  200:        createLessThanCompare(builder, loc, args[0], args[1], item.value(),
+    #####:  201:                              (item.index() == dim - 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  202:    if (item.index() == 0) {
+branch  0 never executed
+branch  1 never executed
+        -:  203:      topIfOp = ifOp;
+        -:  204:    } else {
+    #####:  205:      OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+    #####:  206:      builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  207:      builder.create<scf::YieldOp>(loc, ifOp.getResult(0));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  208:    }
+        -:  209:  }
+        -:  210:
+    #####:  211:  builder.setInsertionPointAfter(topIfOp);
+call    0 never executed
+    #####:  212:  builder.create<func::ReturnOp>(loc, topIfOp.getResult(0));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  213:}
+        -:  214:
+        -:  215:/// Creates a function to use a binary search to find the insertion point for
+        -:  216:/// inserting xs[hi] to the sorted values xs[lo..hi).
+        -:  217://
+        -:  218:// The generate IR corresponds to this C like algorithm:
+        -:  219://   p = hi
+        -:  220://   while (lo < hi)
+        -:  221://      mid = (lo + hi) >> 1
+        -:  222://      if (xs[p] < xs[mid])
+        -:  223://        hi = mid
+        -:  224://      else
+        -:  225://        lo = mid - 1
+        -:  226://   return lo;
+        -:  227://
+function _ZL22createBinarySearchFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  228:static void createBinarySearchFunc(OpBuilder &builder, ModuleOp module,
+        -:  229:                                   func::FuncOp func, size_t dim) {
+    #####:  230:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+    #####:  231:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  232:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+        -:  233:
+    #####:  234:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  235:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+    #####:  236:  Value p = args[hiIdx];
+call    0 never executed
+    #####:  237:  SmallVector<Type, 2> types(2, p.getType());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  238:  scf::WhileOp whileOp = builder.create<scf::WhileOp>(
+    #####:  239:      loc, types, SmallVector<Value, 2>{args[loIdx], args[hiIdx]});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  240:
+        -:  241:  // The before-region of the WhileOp.
+    #####:  242:  Block *before =
+    #####:  243:      builder.createBlock(&whileOp.getBefore(), {}, types, {loc, loc});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  244:  builder.setInsertionPointToEnd(before);
+call    0 never executed
+    #####:  245:  Value cond1 = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult,
+call    0 never executed
+    #####:  246:                                              before->getArgument(0),
+    #####:  247:                                              before->getArgument(1));
+call    0 never executed
+call    1 never executed
+    #####:  248:  builder.create<scf::ConditionOp>(loc, cond1, before->getArguments());
+call    0 never executed
+        -:  249:
+        -:  250:  // The after-region of the WhileOp.
+    #####:  251:  Block *after =
+    #####:  252:      builder.createBlock(&whileOp.getAfter(), {}, types, {loc, loc});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  253:  builder.setInsertionPointToEnd(after);
+call    0 never executed
+    #####:  254:  Value lo = after->getArgument(0);
+call    0 never executed
+    #####:  255:  Value hi = after->getArgument(1);
+        -:  256:  // Compute mid = (lo + hi) >> 1.
+    #####:  257:  Value c1 = constantIndex(builder, loc, 1);
+call    0 never executed
+    #####:  258:  Value mid = builder.create<arith::ShRUIOp>(
+    #####:  259:      loc, builder.create<arith::AddIOp>(loc, lo, hi), c1);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  260:  Value midp1 = builder.create<arith::AddIOp>(loc, mid, c1);
+call    0 never executed
+call    1 never executed
+        -:  261:
+        -:  262:  // Compare xs[p] < xs[mid].
+    #####:  263:  SmallVector<Value, 6> compareOperands{p, mid};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  264:  compareOperands.append(args.begin() + xStartIdx,
+call    0 never executed
+    #####:  265:                         args.begin() + xStartIdx + dim);
+call    0 never executed
+    #####:  266:  Type i1Type = IntegerType::get(module.getContext(), 1, IntegerType::Signless);
+call    0 never executed
+call    1 never executed
+    #####:  267:  FlatSymbolRefAttr lessThanFunc =
+call    0 never executed
+        -:  268:      getMangledSortHelperFunc(builder, func, {i1Type}, kLessThanFuncNamePrefix,
+    #####:  269:                               dim, compareOperands, createLessThanFunc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  270:  Value cond2 = builder
+    #####:  271:                    .create<func::CallOp>(loc, lessThanFunc, TypeRange{i1Type},
+call    0 never executed
+    #####:  272:                                          compareOperands)
+call    0 never executed
+call    1 never executed
+    #####:  273:                    .getResult(0);
+        -:  274:
+        -:  275:  // Update lo and hi for the WhileOp as follows:
+        -:  276:  //   if (xs[p] < xs[mid]))
+        -:  277:  //     hi = mid;
+        -:  278:  //   else
+        -:  279:  //     lo = mid + 1;
+    #####:  280:  Value newLo = builder.create<arith::SelectOp>(loc, cond2, lo, midp1);
+call    0 never executed
+call    1 never executed
+    #####:  281:  Value newHi = builder.create<arith::SelectOp>(loc, cond2, mid, hi);
+call    0 never executed
+call    1 never executed
+    #####:  282:  builder.create<scf::YieldOp>(loc, ValueRange{newLo, newHi});
+call    0 never executed
+call    1 never executed
+        -:  283:
+    #####:  284:  builder.setInsertionPointAfter(whileOp);
+call    0 never executed
+    #####:  285:  builder.create<func::ReturnOp>(loc, whileOp.getResult(0));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  286:}
+        -:  287:
+        -:  288:/// Creates a function to perform quick sort partition on the values in the
+        -:  289:/// range of index [lo, hi), assuming lo < hi.
+        -:  290://
+        -:  291:// The generated IR corresponds to this C like algorithm:
+        -:  292:// int partition(lo, hi, data) {
+        -:  293://   pivot = data[hi - 1];
+        -:  294://   i = (lo – 1)  // RHS of the pivot found so far.
+        -:  295://   for (j = lo; j < hi - 1; j++){
+        -:  296://     if (data[j] < pivot){
+        -:  297://       i++;
+        -:  298://       swap data[i] and data[j]
+        -:  299://     }
+        -:  300://   }
+        -:  301://   i++
+        -:  302://   swap data[i] and data[hi-1])
+        -:  303://   return i
+        -:  304:// }
+function _ZL19createPartitionFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  305:static void createPartitionFunc(OpBuilder &builder, ModuleOp module,
+        -:  306:                                func::FuncOp func, size_t dim) {
+    #####:  307:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+        -:  308:
+    #####:  309:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  310:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+        -:  311:
+    #####:  312:  MLIRContext *context = module.getContext();
+call    0 never executed
+    #####:  313:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  314:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+    #####:  315:  Value lo = args[loIdx];
+call    0 never executed
+    #####:  316:  Value c1 = constantIndex(builder, loc, 1);
+call    0 never executed
+    #####:  317:  Value i = builder.create<arith::SubIOp>(loc, lo, c1);
+call    0 never executed
+call    1 never executed
+    #####:  318:  Value him1 = builder.create<arith::SubIOp>(loc, args[hiIdx], c1);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  319:  scf::ForOp forOp =
+    #####:  320:      builder.create<scf::ForOp>(loc, lo, him1, c1, ValueRange{i});
+call    0 never executed
+call    1 never executed
+        -:  321:
+        -:  322:  // Start the for-stmt body.
+    #####:  323:  builder.setInsertionPointToStart(forOp.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  324:  Value j = forOp.getInductionVar();
+call    0 never executed
+    #####:  325:  SmallVector<Value, 6> compareOperands{j, him1};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  326:  ValueRange xs = args.slice(xStartIdx, dim);
+call    0 never executed
+    #####:  327:  compareOperands.append(xs.begin(), xs.end());
+call    0 never executed
+    #####:  328:  Type i1Type = IntegerType::get(context, 1, IntegerType::Signless);
+call    0 never executed
+    #####:  329:  FlatSymbolRefAttr lessThanFunc =
+call    0 never executed
+        -:  330:      getMangledSortHelperFunc(builder, func, {i1Type}, kLessThanFuncNamePrefix,
+    #####:  331:                               dim, compareOperands, createLessThanFunc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  332:  Value cond = builder
+    #####:  333:                   .create<func::CallOp>(loc, lessThanFunc, TypeRange{i1Type},
+call    0 never executed
+    #####:  334:                                         compareOperands)
+call    0 never executed
+call    1 never executed
+    #####:  335:                   .getResult(0);
+    #####:  336:  scf::IfOp ifOp =
+    #####:  337:      builder.create<scf::IfOp>(loc, i.getType(), cond, /*else=*/true);
+call    0 never executed
+        -:  338:
+        -:  339:  // The if-stmt true branch: i++; swap(data[i], data[j]); yield i.
+    #####:  340:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  341:  Value i1 =
+    #####:  342:      builder.create<arith::AddIOp>(loc, forOp.getRegionIterArgs().front(), c1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  343:  SmallVector<Value, 6> swapOperands{i1, j};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  344:  swapOperands.append(args.begin() + xStartIdx, args.end());
+call    0 never executed
+    #####:  345:  FlatSymbolRefAttr swapFunc = getMangledSortHelperFunc(
+call    0 never executed
+        -:  346:      builder, func, TypeRange(), kMaySwapFuncNamePrefix, dim, swapOperands,
+    #####:  347:      createMaySwapFunc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  348:  builder.create<func::CallOp>(loc, swapFunc, TypeRange(), swapOperands);
+call    0 never executed
+call    1 never executed
+    #####:  349:  builder.create<scf::YieldOp>(loc, i1);
+call    0 never executed
+        -:  350:
+        -:  351:  // The if-stmt false branch: yield i.
+    #####:  352:  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  353:  builder.create<scf::YieldOp>(loc, forOp.getRegionIterArgs().front());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  354:
+        -:  355:  // After the if-stmt, yield the updated i value to end the for-stmt body.
+    #####:  356:  builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  357:  builder.create<scf::YieldOp>(loc, ifOp.getResult(0));
+call    0 never executed
+        -:  358:
+        -:  359:  // After the for-stmt: i++; swap(data[i], data[him1]); return i.
+    #####:  360:  builder.setInsertionPointAfter(forOp);
+call    0 never executed
+    #####:  361:  i1 = builder.create<arith::AddIOp>(loc, forOp.getResult(0), c1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  362:  swapOperands[0] = i1;
+branch  0 never executed
+branch  1 never executed
+    #####:  363:  swapOperands[1] = him1;
+branch  0 never executed
+branch  1 never executed
+    #####:  364:  builder.create<func::CallOp>(loc, swapFunc, TypeRange(), swapOperands);
+call    0 never executed
+call    1 never executed
+    #####:  365:  builder.create<func::ReturnOp>(loc, i1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  366:}
+        -:  367:
+        -:  368:/// Creates a function to perform quick sort on the value in the range of
+        -:  369:/// index [lo, hi).
+        -:  370://
+        -:  371:// The generate IR corresponds to this C like algorithm:
+        -:  372:// void quickSort(lo, hi, data) {
+        -:  373://   if (lo < hi) {
+        -:  374://        p = partition(low, high, data);
+        -:  375://        quickSort(lo, p, data);
+        -:  376://        quickSort(p + 1, hi, data);
+        -:  377://   }
+        -:  378:// }
+function _ZL23createSortNonstableFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  379:static void createSortNonstableFunc(OpBuilder &builder, ModuleOp module,
+        -:  380:                                    func::FuncOp func, size_t dim) {
+    #####:  381:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+    #####:  382:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  383:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+        -:  384:
+    #####:  385:  MLIRContext *context = module.getContext();
+call    0 never executed
+    #####:  386:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  387:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+    #####:  388:  Value lo = args[loIdx];
+call    0 never executed
+    #####:  389:  Value hi = args[hiIdx];
+call    0 never executed
+    #####:  390:  Value cond =
+    #####:  391:      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, lo, hi);
+call    0 never executed
+call    1 never executed
+    #####:  392:  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, cond, /*else=*/false);
+call    0 never executed
+        -:  393:
+        -:  394:  // The if-stmt true branch.
+    #####:  395:  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  396:  FlatSymbolRefAttr partitionFunc = getMangledSortHelperFunc(
+call    0 never executed
+    #####:  397:      builder, func, {IndexType::get(context)}, kPartitionFuncNamePrefix, dim,
+call    0 never executed
+    #####:  398:      args, createPartitionFunc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  399:  auto p = builder.create<func::CallOp>(
+    #####:  400:      loc, partitionFunc, TypeRange{IndexType::get(context)}, ValueRange(args));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  401:
+    #####:  402:  SmallVector<Value, 6> lowOperands{lo, p.getResult(0)};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  403:  lowOperands.append(args.begin() + xStartIdx, args.end());
+call    0 never executed
+    #####:  404:  builder.create<func::CallOp>(loc, func, lowOperands);
+call    0 never executed
+        -:  405:
+    #####:  406:  SmallVector<Value, 6> highOperands{
+call    0 never executed
+    #####:  407:      builder.create<arith::AddIOp>(loc, p.getResult(0),
+call    0 never executed
+    #####:  408:                                    constantIndex(builder, loc, 1)),
+call    0 never executed
+call    1 never executed
+    #####:  409:      hi};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  410:  highOperands.append(args.begin() + xStartIdx, args.end());
+call    0 never executed
+    #####:  411:  builder.create<func::CallOp>(loc, func, highOperands);
+call    0 never executed
+        -:  412:
+        -:  413:  // After the if-stmt.
+    #####:  414:  builder.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  415:  builder.create<func::ReturnOp>(loc);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  416:}
+        -:  417:
+        -:  418:/// Creates a function to perform insertion sort on the values in the range of
+        -:  419:/// index [lo, hi).
+        -:  420://
+        -:  421:// The generate IR corresponds to this C like algorithm:
+        -:  422:// void insertionSort(lo, hi, data) {
+        -:  423://   for (i = lo+1; i < hi; i++) {
+        -:  424://      d = data[i];
+        -:  425://      p = binarySearch(lo, i-1, data)
+        -:  426://      for (j = 0; j > i - p; j++)
+        -:  427://        data[i-j] = data[i-j-1]
+        -:  428://      data[p] = d
+        -:  429://   }
+        -:  430:// }
+function _ZL20createSortStableFuncRN4mlir9OpBuilderENS_8ModuleOpENS_4func6FuncOpEm called 0 returned 0% blocks executed 0%
+    #####:  431:static void createSortStableFunc(OpBuilder &builder, ModuleOp module,
+        -:  432:                                 func::FuncOp func, size_t dim) {
+    #####:  433:  OpBuilder::InsertionGuard insertionGuard(builder);
+call    0 never executed
+    #####:  434:  Block *entryBlock = func.addEntryBlock();
+call    0 never executed
+    #####:  435:  builder.setInsertionPointToStart(entryBlock);
+call    0 never executed
+        -:  436:
+    #####:  437:  MLIRContext *context = module.getContext();
+call    0 never executed
+    #####:  438:  Location loc = func.getLoc();
+call    0 never executed
+    #####:  439:  ValueRange args = entryBlock->getArguments();
+call    0 never executed
+    #####:  440:  Value c1 = constantIndex(builder, loc, 1);
+call    0 never executed
+    #####:  441:  Value lo = args[loIdx];
+call    0 never executed
+    #####:  442:  Value hi = args[hiIdx];
+call    0 never executed
+    #####:  443:  Value lop1 = builder.create<arith::AddIOp>(loc, lo, c1);
+call    0 never executed
+call    1 never executed
+        -:  444:
+        -:  445:  // Start the outer for-stmt with induction variable i.
+    #####:  446:  scf::ForOp forOpI = builder.create<scf::ForOp>(loc, lop1, hi, c1);
+call    0 never executed
+    #####:  447:  builder.setInsertionPointToStart(forOpI.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  448:  Value i = forOpI.getInductionVar();
+call    0 never executed
+        -:  449:
+        -:  450:  // Binary search to find the insertion point p.
+    #####:  451:  SmallVector<Value, 6> operands{lo, i};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  452:  operands.append(args.begin() + xStartIdx, args.begin() + xStartIdx + dim);
+call    0 never executed
+    #####:  453:  FlatSymbolRefAttr searchFunc = getMangledSortHelperFunc(
+call    0 never executed
+    #####:  454:      builder, func, {IndexType::get(context)}, kBinarySearchFuncNamePrefix,
+call    0 never executed
+    #####:  455:      dim, operands, createBinarySearchFunc);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  456:  Value p = builder
+    #####:  457:                .create<func::CallOp>(loc, searchFunc, TypeRange{c1.getType()},
+call    0 never executed
+    #####:  458:                                      operands)
+call    0 never executed
+call    1 never executed
+    #####:  459:                .getResult(0);
+        -:  460:
+        -:  461:  // Move the value at data[i] to a temporary location.
+    #####:  462:  ValueRange data = args.drop_front(xStartIdx);
+call    0 never executed
+    #####:  463:  SmallVector<Value, 6> d;
+branch  0 never executed
+branch  1 never executed
+    #####:  464:  for (Value v : data)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  465:    d.push_back(builder.create<memref::LoadOp>(loc, v, i));
+call    0 never executed
+call    1 never executed
+        -:  466:
+        -:  467:  // Start the inner for-stmt with induction variable j, for moving data[p..i)
+        -:  468:  // to data[p+1..i+1).
+    #####:  469:  Value imp = builder.create<arith::SubIOp>(loc, i, p);
+call    0 never executed
+call    1 never executed
+    #####:  470:  Value c0 = constantIndex(builder, loc, 0);
+call    0 never executed
+    #####:  471:  scf::ForOp forOpJ = builder.create<scf::ForOp>(loc, c0, imp, c1);
+call    0 never executed
+    #####:  472:  builder.setInsertionPointToStart(forOpJ.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  473:  Value j = forOpJ.getInductionVar();
+call    0 never executed
+    #####:  474:  Value imj = builder.create<arith::SubIOp>(loc, i, j);
+call    0 never executed
+call    1 never executed
+    #####:  475:  Value imjm1 = builder.create<arith::SubIOp>(loc, imj, c1);
+call    0 never executed
+    #####:  476:  for (Value v : data) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  477:    Value t = builder.create<memref::LoadOp>(loc, v, imjm1);
+call    0 never executed
+call    1 never executed
+    #####:  478:    builder.create<memref::StoreOp>(loc, t, v, imj);
+call    0 never executed
+        -:  479:  }
+        -:  480:
+        -:  481:  // Store the value at data[i] to data[p].
+    #####:  482:  builder.setInsertionPointAfter(forOpJ);
+call    0 never executed
+    #####:  483:  for (auto it : llvm::zip(d, data))
+branch  0 never executed
+branch  1 never executed
+    #####:  484:    builder.create<memref::StoreOp>(loc, std::get<0>(it), std::get<1>(it), p);
+call    0 never executed
+        -:  485:
+    #####:  486:  builder.setInsertionPointAfter(forOpI);
+call    0 never executed
+    #####:  487:  builder.create<func::ReturnOp>(loc);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  488:}
+        -:  489:
+        -:  490://===---------------------------------------------------------------------===//
+        -:  491:// The actual sparse buffer rewriting rules.
+        -:  492://===---------------------------------------------------------------------===//
+        -:  493:
+        -:  494:namespace {
+        -:  495:
+        -:  496:/// Sparse rewriting rule for the push_back operator.
+        -:  497:struct PushBackRewriter : OpRewritePattern<PushBackOp> {
+        -:  498:public:
+        -:  499:  using OpRewritePattern<PushBackOp>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_116PushBackRewriter15matchAndRewriteEN4mlir13sparse_tensor10PushBackOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  500:  LogicalResult matchAndRewrite(PushBackOp op,
+        -:  501:                                PatternRewriter &rewriter) const override {
+        -:  502:    // Rewrite push_back(buffer, value, n) to:
+        -:  503:    // new_size = size(buffer) + n
+        -:  504:    // if (new_size > capacity(buffer))
+        -:  505:    //    while new_size > new_capacity
+        -:  506:    //      new_capacity = new_capacity*2
+        -:  507:    //    new_buffer = realloc(buffer, new_capacity)
+        -:  508:    // buffer = new_buffer
+        -:  509:    // subBuffer = subviewof(buffer)
+        -:  510:    // linalg.fill subBuffer value
+        -:  511:    //
+        -:  512:    // size(buffer) += n
+        -:  513:    //
+        -:  514:    // The capacity check is skipped when the attribute inbounds is presented.
+    #####:  515:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  516:    Value c0 = constantIndex(rewriter, loc, 0);
+call    0 never executed
+    #####:  517:    Value buffer = op.getInBuffer();
+call    0 never executed
+    #####:  518:    Value capacity = rewriter.create<memref::DimOp>(loc, buffer, c0);
+call    0 never executed
+call    1 never executed
+    #####:  519:    Value idx = constantIndex(rewriter, loc, op.getIdx().getZExtValue());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  520:    Value bufferSizes = op.getBufferSizes();
+call    0 never executed
+    #####:  521:    Value size = rewriter.create<memref::LoadOp>(loc, bufferSizes, idx);
+call    0 never executed
+call    1 never executed
+    #####:  522:    Value value = op.getValue();
+call    0 never executed
+        -:  523:
+    #####:  524:    Value n = op.getN() ? op.getN() : constantIndex(rewriter, loc, 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  525:    Value newSize = rewriter.create<arith::AddIOp>(loc, size, n);
+call    0 never executed
+call    1 never executed
+    #####:  526:    auto nValue = dyn_cast_or_null<arith::ConstantIndexOp>(n.getDefiningOp());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  527:    bool nIsOne = (nValue && nValue.value() == 1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  528:
+    #####:  529:    if (!op.getInbounds()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  530:      Value cond = rewriter.create<arith::CmpIOp>(
+    #####:  531:          loc, arith::CmpIPredicate::ugt, newSize, capacity);
+call    0 never executed
+call    1 never executed
+        -:  532:
+    #####:  533:      Value c2 = constantIndex(rewriter, loc, 2);
+call    0 never executed
+    #####:  534:      auto bufferType =
+    #####:  535:          MemRefType::get({ShapedType::kDynamicSize}, value.getType());
+call    0 never executed
+call    1 never executed
+    #####:  536:      scf::IfOp ifOp = rewriter.create<scf::IfOp>(loc, bufferType, cond,
+    #####:  537:                                                  /*else=*/true);
+call    0 never executed
+        -:  538:      // True branch.
+    #####:  539:      rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  540:      if (nIsOne) {
+branch  0 never executed
+branch  1 never executed
+    #####:  541:        capacity = rewriter.create<arith::MulIOp>(loc, capacity, c2);
+call    0 never executed
+        -:  542:      } else {
+        -:  543:        // Use a do-while loop to calculate the new capacity as follows:
+        -:  544:        //   do { new_capacity *= 2 } while (size > new_capacity)
+    #####:  545:        scf::WhileOp whileOp =
+    #####:  546:            rewriter.create<scf::WhileOp>(loc, capacity.getType(), capacity);
+call    0 never executed
+        -:  547:
+        -:  548:        // The before-region of the WhileOp.
+    #####:  549:        Block *before = rewriter.createBlock(&whileOp.getBefore(), {},
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  550:                                             {capacity.getType()}, {loc});
+call    0 never executed
+    #####:  551:        rewriter.setInsertionPointToEnd(before);
+call    0 never executed
+        -:  552:
+    #####:  553:        capacity =
+    #####:  554:            rewriter.create<arith::MulIOp>(loc, before->getArgument(0), c2);
+call    0 never executed
+call    1 never executed
+    #####:  555:        cond = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt,
+    #####:  556:                                              newSize, capacity);
+call    0 never executed
+call    1 never executed
+    #####:  557:        rewriter.create<scf::ConditionOp>(loc, cond, ValueRange{capacity});
+call    0 never executed
+call    1 never executed
+        -:  558:        // The after-region of the WhileOp.
+    #####:  559:        Block *after = rewriter.createBlock(&whileOp.getAfter(), {},
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  560:                                            {capacity.getType()}, {loc});
+call    0 never executed
+    #####:  561:        rewriter.setInsertionPointToEnd(after);
+call    0 never executed
+    #####:  562:        rewriter.create<scf::YieldOp>(loc, after->getArguments());
+call    0 never executed
+        -:  563:
+    #####:  564:        rewriter.setInsertionPointAfter(whileOp);
+call    0 never executed
+    #####:  565:        capacity = whileOp.getResult(0);
+        -:  566:      }
+        -:  567:
+    #####:  568:      Value newBuffer =
+    #####:  569:          rewriter.create<memref::ReallocOp>(loc, bufferType, buffer, capacity);
+call    0 never executed
+call    1 never executed
+    #####:  570:      rewriter.create<scf::YieldOp>(loc, newBuffer);
+call    0 never executed
+        -:  571:
+        -:  572:      // False branch.
+    #####:  573:      rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  574:      rewriter.create<scf::YieldOp>(loc, buffer);
+call    0 never executed
+        -:  575:
+        -:  576:      // Prepare for adding the value to the end of the buffer.
+    #####:  577:      rewriter.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  578:      buffer = ifOp.getResult(0);
+        -:  579:    }
+        -:  580:
+        -:  581:    // Add the value to the end of the buffer.
+    #####:  582:    if (nIsOne) {
+branch  0 never executed
+branch  1 never executed
+    #####:  583:      rewriter.create<memref::StoreOp>(loc, value, buffer, size);
+call    0 never executed
+        -:  584:    } else {
+    #####:  585:      Value subBuffer = rewriter.create<memref::SubViewOp>(
+    #####:  586:          loc, buffer, /*offset=*/ValueRange{size}, /*size=*/ValueRange{n},
+call    0 never executed
+    #####:  587:          /*step=*/ValueRange{constantIndex(rewriter, loc, 1)});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  588:      rewriter.create<linalg::FillOp>(loc, value, subBuffer);
+call    0 never executed
+        -:  589:    }
+        -:  590:
+        -:  591:    // Update the buffer size.
+    #####:  592:    rewriter.create<memref::StoreOp>(loc, newSize, bufferSizes, idx);
+call    0 never executed
+    #####:  593:    rewriter.replaceOp(op, buffer);
+call    0 never executed
+call    1 never executed
+    #####:  594:    return success();
+        -:  595:  }
+        -:  596:};
+        -:  597:
+        -:  598:/// Sparse rewriting rule for the sort operator.
+        -:  599:struct SortRewriter : public OpRewritePattern<SortOp> {
+        -:  600:public:
+        -:  601:  using OpRewritePattern<SortOp>::OpRewritePattern;
+        -:  602:
+function _ZNK12_GLOBAL__N_112SortRewriter15matchAndRewriteEN4mlir13sparse_tensor6SortOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  603:  LogicalResult matchAndRewrite(SortOp op,
+        -:  604:                                PatternRewriter &rewriter) const override {
+    #####:  605:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  606:    SmallVector<Value, 6> operands{constantIndex(rewriter, loc, 0), op.getN()};
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  607:
+        -:  608:    // Convert `values` to have dynamic shape and append them to `operands`.
+function _ZZNK12_GLOBAL__N_112SortRewriter15matchAndRewriteEN4mlir13sparse_tensor6SortOpERNS1_15PatternRewriterEENKUlNS1_10ValueRangeEE_clES6_ called 0 returned 0% blocks executed 0%
+    #####:  609:    auto addValues = [&](ValueRange values) {
+    #####:  610:      for (Value v : values) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  611:        auto mtp = v.getType().cast<MemRefType>();
+call    0 never executed
+    #####:  612:        if (!mtp.isDynamicDim(0)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  613:          auto newMtp =
+    #####:  614:              MemRefType::get({ShapedType::kDynamicSize}, mtp.getElementType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  615:          v = rewriter.create<memref::CastOp>(loc, newMtp, v);
+call    0 never executed
+        -:  616:        }
+    #####:  617:        operands.push_back(v);
+call    0 never executed
+        -:  618:      }
+    #####:  619:    };
+    #####:  620:    ValueRange xs = op.getXs();
+call    0 never executed
+call    1 never executed
+    #####:  621:    addValues(xs);
+call    0 never executed
+    #####:  622:    addValues(op.getYs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  623:    auto insertPoint = op->getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  624:    SmallString<32> funcName(op.getStable() ? kSortStableFuncNamePrefix
+call    0 never executed
+    #####:  625:                                            : kSortNonstableFuncNamePrefix);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  626:    FuncGeneratorType funcGenerator =
+    #####:  627:        op.getStable() ? createSortStableFunc : createSortNonstableFunc;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  628:    FlatSymbolRefAttr func =
+call    0 never executed
+        -:  629:        getMangledSortHelperFunc(rewriter, insertPoint, TypeRange(), funcName,
+    #####:  630:                                 xs.size(), operands, funcGenerator);
+call    0 never executed
+call    1 never executed
+    #####:  631:    rewriter.replaceOpWithNewOp<func::CallOp>(op, func, TypeRange(), operands);
+call    0 never executed
+call    1 never executed
+    #####:  632:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  633:  }
+        -:  634:};
+        -:  635:
+        -:  636:} // namespace
+        -:  637:
+        -:  638://===---------------------------------------------------------------------===//
+        -:  639:// Methods that add patterns described in this file to a pattern list.
+        -:  640://===---------------------------------------------------------------------===//
+        -:  641:
+function _ZN4mlir29populateSparseBufferRewritingERNS_17RewritePatternSetE called 1716 returned 100% blocks executed 100%
+     1716:  642:void mlir::populateSparseBufferRewriting(RewritePatternSet &patterns) {
+     1716:  643:  patterns.add<PushBackRewriter, SortRewriter>(patterns.getContext());
+call    0 returned 100%
+     1716:  644:}

@@ -1,0 +1,3369 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/LoopFusion.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/LoopFusion.cpp.gcda
+        -:    0:Runs:128624
+        -:    1://===- LoopFusion.cpp - Code to perform loop fusion -----------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements loop fusion.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Affine/Passes.h"
+        -:   14:
+        -:   15:#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+        -:   16:#include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
+        -:   17:#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+        -:   18:#include "mlir/Dialect/Affine/Analysis/Utils.h"
+        -:   19:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   20:#include "mlir/Dialect/Affine/LoopFusionUtils.h"
+        -:   21:#include "mlir/Dialect/Affine/LoopUtils.h"
+        -:   22:#include "mlir/Dialect/Affine/Utils.h"
+        -:   23:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   24:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   25:#include "mlir/IR/AffineExpr.h"
+        -:   26:#include "mlir/IR/AffineMap.h"
+        -:   27:#include "mlir/IR/Builders.h"
+        -:   28:#include "mlir/Transforms/Passes.h"
+        -:   29:#include "llvm/ADT/DenseMap.h"
+        -:   30:#include "llvm/ADT/DenseSet.h"
+        -:   31:#include "llvm/ADT/STLExtras.h"
+        -:   32:#include "llvm/ADT/SetVector.h"
+        -:   33:#include "llvm/Support/CommandLine.h"
+        -:   34:#include "llvm/Support/Debug.h"
+        -:   35:#include "llvm/Support/raw_ostream.h"
+        -:   36:#include <iomanip>
+        -:   37:#include <sstream>
+        -:   38:
+        -:   39:namespace mlir {
+        -:   40:#define GEN_PASS_DEF_AFFINELOOPFUSION
+        -:   41:#include "mlir/Dialect/Affine/Passes.h.inc"
+        -:   42:} // namespace mlir
+        -:   43:
+        -:   44:#define DEBUG_TYPE "affine-loop-fusion"
+        -:   45:
+        -:   46:using namespace mlir;
+        -:   47:
+        -:   48:namespace {
+        -:   49:/// Loop fusion pass. This pass currently supports a greedy fusion policy,
+        -:   50:/// which fuses loop nests with single-writer/single-reader memref dependences
+        -:   51:/// with the goal of improving locality.
+        -:   52:
+        -:   53:// TODO: Support fusion of source loop nests which write to multiple
+        -:   54:// memrefs, where each memref can have multiple users (if profitable).
+        -:   55:// TODO: Extend this pass to check for fusion preventing dependences,
+        -:   56:// and add support for more general loop fusion algorithms.
+        -:   57:
+    41472:   58:struct LoopFusion : public impl::AffineLoopFusionBase<LoopFusion> {
+call    0 returned 100%
+        -:   59:  LoopFusion() = default;
+function _ZN12_GLOBAL__N_110LoopFusionC2EjmbN4mlir10FusionModeE called 129292 returned 100% blocks executed 71%
+   129292:   60:  LoopFusion(unsigned fastMemorySpace, uint64_t localBufSizeThresholdBytes,
+   129292:   61:             bool maximalFusion, enum FusionMode affineFusionMode) {
+call    0 returned 100%
+   129292:   62:    this->fastMemorySpace = fastMemorySpace;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129292:   63:    this->localBufSizeThreshold = localBufSizeThresholdBytes / 1024;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129292:   64:    this->maximalFusion = maximalFusion;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129292:   65:    this->affineFusionMode = affineFusionMode;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   129292:   66:  }
+        -:   67:
+        -:   68:  void runOnOperation() override;
+        -:   69:};
+        -:   70:
+        -:   71:} // namespace
+        -:   72:
+        -:   73:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir20createLoopFusionPassEjmbNS_10FusionModeE called 129292 returned 100% blocks executed 100%
+   129292:   74:mlir::createLoopFusionPass(unsigned fastMemorySpace,
+        -:   75:                           uint64_t localBufSizeThreshold, bool maximalFusion,
+        -:   76:                           enum FusionMode affineFusionMode) {
+   129292:   77:  return std::make_unique<LoopFusion>(fastMemorySpace, localBufSizeThreshold,
+call    0 returned 100%
+   129292:   78:                                      maximalFusion, affineFusionMode);
+        -:   79:}
+        -:   80:
+        -:   81:namespace {
+        -:   82:
+        -:   83:// LoopNestStateCollector walks loop nests and collects load and store
+        -:   84:// operations, and whether or not a region holding op other than ForOp and IfOp
+        -:   85:// was encountered in the loop nest.
+    #####:   86:struct LoopNestStateCollector {
+        -:   87:  SmallVector<AffineForOp, 4> forOps;
+        -:   88:  SmallVector<Operation *, 4> loadOpInsts;
+        -:   89:  SmallVector<Operation *, 4> storeOpInsts;
+        -:   90:  bool hasNonAffineRegionOp = false;
+        -:   91:
+    #####:   92:  void collect(Operation *opToWalk) {
+function _ZZN12_GLOBAL__N_122LoopNestStateCollector7collectEPN4mlir9OperationEENKUlS3_E_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:   93:    opToWalk->walk([&](Operation *op) {
+call    0 never executed
+    #####:   94:      if (isa<AffineForOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   95:        forOps.push_back(cast<AffineForOp>(op));
+call    0 never executed
+call    1 never executed
+    #####:   96:      else if (op->getNumRegions() != 0 && !isa<AffineIfOp>(op))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   97:        hasNonAffineRegionOp = true;
+    #####:   98:      else if (isa<AffineReadOpInterface>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   99:        loadOpInsts.push_back(op);
+call    0 never executed
+    #####:  100:      else if (isa<AffineWriteOpInterface>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  101:        storeOpInsts.push_back(op);
+call    0 never executed
+    #####:  102:    });
+        -:  103:  }
+        -:  104:};
+        -:  105:
+        -:  106:// MemRefDependenceGraph is a graph data structure where graph nodes are
+        -:  107:// top-level operations in a FuncOp which contain load/store ops, and edges
+        -:  108:// are memref dependences between the nodes.
+        -:  109:// TODO: Add a more flexible dependence graph representation.
+        -:  110:// TODO: Add a depth parameter to dependence graph construction.
+        -:  111:struct MemRefDependenceGraph {
+        -:  112:public:
+        -:  113:  // Node represents a node in the graph. A Node is either an entire loop nest
+        -:  114:  // rooted at the top level which contains loads/stores, or a top level
+        -:  115:  // load/store.
+        -:  116:  struct Node {
+        -:  117:    // The unique identifier of this node in the graph.
+        -:  118:    unsigned id;
+        -:  119:    // The top-level statement which is (or contains) a load/store.
+        -:  120:    Operation *op;
+        -:  121:    // List of load operations.
+        -:  122:    SmallVector<Operation *, 4> loads;
+        -:  123:    // List of store op insts.
+        -:  124:    SmallVector<Operation *, 4> stores;
+    #####:  125:    Node(unsigned id, Operation *op) : id(id), op(op) {}
+        -:  126:
+        -:  127:    // Returns the load op count for 'memref'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph4Node14getLoadOpCountEN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  128:    unsigned getLoadOpCount(Value memref) {
+    #####:  129:      unsigned loadOpCount = 0;
+    #####:  130:      for (auto *loadOpInst : loads) {
+branch  0 never executed
+branch  1 never executed
+    #####:  131:        if (memref == cast<AffineReadOpInterface>(loadOpInst).getMemRef())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  132:          ++loadOpCount;
+        -:  133:      }
+    #####:  134:      return loadOpCount;
+        -:  135:    }
+        -:  136:
+        -:  137:    // Returns the store op count for 'memref'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph4Node15getStoreOpCountEN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  138:    unsigned getStoreOpCount(Value memref) {
+    #####:  139:      unsigned storeOpCount = 0;
+    #####:  140:      for (auto *storeOpInst : stores) {
+branch  0 never executed
+branch  1 never executed
+    #####:  141:        if (memref == cast<AffineWriteOpInterface>(storeOpInst).getMemRef())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  142:          ++storeOpCount;
+        -:  143:      }
+    #####:  144:      return storeOpCount;
+        -:  145:    }
+        -:  146:
+        -:  147:    // Returns all store ops in 'storeOps' which access 'memref'.
+        -:  148:    void getStoreOpsForMemref(Value memref,
+        -:  149:                              SmallVectorImpl<Operation *> *storeOps) {
+        -:  150:      for (auto *storeOpInst : stores) {
+        -:  151:        if (memref == cast<AffineWriteOpInterface>(storeOpInst).getMemRef())
+        -:  152:          storeOps->push_back(storeOpInst);
+        -:  153:      }
+        -:  154:    }
+        -:  155:
+        -:  156:    // Returns all load ops in 'loadOps' which access 'memref'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph4Node19getLoadOpsForMemrefEN4mlir5ValueEPN4llvm15SmallVectorImplIPNS2_9OperationEEE called 0 returned 0% blocks executed 0%
+    #####:  157:    void getLoadOpsForMemref(Value memref,
+        -:  158:                             SmallVectorImpl<Operation *> *loadOps) {
+    #####:  159:      for (auto *loadOpInst : loads) {
+branch  0 never executed
+branch  1 never executed
+    #####:  160:        if (memref == cast<AffineReadOpInterface>(loadOpInst).getMemRef())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  161:          loadOps->push_back(loadOpInst);
+call    0 never executed
+        -:  162:      }
+    #####:  163:    }
+        -:  164:
+        -:  165:    // Returns all memrefs in 'loadAndStoreMemrefSet' for which this node
+        -:  166:    // has at least one load and store operation.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph4Node24getLoadAndStoreMemrefSetEPN4llvm8DenseSetIN4mlir5ValueENS2_12DenseMapInfoIS5_vEEEE called 0 returned 0% blocks executed 0%
+    #####:  167:    void getLoadAndStoreMemrefSet(DenseSet<Value> *loadAndStoreMemrefSet) {
+    #####:  168:      llvm::SmallDenseSet<Value, 2> loadMemrefs;
+call    0 never executed
+    #####:  169:      for (auto *loadOpInst : loads) {
+branch  0 never executed
+branch  1 never executed
+    #####:  170:        loadMemrefs.insert(cast<AffineReadOpInterface>(loadOpInst).getMemRef());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  171:      }
+    #####:  172:      for (auto *storeOpInst : stores) {
+branch  0 never executed
+branch  1 never executed
+    #####:  173:        auto memref = cast<AffineWriteOpInterface>(storeOpInst).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  174:        if (loadMemrefs.count(memref) > 0)
+call    0 never executed
+    #####:  175:          loadAndStoreMemrefSet->insert(memref);
+call    0 never executed
+        -:  176:      }
+    #####:  177:    }
+        -:  178:  };
+        -:  179:
+        -:  180:  // Edge represents a data dependence between nodes in the graph.
+        -:  181:  struct Edge {
+        -:  182:    // The id of the node at the other end of the edge.
+        -:  183:    // If this edge is stored in Edge = Node.inEdges[i], then
+        -:  184:    // 'Node.inEdges[i].id' is the identifier of the source node of the edge.
+        -:  185:    // If this edge is stored in Edge = Node.outEdges[i], then
+        -:  186:    // 'Node.outEdges[i].id' is the identifier of the dest node of the edge.
+        -:  187:    unsigned id;
+        -:  188:    // The SSA value on which this edge represents a dependence.
+        -:  189:    // If the value is a memref, then the dependence is between graph nodes
+        -:  190:    // which contain accesses to the same memref 'value'. If the value is a
+        -:  191:    // non-memref value, then the dependence is between a graph node which
+        -:  192:    // defines an SSA value and another graph node which uses the SSA value
+        -:  193:    // (e.g. a constant or load operation defining a value which is used inside
+        -:  194:    // a loop nest).
+        -:  195:    Value value;
+        -:  196:  };
+        -:  197:
+        -:  198:  // Map from node id to Node.
+        -:  199:  DenseMap<unsigned, Node> nodes;
+        -:  200:  // Map from node id to list of input edges.
+        -:  201:  DenseMap<unsigned, SmallVector<Edge, 2>> inEdges;
+        -:  202:  // Map from node id to list of output edges.
+        -:  203:  DenseMap<unsigned, SmallVector<Edge, 2>> outEdges;
+        -:  204:  // Map from memref to a count on the dependence edges associated with that
+        -:  205:  // memref.
+        -:  206:  DenseMap<Value, unsigned> memrefEdgeCount;
+        -:  207:  // The next unique identifier to use for newly created graph nodes.
+        -:  208:  unsigned nextNodeId = 0;
+        -:  209:
+function _ZN12_GLOBAL__N_121MemRefDependenceGraphC2Ev called 0 returned 0% blocks executed 0%
+    #####:  210:  MemRefDependenceGraph() = default;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  211:
+        -:  212:  // Initializes the dependence graph based on operations in 'f'.
+        -:  213:  // Returns true on success, false otherwise.
+        -:  214:  bool init(func::FuncOp f);
+        -:  215:
+        -:  216:  // Returns the graph node for 'id'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph7getNodeEj called 0 returned 0% blocks executed 0%
+    #####:  217:  Node *getNode(unsigned id) {
+    #####:  218:    auto it = nodes.find(id);
+call    0 never executed
+    #####:  219:    assert(it != nodes.end());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  220:    return &it->second;
+call    0 never executed
+        -:  221:  }
+        -:  222:
+        -:  223:  // Returns the graph node for 'forOp'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph12getForOpNodeEN4mlir11AffineForOpE called 0 returned 0% blocks executed 0%
+    #####:  224:  Node *getForOpNode(AffineForOp forOp) {
+    #####:  225:    for (auto &idAndNode : nodes)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  226:      if (idAndNode.second.op == forOp.getOperation())
+branch  0 never executed
+branch  1 never executed
+    #####:  227:        return &idAndNode.second;
+    #####:  228:    return nullptr;
+        -:  229:  }
+        -:  230:
+        -:  231:  // Adds a node with 'op' to the graph and returns its unique identifier.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph7addNodeEPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  232:  unsigned addNode(Operation *op) {
+    #####:  233:    Node node(nextNodeId++, op);
+call    0 never executed
+    #####:  234:    nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  235:    return node.id;
+call    0 never executed
+        -:  236:  }
+        -:  237:
+        -:  238:  // Remove node 'id' (and its associated edges) from graph.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph10removeNodeEj called 0 returned 0% blocks executed 0%
+    #####:  239:  void removeNode(unsigned id) {
+        -:  240:    // Remove each edge in 'inEdges[id]'.
+    #####:  241:    if (inEdges.count(id) > 0) {
+call    0 never executed
+    #####:  242:      SmallVector<Edge, 2> oldInEdges = inEdges[id];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  243:      for (auto &inEdge : oldInEdges) {
+branch  0 never executed
+branch  1 never executed
+    #####:  244:        removeEdge(inEdge.id, id, inEdge.value);
+call    0 never executed
+        -:  245:      }
+        -:  246:    }
+        -:  247:    // Remove each edge in 'outEdges[id]'.
+    #####:  248:    if (outEdges.count(id) > 0) {
+call    0 never executed
+    #####:  249:      SmallVector<Edge, 2> oldOutEdges = outEdges[id];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  250:      for (auto &outEdge : oldOutEdges) {
+branch  0 never executed
+branch  1 never executed
+    #####:  251:        removeEdge(id, outEdge.id, outEdge.value);
+call    0 never executed
+        -:  252:      }
+        -:  253:    }
+        -:  254:    // Erase remaining node state.
+    #####:  255:    inEdges.erase(id);
+call    0 never executed
+    #####:  256:    outEdges.erase(id);
+call    0 never executed
+    #####:  257:    nodes.erase(id);
+call    0 never executed
+    #####:  258:  }
+        -:  259:
+        -:  260:  // Returns true if node 'id' writes to any memref which escapes (or is an
+        -:  261:  // argument to) the function/block. Returns false otherwise.
+        -:  262:  bool writesToLiveInOrEscapingMemrefs(unsigned id) {
+        -:  263:    Node *node = getNode(id);
+        -:  264:    for (auto *storeOpInst : node->stores) {
+        -:  265:      auto memref = cast<AffineWriteOpInterface>(storeOpInst).getMemRef();
+        -:  266:      auto *op = memref.getDefiningOp();
+        -:  267:      // Return true if 'memref' is a block argument.
+        -:  268:      if (!op)
+        -:  269:        return true;
+        -:  270:      // Return true if any use of 'memref' escapes the function.
+        -:  271:      for (auto *user : memref.getUsers())
+        -:  272:        if (!isa<AffineMapAccessInterface>(*user))
+        -:  273:          return true;
+        -:  274:    }
+        -:  275:    return false;
+        -:  276:  }
+        -:  277:
+        -:  278:  // Returns true iff there is an edge from node 'srcId' to node 'dstId' which
+        -:  279:  // is for 'value' if non-null, or for any value otherwise. Returns false
+        -:  280:  // otherwise.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph7hasEdgeEjjN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  281:  bool hasEdge(unsigned srcId, unsigned dstId, Value value = nullptr) {
+    #####:  282:    if (outEdges.count(srcId) == 0 || inEdges.count(dstId) == 0) {
+call    0 never executed
+call    1 never executed
+    #####:  283:      return false;
+        -:  284:    }
+    #####:  285:    bool hasOutEdge = llvm::any_of(outEdges[srcId], [=](Edge &edge) {
+call    0 never executed
+call    1 never executed
+        -:  286:      return edge.id == dstId && (!value || edge.value == value);
+        -:  287:    });
+    #####:  288:    bool hasInEdge = llvm::any_of(inEdges[dstId], [=](Edge &edge) {
+call    0 never executed
+        -:  289:      return edge.id == srcId && (!value || edge.value == value);
+        -:  290:    });
+    #####:  291:    return hasOutEdge && hasInEdge;
+        -:  292:  }
+        -:  293:
+        -:  294:  // Adds an edge from node 'srcId' to node 'dstId' for 'value'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph7addEdgeEjjN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  295:  void addEdge(unsigned srcId, unsigned dstId, Value value) {
+    #####:  296:    if (!hasEdge(srcId, dstId, value)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  297:      outEdges[srcId].push_back({dstId, value});
+call    0 never executed
+call    1 never executed
+    #####:  298:      inEdges[dstId].push_back({srcId, value});
+call    0 never executed
+call    1 never executed
+    #####:  299:      if (value.getType().isa<MemRefType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  300:        memrefEdgeCount[value]++;
+call    0 never executed
+        -:  301:    }
+    #####:  302:  }
+        -:  303:
+        -:  304:  // Removes an edge from node 'srcId' to node 'dstId' for 'value'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph10removeEdgeEjjN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  305:  void removeEdge(unsigned srcId, unsigned dstId, Value value) {
+    #####:  306:    assert(inEdges.count(dstId) > 0);
+call    0 never executed
+call    1 never executed
+    #####:  307:    assert(outEdges.count(srcId) > 0);
+call    0 never executed
+call    1 never executed
+    #####:  308:    if (value.getType().isa<MemRefType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  309:      assert(memrefEdgeCount.count(value) > 0);
+call    0 never executed
+call    1 never executed
+    #####:  310:      memrefEdgeCount[value]--;
+call    0 never executed
+        -:  311:    }
+        -:  312:    // Remove 'srcId' from 'inEdges[dstId]'.
+    #####:  313:    for (auto *it = inEdges[dstId].begin(); it != inEdges[dstId].end(); ++it) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  314:      if ((*it).id == srcId && (*it).value == value) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  315:        inEdges[dstId].erase(it);
+call    0 never executed
+    #####:  316:        break;
+call    0 never executed
+        -:  317:      }
+        -:  318:    }
+        -:  319:    // Remove 'dstId' from 'outEdges[srcId]'.
+    #####:  320:    for (auto *it = outEdges[srcId].begin(); it != outEdges[srcId].end();
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  321:         ++it) {
+    #####:  322:      if ((*it).id == dstId && (*it).value == value) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  323:        outEdges[srcId].erase(it);
+call    0 never executed
+    #####:  324:        break;
+call    0 never executed
+        -:  325:      }
+        -:  326:    }
+    #####:  327:  }
+        -:  328:
+        -:  329:  // Returns true if there is a path in the dependence graph from node 'srcId'
+        -:  330:  // to node 'dstId'. Returns false otherwise.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph17hasDependencePathEjj called 0 returned 0% blocks executed 0%
+    #####:  331:  bool hasDependencePath(unsigned srcId, unsigned dstId) {
+        -:  332:    // Worklist state is: <node-id, next-output-edge-index-to-visit>
+    #####:  333:    SmallVector<std::pair<unsigned, unsigned>, 4> worklist;
+call    0 never executed
+    #####:  334:    worklist.push_back({srcId, 0});
+call    0 never executed
+        -:  335:    // Run DFS traversal to see if 'dstId' is reachable from 'srcId'.
+    #####:  336:    while (!worklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  337:      auto &idAndIndex = worklist.back();
+call    0 never executed
+        -:  338:      // Return true if we have reached 'dstId'.
+    #####:  339:      if (idAndIndex.first == dstId)
+branch  0 never executed
+branch  1 never executed
+    #####:  340:        return true;
+branch  0 never executed
+branch  1 never executed
+        -:  341:      // Pop and continue if node has no out edges, or if all out edges have
+        -:  342:      // already been visited.
+    #####:  343:      if (outEdges.count(idAndIndex.first) == 0 ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  344:          idAndIndex.second == outEdges[idAndIndex.first].size()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  345:        worklist.pop_back();
+call    0 never executed
+    #####:  346:        continue;
+        -:  347:      }
+        -:  348:      // Get graph edge to traverse.
+    #####:  349:      Edge edge = outEdges[idAndIndex.first][idAndIndex.second];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  350:      // Increment next output edge index for 'idAndIndex'.
+    #####:  351:      ++idAndIndex.second;
+        -:  352:      // Add node at 'edge.id' to worklist.
+    #####:  353:      worklist.push_back({edge.id, 0});
+call    0 never executed
+        -:  354:    }
+        -:  355:    return false;
+        -:  356:  }
+        -:  357:
+        -:  358:  // Returns the input edge count for node 'id' and 'memref' from src nodes
+        -:  359:  // which access 'memref' with a store operation.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph25getIncomingMemRefAccessesEjN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  360:  unsigned getIncomingMemRefAccesses(unsigned id, Value memref) {
+    #####:  361:    unsigned inEdgeCount = 0;
+    #####:  362:    if (inEdges.count(id) > 0)
+call    0 never executed
+    #####:  363:      for (auto &inEdge : inEdges[id])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  364:        if (inEdge.value == memref) {
+branch  0 never executed
+branch  1 never executed
+    #####:  365:          Node *srcNode = getNode(inEdge.id);
+call    0 never executed
+        -:  366:          // Only count in edges from 'srcNode' if 'srcNode' accesses 'memref'
+    #####:  367:          if (srcNode->getStoreOpCount(memref) > 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  368:            ++inEdgeCount;
+        -:  369:        }
+    #####:  370:    return inEdgeCount;
+        -:  371:  }
+        -:  372:
+        -:  373:  // Returns the output edge count for node 'id' and 'memref' (if non-null),
+        -:  374:  // otherwise returns the total output edge count from node 'id'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph15getOutEdgeCountEjN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  375:  unsigned getOutEdgeCount(unsigned id, Value memref = nullptr) {
+    #####:  376:    unsigned outEdgeCount = 0;
+    #####:  377:    if (outEdges.count(id) > 0)
+call    0 never executed
+    #####:  378:      for (auto &outEdge : outEdges[id])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  379:        if (!memref || outEdge.value == memref)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  380:          ++outEdgeCount;
+    #####:  381:    return outEdgeCount;
+        -:  382:  }
+        -:  383:
+        -:  384:  /// Return all nodes which define SSA values used in node 'id'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph19gatherDefiningNodesEjRN4llvm8DenseSetIjNS1_12DenseMapInfoIjvEEEE called 0 returned 0% blocks executed 0%
+    #####:  385:  void gatherDefiningNodes(unsigned id, DenseSet<unsigned> &definingNodes) {
+    #####:  386:    for (MemRefDependenceGraph::Edge edge : inEdges[id])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  387:      // By definition of edge, if the edge value is a non-memref value,
+        -:  388:      // then the dependence is between a graph node which defines an SSA value
+        -:  389:      // and another graph node which uses the SSA value.
+    #####:  390:      if (!edge.value.getType().isa<MemRefType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  391:        definingNodes.insert(edge.id);
+call    0 never executed
+    #####:  392:  }
+        -:  393:
+        -:  394:  // Computes and returns an insertion point operation, before which the
+        -:  395:  // the fused <srcId, dstId> loop nest can be inserted while preserving
+        -:  396:  // dependences. Returns nullptr if no such insertion point is found.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph30getFusedLoopNestInsertionPointEjj called 0 returned 0% blocks executed 0%
+    #####:  397:  Operation *getFusedLoopNestInsertionPoint(unsigned srcId, unsigned dstId) {
+    #####:  398:    if (outEdges.count(srcId) == 0)
+call    0 never executed
+    #####:  399:      return getNode(dstId)->op;
+call    0 never executed
+        -:  400:
+        -:  401:    // Skip if there is any defining node of 'dstId' that depends on 'srcId'.
+    #####:  402:    DenseSet<unsigned> definingNodes;
+call    0 never executed
+    #####:  403:    gatherDefiningNodes(dstId, definingNodes);
+call    0 never executed
+    #####:  404:    if (llvm::any_of(definingNodes, [&](unsigned id) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  405:          return hasDependencePath(srcId, id);
+call    0 never executed
+        -:  406:        })) {
+    #####:  407:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  408:                 << "Can't fuse: a defining op with a user in the dst "
+        -:  409:                    "loop has dependence from the src loop\n");
+    #####:  410:      return nullptr;
+        -:  411:    }
+        -:  412:
+        -:  413:    // Build set of insts in range (srcId, dstId) which depend on 'srcId'.
+    #####:  414:    SmallPtrSet<Operation *, 2> srcDepInsts;
+call    0 never executed
+call    1 never executed
+    #####:  415:    for (auto &outEdge : outEdges[srcId])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  416:      if (outEdge.id != dstId)
+branch  0 never executed
+branch  1 never executed
+    #####:  417:        srcDepInsts.insert(getNode(outEdge.id)->op);
+call    0 never executed
+call    1 never executed
+        -:  418:
+        -:  419:    // Build set of insts in range (srcId, dstId) on which 'dstId' depends.
+    #####:  420:    SmallPtrSet<Operation *, 2> dstDepInsts;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  421:    for (auto &inEdge : inEdges[dstId])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  422:      if (inEdge.id != srcId)
+branch  0 never executed
+branch  1 never executed
+    #####:  423:        dstDepInsts.insert(getNode(inEdge.id)->op);
+call    0 never executed
+call    1 never executed
+        -:  424:
+    #####:  425:    Operation *srcNodeInst = getNode(srcId)->op;
+call    0 never executed
+    #####:  426:    Operation *dstNodeInst = getNode(dstId)->op;
+call    0 never executed
+        -:  427:
+        -:  428:    // Computing insertion point:
+        -:  429:    // *) Walk all operation positions in Block operation list in the
+        -:  430:    //    range (src, dst). For each operation 'op' visited in this search:
+        -:  431:    //   *) Store in 'firstSrcDepPos' the first position where 'op' has a
+        -:  432:    //      dependence edge from 'srcNode'.
+        -:  433:    //   *) Store in 'lastDstDepPost' the last position where 'op' has a
+        -:  434:    //      dependence edge to 'dstNode'.
+        -:  435:    // *) Compare 'firstSrcDepPos' and 'lastDstDepPost' to determine the
+        -:  436:    //    operation insertion point (or return null pointer if no such
+        -:  437:    //    insertion point exists: 'firstSrcDepPos' <= 'lastDstDepPos').
+    #####:  438:    SmallVector<Operation *, 2> depInsts;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  439:    Optional<unsigned> firstSrcDepPos;
+    #####:  440:    Optional<unsigned> lastDstDepPos;
+    #####:  441:    unsigned pos = 0;
+    #####:  442:    for (Block::iterator it = std::next(Block::iterator(srcNodeInst));
+call    0 never executed
+    #####:  443:         it != Block::iterator(dstNodeInst); ++it) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  444:      Operation *op = &(*it);
+call    0 never executed
+    #####:  445:      if (srcDepInsts.count(op) > 0 && firstSrcDepPos == None)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  446:        firstSrcDepPos = pos;
+    #####:  447:      if (dstDepInsts.count(op) > 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  448:        lastDstDepPos = pos;
+branch  0 never executed
+branch  1 never executed
+    #####:  449:      depInsts.push_back(op);
+call    0 never executed
+    #####:  450:      ++pos;
+        -:  451:    }
+        -:  452:
+    #####:  453:    if (firstSrcDepPos.has_value()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  454:      if (lastDstDepPos.has_value()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  455:        if (firstSrcDepPos.value() <= lastDstDepPos.value()) {
+branch  0 never executed
+branch  1 never executed
+        -:  456:          // No valid insertion point exists which preserves dependences.
+        -:  457:          return nullptr;
+        -:  458:        }
+        -:  459:      }
+        -:  460:      // Return the insertion point at 'firstSrcDepPos'.
+    #####:  461:      return depInsts[firstSrcDepPos.value()];
+branch  0 never executed
+branch  1 never executed
+        -:  462:    }
+        -:  463:    // No dependence targets in range (or only dst deps in range), return
+        -:  464:    // 'dstNodInst' insertion point.
+        -:  465:    return dstNodeInst;
+        -:  466:  }
+        -:  467:
+        -:  468:  // Updates edge mappings from node 'srcId' to node 'dstId' after fusing them,
+        -:  469:  // taking into account that:
+        -:  470:  //   *) if 'removeSrcId' is true, 'srcId' will be removed after fusion,
+        -:  471:  //   *) memrefs in 'privateMemRefs' has been replaced in node at 'dstId' by a
+        -:  472:  //      private memref.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph11updateEdgesEjjRKN4llvm8DenseSetIN4mlir5ValueENS1_12DenseMapInfoIS4_vEEEEb called 0 returned 0% blocks executed 0%
+    #####:  473:  void updateEdges(unsigned srcId, unsigned dstId,
+        -:  474:                   const DenseSet<Value> &privateMemRefs, bool removeSrcId) {
+        -:  475:    // For each edge in 'inEdges[srcId]': add new edge remapping to 'dstId'.
+    #####:  476:    if (inEdges.count(srcId) > 0) {
+call    0 never executed
+    #####:  477:      SmallVector<Edge, 2> oldInEdges = inEdges[srcId];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  478:      for (auto &inEdge : oldInEdges) {
+branch  0 never executed
+branch  1 never executed
+        -:  479:        // Add edge from 'inEdge.id' to 'dstId' if it's not a private memref.
+    #####:  480:        if (privateMemRefs.count(inEdge.value) == 0)
+call    0 never executed
+    #####:  481:          addEdge(inEdge.id, dstId, inEdge.value);
+call    0 never executed
+        -:  482:      }
+        -:  483:    }
+        -:  484:    // For each edge in 'outEdges[srcId]': remove edge from 'srcId' to 'dstId'.
+        -:  485:    // If 'srcId' is going to be removed, remap all the out edges to 'dstId'.
+    #####:  486:    if (outEdges.count(srcId) > 0) {
+call    0 never executed
+    #####:  487:      SmallVector<Edge, 2> oldOutEdges = outEdges[srcId];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  488:      for (auto &outEdge : oldOutEdges) {
+branch  0 never executed
+branch  1 never executed
+        -:  489:        // Remove any out edges from 'srcId' to 'dstId' across memrefs.
+    #####:  490:        if (outEdge.id == dstId)
+branch  0 never executed
+branch  1 never executed
+    #####:  491:          removeEdge(srcId, outEdge.id, outEdge.value);
+call    0 never executed
+    #####:  492:        else if (removeSrcId) {
+branch  0 never executed
+branch  1 never executed
+    #####:  493:          addEdge(dstId, outEdge.id, outEdge.value);
+call    0 never executed
+    #####:  494:          removeEdge(srcId, outEdge.id, outEdge.value);
+call    0 never executed
+        -:  495:        }
+        -:  496:      }
+        -:  497:    }
+        -:  498:    // Remove any edges in 'inEdges[dstId]' on 'oldMemRef' (which is being
+        -:  499:    // replaced by a private memref). These edges could come from nodes
+        -:  500:    // other than 'srcId' which were removed in the previous step.
+    #####:  501:    if (inEdges.count(dstId) > 0 && !privateMemRefs.empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  502:      SmallVector<Edge, 2> oldInEdges = inEdges[dstId];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  503:      for (auto &inEdge : oldInEdges)
+branch  0 never executed
+branch  1 never executed
+    #####:  504:        if (privateMemRefs.count(inEdge.value) > 0)
+call    0 never executed
+    #####:  505:          removeEdge(inEdge.id, dstId, inEdge.value);
+call    0 never executed
+        -:  506:    }
+    #####:  507:  }
+        -:  508:
+        -:  509:  // Update edge mappings for nodes 'sibId' and 'dstId' to reflect fusion
+        -:  510:  // of sibling node 'sibId' into node 'dstId'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph11updateEdgesEjj called 0 returned 0% blocks executed 0%
+    #####:  511:  void updateEdges(unsigned sibId, unsigned dstId) {
+        -:  512:    // For each edge in 'inEdges[sibId]':
+        -:  513:    // *) Add new edge from source node 'inEdge.id' to 'dstNode'.
+        -:  514:    // *) Remove edge from source node 'inEdge.id' to 'sibNode'.
+    #####:  515:    if (inEdges.count(sibId) > 0) {
+call    0 never executed
+    #####:  516:      SmallVector<Edge, 2> oldInEdges = inEdges[sibId];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  517:      for (auto &inEdge : oldInEdges) {
+branch  0 never executed
+branch  1 never executed
+    #####:  518:        addEdge(inEdge.id, dstId, inEdge.value);
+call    0 never executed
+    #####:  519:        removeEdge(inEdge.id, sibId, inEdge.value);
+call    0 never executed
+        -:  520:      }
+        -:  521:    }
+        -:  522:
+        -:  523:    // For each edge in 'outEdges[sibId]' to node 'id'
+        -:  524:    // *) Add new edge from 'dstId' to 'outEdge.id'.
+        -:  525:    // *) Remove edge from 'sibId' to 'outEdge.id'.
+    #####:  526:    if (outEdges.count(sibId) > 0) {
+call    0 never executed
+    #####:  527:      SmallVector<Edge, 2> oldOutEdges = outEdges[sibId];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  528:      for (auto &outEdge : oldOutEdges) {
+branch  0 never executed
+branch  1 never executed
+    #####:  529:        addEdge(dstId, outEdge.id, outEdge.value);
+call    0 never executed
+    #####:  530:        removeEdge(sibId, outEdge.id, outEdge.value);
+call    0 never executed
+        -:  531:      }
+        -:  532:    }
+    #####:  533:  }
+        -:  534:
+        -:  535:  // Adds ops in 'loads' and 'stores' to node at 'id'.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph9addToNodeEjRKN4llvm15SmallVectorImplIPN4mlir9OperationEEES8_ called 0 returned 0% blocks executed 0%
+    #####:  536:  void addToNode(unsigned id, const SmallVectorImpl<Operation *> &loads,
+        -:  537:                 const SmallVectorImpl<Operation *> &stores) {
+    #####:  538:    Node *node = getNode(id);
+call    0 never executed
+    #####:  539:    llvm::append_range(node->loads, loads);
+call    0 never executed
+    #####:  540:    llvm::append_range(node->stores, stores);
+call    0 never executed
+    #####:  541:  }
+        -:  542:
+    #####:  543:  void clearNodeLoadAndStores(unsigned id) {
+    #####:  544:    Node *node = getNode(id);
+    #####:  545:    node->loads.clear();
+call    0 never executed
+    #####:  546:    node->stores.clear();
+        -:  547:  }
+        -:  548:
+        -:  549:  // Calls 'callback' for each input edge incident to node 'id' which carries a
+        -:  550:  // memref dependence.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph22forEachMemRefInputEdgeEjRKSt8functionIFvNS0_4EdgeEEE called 0 returned 0% blocks executed 0%
+    #####:  551:  void forEachMemRefInputEdge(unsigned id,
+        -:  552:                              const std::function<void(Edge)> &callback) {
+    #####:  553:    if (inEdges.count(id) > 0)
+call    0 never executed
+    #####:  554:      forEachMemRefEdge(inEdges[id], callback);
+call    0 never executed
+call    1 never executed
+    #####:  555:  }
+        -:  556:
+        -:  557:  // Calls 'callback' for each output edge from node 'id' which carries a
+        -:  558:  // memref dependence.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph23forEachMemRefOutputEdgeEjRKSt8functionIFvNS0_4EdgeEEE called 0 returned 0% blocks executed 0%
+    #####:  559:  void forEachMemRefOutputEdge(unsigned id,
+        -:  560:                               const std::function<void(Edge)> &callback) {
+    #####:  561:    if (outEdges.count(id) > 0)
+call    0 never executed
+    #####:  562:      forEachMemRefEdge(outEdges[id], callback);
+call    0 never executed
+call    1 never executed
+    #####:  563:  }
+        -:  564:
+        -:  565:  // Calls 'callback' for each edge in 'edges' which carries a memref
+        -:  566:  // dependence.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph17forEachMemRefEdgeEN4llvm8ArrayRefINS0_4EdgeEEERKSt8functionIFvS3_EE called 0 returned 0% blocks executed 0%
+    #####:  567:  void forEachMemRefEdge(ArrayRef<Edge> edges,
+        -:  568:                         const std::function<void(Edge)> &callback) {
+    #####:  569:    for (const auto &edge : edges) {
+branch  0 never executed
+branch  1 never executed
+        -:  570:      // Skip if 'edge' is not a memref dependence edge.
+    #####:  571:      if (!edge.value.getType().isa<MemRefType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  572:        continue;
+    #####:  573:      assert(nodes.count(edge.id) > 0);
+call    0 never executed
+call    1 never executed
+        -:  574:      // Skip if 'edge.id' is not a loop nest.
+    #####:  575:      if (!isa<AffineForOp>(getNode(edge.id)->op))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  576:        continue;
+        -:  577:      // Visit current input edge 'edge'.
+    #####:  578:      callback(edge);
+branch  0 never executed
+branch  1 never executed
+        -:  579:    }
+    #####:  580:  }
+        -:  581:
+        -:  582:  void print(raw_ostream &os) const {
+        -:  583:    os << "\nMemRefDependenceGraph\n";
+        -:  584:    os << "\nNodes:\n";
+        -:  585:    for (const auto &idAndNode : nodes) {
+        -:  586:      os << "Node: " << idAndNode.first << "\n";
+        -:  587:      auto it = inEdges.find(idAndNode.first);
+        -:  588:      if (it != inEdges.end()) {
+        -:  589:        for (const auto &e : it->second)
+        -:  590:          os << "  InEdge: " << e.id << " " << e.value << "\n";
+        -:  591:      }
+        -:  592:      it = outEdges.find(idAndNode.first);
+        -:  593:      if (it != outEdges.end()) {
+        -:  594:        for (const auto &e : it->second)
+        -:  595:          os << "  OutEdge: " << e.id << " " << e.value << "\n";
+        -:  596:      }
+        -:  597:    }
+        -:  598:  }
+        -:  599:  void dump() const { print(llvm::errs()); }
+        -:  600:};
+        -:  601:
+        -:  602:/// Returns true if node 'srcId' can be removed after fusing it with node
+        -:  603:/// 'dstId'. The node can be removed if any of the following conditions are met:
+        -:  604:///   1. 'srcId' has no output dependences after fusion and no escaping memrefs.
+        -:  605:///   2. 'srcId' has no output dependences after fusion, has escaping memrefs
+        -:  606:///       and the fusion slice is maximal.
+        -:  607:///   3. 'srcId' has output dependences after fusion, the fusion slice is
+        -:  608:///      maximal and the fusion insertion point dominates all the dependences.
+function _ZN12_GLOBAL__N_1L27canRemoveSrcNodeAfterFusionEjjRKN4mlir21ComputationSliceStateEPNS0_9OperationERKN4llvm8DenseSetINS0_5ValueENS6_12DenseMapInfoIS8_vEEEEPNS_21MemRefDependenceGraphE called 0 returned 0% blocks executed 0%
+    #####:  609:static bool canRemoveSrcNodeAfterFusion(
+        -:  610:    unsigned srcId, unsigned dstId, const ComputationSliceState &fusionSlice,
+        -:  611:    Operation *fusedLoopInsPoint, const DenseSet<Value> &escapingMemRefs,
+        -:  612:    MemRefDependenceGraph *mdg) {
+        -:  613:
+    #####:  614:  Operation *dstNodeOp = mdg->getNode(dstId)->op;
+call    0 never executed
+    #####:  615:  bool hasOutDepsAfterFusion = false;
+        -:  616:
+    #####:  617:  for (auto &outEdge : mdg->outEdges[srcId]) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  618:    Operation *depNodeOp = mdg->getNode(outEdge.id)->op;
+call    0 never executed
+        -:  619:    // Skip dependence with dstOp since it will be removed after fusion.
+    #####:  620:    if (depNodeOp == dstNodeOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  621:      continue;
+        -:  622:
+        -:  623:    // Only fusion within the same block is supported. Use domination analysis
+        -:  624:    // when needed.
+    #####:  625:    if (depNodeOp->getBlock() != dstNodeOp->getBlock())
+branch  0 never executed
+branch  1 never executed
+        -:  626:      return false;
+        -:  627:
+        -:  628:    // Check if the insertion point of the fused loop dominates the dependence.
+        -:  629:    // Otherwise, the src loop can't be removed.
+    #####:  630:    if (fusedLoopInsPoint != depNodeOp &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  631:        !fusedLoopInsPoint->isBeforeInBlock(depNodeOp)) {
+call    0 never executed
+    #####:  632:      LLVM_DEBUG(llvm::dbgs() << "Src loop can't be removed: dst loop doesn't "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  633:                                 "dominate dependence\n");
+    #####:  634:      return false;
+        -:  635:    }
+        -:  636:
+        -:  637:    hasOutDepsAfterFusion = true;
+        -:  638:  }
+        -:  639:
+        -:  640:  // If src loop has dependences after fusion or it writes to an live-out or
+        -:  641:  // escaping memref, we can only remove it if the fusion slice is maximal so
+        -:  642:  // that all the dependences are preserved.
+    #####:  643:  if (hasOutDepsAfterFusion || !escapingMemRefs.empty()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  644:    Optional<bool> isMaximal = fusionSlice.isMaximal();
+call    0 never executed
+    #####:  645:    if (!isMaximal) {
+branch  0 never executed
+branch  1 never executed
+    #####:  646:      LLVM_DEBUG(llvm::dbgs() << "Src loop can't be removed: can't determine "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  647:                                 "if fusion is maximal\n");
+    #####:  648:      return false;
+        -:  649:    }
+        -:  650:
+    #####:  651:    if (!*isMaximal) {
+branch  0 never executed
+branch  1 never executed
+    #####:  652:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  653:                 << "Src loop can't be removed: fusion is not maximal\n");
+    #####:  654:      return false;
+        -:  655:    }
+        -:  656:  }
+        -:  657:
+        -:  658:  return true;
+        -:  659:}
+        -:  660:
+        -:  661:/// Returns in 'srcIdCandidates' the producer fusion candidates for consumer
+        -:  662:/// 'dstId'. Candidates are sorted by node id order. This order corresponds to
+        -:  663:/// the program order when the 'mdg' is created. However, program order is not
+        -:  664:/// guaranteed and must not be required by the client. Program order won't be
+        -:  665:/// held if the 'mdg' is reused from a previous fusion step or if the node
+        -:  666:/// creation order changes in the future to support more advance cases.
+        -:  667:// TODO: Move this to a loop fusion utility once 'mdg' is also moved.
+function _ZN12_GLOBAL__N_1L21getProducerCandidatesEjPNS_21MemRefDependenceGraphERN4llvm15SmallVectorImplIjEE called 0 returned 0% blocks executed 0%
+    #####:  668:static void getProducerCandidates(unsigned dstId, MemRefDependenceGraph *mdg,
+        -:  669:                                  SmallVectorImpl<unsigned> &srcIdCandidates) {
+        -:  670:  // Skip if no input edges along which to fuse.
+    #####:  671:  if (mdg->inEdges.count(dstId) == 0)
+call    0 never executed
+    #####:  672:    return;
+        -:  673:
+        -:  674:  // Gather memrefs from loads in 'dstId'.
+    #####:  675:  auto *dstNode = mdg->getNode(dstId);
+call    0 never executed
+    #####:  676:  DenseSet<Value> consumedMemrefs;
+call    0 never executed
+    #####:  677:  for (Operation *load : dstNode->loads)
+branch  0 never executed
+branch  1 never executed
+    #####:  678:    consumedMemrefs.insert(cast<AffineReadOpInterface>(load).getMemRef());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  679:
+        -:  680:  // Traverse 'dstId' incoming edges and gather the nodes that contain a store
+        -:  681:  // to one of the consumed memrefs.
+    #####:  682:  for (auto &srcEdge : mdg->inEdges[dstId]) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  683:    auto *srcNode = mdg->getNode(srcEdge.id);
+call    0 never executed
+        -:  684:    // Skip if 'srcNode' is not a loop nest.
+    #####:  685:    if (!isa<AffineForOp>(srcNode->op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  686:      continue;
+        -:  687:
+function _ZZN12_GLOBAL__N_1L21getProducerCandidatesEjPNS_21MemRefDependenceGraphERN4llvm15SmallVectorImplIjEEENKUlPN4mlir9OperationEE_clES8_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  688:    if (any_of(srcNode->stores, [&](Operation *op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  689:          auto storeOp = cast<AffineWriteOpInterface>(op);
+call    0 never executed
+    #####:  690:          return consumedMemrefs.count(storeOp.getMemRef()) > 0;
+call    0 never executed
+call    1 never executed
+        -:  691:        }))
+    #####:  692:      srcIdCandidates.push_back(srcNode->id);
+call    0 never executed
+        -:  693:  }
+        -:  694:
+    #####:  695:  llvm::sort(srcIdCandidates);
+call    0 never executed
+    #####:  696:  srcIdCandidates.erase(
+call    0 never executed
+    #####:  697:      std::unique(srcIdCandidates.begin(), srcIdCandidates.end()),
+call    0 never executed
+call    1 never executed
+    #####:  698:      srcIdCandidates.end());
+call    0 never executed
+        -:  699:}
+        -:  700:
+        -:  701:/// Returns in 'producerConsumerMemrefs' the memrefs involved in a
+        -:  702:/// producer-consumer dependence between 'srcId' and 'dstId'.
+        -:  703:static void
+function _ZN12_GLOBAL__N_1L29gatherProducerConsumerMemrefsEjjPNS_21MemRefDependenceGraphERN4llvm8DenseSetIN4mlir5ValueENS2_12DenseMapInfoIS5_vEEEE called 0 returned 0% blocks executed 0%
+    #####:  704:gatherProducerConsumerMemrefs(unsigned srcId, unsigned dstId,
+        -:  705:                              MemRefDependenceGraph *mdg,
+        -:  706:                              DenseSet<Value> &producerConsumerMemrefs) {
+    #####:  707:  auto *dstNode = mdg->getNode(dstId);
+call    0 never executed
+    #####:  708:  auto *srcNode = mdg->getNode(srcId);
+call    0 never executed
+    #####:  709:  gatherProducerConsumerMemrefs(srcNode->stores, dstNode->loads,
+call    0 never executed
+        -:  710:                                producerConsumerMemrefs);
+    #####:  711:}
+        -:  712:
+        -:  713:/// Returns in 'escapingMemRefs' the memrefs from affine store ops in node 'id'
+        -:  714:/// that escape the function. A memref escapes the function if either:
+        -:  715:///   1. It's a function argument, or
+        -:  716:///   2. It's used by a non-affine op (e.g., std load/store, std call, etc.)
+function _ZN12_GLOBAL__N_121gatherEscapingMemrefsEjPNS_21MemRefDependenceGraphERN4llvm8DenseSetIN4mlir5ValueENS2_12DenseMapInfoIS5_vEEEE called 0 returned 0% blocks executed 0%
+    #####:  717:void gatherEscapingMemrefs(unsigned id, MemRefDependenceGraph *mdg,
+        -:  718:                           DenseSet<Value> &escapingMemRefs) {
+    #####:  719:  auto *node = mdg->getNode(id);
+call    0 never executed
+    #####:  720:  for (auto *storeOpInst : node->stores) {
+branch  0 never executed
+branch  1 never executed
+    #####:  721:    auto memref = cast<AffineWriteOpInterface>(storeOpInst).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  722:    if (escapingMemRefs.count(memref))
+call    0 never executed
+    #####:  723:      continue;
+        -:  724:    // Check if 'memref' escapes because it's a block argument.
+    #####:  725:    if (memref.isa<BlockArgument>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  726:      escapingMemRefs.insert(memref);
+call    0 never executed
+    #####:  727:      continue;
+        -:  728:    }
+        -:  729:    // Check if 'memref' escapes through a non-affine op (e.g., std load/store,
+        -:  730:    // call op, etc.).
+    #####:  731:    for (Operation *user : memref.getUsers())
+branch  0 never executed
+branch  1 never executed
+    #####:  732:      if (!isa<AffineMapAccessInterface>(*user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  733:        escapingMemRefs.insert(memref);
+call    0 never executed
+        -:  734:  }
+    #####:  735:}
+        -:  736:
+        -:  737:} // namespace
+        -:  738:
+        -:  739:// Initializes the data dependence graph by walking operations in 'f'.
+        -:  740:// Assigns each node in the graph a node id based on program order in 'f'.
+        -:  741:// TODO: Add support for taking a Block arg to construct the
+        -:  742:// dependence graph at a different depth.
+function _ZN12_GLOBAL__N_121MemRefDependenceGraph4initEN4mlir4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  743:bool MemRefDependenceGraph::init(func::FuncOp f) {
+    #####:  744:  LLVM_DEBUG(llvm::dbgs() << "--- Initializing MDG ---\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  745:  DenseMap<Value, SetVector<unsigned>> memrefAccesses;
+call    0 never executed
+        -:  746:
+        -:  747:  // TODO: support multi-block functions.
+    #####:  748:  if (!llvm::hasSingleElement(f))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  749:    return false;
+        -:  750:
+    #####:  751:  DenseMap<Operation *, unsigned> forToNodeMap;
+call    0 never executed
+call    1 never executed
+    #####:  752:  for (auto &op : f.front()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  753:    if (auto forOp = dyn_cast<AffineForOp>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  754:      // Create graph node 'id' to represent top-level 'forOp' and record
+        -:  755:      // all loads and store accesses it contains.
+    #####:  756:      LoopNestStateCollector collector;
+call    0 never executed
+call    1 never executed
+    #####:  757:      collector.collect(&op);
+call    0 never executed
+        -:  758:      // Return false if a region holding op other than 'affine.for' and
+        -:  759:      // 'affine.if' was found (not currently supported).
+    #####:  760:      if (collector.hasNonAffineRegionOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  761:        return false;
+call    0 never executed
+    #####:  762:      Node node(nextNodeId++, &op);
+    #####:  763:      for (auto *opInst : collector.loadOpInsts) {
+branch  0 never executed
+branch  1 never executed
+    #####:  764:        node.loads.push_back(opInst);
+call    0 never executed
+    #####:  765:        auto memref = cast<AffineReadOpInterface>(opInst).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  766:        memrefAccesses[memref].insert(node.id);
+call    0 never executed
+call    1 never executed
+        -:  767:      }
+    #####:  768:      for (auto *opInst : collector.storeOpInsts) {
+branch  0 never executed
+branch  1 never executed
+    #####:  769:        node.stores.push_back(opInst);
+call    0 never executed
+    #####:  770:        auto memref = cast<AffineWriteOpInterface>(opInst).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  771:        memrefAccesses[memref].insert(node.id);
+call    0 never executed
+call    1 never executed
+        -:  772:      }
+    #####:  773:      forToNodeMap[&op] = node.id;
+call    0 never executed
+    #####:  774:      nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  775:    } else if (auto loadOp = dyn_cast<AffineReadOpInterface>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  776:      // Create graph node for top-level load op.
+    #####:  777:      Node node(nextNodeId++, &op);
+call    0 never executed
+    #####:  778:      node.loads.push_back(&op);
+call    0 never executed
+    #####:  779:      auto memref = cast<AffineReadOpInterface>(op).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  780:      memrefAccesses[memref].insert(node.id);
+call    0 never executed
+call    1 never executed
+    #####:  781:      nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  782:    } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  783:      // Create graph node for top-level store op.
+    #####:  784:      Node node(nextNodeId++, &op);
+call    0 never executed
+    #####:  785:      node.stores.push_back(&op);
+call    0 never executed
+    #####:  786:      auto memref = cast<AffineWriteOpInterface>(op).getMemRef();
+call    0 never executed
+call    1 never executed
+    #####:  787:      memrefAccesses[memref].insert(node.id);
+call    0 never executed
+call    1 never executed
+    #####:  788:      nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  789:    } else if (op.getNumRegions() != 0) {
+branch  0 never executed
+branch  1 never executed
+        -:  790:      // Return false if another region is found (not currently supported).
+    #####:  791:      return false;
+call    0 never executed
+    #####:  792:    } else if (op.getNumResults() > 0 && !op.use_empty()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  793:      // Create graph node for top-level producer of SSA values, which
+        -:  794:      // could be used by loop nest nodes.
+    #####:  795:      Node node(nextNodeId++, &op);
+call    0 never executed
+    #####:  796:      nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  797:    } else if (isa<CallOpInterface>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  798:      // Create graph node for top-level Call Op that takes any argument of
+        -:  799:      // memref type. Call Op that returns one or more memref type results
+        -:  800:      // is already taken care of, by the previous conditions.
+    #####:  801:      if (llvm::any_of(op.getOperandTypes(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  802:                       [&](Type t) { return t.isa<MemRefType>(); })) {
+    #####:  803:        Node node(nextNodeId++, &op);
+call    0 never executed
+    #####:  804:        nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  805:      }
+    #####:  806:    } else if (hasEffect<MemoryEffects::Write, MemoryEffects::Free>(&op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  807:      // Create graph node for top-level op, which could have a memory write
+        -:  808:      // side effect.
+    #####:  809:      Node node(nextNodeId++, &op);
+call    0 never executed
+    #####:  810:      nodes.insert({node.id, node});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  811:    }
+        -:  812:  }
+        -:  813:
+    #####:  814:  for (auto &idAndNode : nodes) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  815:    LLVM_DEBUG(llvm::dbgs() << "Create node " << idAndNode.first << " for:\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -:  816:                            << *(idAndNode.second.op) << "\n");
+    #####:  817:    (void)idAndNode;
+call    0 never executed
+        -:  818:  }
+        -:  819:
+        -:  820:  // Add dependence edges between nodes which produce SSA values and their
+        -:  821:  // users. Load ops can be considered as the ones producing SSA values.
+    #####:  822:  for (auto &idAndNode : nodes) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  823:    const Node &node = idAndNode.second;
+        -:  824:    // Stores don't define SSA values, skip them.
+    #####:  825:    if (!node.stores.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  826:      continue;
+    #####:  827:    auto *opInst = node.op;
+    #####:  828:    for (auto value : opInst->getResults()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  829:      for (auto *user : value.getUsers()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  830:        SmallVector<AffineForOp, 4> loops;
+call    0 never executed
+    #####:  831:        getLoopIVs(*user, &loops);
+call    0 never executed
+    #####:  832:        if (loops.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  833:          continue;
+branch  0 never executed
+branch  1 never executed
+    #####:  834:        assert(forToNodeMap.count(loops[0].getOperation()) > 0);
+call    0 never executed
+call    1 never executed
+    #####:  835:        unsigned userLoopNestId = forToNodeMap[loops[0].getOperation()];
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  836:        addEdge(node.id, userLoopNestId, value);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  837:      }
+        -:  838:    }
+        -:  839:  }
+        -:  840:
+        -:  841:  // Walk memref access lists and add graph edges between dependent nodes.
+    #####:  842:  for (auto &memrefAndList : memrefAccesses) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  843:    unsigned n = memrefAndList.second.size();
+    #####:  844:    for (unsigned i = 0; i < n; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  845:      unsigned srcId = memrefAndList.second[i];
+call    0 never executed
+    #####:  846:      bool srcHasStore =
+    #####:  847:          getNode(srcId)->getStoreOpCount(memrefAndList.first) > 0;
+call    0 never executed
+call    1 never executed
+    #####:  848:      for (unsigned j = i + 1; j < n; ++j) {
+branch  0 never executed
+branch  1 never executed
+    #####:  849:        unsigned dstId = memrefAndList.second[j];
+call    0 never executed
+    #####:  850:        bool dstHasStore =
+    #####:  851:            getNode(dstId)->getStoreOpCount(memrefAndList.first) > 0;
+call    0 never executed
+call    1 never executed
+    #####:  852:        if (srcHasStore || dstHasStore)
+branch  0 never executed
+branch  1 never executed
+    #####:  853:          addEdge(srcId, dstId, memrefAndList.first);
+call    0 never executed
+        -:  854:      }
+        -:  855:    }
+        -:  856:  }
+    #####:  857:  return true;
+        -:  858:}
+        -:  859:
+        -:  860:// Sinks all sequential loops to the innermost levels (while preserving
+        -:  861:// relative order among them) and moves all parallel loops to the
+        -:  862:// outermost (while again preserving relative order among them).
+        -:  863:// This can increase the loop depth at which we can fuse a slice, since we are
+        -:  864:// pushing loop carried dependence to a greater depth in the loop nest.
+function _ZL19sinkSequentialLoopsPN12_GLOBAL__N_121MemRefDependenceGraph4NodeE called 0 returned 0% blocks executed 0%
+    #####:  865:static void sinkSequentialLoops(MemRefDependenceGraph::Node *node) {
+    #####:  866:  assert(isa<AffineForOp>(node->op));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  867:  AffineForOp newRootForOp = sinkSequentialLoops(cast<AffineForOp>(node->op));
+call    0 never executed
+call    1 never executed
+    #####:  868:  node->op = newRootForOp.getOperation();
+    #####:  869:}
+        -:  870:
+        -:  871://  TODO: improve/complete this when we have target data.
+function _ZL23getMemRefEltSizeInBytesN4mlir10MemRefTypeE called 0 returned 0% blocks executed 0%
+    #####:  872:static unsigned getMemRefEltSizeInBytes(MemRefType memRefType) {
+    #####:  873:  auto elementType = memRefType.getElementType();
+call    0 never executed
+        -:  874:
+    #####:  875:  unsigned sizeInBits;
+    #####:  876:  if (elementType.isIntOrFloat()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  877:    sizeInBits = elementType.getIntOrFloatBitWidth();
+call    0 never executed
+        -:  878:  } else {
+    #####:  879:    auto vectorType = elementType.cast<VectorType>();
+call    0 never executed
+    #####:  880:    sizeInBits =
+call    0 never executed
+    #####:  881:        vectorType.getElementTypeBitWidth() * vectorType.getNumElements();
+call    0 never executed
+        -:  882:  }
+    #####:  883:  return llvm::divideCeil(sizeInBits, 8);
+        -:  884:}
+        -:  885:
+        -:  886:// Creates and returns a private (single-user) memref for fused loop rooted
+        -:  887:// at 'forOp', with (potentially reduced) memref size based on the
+        -:  888:// MemRefRegion written to by 'srcStoreOpInst' at depth 'dstLoopDepth'.
+        -:  889:// TODO: consider refactoring the common code from generateDma and
+        -:  890:// this one.
+        -:  891:static Value createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
+        -:  892:                                 unsigned dstLoopDepth,
+        -:  893:                                 Optional<unsigned> fastMemorySpace,
+        -:  894:                                 uint64_t localBufSizeThreshold) {
+        -:  895:  auto *forInst = forOp.getOperation();
+        -:  896:
+        -:  897:  // Create builder to insert alloc op just before 'forOp'.
+        -:  898:  OpBuilder b(forInst);
+        -:  899:  // Builder to create constants at the top level.
+        -:  900:  OpBuilder top(forInst->getParentOfType<func::FuncOp>().getBody());
+        -:  901:  // Create new memref type based on slice bounds.
+        -:  902:  auto oldMemRef = cast<AffineWriteOpInterface>(srcStoreOpInst).getMemRef();
+        -:  903:  auto oldMemRefType = oldMemRef.getType().cast<MemRefType>();
+        -:  904:  unsigned rank = oldMemRefType.getRank();
+        -:  905:
+        -:  906:  // Compute MemRefRegion for 'srcStoreOpInst' at depth 'dstLoopDepth'.
+        -:  907:  MemRefRegion region(srcStoreOpInst->getLoc());
+        -:  908:  bool validRegion = succeeded(region.compute(srcStoreOpInst, dstLoopDepth));
+        -:  909:  (void)validRegion;
+        -:  910:  assert(validRegion && "unexpected memref region failure");
+        -:  911:  SmallVector<int64_t, 4> newShape;
+        -:  912:  std::vector<SmallVector<int64_t, 4>> lbs;
+        -:  913:  SmallVector<int64_t, 8> lbDivisors;
+        -:  914:  lbs.reserve(rank);
+        -:  915:  // Query 'region' for 'newShape' and lower bounds of MemRefRegion accessed
+        -:  916:  // by 'srcStoreOpInst' at depth 'dstLoopDepth'.
+        -:  917:  Optional<int64_t> numElements =
+        -:  918:      region.getConstantBoundingSizeAndShape(&newShape, &lbs, &lbDivisors);
+        -:  919:  assert(numElements && "non-constant number of elts in local buffer");
+        -:  920:
+        -:  921:  const FlatAffineValueConstraints *cst = region.getConstraints();
+        -:  922:  // 'outerIVs' holds the values that this memory region is symbolic/parametric
+        -:  923:  // on; this would correspond to loop IVs surrounding the level at which the
+        -:  924:  // slice is being materialized.
+        -:  925:  SmallVector<Value, 8> outerIVs;
+        -:  926:  cst->getValues(rank, cst->getNumVars(), &outerIVs);
+        -:  927:
+        -:  928:  // Build 'rank' AffineExprs from MemRefRegion 'lbs'
+        -:  929:  SmallVector<AffineExpr, 4> offsets;
+        -:  930:  offsets.reserve(rank);
+        -:  931:  for (unsigned d = 0; d < rank; ++d) {
+        -:  932:    assert(lbs[d].size() == cst->getNumCols() - rank && "incorrect bound size");
+        -:  933:
+        -:  934:    AffineExpr offset = top.getAffineConstantExpr(0);
+        -:  935:    for (unsigned j = 0, e = cst->getNumCols() - rank - 1; j < e; j++) {
+        -:  936:      offset = offset + lbs[d][j] * top.getAffineDimExpr(j);
+        -:  937:    }
+        -:  938:    assert(lbDivisors[d] > 0);
+        -:  939:    offset =
+        -:  940:        (offset + lbs[d][cst->getNumCols() - 1 - rank]).floorDiv(lbDivisors[d]);
+        -:  941:    offsets.push_back(offset);
+        -:  942:  }
+        -:  943:
+        -:  944:  // Create 'newMemRefType' using 'newShape' from MemRefRegion accessed
+        -:  945:  // by 'srcStoreOpInst'.
+        -:  946:  uint64_t bufSize =
+        -:  947:      getMemRefEltSizeInBytes(oldMemRefType) * numElements.value();
+        -:  948:  unsigned newMemSpace;
+        -:  949:  if (bufSize <= localBufSizeThreshold && fastMemorySpace.has_value()) {
+        -:  950:    newMemSpace = fastMemorySpace.value();
+        -:  951:  } else {
+        -:  952:    newMemSpace = oldMemRefType.getMemorySpaceAsInt();
+        -:  953:  }
+        -:  954:  auto newMemRefType = MemRefType::get(newShape, oldMemRefType.getElementType(),
+        -:  955:                                       {}, newMemSpace);
+        -:  956:
+        -:  957:  // Create new private memref for fused loop 'forOp'. 'newShape' is always
+        -:  958:  // a constant shape.
+        -:  959:  // TODO: Create/move alloc ops for private memrefs closer to their
+        -:  960:  // consumer loop nests to reduce their live range. Currently they are added
+        -:  961:  // at the beginning of the function, because loop nests can be reordered
+        -:  962:  // during the fusion pass.
+        -:  963:  Value newMemRef = top.create<memref::AllocOp>(forOp.getLoc(), newMemRefType);
+        -:  964:
+        -:  965:  // Build an AffineMap to remap access functions based on lower bound offsets.
+        -:  966:  SmallVector<AffineExpr, 4> remapExprs;
+        -:  967:  remapExprs.reserve(rank);
+        -:  968:  for (unsigned i = 0; i < rank; i++) {
+        -:  969:    auto dimExpr = b.getAffineDimExpr(outerIVs.size() + i);
+        -:  970:
+        -:  971:    auto remapExpr =
+        -:  972:        simplifyAffineExpr(dimExpr - offsets[i], outerIVs.size() + rank, 0);
+        -:  973:    remapExprs.push_back(remapExpr);
+        -:  974:  }
+        -:  975:
+        -:  976:  auto indexRemap =
+        -:  977:      AffineMap::get(outerIVs.size() + rank, 0, remapExprs, forOp.getContext());
+        -:  978:
+        -:  979:  // Replace all users of 'oldMemRef' with 'newMemRef'.
+        -:  980:  LogicalResult res =
+        -:  981:      replaceAllMemRefUsesWith(oldMemRef, newMemRef, {}, indexRemap,
+        -:  982:                               /*extraOperands=*/outerIVs,
+        -:  983:                               /*symbolOperands=*/{},
+        -:  984:                               /*domOpFilter=*/&*forOp.getBody()->begin());
+        -:  985:  assert(succeeded(res) &&
+        -:  986:         "replaceAllMemrefUsesWith should always succeed here");
+        -:  987:  (void)res;
+        -:  988:  return newMemRef;
+        -:  989:}
+        -:  990:
+        -:  991:/// Walking from node 'srcId' to node 'dstId' (exclusive of 'srcId' and
+        -:  992:/// 'dstId'), if there is any non-affine operation accessing 'memref', return
+        -:  993:/// true. Otherwise, return false.
+function _ZL26hasNonAffineUsersOnThePathjjN4mlir5ValueEPN12_GLOBAL__N_121MemRefDependenceGraphE called 0 returned 0% blocks executed 0%
+    #####:  994:static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
+        -:  995:                                       Value memref,
+        -:  996:                                       MemRefDependenceGraph *mdg) {
+    #####:  997:  auto *srcNode = mdg->getNode(srcId);
+call    0 never executed
+    #####:  998:  auto *dstNode = mdg->getNode(dstId);
+call    0 never executed
+    #####:  999:  Value::user_range users = memref.getUsers();
+call    0 never executed
+        -: 1000:  // For each MemRefDependenceGraph's node that is between 'srcNode' and
+        -: 1001:  // 'dstNode' (exclusive of 'srcNodes' and 'dstNode'), check whether any
+        -: 1002:  // non-affine operation in the node accesses the 'memref'.
+    #####: 1003:  for (auto &idAndNode : mdg->nodes) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1004:    Operation *op = idAndNode.second.op;
+        -: 1005:    // Take care of operations between 'srcNode' and 'dstNode'.
+    #####: 1006:    if (srcNode->op->isBeforeInBlock(op) && op->isBeforeInBlock(dstNode->op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1007:      // Walk inside the operation to find any use of the memref.
+        -: 1008:      // Interrupt the walk if found.
+function _ZZL26hasNonAffineUsersOnThePathjjN4mlir5ValueEPN12_GLOBAL__N_121MemRefDependenceGraphEENKUlPNS_9OperationEE_clES5_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1009:      auto walkResult = op->walk([&](Operation *user) {
+        -: 1010:        // Skip affine ops.
+    #####: 1011:        if (isa<AffineMapAccessInterface>(*user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1012:          return WalkResult::advance();
+        -: 1013:        // Find a non-affine op that uses the memref.
+    #####: 1014:        if (llvm::is_contained(users, user))
+branch  0 never executed
+branch  1 never executed
+    #####: 1015:          return WalkResult::interrupt();
+    #####: 1016:        return WalkResult::advance();
+    #####: 1017:      });
+call    0 never executed
+    #####: 1018:      if (walkResult.wasInterrupted())
+branch  0 never executed
+branch  1 never executed
+    #####: 1019:        return true;
+        -: 1020:    }
+        -: 1021:  }
+    #####: 1022:  return false;
+        -: 1023:}
+        -: 1024:
+        -: 1025:/// Check whether a memref value in node 'srcId' has a non-affine that
+        -: 1026:/// is between node 'srcId' and node 'dstId' (exclusive of 'srcNode' and
+        -: 1027:/// 'dstNode').
+function _ZL26hasNonAffineUsersOnThePathjjPN12_GLOBAL__N_121MemRefDependenceGraphE called 0 returned 0% blocks executed 0%
+    #####: 1028:static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
+        -: 1029:                                       MemRefDependenceGraph *mdg) {
+        -: 1030:  // Collect memref values in node 'srcId'.
+    #####: 1031:  auto *srcNode = mdg->getNode(srcId);
+call    0 never executed
+    #####: 1032:  llvm::SmallDenseSet<Value, 2> memRefValues;
+call    0 never executed
+function _ZZL26hasNonAffineUsersOnThePathjjPN12_GLOBAL__N_121MemRefDependenceGraphEENKUlPN4mlir9OperationEE_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1033:  srcNode->op->walk([&](Operation *op) {
+        -: 1034:    // Skip affine ops.
+    #####: 1035:    if (isa<AffineForOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1036:      return WalkResult::advance();
+    #####: 1037:    for (Value v : op->getOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1038:      // Collect memref values only.
+    #####: 1039:      if (v.getType().isa<MemRefType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1040:        memRefValues.insert(v);
+call    0 never executed
+    #####: 1041:    return WalkResult::advance();
+    #####: 1042:  });
+call    0 never executed
+        -: 1043:  // Looking for users between node 'srcId' and node 'dstId'.
+    #####: 1044:  for (Value memref : memRefValues)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####: 1045:    if (hasNonAffineUsersOnThePath(srcId, dstId, memref, mdg))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1046:      return true;
+    #####: 1047:  return false;
+        -: 1048:}
+        -: 1049:
+        -: 1050:// Checks the profitability of fusing a backwards slice of the loop nest
+        -: 1051:// surrounding 'srcOpInst' into the loop nest surrounding 'dstLoadOpInsts'.
+        -: 1052:// The argument 'srcStoreOpInst' is used to calculate the storage reduction on
+        -: 1053:// the memref being produced and consumed, which is an input to the cost model.
+        -: 1054:// For producer-consumer fusion, 'srcStoreOpInst' will be the same as
+        -: 1055:// 'srcOpInst', as we are slicing w.r.t to that producer. For input-reuse
+        -: 1056:// fusion, 'srcOpInst' will be the src loop nest LoadOp which reads from the
+        -: 1057:// same memref as dst loop nest load ops, and 'srcStoreOpInst' will be the
+        -: 1058:// unique store op in the src node, which will be used to check that the write
+        -: 1059:// region is the same after input-reuse fusion. Computation slices are provided
+        -: 1060:// in 'depthSliceUnions' for each legal fusion depth. The maximal depth at which
+        -: 1061:// fusion is legal is provided in 'maxLegalFusionDepth'. Returns true if it is
+        -: 1062:// profitable to fuse the candidate loop nests. Returns false otherwise.
+        -: 1063:// `dstLoopDepth` is set to the most profitable depth at which to materialize
+        -: 1064:// the source loop nest slice.
+        -: 1065:// The profitability model executes the following steps:
+        -: 1066:// *) Computes the backward computation slice at 'srcOpInst'. This
+        -: 1067://    computation slice of the loop nest surrounding 'srcOpInst' is
+        -: 1068://    represented by modified src loop bounds in 'sliceState', which are
+        -: 1069://    functions of loop IVs in the loop nest surrounding 'srcOpInst'.
+        -: 1070:// *) Computes the cost of unfused src/dst loop nests (currently the cost of a
+        -: 1071://    loop nest is the total number of dynamic operation instances in the loop
+        -: 1072://    nest).
+        -: 1073:// *) Computes the cost of fusing a slice of the src loop nest into the dst
+        -: 1074://    loop nest at various values of dst loop depth, attempting to fuse
+        -: 1075://    the largest computation slice at the maximal dst loop depth (closest to
+        -: 1076://    the load) to minimize reuse distance and potentially enable subsequent
+        -: 1077://    load/store forwarding.
+        -: 1078://    NOTE: 'dstLoopDepth' refers to the loop depth within the destination loop
+        -: 1079://    nest, at which the src computation slice is inserted/fused.
+        -: 1080://    NOTE: We attempt to maximize the dst loop depth, but there are cases
+        -: 1081://    where a particular setting for 'dstLoopNest' might fuse an unsliced
+        -: 1082://    loop (within the src computation slice) at a depth which results in
+        -: 1083://    excessive recomputation (see unit tests for examples).
+        -: 1084:// *) Compares the total cost of the unfused loop nests to the min cost fused
+        -: 1085://    loop nest computed in the previous step, and returns true if the latter
+        -: 1086://    is lower.
+        -: 1087:// TODO: Extend profitability analysis to support scenarios with multiple
+        -: 1088:// stores.
+function _ZL18isFusionProfitablePN4mlir9OperationES1_NS_11AffineForOpEN4llvm8ArrayRefINS_21ComputationSliceStateEEEjPjd called 0 returned 0% blocks executed 0%
+    #####: 1089:static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
+        -: 1090:                               AffineForOp dstForOp,
+        -: 1091:                               ArrayRef<ComputationSliceState> depthSliceUnions,
+        -: 1092:                               unsigned maxLegalFusionDepth,
+        -: 1093:                               unsigned *dstLoopDepth,
+        -: 1094:                               double computeToleranceThreshold) {
+    #####: 1095:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+        -: 1096:    llvm::dbgs() << "Checking whether fusion is profitable between src op:\n";
+        -: 1097:    llvm::dbgs() << ' ' << *srcOpInst << " and destination loop:\n";
+        -: 1098:    llvm::dbgs() << dstForOp << "\n";
+        -: 1099:  });
+        -: 1100:
+    #####: 1101:  if (maxLegalFusionDepth == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1102:    LLVM_DEBUG(llvm::dbgs() << "Can't fuse: maxLegalFusionDepth == 0 .\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1103:    return false;
+        -: 1104:  }
+        -: 1105:
+        -: 1106:  // Compute cost of sliced and unsliced src loop nest.
+    #####: 1107:  SmallVector<AffineForOp, 4> srcLoopIVs;
+call    0 never executed
+    #####: 1108:  getLoopIVs(*srcOpInst, &srcLoopIVs);
+call    0 never executed
+        -: 1109:
+        -: 1110:  // Walk src loop nest and collect stats.
+    #####: 1111:  LoopNestStats srcLoopNestStats;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1112:  if (!getLoopNestStats(srcLoopIVs[0], &srcLoopNestStats))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1113:    return false;
+        -: 1114:
+        -: 1115:  // Compute cost of dst loop nest.
+    #####: 1116:  LoopNestStats dstLoopNestStats;
+call    0 never executed
+    #####: 1117:  if (!getLoopNestStats(dstForOp, &dstLoopNestStats))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1118:    return false;
+        -: 1119:
+        -: 1120:  // Search for min cost value for 'dstLoopDepth'. At each value of
+        -: 1121:  // 'dstLoopDepth' from 'maxLegalLoopDepth' to '1', compute computation slice
+        -: 1122:  // bounds between 'srcOpInst' and each op in 'dstOpinsts' (taking the union
+        -: 1123:  // of these bounds). Next the union slice bounds are used to calculate
+        -: 1124:  // the cost of the slice and the cost of the slice inserted into the dst
+        -: 1125:  // loop nest at 'dstLoopDepth'.
+    #####: 1126:  uint64_t minFusedLoopNestComputeCost = std::numeric_limits<uint64_t>::max();
+    #####: 1127:  double maxStorageReduction = 0.0;
+    #####: 1128:  Optional<uint64_t> sliceMemEstimate;
+        -: 1129:
+        -: 1130:  // The best loop depth at which to materialize the slice.
+    #####: 1131:  Optional<unsigned> bestDstLoopDepth;
+        -: 1132:
+        -: 1133:  // Compute op instance count for the src loop nest without iteration slicing.
+    #####: 1134:  uint64_t srcLoopNestCost = getComputeCost(srcLoopIVs[0], srcLoopNestStats);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1135:
+        -: 1136:  // Compute src loop nest write region size.
+    #####: 1137:  MemRefRegion srcWriteRegion(srcStoreOpInst->getLoc());
+call    0 never executed
+call    1 never executed
+    #####: 1138:  if (failed(srcWriteRegion.compute(srcStoreOpInst, /*loopDepth=*/0))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1139:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1140:               << "Unable to compute MemRefRegion for source operation\n.");
+    #####: 1141:    return false;
+        -: 1142:  }
+        -: 1143:
+    #####: 1144:  Optional<int64_t> maybeSrcWriteRegionSizeBytes =
+    #####: 1145:      srcWriteRegion.getRegionSize();
+call    0 never executed
+    #####: 1146:  if (!maybeSrcWriteRegionSizeBytes.has_value())
+branch  0 never executed
+branch  1 never executed
+        -: 1147:    return false;
+    #####: 1148:  int64_t srcWriteRegionSizeBytes = maybeSrcWriteRegionSizeBytes.value();
+call    0 never executed
+        -: 1149:
+        -: 1150:  // Compute op instance count for the src loop nest.
+    #####: 1151:  uint64_t dstLoopNestCost = getComputeCost(dstForOp, dstLoopNestStats);
+call    0 never executed
+        -: 1152:
+        -: 1153:  // Evaluate all depth choices for materializing the slice in the destination
+        -: 1154:  // loop nest.
+    #####: 1155:  for (unsigned i = maxLegalFusionDepth; i >= 1; --i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1156:    const ComputationSliceState &slice = depthSliceUnions[i - 1];
+branch  0 never executed
+branch  1 never executed
+        -: 1157:    // Skip slice union if it wasn't computed for this depth.
+    #####: 1158:    if (slice.isEmpty())
+branch  0 never executed
+branch  1 never executed
+    #####: 1159:      continue;
+        -: 1160:
+    #####: 1161:    int64_t fusedLoopNestComputeCost;
+    #####: 1162:    if (!getFusionComputeCost(srcLoopIVs[0], srcLoopNestStats, dstForOp,
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1163:                              dstLoopNestStats, slice,
+        -: 1164:                              &fusedLoopNestComputeCost)) {
+    #####: 1165:      LLVM_DEBUG(llvm::dbgs() << "Unable to compute fusion compute cost.\n.");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1166:      continue;
+        -: 1167:    }
+        -: 1168:
+    #####: 1169:    double additionalComputeFraction =
+    #####: 1170:        fusedLoopNestComputeCost /
+    #####: 1171:            (static_cast<double>(srcLoopNestCost) + dstLoopNestCost) -
+        -: 1172:        1;
+        -: 1173:
+        -: 1174:    // Determine what the slice write MemRefRegion would be, if the src loop
+        -: 1175:    // nest slice 'slice' were to be inserted into the dst loop nest at loop
+        -: 1176:    // depth 'i'.
+    #####: 1177:    MemRefRegion sliceWriteRegion(srcStoreOpInst->getLoc());
+call    0 never executed
+    #####: 1178:    if (failed(sliceWriteRegion.compute(srcStoreOpInst, /*loopDepth=*/0,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1179:                                        &slice))) {
+    #####: 1180:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1181:                 << "Failed to compute slice write region at loopDepth: " << i
+        -: 1182:                 << "\n");
+    #####: 1183:      continue;
+        -: 1184:    }
+        -: 1185:
+    #####: 1186:    Optional<int64_t> maybeSliceWriteRegionSizeBytes =
+    #####: 1187:        sliceWriteRegion.getRegionSize();
+call    0 never executed
+    #####: 1188:    if (!maybeSliceWriteRegionSizeBytes.has_value() ||
+branch  0 never executed
+branch  1 never executed
+    #####: 1189:        maybeSliceWriteRegionSizeBytes.value() == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1190:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1191:                 << "Failed to get slice write region size at loopDepth: " << i
+        -: 1192:                 << "\n");
+    #####: 1193:      continue;
+        -: 1194:    }
+    #####: 1195:    int64_t sliceWriteRegionSizeBytes = maybeSliceWriteRegionSizeBytes.value();
+branch  0 never executed
+branch  1 never executed
+        -: 1196:
+        -: 1197:    // If we are fusing for reuse, check that write regions remain the same.
+        -: 1198:    // TODO: Write region check should check sizes and offsets in
+        -: 1199:    // each dimension, so that we are sure they are covering the same memref
+        -: 1200:    // region. Also, move this out to a isMemRefRegionSuperSet helper function.
+    #####: 1201:    if (srcOpInst != srcStoreOpInst &&
+    #####: 1202:        sliceWriteRegionSizeBytes != srcWriteRegionSizeBytes)
+branch  0 never executed
+branch  1 never executed
+    #####: 1203:      continue;
+        -: 1204:
+    #####: 1205:    double storageReduction = static_cast<double>(srcWriteRegionSizeBytes) /
+    #####: 1206:                              static_cast<double>(sliceWriteRegionSizeBytes);
+        -: 1207:
+    #####: 1208:    LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+call   19 never executed
+call   20 never executed
+call   21 never executed
+call   22 never executed
+call   23 never executed
+call   24 never executed
+call   25 never executed
+call   26 never executed
+call   27 never executed
+branch 28 never executed
+branch 29 never executed
+call   30 never executed
+        -: 1209:      std::stringstream msg;
+        -: 1210:      msg << "  evaluating fusion profitability at depth : " << i << "\n"
+        -: 1211:          << std::fixed << std::setprecision(2)
+        -: 1212:          << "   additional compute fraction: "
+        -: 1213:          << 100.0 * additionalComputeFraction << "%\n"
+        -: 1214:          << "   storage reduction factor: " << storageReduction << "x\n"
+        -: 1215:          << "   fused nest cost: " << fusedLoopNestComputeCost << "\n"
+        -: 1216:          << "   src write region size: " << srcWriteRegionSizeBytes << "\n"
+        -: 1217:          << "   slice write region size: " << sliceWriteRegionSizeBytes
+        -: 1218:          << "\n";
+        -: 1219:      llvm::dbgs() << msg.str();
+        -: 1220:    });
+        -: 1221:
+        -: 1222:    // TODO: This is a placeholder cost model.
+        -: 1223:    // Among all choices that add an acceptable amount of redundant computation
+        -: 1224:    // (as per computeToleranceThreshold), we will simply pick the one that
+        -: 1225:    // reduces the intermediary size the most.
+    #####: 1226:    if ((storageReduction > maxStorageReduction) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1227:        (additionalComputeFraction < computeToleranceThreshold)) {
+    #####: 1228:      maxStorageReduction = storageReduction;
+    #####: 1229:      bestDstLoopDepth = i;
+branch  0 never executed
+branch  1 never executed
+    #####: 1230:      minFusedLoopNestComputeCost = fusedLoopNestComputeCost;
+    #####: 1231:      sliceMemEstimate = sliceWriteRegionSizeBytes;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1232:    }
+        -: 1233:  }
+        -: 1234:
+        -: 1235:  // A simple cost model: fuse if it reduces the memory footprint.
+        -: 1236:
+    #####: 1237:  if (!bestDstLoopDepth) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1238:    LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1239:        llvm::dbgs()
+        -: 1240:        << "All fusion choices involve more than the threshold amount of "
+        -: 1241:           "redundant computation; NOT fusing.\n");
+    #####: 1242:    return false;
+        -: 1243:  }
+        -: 1244:
+    #####: 1245:  if (!bestDstLoopDepth) {
+branch  0 never executed
+branch  1 never executed
+        -: 1246:    LLVM_DEBUG(llvm::dbgs() << "no fusion depth could be evaluated.\n");
+        -: 1247:    return false;
+        -: 1248:  }
+        -: 1249:
+        -: 1250:  // Set dstLoopDepth based on best values from search.
+    #####: 1251:  *dstLoopDepth = *bestDstLoopDepth;
+branch  0 never executed
+branch  1 never executed
+        -: 1252:
+    #####: 1253:  LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+        -: 1254:      llvm::dbgs() << " LoopFusion fusion stats:"
+        -: 1255:                   << "\n  best loop depth: " << bestDstLoopDepth
+        -: 1256:                   << "\n  src loop nest compute cost: " << srcLoopNestCost
+        -: 1257:                   << "\n  dst loop nest compute cost: " << dstLoopNestCost
+        -: 1258:                   << "\n  fused loop nest compute cost: "
+        -: 1259:                   << minFusedLoopNestComputeCost << "\n");
+        -: 1260:
+    #####: 1261:  auto dstMemSize = getMemoryFootprintBytes(dstForOp);
+call    0 never executed
+    #####: 1262:  auto srcMemSize = getMemoryFootprintBytes(srcLoopIVs[0]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1263:
+    #####: 1264:  Optional<double> storageReduction;
+        -: 1265:
+    #####: 1266:  if (!dstMemSize || !srcMemSize) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1267:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1268:               << "  fusion memory benefit cannot be evaluated; NOT fusing.\n");
+    #####: 1269:    return false;
+        -: 1270:  }
+        -: 1271:
+    #####: 1272:  auto srcMemSizeVal = srcMemSize.value();
+branch  0 never executed
+branch  1 never executed
+    #####: 1273:  auto dstMemSizeVal = dstMemSize.value();
+        -: 1274:
+    #####: 1275:  assert(sliceMemEstimate && "expected value");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1276:  auto fusedMem = dstMemSizeVal + sliceMemEstimate.value();
+branch  0 never executed
+branch  1 never executed
+        -: 1277:
+    #####: 1278:  LLVM_DEBUG(llvm::dbgs() << "   src mem: " << srcMemSizeVal << "\n"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+        -: 1279:                          << "   dst mem: " << dstMemSizeVal << "\n"
+        -: 1280:                          << "   fused mem: " << fusedMem << "\n"
+        -: 1281:                          << "   slice mem: " << sliceMemEstimate << "\n");
+        -: 1282:
+    #####: 1283:  if (static_cast<long>(fusedMem) > srcMemSizeVal + dstMemSizeVal) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1284:    LLVM_DEBUG(llvm::dbgs() << "Fusion is not profitable; NOT fusing.\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1285:    return false;
+        -: 1286:  }
+    #####: 1287:  storageReduction =
+    #####: 1288:      100.0 *
+    #####: 1289:      (1.0 - fusedMem / (static_cast<double>(srcMemSizeVal) + dstMemSizeVal));
+branch  0 never executed
+branch  1 never executed
+        -: 1290:
+    #####: 1291:  double additionalComputeFraction =
+    #####: 1292:      100.0 * (minFusedLoopNestComputeCost /
+    #####: 1293:                   (static_cast<double>(srcLoopNestCost) + dstLoopNestCost) -
+        -: 1294:               1);
+    #####: 1295:  (void)additionalComputeFraction;
+    #####: 1296:  LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+branch 13 never executed
+branch 14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+branch 19 never executed
+branch 20 never executed
+call   21 never executed
+        -: 1297:    std::stringstream msg;
+        -: 1298:    msg << " fusion is most profitable at depth " << *dstLoopDepth << " with "
+        -: 1299:        << std::setprecision(2) << additionalComputeFraction
+        -: 1300:        << "% redundant computation and a ";
+        -: 1301:    msg << (storageReduction ? std::to_string(*storageReduction) : "<unknown>");
+        -: 1302:    msg << "% storage reduction.\n";
+        -: 1303:    llvm::dbgs() << msg.str();
+        -: 1304:  });
+        -: 1305:
+        -: 1306:  return true;
+        -: 1307:}
+        -: 1308:
+        -: 1309:namespace {
+        -: 1310:
+        -: 1311:// GreedyFusion greedily fuses loop nests which have a producer/consumer or
+        -: 1312:// input-reuse relationship on a memref, with the goal of improving locality.
+        -: 1313://
+        -: 1314:// The steps of the producer-consumer fusion algorithm are as follows:
+        -: 1315://
+        -: 1316:// *) A worklist is initialized with node ids from the dependence graph.
+        -: 1317:// *) For each node id in the worklist:
+        -: 1318://   *) Pop an AffineForOp of the worklist. This 'dstAffineForOp' will be a
+        -: 1319://      candidate destination AffineForOp into which fusion will be attempted.
+        -: 1320://   *) Add each LoadOp currently in 'dstAffineForOp' into list 'dstLoadOps'.
+        -: 1321://   *) For each LoadOp in 'dstLoadOps' do:
+        -: 1322://      *) Look up dependent loop nests which have a single store op to the same
+        -: 1323://         memref.
+        -: 1324://      *) Check if dependences would be violated by the fusion.
+        -: 1325://      *) Get a computation slice of 'srcLoopNest', which adjusts its loop
+        -: 1326://         bounds to be functions of 'dstLoopNest' IVs and symbols.
+        -: 1327://      *) Fuse the 'srcLoopNest' computation slice into the 'dstLoopNest',
+        -: 1328://         at a loop depth determined by the cost model in 'isFusionProfitable'.
+        -: 1329://      *) Add the newly fused load/store operations to the state,
+        -: 1330://         and also add newly fused load ops to 'dstLoopOps' to be considered
+        -: 1331://         as fusion dst load ops in another iteration.
+        -: 1332://      *) Remove old src loop nest and its associated state.
+        -: 1333://
+        -: 1334:// The steps of the input-reuse fusion algorithm are as follows:
+        -: 1335://
+        -: 1336:// *) Initialize 'worklist' with node ids from the dependence graph.
+        -: 1337:// *) For each 'dstNode' in the worklist:
+        -: 1338://   *) Find a candidate sibling node 'sibNode' to fuse with 'dstNode' which
+        -: 1339://      loads from the same memref, but which has no dependence paths to/from.
+        -: 1340://   *) Get a computation slice of 'sibLoopNest', which adjusts its loop
+        -: 1341://      bounds to be functions of 'dstLoopNest' IVs and symbols.
+        -: 1342://   *) Fuse the 'sibLoopNest' computation slice into the 'dstLoopNest',
+        -: 1343://      at a loop depth determined by the cost model in 'isFusionProfitable'.
+        -: 1344://      This function also checks that the memref write region of 'sibLoopNest',
+        -: 1345://      is preserved in the fused loop nest.
+        -: 1346://   *) Update graph state to reflect the fusion of 'sibNode' into 'dstNode'.
+        -: 1347://
+        -: 1348:// Given a graph where top-level operations are vertices in the set 'V' and
+        -: 1349:// edges in the set 'E' are dependences between vertices, this algorithm
+        -: 1350:// takes O(V) time for initialization, and has runtime O(V + E).
+        -: 1351://
+        -: 1352:// This greedy algorithm is not 'maximal' due to the current restriction of
+        -: 1353:// fusing along single producer consumer edges, but there is a TODO: to fix
+        -: 1354:// this.
+        -: 1355://
+        -: 1356:// TODO: Experiment with other fusion policies.
+    #####: 1357:struct GreedyFusion {
+        -: 1358:public:
+        -: 1359:  // The data dependence graph to traverse during fusion.
+        -: 1360:  MemRefDependenceGraph *mdg;
+        -: 1361:  // Worklist of graph nodes visited during the fusion pass.
+        -: 1362:  SmallVector<unsigned, 8> worklist;
+        -: 1363:  // Parameter for local buffer size threshold.
+        -: 1364:  unsigned localBufSizeThreshold;
+        -: 1365:  // Parameter for fast memory space.
+        -: 1366:  Optional<unsigned> fastMemorySpace;
+        -: 1367:  // If true, ignore any additional (redundant) computation tolerance threshold
+        -: 1368:  // that would have prevented fusion.
+        -: 1369:  bool maximalFusion;
+        -: 1370:  // The amount of additional computation that is tolerated while fusing
+        -: 1371:  // pair-wise as a fraction of the total computation.
+        -: 1372:  double computeToleranceThreshold;
+        -: 1373:
+        -: 1374:  using Node = MemRefDependenceGraph::Node;
+        -: 1375:
+    #####: 1376:  GreedyFusion(MemRefDependenceGraph *mdg, unsigned localBufSizeThreshold,
+        -: 1377:               Optional<unsigned> fastMemorySpace, bool maximalFusion,
+        -: 1378:               double computeToleranceThreshold)
+    #####: 1379:      : mdg(mdg), localBufSizeThreshold(localBufSizeThreshold),
+        -: 1380:        fastMemorySpace(fastMemorySpace), maximalFusion(maximalFusion),
+    #####: 1381:        computeToleranceThreshold(computeToleranceThreshold) {}
+        -: 1382:
+        -: 1383:  /// Initializes 'worklist' with nodes from 'mdg'.
+function _ZN12_GLOBAL__N_112GreedyFusion4initEv called 0 returned 0% blocks executed 0%
+    #####: 1384:  void init() {
+        -: 1385:    // TODO: Add a priority queue for prioritizing nodes by different
+        -: 1386:    // metrics (e.g. arithmetic intensity/flops-to-bytes ratio).
+    #####: 1387:    worklist.clear();
+call    0 never executed
+    #####: 1388:    for (auto &idAndNode : mdg->nodes) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1389:      const Node &node = idAndNode.second;
+    #####: 1390:      worklist.push_back(node.id);
+call    0 never executed
+        -: 1391:    }
+    #####: 1392:  }
+        -: 1393:  /// Run only sibling fusion on the `mdg`.
+    #####: 1394:  void runSiblingFusionOnly() {
+    #####: 1395:    fuseSiblingNodes();
+    #####: 1396:    eraseUnusedMemRefAllocations();
+call    0 never executed
+    #####: 1397:  }
+        -: 1398:
+        -: 1399:  /// Run only producer/consumer fusion on the `mdg`.
+    #####: 1400:  void runProducerConsumerFusionOnly() {
+    #####: 1401:    fuseProducerConsumerNodes(
+        -: 1402:        /*maxSrcUserCount=*/std::numeric_limits<unsigned>::max());
+    #####: 1403:    eraseUnusedMemRefAllocations();
+call    0 never executed
+    #####: 1404:  }
+        -: 1405:
+        -: 1406:  // Run the GreedyFusion pass.
+        -: 1407:  // *) First pass through the nodes fuses single-use producer nodes into their
+        -: 1408:  //    unique consumer.
+        -: 1409:  // *) Second pass fuses sibling nodes which share no dependence edges.
+        -: 1410:  // *) Third pass fuses any remaining producer nodes into their users.
+function _ZN12_GLOBAL__N_112GreedyFusion15runGreedyFusionEv called 0 returned 0% blocks executed 0%
+    #####: 1411:  void runGreedyFusion() {
+        -: 1412:    // TODO: Run this repeatedly until a fixed-point is reached.
+    #####: 1413:    fuseProducerConsumerNodes(/*maxSrcUserCount=*/1);
+call    0 never executed
+    #####: 1414:    fuseSiblingNodes();
+call    0 never executed
+    #####: 1415:    fuseProducerConsumerNodes(
+call    0 never executed
+        -: 1416:        /*maxSrcUserCount=*/std::numeric_limits<unsigned>::max());
+    #####: 1417:    eraseUnusedMemRefAllocations();
+call    0 never executed
+    #####: 1418:  }
+        -: 1419:
+function _ZN12_GLOBAL__N_112GreedyFusion25fuseProducerConsumerNodesEj called 0 returned 0% blocks executed 0%
+    #####: 1420:  void fuseProducerConsumerNodes(unsigned maxSrcUserCount) {
+    #####: 1421:    LLVM_DEBUG(llvm::dbgs() << "--- Producer/Consumer Fusion ---\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1422:    init();
+call    0 never executed
+    #####: 1423:    while (!worklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1424:      unsigned dstId = worklist.back();
+call    0 never executed
+    #####: 1425:      worklist.pop_back();
+call    0 never executed
+        -: 1426:
+        -: 1427:      // Skip if this node was removed (fused into another node).
+    #####: 1428:      if (mdg->nodes.count(dstId) == 0)
+call    0 never executed
+    #####: 1429:        continue;
+        -: 1430:      // Get 'dstNode' into which to attempt fusion.
+    #####: 1431:      auto *dstNode = mdg->getNode(dstId);
+call    0 never executed
+        -: 1432:      // Skip if 'dstNode' is not a loop nest.
+    #####: 1433:      if (!isa<AffineForOp>(dstNode->op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1434:        continue;
+        -: 1435:      // Skip if 'dstNode' is a loop nest returning values.
+        -: 1436:      // TODO: support loop nests that return values.
+    #####: 1437:      if (dstNode->op->getNumResults() > 0)
+branch  0 never executed
+branch  1 never executed
+    #####: 1438:        continue;
+        -: 1439:
+    #####: 1440:      LLVM_DEBUG(llvm::dbgs() << "Evaluating dst loop " << dstId << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1441:
+        -: 1442:      // Sink sequential loops in 'dstNode' (and thus raise parallel loops)
+        -: 1443:      // while preserving relative order. This can increase the maximum loop
+        -: 1444:      // depth at which we can fuse a slice of a producer loop nest into a
+        -: 1445:      // consumer loop nest.
+    #####: 1446:      sinkSequentialLoops(dstNode);
+call    0 never executed
+    #####: 1447:      auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
+call    0 never executed
+        -: 1448:
+        -: 1449:      // Try to fuse 'dstNode' with candidate producer loops until a fixed point
+        -: 1450:      // is reached. Fusing two loops may expose new fusion opportunities.
+    #####: 1451:      bool dstNodeChanged;
+    #####: 1452:      do {
+        -: 1453:        // Gather src loop candidates for 'dstNode' and visit them in "quasi"
+        -: 1454:        // reverse program order to minimize the number of iterations needed to
+        -: 1455:        // reach the fixed point. Note that this is a best effort approach since
+        -: 1456:        // 'getProducerCandidates' does not always guarantee that program order
+        -: 1457:        // in 'srcIdCandidates'.
+    #####: 1458:        dstNodeChanged = false;
+    #####: 1459:        SmallVector<unsigned, 16> srcIdCandidates;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1460:        getProducerCandidates(dstId, mdg, srcIdCandidates);
+call    0 never executed
+        -: 1461:
+    #####: 1462:        for (unsigned srcId : llvm::reverse(srcIdCandidates)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1463:          // Get 'srcNode' from which to attempt fusion into 'dstNode'.
+    #####: 1464:          auto *srcNode = mdg->getNode(srcId);
+call    0 never executed
+    #####: 1465:          auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
+call    0 never executed
+    #####: 1466:          LLVM_DEBUG(llvm::dbgs() << "Evaluating src loop " << srcId
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -: 1467:                                  << " for dst loop " << dstId << "\n");
+        -: 1468:
+        -: 1469:          // Skip if 'srcNode' is a loop nest returning values.
+        -: 1470:          // TODO: support loop nests that return values.
+    #####: 1471:          if (isa<AffineForOp>(srcNode->op) && srcNode->op->getNumResults() > 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1472:            continue;
+        -: 1473:
+    #####: 1474:          DenseSet<Value> producerConsumerMemrefs;
+call    0 never executed
+    #####: 1475:          gatherProducerConsumerMemrefs(srcId, dstId, mdg,
+call    0 never executed
+        -: 1476:                                        producerConsumerMemrefs);
+        -: 1477:
+        -: 1478:          // Skip if 'srcNode' out edge count on any memref is greater than
+        -: 1479:          // 'maxSrcUserCount'.
+function _ZZN12_GLOBAL__N_112GreedyFusion25fuseProducerConsumerNodesEjENKUlN4mlir5ValueEE_clES2_ called 0 returned 0% blocks executed 0%
+    #####: 1480:          if (any_of(producerConsumerMemrefs, [&](Value memref) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1481:                return mdg->getOutEdgeCount(srcNode->id, memref) >
+call    0 never executed
+    #####: 1482:                       maxSrcUserCount;
+        -: 1483:              }))
+    #####: 1484:            continue;
+        -: 1485:
+        -: 1486:          // Gather memrefs in 'srcNode' that are written and escape to the
+        -: 1487:          // function (e.g., memref function arguments, returned memrefs,
+        -: 1488:          // memrefs passed to function calls, etc.).
+    #####: 1489:          DenseSet<Value> srcEscapingMemRefs;
+call    0 never executed
+call    1 never executed
+    #####: 1490:          gatherEscapingMemrefs(srcNode->id, mdg, srcEscapingMemRefs);
+call    0 never executed
+        -: 1491:
+        -: 1492:          // Skip if there are non-affine operations in between the 'srcNode'
+        -: 1493:          // and 'dstNode' using their memrefs. If so, we wouldn't be able to
+        -: 1494:          // compute a legal insertion point for now. 'srcNode' and 'dstNode'
+        -: 1495:          // memrefs with non-affine operation users would be considered
+        -: 1496:          // escaping memrefs so we can limit this check to only scenarios with
+        -: 1497:          // escaping memrefs.
+    #####: 1498:          if (!srcEscapingMemRefs.empty() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1499:              hasNonAffineUsersOnThePath(srcId, dstId, mdg)) {
+call    0 never executed
+    #####: 1500:            LLVM_DEBUG(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1501:                llvm::dbgs()
+        -: 1502:                << "Can't fuse: non-affine users in between the loops\n.");
+    #####: 1503:            continue;
+call    0 never executed
+        -: 1504:          }
+        -: 1505:
+        -: 1506:          // Compute an operation list insertion point for the fused loop
+        -: 1507:          // nest which preserves dependences.
+    #####: 1508:          Operation *fusedLoopInsPoint =
+    #####: 1509:              mdg->getFusedLoopNestInsertionPoint(srcNode->id, dstNode->id);
+call    0 never executed
+    #####: 1510:          if (fusedLoopInsPoint == nullptr)
+branch  0 never executed
+branch  1 never executed
+    #####: 1511:            continue;
+        -: 1512:
+        -: 1513:          // Compute the innermost common loop depth for dstNode
+        -: 1514:          // producer-consumer loads/stores.
+    #####: 1515:          SmallVector<Operation *, 2> dstMemrefOps;
+call    0 never executed
+    #####: 1516:          for (Operation *op : dstNode->loads)
+branch  0 never executed
+branch  1 never executed
+    #####: 1517:            if (producerConsumerMemrefs.count(
+    #####: 1518:                    cast<AffineReadOpInterface>(op).getMemRef()) > 0)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1519:              dstMemrefOps.push_back(op);
+call    0 never executed
+    #####: 1520:          for (Operation *op : dstNode->stores)
+branch  0 never executed
+branch  1 never executed
+    #####: 1521:            if (producerConsumerMemrefs.count(
+    #####: 1522:                    cast<AffineWriteOpInterface>(op).getMemRef()))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1523:              dstMemrefOps.push_back(op);
+call    0 never executed
+    #####: 1524:          unsigned dstLoopDepthTest = getInnermostCommonLoopDepth(dstMemrefOps);
+call    0 never executed
+        -: 1525:
+        -: 1526:          // Check the feasibility of fusing src loop nest into dst loop nest
+        -: 1527:          // at loop depths in range [1, dstLoopDepthTest].
+    #####: 1528:          unsigned maxLegalFusionDepth = 0;
+    #####: 1529:          SmallVector<ComputationSliceState, 8> depthSliceUnions;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1530:          depthSliceUnions.resize(dstLoopDepthTest);
+call    0 never executed
+    #####: 1531:          FusionStrategy strategy(FusionStrategy::ProducerConsumer);
+    #####: 1532:          for (unsigned i = 1; i <= dstLoopDepthTest; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1533:            FusionResult result = mlir::canFuseLoops(
+        -: 1534:                srcAffineForOp, dstAffineForOp,
+    #####: 1535:                /*dstLoopDepth=*/i, &depthSliceUnions[i - 1], strategy);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1536:
+    #####: 1537:            if (result.value == FusionResult::Success)
+branch  0 never executed
+branch  1 never executed
+    #####: 1538:              maxLegalFusionDepth = i;
+        -: 1539:          }
+        -: 1540:
+    #####: 1541:          if (maxLegalFusionDepth == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1542:            LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1543:                       << "Can't fuse: fusion is not legal at any depth\n");
+    #####: 1544:            continue;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1545:          }
+        -: 1546:
+        -: 1547:          // Check if fusion would be profitable. We skip profitability analysis
+        -: 1548:          // for maximal fusion since we already know the maximal legal depth to
+        -: 1549:          // fuse.
+    #####: 1550:          unsigned bestDstLoopDepth = maxLegalFusionDepth;
+    #####: 1551:          if (!maximalFusion) {
+branch  0 never executed
+branch  1 never executed
+        -: 1552:            // Retrieve producer stores from the src loop.
+    #####: 1553:            SmallVector<Operation *, 2> producerStores;
+    #####: 1554:            for (Operation *op : srcNode->stores)
+branch  0 never executed
+branch  1 never executed
+    #####: 1555:              if (producerConsumerMemrefs.count(
+    #####: 1556:                      cast<AffineWriteOpInterface>(op).getMemRef()))
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1557:                producerStores.push_back(op);
+call    0 never executed
+        -: 1558:
+        -: 1559:            // TODO: Suppport multiple producer stores in profitability
+        -: 1560:            // analysis. We limit profitability analysis to only scenarios with
+        -: 1561:            // a single producer store for now. Note that some multi-store
+        -: 1562:            // producer scenarios will still go through profitability analysis
+        -: 1563:            // if only one of the stores is involved the producer-consumer
+        -: 1564:            // relationship of the candidate loops.
+    #####: 1565:            assert(!producerStores.empty() && "Expected producer store");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1566:            if (producerStores.size() > 1)
+branch  0 never executed
+branch  1 never executed
+    #####: 1567:              LLVM_DEBUG(llvm::dbgs() << "Skipping profitability analysis. Not "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1568:                                         "supported for this case\n");
+    #####: 1569:            else if (!isFusionProfitable(producerStores[0], producerStores[0],
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1570:                                         dstAffineForOp, depthSliceUnions,
+        -: 1571:                                         maxLegalFusionDepth, &bestDstLoopDepth,
+        -: 1572:                                         computeToleranceThreshold))
+    #####: 1573:              continue;
+branch  0 never executed
+branch  1 never executed
+        -: 1574:          }
+        -: 1575:
+    #####: 1576:          assert(bestDstLoopDepth > 0 && "Unexpected loop fusion depth");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1577:          ComputationSliceState &bestSlice =
+    #####: 1578:              depthSliceUnions[bestDstLoopDepth - 1];
+branch  0 never executed
+branch  1 never executed
+    #####: 1579:          assert(!bestSlice.isEmpty() && "Missing slice union for depth");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1580:
+        -: 1581:          // Determine if 'srcId' can be removed after fusion, taking into
+        -: 1582:          // account remaining dependences, escaping memrefs and the fusion
+        -: 1583:          // insertion point.
+    #####: 1584:          bool removeSrcNode = canRemoveSrcNodeAfterFusion(
+call    0 never executed
+        -: 1585:              srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
+        -: 1586:              mdg);
+        -: 1587:
+    #####: 1588:          DenseSet<Value> privateMemrefs;
+call    0 never executed
+call    1 never executed
+    #####: 1589:          for (Value memref : producerConsumerMemrefs) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -: 1590:            // If `memref` is an escaping one, do not create a private memref
+        -: 1591:            // for the below scenarios, since doing so will leave the escaping
+        -: 1592:            // memref unmodified as all the writes originally meant for the
+        -: 1593:            // escaping memref would be performed on the private memref:
+        -: 1594:            // 1. The source is to be removed after fusion,
+        -: 1595:            // OR
+        -: 1596:            // 2. The destination writes to `memref`.
+    #####: 1597:            if (srcEscapingMemRefs.count(memref) > 0 &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1598:                (removeSrcNode || dstNode->getStoreOpCount(memref) > 0))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1599:              continue;
+        -: 1600:
+        -: 1601:            // Don't create a private memref if 'srcNode' has in edges on
+        -: 1602:            // 'memref' or 'dstNode' has out edges on 'memref'.
+    #####: 1603:            if (mdg->getIncomingMemRefAccesses(srcId, memref) > 0 ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1604:                mdg->getOutEdgeCount(dstId, memref) > 0)
+call    0 never executed
+    #####: 1605:              continue;
+        -: 1606:
+        -: 1607:            // If 'srcNode' will be removed but it has out edges on 'memref' to
+        -: 1608:            // nodes other than 'dstNode', we have to preserve dependences and
+        -: 1609:            // cannot create a private memref.
+    #####: 1610:            if (removeSrcNode &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1611:                any_of(mdg->outEdges[srcId], [&](const auto &edge) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1612:                  return edge.value == memref && edge.id != dstId;
+        -: 1613:                }))
+    #####: 1614:              continue;
+        -: 1615:
+        -: 1616:            // Create a private version of this memref.
+    #####: 1617:            privateMemrefs.insert(memref);
+call    0 never executed
+        -: 1618:          }
+        -: 1619:
+        -: 1620:          // Fuse computation slice of 'srcLoopNest' into 'dstLoopNest'.
+    #####: 1621:          fuseLoops(srcAffineForOp, dstAffineForOp, bestSlice);
+call    0 never executed
+    #####: 1622:          dstNodeChanged = true;
+        -: 1623:
+    #####: 1624:          LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+        -: 1625:                     << "Fused src loop " << srcId << " into dst loop " << dstId
+        -: 1626:                     << " at depth " << bestDstLoopDepth << ":\n"
+        -: 1627:                     << dstAffineForOp << "\n");
+        -: 1628:
+        -: 1629:          // Move 'dstAffineForOp' before 'insertPointInst' if needed.
+    #####: 1630:          if (fusedLoopInsPoint != dstAffineForOp.getOperation())
+branch  0 never executed
+branch  1 never executed
+    #####: 1631:            dstAffineForOp.getOperation()->moveBefore(fusedLoopInsPoint);
+call    0 never executed
+        -: 1632:
+        -: 1633:          // Update edges between 'srcNode' and 'dstNode'.
+    #####: 1634:          mdg->updateEdges(srcNode->id, dstNode->id, privateMemrefs,
+call    0 never executed
+        -: 1635:                           removeSrcNode);
+        -: 1636:
+        -: 1637:          // Create private memrefs.
+    #####: 1638:          if (!privateMemrefs.empty()) {
+branch  0 never executed
+branch  1 never executed
+        -: 1639:            // Gather stores for all the private-to-be memrefs.
+    #####: 1640:            DenseMap<Value, SmallVector<Operation *, 4>> privateMemRefToStores;
+call    0 never executed
+function _ZZN12_GLOBAL__N_112GreedyFusion25fuseProducerConsumerNodesEjENKUlN4mlir22AffineWriteOpInterfaceEE1_clES2_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1641:            dstAffineForOp.walk([&](AffineWriteOpInterface storeOp) {
+call    0 never executed
+    #####: 1642:              Value storeMemRef = storeOp.getMemRef();
+call    0 never executed
+    #####: 1643:              if (privateMemrefs.count(storeMemRef) > 0)
+call    0 never executed
+    #####: 1644:                privateMemRefToStores[storeMemRef].push_back(
+call    0 never executed
+call    1 never executed
+        -: 1645:                    storeOp.getOperation());
+    #####: 1646:            });
+        -: 1647:
+        -: 1648:            // Replace original memrefs with private memrefs. Note that all the
+        -: 1649:            // loads and stores on these memrefs will be replaced with a new
+        -: 1650:            // loads and stores. Any reference to the original ones becomes
+        -: 1651:            // invalid after this point.
+    #####: 1652:            for (auto &memrefToStoresPair : privateMemRefToStores) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1653:              // TODO: Use union of memref write regions to compute
+        -: 1654:              // private memref footprint.
+    #####: 1655:              SmallVector<Operation *, 4> &storesForMemref =
+        -: 1656:                  memrefToStoresPair.second;
+    #####: 1657:              Value newMemRef = createPrivateMemRef(
+    #####: 1658:                  dstAffineForOp, storesForMemref[0], bestDstLoopDepth,
+    #####: 1659:                  fastMemorySpace, localBufSizeThreshold);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1660:              // Create new node in dependence graph for 'newMemRef' alloc op.
+    #####: 1661:              unsigned newMemRefNodeId =
+    #####: 1662:                  mdg->addNode(newMemRef.getDefiningOp());
+call    0 never executed
+call    1 never executed
+        -: 1663:              // Add edge from 'newMemRef' node to dstNode.
+    #####: 1664:              mdg->addEdge(newMemRefNodeId, dstId, newMemRef);
+call    0 never executed
+        -: 1665:            }
+        -: 1666:            // One or more entries for 'newMemRef' alloc op are inserted into
+        -: 1667:            // the DenseMap mdg->nodes. Since an insertion may cause DenseMap to
+        -: 1668:            // reallocate, update dstNode.
+    #####: 1669:            dstNode = mdg->getNode(dstId);
+call    0 never executed
+call    1 never executed
+        -: 1670:          }
+        -: 1671:
+        -: 1672:          // Collect dst loop stats after memref privatization transformation.
+    #####: 1673:          LoopNestStateCollector dstLoopCollector;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1674:          dstLoopCollector.collect(dstAffineForOp.getOperation());
+call    0 never executed
+        -: 1675:
+        -: 1676:          // Clear and add back loads and stores.
+    #####: 1677:          mdg->clearNodeLoadAndStores(dstNode->id);
+call    0 never executed
+    #####: 1678:          mdg->addToNode(dstId, dstLoopCollector.loadOpInsts,
+call    0 never executed
+        -: 1679:                         dstLoopCollector.storeOpInsts);
+        -: 1680:
+    #####: 1681:          if (removeSrcNode) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1682:            LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1683:                       << "Removing src loop " << srcId << " after fusion\n");
+        -: 1684:            // srcNode is no longer valid after it is removed from mdg.
+    #####: 1685:            srcAffineForOp.erase();
+call    0 never executed
+    #####: 1686:            mdg->removeNode(srcId);
+call    0 never executed
+    #####: 1687:            srcNode = nullptr;
+        -: 1688:          }
+        -: 1689:        }
+        -: 1690:      } while (dstNodeChanged);
+        -: 1691:    }
+    #####: 1692:  }
+        -: 1693:
+        -: 1694:  // Visits each node in the graph, and for each node, attempts to fuse it with
+        -: 1695:  // its sibling nodes (nodes which share a parent, but no dependence edges).
+function _ZN12_GLOBAL__N_112GreedyFusion16fuseSiblingNodesEv called 0 returned 0% blocks executed 0%
+    #####: 1696:  void fuseSiblingNodes() {
+    #####: 1697:    LLVM_DEBUG(llvm::dbgs() << "--- Sibling Fusion ---\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1698:    init();
+call    0 never executed
+    #####: 1699:    while (!worklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1700:      unsigned dstId = worklist.back();
+call    0 never executed
+    #####: 1701:      worklist.pop_back();
+call    0 never executed
+        -: 1702:
+        -: 1703:      // Skip if this node was removed (fused into another node).
+    #####: 1704:      if (mdg->nodes.count(dstId) == 0)
+call    0 never executed
+    #####: 1705:        continue;
+        -: 1706:      // Get 'dstNode' into which to attempt fusion.
+    #####: 1707:      auto *dstNode = mdg->getNode(dstId);
+call    0 never executed
+        -: 1708:      // Skip if 'dstNode' is not a loop nest.
+    #####: 1709:      if (!isa<AffineForOp>(dstNode->op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1710:        continue;
+        -: 1711:      // Attempt to fuse 'dstNode' with its sibling nodes in the graph.
+    #####: 1712:      fuseWithSiblingNodes(dstNode);
+call    0 never executed
+        -: 1713:    }
+    #####: 1714:  }
+        -: 1715:
+        -: 1716:  // Attempt to fuse 'dstNode' with sibling nodes in the graph.
+function _ZN12_GLOBAL__N_112GreedyFusion20fuseWithSiblingNodesEPNS_21MemRefDependenceGraph4NodeE called 0 returned 0% blocks executed 0%
+    #####: 1717:  void fuseWithSiblingNodes(Node *dstNode) {
+    #####: 1718:    DenseSet<unsigned> visitedSibNodeIds;
+call    0 never executed
+    #####: 1719:    std::pair<unsigned, Value> idAndMemref;
+    #####: 1720:    auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
+call    0 never executed
+        -: 1721:
+    #####: 1722:    while (findSiblingNodeToFuse(dstNode, &visitedSibNodeIds, &idAndMemref)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1723:      unsigned sibId = idAndMemref.first;
+    #####: 1724:      Value memref = idAndMemref.second;
+        -: 1725:      // TODO: Check that 'sibStoreOpInst' post-dominates all other
+        -: 1726:      // stores to the same memref in 'sibNode' loop nest.
+    #####: 1727:      auto *sibNode = mdg->getNode(sibId);
+call    0 never executed
+        -: 1728:      // Compute an operation list insertion point for the fused loop
+        -: 1729:      // nest which preserves dependences.
+    #####: 1730:      assert(sibNode->op->getBlock() == dstNode->op->getBlock());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1731:      Operation *insertPointInst =
+    #####: 1732:          sibNode->op->isBeforeInBlock(dstNode->op)
+call    0 never executed
+    #####: 1733:              ? mdg->getFusedLoopNestInsertionPoint(sibNode->id, dstNode->id)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1734:              : mdg->getFusedLoopNestInsertionPoint(dstNode->id, sibNode->id);
+call    0 never executed
+    #####: 1735:      if (insertPointInst == nullptr)
+branch  0 never executed
+branch  1 never executed
+    #####: 1736:        continue;
+        -: 1737:
+        -: 1738:      // Check if fusion would be profitable and at what depth.
+        -: 1739:
+        -: 1740:      // Get unique 'sibNode' load op to 'memref'.
+    #####: 1741:      SmallVector<Operation *, 2> sibLoadOpInsts;
+call    0 never executed
+    #####: 1742:      sibNode->getLoadOpsForMemref(memref, &sibLoadOpInsts);
+call    0 never executed
+        -: 1743:      // Currently findSiblingNodeToFuse searches for siblings with one load.
+    #####: 1744:      assert(sibLoadOpInsts.size() == 1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1745:      Operation *sibLoadOpInst = sibLoadOpInsts[0];
+branch  0 never executed
+branch  1 never executed
+    #####: 1746:      assert(!sibNode->stores.empty());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1747:      // TODO: Choose the store which postdominates all other stores.
+    #####: 1748:      auto *sibStoreOpInst = sibNode->stores.back();
+call    0 never executed
+        -: 1749:
+        -: 1750:      // Gather 'dstNode' load ops to 'memref'.
+    #####: 1751:      SmallVector<Operation *, 2> dstLoadOpInsts;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1752:      dstNode->getLoadOpsForMemref(memref, &dstLoadOpInsts);
+call    0 never executed
+        -: 1753:
+    #####: 1754:      SmallVector<AffineForOp, 4> dstLoopIVs;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1755:      getLoopIVs(*dstLoadOpInsts[0], &dstLoopIVs);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1756:      unsigned dstLoopDepthTest = dstLoopIVs.size();
+call    0 never executed
+    #####: 1757:      auto sibAffineForOp = cast<AffineForOp>(sibNode->op);
+call    0 never executed
+        -: 1758:
+        -: 1759:      // Compute loop depth and slice union for fusion.
+    #####: 1760:      SmallVector<ComputationSliceState, 8> depthSliceUnions;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1761:      depthSliceUnions.resize(dstLoopDepthTest);
+call    0 never executed
+    #####: 1762:      unsigned maxLegalFusionDepth = 0;
+    #####: 1763:      FusionStrategy strategy(memref);
+    #####: 1764:      for (unsigned i = 1; i <= dstLoopDepthTest; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1765:        FusionResult result = mlir::canFuseLoops(
+        -: 1766:            sibAffineForOp, dstAffineForOp,
+    #####: 1767:            /*dstLoopDepth=*/i, &depthSliceUnions[i - 1], strategy);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1768:
+    #####: 1769:        if (result.value == FusionResult::Success)
+branch  0 never executed
+branch  1 never executed
+    #####: 1770:          maxLegalFusionDepth = i;
+        -: 1771:      }
+        -: 1772:
+        -: 1773:      // Skip if fusion is not feasible at any loop depths.
+    #####: 1774:      if (maxLegalFusionDepth == 0)
+branch  0 never executed
+branch  1 never executed
+    #####: 1775:        continue;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1776:
+    #####: 1777:      unsigned bestDstLoopDepth = maxLegalFusionDepth;
+    #####: 1778:      if (!maximalFusion) {
+branch  0 never executed
+branch  1 never executed
+        -: 1779:        // Check if fusion would be profitable.
+    #####: 1780:        if (!isFusionProfitable(sibLoadOpInst, sibStoreOpInst, dstAffineForOp,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1781:                                depthSliceUnions, maxLegalFusionDepth,
+        -: 1782:                                &bestDstLoopDepth, computeToleranceThreshold))
+    #####: 1783:          continue;
+        -: 1784:      }
+        -: 1785:
+    #####: 1786:      assert(bestDstLoopDepth > 0 && "Unexpected loop fusion depth");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1787:      assert(!depthSliceUnions[bestDstLoopDepth - 1].isEmpty() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1788:             "Fusion depth has no computed slice union");
+        -: 1789:      // Check if source loop is being inserted in the innermost
+        -: 1790:      // destination loop. Based on this, the fused loop may be optimized
+        -: 1791:      // further inside `fuseLoops`.
+    #####: 1792:      bool isInnermostInsertion = (bestDstLoopDepth == dstLoopDepthTest);
+        -: 1793:      // Fuse computation slice of 'sibLoopNest' into 'dstLoopNest'.
+    #####: 1794:      mlir::fuseLoops(sibAffineForOp, dstAffineForOp,
+    #####: 1795:                      depthSliceUnions[bestDstLoopDepth - 1],
+call    0 never executed
+        -: 1796:                      isInnermostInsertion);
+        -: 1797:
+    #####: 1798:      auto dstForInst = cast<AffineForOp>(dstNode->op);
+call    0 never executed
+        -: 1799:      // Update operation position of fused loop nest (if needed).
+    #####: 1800:      if (insertPointInst != dstForInst.getOperation()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1801:        dstForInst->moveBefore(insertPointInst);
+call    0 never executed
+        -: 1802:      }
+        -: 1803:      // Update data dependence graph state post fusion.
+    #####: 1804:      updateStateAfterSiblingFusion(sibNode, dstNode);
+call    0 never executed
+        -: 1805:    }
+    #####: 1806:  }
+        -: 1807:
+        -: 1808:  // Searches function argument uses and the graph from 'dstNode' looking for a
+        -: 1809:  // fusion candidate sibling node which shares no dependences with 'dstNode'
+        -: 1810:  // but which loads from the same memref. Returns true and sets
+        -: 1811:  // 'idAndMemrefToFuse' on success. Returns false otherwise.
+        -: 1812:  bool findSiblingNodeToFuse(Node *dstNode,
+        -: 1813:                             DenseSet<unsigned> *visitedSibNodeIds,
+        -: 1814:                             std::pair<unsigned, Value> *idAndMemrefToFuse) {
+        -: 1815:    // Returns true if 'sibNode' can be fused with 'dstNode' for input reuse
+        -: 1816:    // on 'memref'.
+function _ZZN12_GLOBAL__N_112GreedyFusion21findSiblingNodeToFuseEPNS_21MemRefDependenceGraph4NodeEPN4llvm8DenseSetIjNS4_12DenseMapInfoIjvEEEEPSt4pairIjN4mlir5ValueEEENKUlS3_SC_E_clES3_SC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1817:    auto canFuseWithSibNode = [&](Node *sibNode, Value memref) {
+        -: 1818:      // Skip if 'outEdge' is not a read-after-write dependence.
+        -: 1819:      // TODO: Remove restrict to single load op restriction.
+    #####: 1820:      if (sibNode->getLoadOpCount(memref) != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1821:        return false;
+        -: 1822:      // Skip if there exists a path of dependent edges between
+        -: 1823:      // 'sibNode' and 'dstNode'.
+    #####: 1824:      if (mdg->hasDependencePath(sibNode->id, dstNode->id) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1825:          mdg->hasDependencePath(dstNode->id, sibNode->id))
+call    0 never executed
+    #####: 1826:        return false;
+        -: 1827:      // Skip sib node if it loads to (and stores from) the same memref on
+        -: 1828:      // which it also has an input dependence edge.
+    #####: 1829:      DenseSet<Value> loadAndStoreMemrefSet;
+call    0 never executed
+    #####: 1830:      sibNode->getLoadAndStoreMemrefSet(&loadAndStoreMemrefSet);
+call    0 never executed
+    #####: 1831:      if (llvm::any_of(loadAndStoreMemrefSet, [=](Value memref) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1832:            return mdg->getIncomingMemRefAccesses(sibNode->id, memref) > 0;
+call    0 never executed
+        -: 1833:          }))
+        -: 1834:        return false;
+        -: 1835:
+        -: 1836:      // Check that all stores are to the same memref.
+    #####: 1837:      DenseSet<Value> storeMemrefs;
+call    0 never executed
+call    1 never executed
+    #####: 1838:      for (auto *storeOpInst : sibNode->stores) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1839:        storeMemrefs.insert(
+    #####: 1840:            cast<AffineWriteOpInterface>(storeOpInst).getMemRef());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1841:      }
+    #####: 1842:      if (storeMemrefs.size() != 1)
+branch  0 never executed
+branch  1 never executed
+        -: 1843:        return false;
+        -: 1844:
+        -: 1845:      // Skip if a memref value in one node is used by a non-affine memref
+        -: 1846:      // access that lies between 'dstNode' and 'sibNode'.
+    #####: 1847:      if (hasNonAffineUsersOnThePath(dstNode->id, sibNode->id, mdg) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1848:          hasNonAffineUsersOnThePath(sibNode->id, dstNode->id, mdg))
+call    0 never executed
+    #####: 1849:        return false;
+        -: 1850:      return true;
+        -: 1851:    };
+        -: 1852:
+        -: 1853:    // Search for siblings which load the same memref function argument.
+        -: 1854:    auto fn = dstNode->op->getParentOfType<func::FuncOp>();
+        -: 1855:    for (unsigned i = 0, e = fn.getNumArguments(); i != e; ++i) {
+        -: 1856:      for (auto *user : fn.getArgument(i).getUsers()) {
+        -: 1857:        if (auto loadOp = dyn_cast<AffineReadOpInterface>(user)) {
+        -: 1858:          // Gather loops surrounding 'use'.
+        -: 1859:          SmallVector<AffineForOp, 4> loops;
+        -: 1860:          getLoopIVs(*user, &loops);
+        -: 1861:          // Skip 'use' if it is not within a loop nest.
+        -: 1862:          if (loops.empty())
+        -: 1863:            continue;
+        -: 1864:          Node *sibNode = mdg->getForOpNode(loops[0]);
+        -: 1865:          assert(sibNode != nullptr);
+        -: 1866:          // Skip 'use' if it not a sibling to 'dstNode'.
+        -: 1867:          if (sibNode->id == dstNode->id)
+        -: 1868:            continue;
+        -: 1869:          // Skip 'use' if it has been visited.
+        -: 1870:          if (visitedSibNodeIds->count(sibNode->id) > 0)
+        -: 1871:            continue;
+        -: 1872:          // Skip 'use' if it does not load from the same memref as 'dstNode'.
+        -: 1873:          auto memref = loadOp.getMemRef();
+        -: 1874:          if (dstNode->getLoadOpCount(memref) == 0)
+        -: 1875:            continue;
+        -: 1876:          // Check if 'sibNode/dstNode' can be input-reuse fused on 'memref'.
+        -: 1877:          if (canFuseWithSibNode(sibNode, memref)) {
+        -: 1878:            visitedSibNodeIds->insert(sibNode->id);
+        -: 1879:            idAndMemrefToFuse->first = sibNode->id;
+        -: 1880:            idAndMemrefToFuse->second = memref;
+        -: 1881:            return true;
+        -: 1882:          }
+        -: 1883:        }
+        -: 1884:      }
+        -: 1885:    }
+        -: 1886:
+        -: 1887:    // Search for siblings by following edges through an intermediate src node.
+        -: 1888:    // Collect candidate 'dstNode' input edges in 'inEdges'.
+        -: 1889:    SmallVector<MemRefDependenceGraph::Edge, 2> inEdges;
+        -: 1890:    mdg->forEachMemRefInputEdge(
+function _ZZN12_GLOBAL__N_112GreedyFusion21findSiblingNodeToFuseEPNS_21MemRefDependenceGraph4NodeEPN4llvm8DenseSetIjNS4_12DenseMapInfoIjvEEEEPSt4pairIjN4mlir5ValueEEENKUlNS1_4EdgeEE0_clESF_ called 0 returned 0% blocks executed 0%
+    #####: 1891:        dstNode->id, [&](MemRefDependenceGraph::Edge inEdge) {
+        -: 1892:          // Add 'inEdge' if it is a read-after-write dependence.
+    #####: 1893:          if (dstNode->getLoadOpCount(inEdge.value) > 0 &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1894:              mdg->getNode(inEdge.id)->getStoreOpCount(inEdge.value) > 0)
+call    0 never executed
+call    1 never executed
+    #####: 1895:            inEdges.push_back(inEdge);
+call    0 never executed
+    #####: 1896:        });
+        -: 1897:
+        -: 1898:    // Search for sibling nodes to fuse by visiting output edges from each input
+        -: 1899:    // edge in 'inEdges'.
+        -: 1900:    for (auto &inEdge : inEdges) {
+        -: 1901:      // Collect candidate output edges from each node 'inEdge.id' in 'inEdges'.
+        -: 1902:      SmallVector<MemRefDependenceGraph::Edge, 2> outEdges;
+        -: 1903:      mdg->forEachMemRefOutputEdge(
+function _ZZN12_GLOBAL__N_112GreedyFusion21findSiblingNodeToFuseEPNS_21MemRefDependenceGraph4NodeEPN4llvm8DenseSetIjNS4_12DenseMapInfoIjvEEEEPSt4pairIjN4mlir5ValueEEENKUlNS1_4EdgeEE1_clESF_ called 0 returned 0% blocks executed 0%
+    #####: 1904:          inEdge.id, [&](MemRefDependenceGraph::Edge outEdge) {
+    #####: 1905:            unsigned sibNodeId = outEdge.id;
+    #####: 1906:            if (visitedSibNodeIds->count(sibNodeId) > 0)
+call    0 never executed
+    #####: 1907:              return;
+        -: 1908:            // Skip output edge if not a sibling using the same memref.
+    #####: 1909:            if (outEdge.id == dstNode->id || outEdge.value != inEdge.value)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1910:              return;
+    #####: 1911:            auto *sibNode = mdg->getNode(sibNodeId);
+call    0 never executed
+    #####: 1912:            if (!isa<AffineForOp>(sibNode->op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1913:              return;
+        -: 1914:            // Check if 'sibNode/dstNode' can be input-reuse fused on 'memref'.
+    #####: 1915:            if (canFuseWithSibNode(sibNode, outEdge.value)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1916:              // Add candidate 'outEdge' to sibling node.
+    #####: 1917:              outEdges.push_back(outEdge);
+call    0 never executed
+        -: 1918:            }
+        -: 1919:          });
+        -: 1920:
+        -: 1921:      // Add first candidate if any were returned.
+        -: 1922:      if (!outEdges.empty()) {
+        -: 1923:        visitedSibNodeIds->insert(outEdges[0].id);
+        -: 1924:        idAndMemrefToFuse->first = outEdges[0].id;
+        -: 1925:        idAndMemrefToFuse->second = outEdges[0].value;
+        -: 1926:        return true;
+        -: 1927:      }
+        -: 1928:    }
+        -: 1929:    return false;
+        -: 1930:  }
+        -: 1931:
+        -: 1932:  /// Update data dependence graph state to reflect sibling fusion of 'sibNode'
+        -: 1933:  /// into 'dstNode'.
+        -: 1934:  void updateStateAfterSiblingFusion(Node *sibNode, Node *dstNode) {
+        -: 1935:    // Update 'sibNode' and 'dstNode' input/output edges to reflect fusion.
+        -: 1936:    mdg->updateEdges(sibNode->id, dstNode->id);
+        -: 1937:
+        -: 1938:    // Collect dst loop stats after memref privatization transformation.
+        -: 1939:    auto dstForInst = cast<AffineForOp>(dstNode->op);
+        -: 1940:    LoopNestStateCollector dstLoopCollector;
+        -: 1941:    dstLoopCollector.collect(dstForInst.getOperation());
+        -: 1942:    // Clear and add back loads and stores
+        -: 1943:    mdg->clearNodeLoadAndStores(dstNode->id);
+        -: 1944:    mdg->addToNode(dstNode->id, dstLoopCollector.loadOpInsts,
+        -: 1945:                   dstLoopCollector.storeOpInsts);
+        -: 1946:    // Remove old sibling loop nest if it no longer has outgoing dependence
+        -: 1947:    // edges, and it does not write to a memref which escapes the
+        -: 1948:    // function.
+        -: 1949:    if (mdg->getOutEdgeCount(sibNode->id) == 0) {
+        -: 1950:      Operation *op = sibNode->op;
+        -: 1951:      mdg->removeNode(sibNode->id);
+        -: 1952:      op->erase();
+        -: 1953:    }
+        -: 1954:  }
+        -: 1955:
+        -: 1956:  // Clean up any allocs with no users.
+        -: 1957:  void eraseUnusedMemRefAllocations() {
+        -: 1958:    for (auto &pair : mdg->memrefEdgeCount) {
+        -: 1959:      if (pair.second > 0)
+        -: 1960:        continue;
+        -: 1961:      auto memref = pair.first;
+        -: 1962:      // Skip if there exist other uses (return operation or function calls).
+        -: 1963:      if (!memref.use_empty())
+        -: 1964:        continue;
+        -: 1965:      // Use list expected to match the dep graph info.
+        -: 1966:      auto *op = memref.getDefiningOp();
+        -: 1967:      if (isa_and_nonnull<memref::AllocOp>(op))
+        -: 1968:        op->erase();
+        -: 1969:    }
+        -: 1970:  }
+        -: 1971:};
+        -: 1972:
+        -: 1973:} // namespace
+        -: 1974:
+function _ZN12_GLOBAL__N_110LoopFusion14runOnOperationEv called 0 returned 0% blocks executed 0%
+    #####: 1975:void LoopFusion::runOnOperation() {
+    #####: 1976:  MemRefDependenceGraph g;
+call    0 never executed
+    #####: 1977:  if (!g.init(getOperation()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1978:    return;
+call    0 never executed
+        -: 1979:
+    #####: 1980:  Optional<unsigned> fastMemorySpaceOpt;
+    #####: 1981:  if (fastMemorySpace.hasValue())
+branch  0 never executed
+branch  1 never executed
+    #####: 1982:    fastMemorySpaceOpt = fastMemorySpace;
+    #####: 1983:  unsigned localBufSizeThresholdBytes = localBufSizeThreshold * 1024;
+branch  0 never executed
+branch  1 never executed
+    #####: 1984:  GreedyFusion fusion(&g, localBufSizeThresholdBytes, fastMemorySpaceOpt,
+    #####: 1985:                      maximalFusion, computeToleranceThreshold);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1986:
+    #####: 1987:  if (affineFusionMode == FusionMode::ProducerConsumer)
+branch  0 never executed
+branch  1 never executed
+    #####: 1988:    fusion.runProducerConsumerFusionOnly();
+call    0 never executed
+    #####: 1989:  else if (affineFusionMode == FusionMode::Sibling)
+branch  0 never executed
+branch  1 never executed
+    #####: 1990:    fusion.runSiblingFusionOnly();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1991:  else
+    #####: 1992:    fusion.runGreedyFusion();
+call    0 never executed
+        -: 1993:}

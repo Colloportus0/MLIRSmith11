@@ -1,0 +1,833 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/llvm/include/llvm/ADT/SmallBitVector.h
+        -:    0:Graph:../tools/mlir/lib/Analysis/Presburger/CMakeFiles/obj.MLIRPresburger.dir/PresburgerRelation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Analysis/Presburger/CMakeFiles/obj.MLIRPresburger.dir/PresburgerRelation.cpp.gcda
+        -:    0:Runs:116175
+        -:    1://===- llvm/ADT/SmallBitVector.h - 'Normally small' bit vectors -*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:///
+        -:    9:/// \file
+        -:   10:/// This file implements the SmallBitVector class.
+        -:   11:///
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef LLVM_ADT_SMALLBITVECTOR_H
+        -:   15:#define LLVM_ADT_SMALLBITVECTOR_H
+        -:   16:
+        -:   17:#include "llvm/ADT/BitVector.h"
+        -:   18:#include "llvm/ADT/iterator_range.h"
+        -:   19:#include "llvm/Support/MathExtras.h"
+        -:   20:#include <algorithm>
+        -:   21:#include <cassert>
+        -:   22:#include <climits>
+        -:   23:#include <cstddef>
+        -:   24:#include <cstdint>
+        -:   25:#include <limits>
+        -:   26:#include <utility>
+        -:   27:
+        -:   28:namespace llvm {
+        -:   29:
+        -:   30:/// This is a 'bitvector' (really, a variable-sized bit array), optimized for
+        -:   31:/// the case when the array is small. It contains one pointer-sized field, which
+        -:   32:/// is directly used as a plain collection of bits when possible, or as a
+        -:   33:/// pointer to a larger heap-allocated array when necessary. This allows normal
+        -:   34:/// "small" cases to be fast without losing generality for large inputs.
+        -:   35:class SmallBitVector {
+        -:   36:  // TODO: In "large" mode, a pointer to a BitVector is used, leading to an
+        -:   37:  // unnecessary level of indirection. It would be more efficient to use a
+        -:   38:  // pointer to memory containing size, allocation size, and the array of bits.
+        -:   39:  uintptr_t X = 1;
+        -:   40:
+        -:   41:  enum {
+        -:   42:    // The number of bits in this class.
+        -:   43:    NumBaseBits = sizeof(uintptr_t) * CHAR_BIT,
+        -:   44:
+        -:   45:    // One bit is used to discriminate between small and large mode. The
+        -:   46:    // remaining bits are used for the small-mode representation.
+        -:   47:    SmallNumRawBits = NumBaseBits - 1,
+        -:   48:
+        -:   49:    // A few more bits are used to store the size of the bit set in small mode.
+        -:   50:    // Theoretically this is a ceil-log2. These bits are encoded in the most
+        -:   51:    // significant bits of the raw bits.
+        -:   52:    SmallNumSizeBits = (NumBaseBits == 32 ? 5 :
+        -:   53:                        NumBaseBits == 64 ? 6 :
+        -:   54:                        SmallNumRawBits),
+        -:   55:
+        -:   56:    // The remaining bits are used to store the actual set in small mode.
+        -:   57:    SmallNumDataBits = SmallNumRawBits - SmallNumSizeBits
+        -:   58:  };
+        -:   59:
+        -:   60:  static_assert(NumBaseBits == 64 || NumBaseBits == 32,
+        -:   61:                "Unsupported word size");
+        -:   62:
+        -:   63:public:
+        -:   64:  using size_type = uintptr_t;
+        -:   65:
+        -:   66:  // Encapsulation of a single bit.
+        -:   67:  class reference {
+        -:   68:    SmallBitVector &TheVector;
+        -:   69:    unsigned BitPos;
+        -:   70:
+        -:   71:  public:
+    #####:   72:    reference(SmallBitVector &b, unsigned Idx) : TheVector(b), BitPos(Idx) {}
+        -:   73:
+        -:   74:    reference(const reference&) = default;
+        -:   75:
+        -:   76:    reference& operator=(reference t) {
+        -:   77:      *this = bool(t);
+        -:   78:      return *this;
+        -:   79:    }
+        -:   80:
+function _ZN4llvm14SmallBitVector9referenceaSEb called 0 returned 0% blocks executed 0%
+    #####:   81:    reference& operator=(bool t) {
+    #####:   82:      if (t)
+branch  0 never executed
+branch  1 never executed
+    #####:   83:        TheVector.set(BitPos);
+call    0 never executed
+        -:   84:      else
+    #####:   85:        TheVector.reset(BitPos);
+call    0 never executed
+    #####:   86:      return *this;
+        -:   87:    }
+        -:   88:
+    #####:   89:    operator bool() const {
+    #####:   90:      return const_cast<const SmallBitVector &>(TheVector).operator[](BitPos);
+call    0 never executed
+        -:   91:    }
+        -:   92:  };
+        -:   93:
+        -:   94:private:
+    #####:   95:  BitVector *getPointer() const {
+    #####:   96:    assert(!isSmall());
+    #####:   97:    return reinterpret_cast<BitVector *>(X);
+        -:   98:  }
+        -:   99:
+    #####:  100:  void switchToSmall(uintptr_t NewSmallBits, size_type NewSize) {
+    #####:  101:    X = 1;
+    #####:  102:    setSmallSize(NewSize);
+call    0 never executed
+    #####:  103:    setSmallBits(NewSmallBits);
+call    0 never executed
+    #####:  104:  }
+        -:  105:
+    #####:  106:  void switchToLarge(BitVector *BV) {
+    #####:  107:    X = reinterpret_cast<uintptr_t>(BV);
+    #####:  108:    assert(!isSmall() && "Tried to use an unaligned pointer");
+call    0 never executed
+        -:  109:  }
+        -:  110:
+        -:  111:  // Return all the bits used for the "small" representation; this includes
+        -:  112:  // bits for the size as well as the element bits.
+    #####:  113:  uintptr_t getSmallRawBits() const {
+    #####:  114:    assert(isSmall());
+call    0 never executed
+call    1 never executed
+    #####:  115:    return X >> 1;
+        -:  116:  }
+        -:  117:
+    #####:  118:  void setSmallRawBits(uintptr_t NewRawBits) {
+    #####:  119:    assert(isSmall());
+call    0 never executed
+    #####:  120:    X = (NewRawBits << 1) | uintptr_t(1);
+        -:  121:  }
+        -:  122:
+        -:  123:  // Return the size.
+    #####:  124:  size_type getSmallSize() const {
+    #####:  125:    return getSmallRawBits() >> SmallNumDataBits;
+        -:  126:  }
+        -:  127:
+function _ZN4llvm14SmallBitVector12setSmallSizeEm called 0 returned 0% blocks executed 0%
+    #####:  128:  void setSmallSize(size_type Size) {
+    #####:  129:    setSmallRawBits(getSmallBits() | (Size << SmallNumDataBits));
+call    0 never executed
+    #####:  130:  }
+        -:  131:
+        -:  132:  // Return the element bits.
+function _ZNK4llvm14SmallBitVector12getSmallBitsEv called 0 returned 0% blocks executed 0%
+    #####:  133:  uintptr_t getSmallBits() const {
+    #####:  134:    return getSmallRawBits() & ~(~uintptr_t(0) << getSmallSize());
+        -:  135:  }
+        -:  136:
+function _ZN4llvm14SmallBitVector12setSmallBitsEm called 0 returned 0% blocks executed 0%
+    #####:  137:  void setSmallBits(uintptr_t NewBits) {
+    #####:  138:    setSmallRawBits((NewBits & ~(~uintptr_t(0) << getSmallSize())) |
+    #####:  139:                    (getSmallSize() << SmallNumDataBits));
+    #####:  140:  }
+        -:  141:
+        -:  142:public:
+        -:  143:  /// Creates an empty bitvector.
+        -:  144:  SmallBitVector() = default;
+        -:  145:
+        -:  146:  /// Creates a bitvector of specified number of bits. All bits are initialized
+        -:  147:  /// to the specified value.
+function _ZN4llvm14SmallBitVectorC2Ejb called 0 returned 0% blocks executed 0%
+    #####:  148:  explicit SmallBitVector(unsigned s, bool t = false) {
+    #####:  149:    if (s <= SmallNumDataBits)
+branch  0 never executed
+branch  1 never executed
+    #####:  150:      switchToSmall(t ? ~uintptr_t(0) : 0, s);
+branch  0 never executed
+branch  1 never executed
+        -:  151:    else
+    #####:  152:      switchToLarge(new BitVector(s, t));
+call    0 never executed
+call    1 never executed
+    #####:  153:  }
+        -:  154:
+        -:  155:  /// SmallBitVector copy ctor.
+        -:  156:  SmallBitVector(const SmallBitVector &RHS) {
+        -:  157:    if (RHS.isSmall())
+        -:  158:      X = RHS.X;
+        -:  159:    else
+        -:  160:      switchToLarge(new BitVector(*RHS.getPointer()));
+        -:  161:  }
+        -:  162:
+        -:  163:  SmallBitVector(SmallBitVector &&RHS) : X(RHS.X) {
+        -:  164:    RHS.X = 1;
+        -:  165:  }
+        -:  166:
+function _ZN4llvm14SmallBitVectorD2Ev called 0 returned 0% blocks executed 0%
+    #####:  167:  ~SmallBitVector() {
+    #####:  168:    if (!isSmall())
+    #####:  169:      delete getPointer();
+call    0 never executed
+    #####:  170:  }
+        -:  171:
+        -:  172:  using const_set_bits_iterator = const_set_bits_iterator_impl<SmallBitVector>;
+        -:  173:  using set_iterator = const_set_bits_iterator;
+        -:  174:
+        -:  175:  const_set_bits_iterator set_bits_begin() const {
+        -:  176:    return const_set_bits_iterator(*this);
+        -:  177:  }
+        -:  178:
+        -:  179:  const_set_bits_iterator set_bits_end() const {
+        -:  180:    return const_set_bits_iterator(*this, -1);
+        -:  181:  }
+        -:  182:
+        -:  183:  iterator_range<const_set_bits_iterator> set_bits() const {
+        -:  184:    return make_range(set_bits_begin(), set_bits_end());
+        -:  185:  }
+        -:  186:
+    #####:  187:  bool isSmall() const { return X & uintptr_t(1); }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+        -:  188:
+        -:  189:  /// Tests whether there are no bits in this bitvector.
+        -:  190:  bool empty() const {
+        -:  191:    return isSmall() ? getSmallSize() == 0 : getPointer()->empty();
+        -:  192:  }
+        -:  193:
+        -:  194:  /// Returns the number of bits in this bitvector.
+    #####:  195:  size_type size() const {
+    #####:  196:    return isSmall() ? getSmallSize() : getPointer()->size();
+        -:  197:  }
+        -:  198:
+        -:  199:  /// Returns the number of bits which are set.
+        -:  200:  size_type count() const {
+        -:  201:    if (isSmall()) {
+        -:  202:      uintptr_t Bits = getSmallBits();
+        -:  203:      return countPopulation(Bits);
+        -:  204:    }
+        -:  205:    return getPointer()->count();
+        -:  206:  }
+        -:  207:
+        -:  208:  /// Returns true if any bit is set.
+        -:  209:  bool any() const {
+        -:  210:    if (isSmall())
+        -:  211:      return getSmallBits() != 0;
+        -:  212:    return getPointer()->any();
+        -:  213:  }
+        -:  214:
+        -:  215:  /// Returns true if all bits are set.
+        -:  216:  bool all() const {
+        -:  217:    if (isSmall())
+        -:  218:      return getSmallBits() == (uintptr_t(1) << getSmallSize()) - 1;
+        -:  219:    return getPointer()->all();
+        -:  220:  }
+        -:  221:
+        -:  222:  /// Returns true if none of the bits are set.
+        -:  223:  bool none() const {
+        -:  224:    if (isSmall())
+        -:  225:      return getSmallBits() == 0;
+        -:  226:    return getPointer()->none();
+        -:  227:  }
+        -:  228:
+        -:  229:  /// Returns the index of the first set bit, -1 if none of the bits are set.
+        -:  230:  int find_first() const {
+        -:  231:    if (isSmall()) {
+        -:  232:      uintptr_t Bits = getSmallBits();
+        -:  233:      if (Bits == 0)
+        -:  234:        return -1;
+        -:  235:      return countTrailingZeros(Bits);
+        -:  236:    }
+        -:  237:    return getPointer()->find_first();
+        -:  238:  }
+        -:  239:
+        -:  240:  int find_last() const {
+        -:  241:    if (isSmall()) {
+        -:  242:      uintptr_t Bits = getSmallBits();
+        -:  243:      if (Bits == 0)
+        -:  244:        return -1;
+        -:  245:      return NumBaseBits - countLeadingZeros(Bits) - 1;
+        -:  246:    }
+        -:  247:    return getPointer()->find_last();
+        -:  248:  }
+        -:  249:
+        -:  250:  /// Returns the index of the first unset bit, -1 if all of the bits are set.
+        -:  251:  int find_first_unset() const {
+        -:  252:    if (isSmall()) {
+        -:  253:      if (count() == getSmallSize())
+        -:  254:        return -1;
+        -:  255:
+        -:  256:      uintptr_t Bits = getSmallBits();
+        -:  257:      return countTrailingOnes(Bits);
+        -:  258:    }
+        -:  259:    return getPointer()->find_first_unset();
+        -:  260:  }
+        -:  261:
+        -:  262:  int find_last_unset() const {
+        -:  263:    if (isSmall()) {
+        -:  264:      if (count() == getSmallSize())
+        -:  265:        return -1;
+        -:  266:
+        -:  267:      uintptr_t Bits = getSmallBits();
+        -:  268:      // Set unused bits.
+        -:  269:      Bits |= ~uintptr_t(0) << getSmallSize();
+        -:  270:      return NumBaseBits - countLeadingOnes(Bits) - 1;
+        -:  271:    }
+        -:  272:    return getPointer()->find_last_unset();
+        -:  273:  }
+        -:  274:
+        -:  275:  /// Returns the index of the next set bit following the "Prev" bit.
+        -:  276:  /// Returns -1 if the next set bit is not found.
+        -:  277:  int find_next(unsigned Prev) const {
+        -:  278:    if (isSmall()) {
+        -:  279:      uintptr_t Bits = getSmallBits();
+        -:  280:      // Mask off previous bits.
+        -:  281:      Bits &= ~uintptr_t(0) << (Prev + 1);
+        -:  282:      if (Bits == 0 || Prev + 1 >= getSmallSize())
+        -:  283:        return -1;
+        -:  284:      return countTrailingZeros(Bits);
+        -:  285:    }
+        -:  286:    return getPointer()->find_next(Prev);
+        -:  287:  }
+        -:  288:
+        -:  289:  /// Returns the index of the next unset bit following the "Prev" bit.
+        -:  290:  /// Returns -1 if the next unset bit is not found.
+        -:  291:  int find_next_unset(unsigned Prev) const {
+        -:  292:    if (isSmall()) {
+        -:  293:      uintptr_t Bits = getSmallBits();
+        -:  294:      // Mask in previous bits.
+        -:  295:      Bits |= (uintptr_t(1) << (Prev + 1)) - 1;
+        -:  296:      // Mask in unused bits.
+        -:  297:      Bits |= ~uintptr_t(0) << getSmallSize();
+        -:  298:
+        -:  299:      if (Bits == ~uintptr_t(0) || Prev + 1 >= getSmallSize())
+        -:  300:        return -1;
+        -:  301:      return countTrailingOnes(Bits);
+        -:  302:    }
+        -:  303:    return getPointer()->find_next_unset(Prev);
+        -:  304:  }
+        -:  305:
+        -:  306:  /// find_prev - Returns the index of the first set bit that precedes the
+        -:  307:  /// the bit at \p PriorTo.  Returns -1 if all previous bits are unset.
+        -:  308:  int find_prev(unsigned PriorTo) const {
+        -:  309:    if (isSmall()) {
+        -:  310:      if (PriorTo == 0)
+        -:  311:        return -1;
+        -:  312:
+        -:  313:      --PriorTo;
+        -:  314:      uintptr_t Bits = getSmallBits();
+        -:  315:      Bits &= maskTrailingOnes<uintptr_t>(PriorTo + 1);
+        -:  316:      if (Bits == 0)
+        -:  317:        return -1;
+        -:  318:
+        -:  319:      return NumBaseBits - countLeadingZeros(Bits) - 1;
+        -:  320:    }
+        -:  321:    return getPointer()->find_prev(PriorTo);
+        -:  322:  }
+        -:  323:
+        -:  324:  /// Clear all bits.
+        -:  325:  void clear() {
+        -:  326:    if (!isSmall())
+        -:  327:      delete getPointer();
+        -:  328:    switchToSmall(0, 0);
+        -:  329:  }
+        -:  330:
+        -:  331:  /// Grow or shrink the bitvector.
+        -:  332:  void resize(unsigned N, bool t = false) {
+        -:  333:    if (!isSmall()) {
+        -:  334:      getPointer()->resize(N, t);
+        -:  335:    } else if (SmallNumDataBits >= N) {
+        -:  336:      uintptr_t NewBits = t ? ~uintptr_t(0) << getSmallSize() : 0;
+        -:  337:      setSmallSize(N);
+        -:  338:      setSmallBits(NewBits | getSmallBits());
+        -:  339:    } else {
+        -:  340:      BitVector *BV = new BitVector(N, t);
+        -:  341:      uintptr_t OldBits = getSmallBits();
+        -:  342:      for (size_type I = 0, E = getSmallSize(); I != E; ++I)
+        -:  343:        (*BV)[I] = (OldBits >> I) & 1;
+        -:  344:      switchToLarge(BV);
+        -:  345:    }
+        -:  346:  }
+        -:  347:
+        -:  348:  void reserve(unsigned N) {
+        -:  349:    if (isSmall()) {
+        -:  350:      if (N > SmallNumDataBits) {
+        -:  351:        uintptr_t OldBits = getSmallRawBits();
+        -:  352:        size_type SmallSize = getSmallSize();
+        -:  353:        BitVector *BV = new BitVector(SmallSize);
+        -:  354:        for (size_type I = 0; I < SmallSize; ++I)
+        -:  355:          if ((OldBits >> I) & 1)
+        -:  356:            BV->set(I);
+        -:  357:        BV->reserve(N);
+        -:  358:        switchToLarge(BV);
+        -:  359:      }
+        -:  360:    } else {
+        -:  361:      getPointer()->reserve(N);
+        -:  362:    }
+        -:  363:  }
+        -:  364:
+        -:  365:  // Set, reset, flip
+        -:  366:  SmallBitVector &set() {
+        -:  367:    if (isSmall())
+        -:  368:      setSmallBits(~uintptr_t(0));
+        -:  369:    else
+        -:  370:      getPointer()->set();
+        -:  371:    return *this;
+        -:  372:  }
+        -:  373:
+function _ZN4llvm14SmallBitVector3setEj called 0 returned 0% blocks executed 0%
+    #####:  374:  SmallBitVector &set(unsigned Idx) {
+    #####:  375:    if (isSmall()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  376:      assert(Idx <= static_cast<unsigned>(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  377:                        std::numeric_limits<uintptr_t>::digits) &&
+        -:  378:             "undefined behavior");
+    #####:  379:      setSmallBits(getSmallBits() | (uintptr_t(1) << Idx));
+call    0 never executed
+call    1 never executed
+        -:  380:    }
+        -:  381:    else
+    #####:  382:      getPointer()->set(Idx);
+call    0 never executed
+    #####:  383:    return *this;
+        -:  384:  }
+        -:  385:
+        -:  386:  /// Efficiently set a range of bits in [I, E)
+        -:  387:  SmallBitVector &set(unsigned I, unsigned E) {
+        -:  388:    assert(I <= E && "Attempted to set backwards range!");
+        -:  389:    assert(E <= size() && "Attempted to set out-of-bounds range!");
+        -:  390:    if (I == E) return *this;
+        -:  391:    if (isSmall()) {
+        -:  392:      uintptr_t EMask = ((uintptr_t)1) << E;
+        -:  393:      uintptr_t IMask = ((uintptr_t)1) << I;
+        -:  394:      uintptr_t Mask = EMask - IMask;
+        -:  395:      setSmallBits(getSmallBits() | Mask);
+        -:  396:    } else
+        -:  397:      getPointer()->set(I, E);
+        -:  398:    return *this;
+        -:  399:  }
+        -:  400:
+        -:  401:  SmallBitVector &reset() {
+        -:  402:    if (isSmall())
+        -:  403:      setSmallBits(0);
+        -:  404:    else
+        -:  405:      getPointer()->reset();
+        -:  406:    return *this;
+        -:  407:  }
+        -:  408:
+function _ZN4llvm14SmallBitVector5resetEj called 0 returned 0% blocks executed 0%
+    #####:  409:  SmallBitVector &reset(unsigned Idx) {
+    #####:  410:    if (isSmall())
+branch  0 never executed
+branch  1 never executed
+    #####:  411:      setSmallBits(getSmallBits() & ~(uintptr_t(1) << Idx));
+call    0 never executed
+call    1 never executed
+        -:  412:    else
+    #####:  413:      getPointer()->reset(Idx);
+call    0 never executed
+    #####:  414:    return *this;
+        -:  415:  }
+        -:  416:
+        -:  417:  /// Efficiently reset a range of bits in [I, E)
+        -:  418:  SmallBitVector &reset(unsigned I, unsigned E) {
+        -:  419:    assert(I <= E && "Attempted to reset backwards range!");
+        -:  420:    assert(E <= size() && "Attempted to reset out-of-bounds range!");
+        -:  421:    if (I == E) return *this;
+        -:  422:    if (isSmall()) {
+        -:  423:      uintptr_t EMask = ((uintptr_t)1) << E;
+        -:  424:      uintptr_t IMask = ((uintptr_t)1) << I;
+        -:  425:      uintptr_t Mask = EMask - IMask;
+        -:  426:      setSmallBits(getSmallBits() & ~Mask);
+        -:  427:    } else
+        -:  428:      getPointer()->reset(I, E);
+        -:  429:    return *this;
+        -:  430:  }
+        -:  431:
+        -:  432:  SmallBitVector &flip() {
+        -:  433:    if (isSmall())
+        -:  434:      setSmallBits(~getSmallBits());
+        -:  435:    else
+        -:  436:      getPointer()->flip();
+        -:  437:    return *this;
+        -:  438:  }
+        -:  439:
+        -:  440:  SmallBitVector &flip(unsigned Idx) {
+        -:  441:    if (isSmall())
+        -:  442:      setSmallBits(getSmallBits() ^ (uintptr_t(1) << Idx));
+        -:  443:    else
+        -:  444:      getPointer()->flip(Idx);
+        -:  445:    return *this;
+        -:  446:  }
+        -:  447:
+        -:  448:  // No argument flip.
+        -:  449:  SmallBitVector operator~() const {
+        -:  450:    return SmallBitVector(*this).flip();
+        -:  451:  }
+        -:  452:
+        -:  453:  // Indexing.
+function _ZN4llvm14SmallBitVectorixEj called 0 returned 0% blocks executed 0%
+    #####:  454:  reference operator[](unsigned Idx) {
+    #####:  455:    assert(Idx < size() && "Out-of-bounds Bit access.");
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  456:    return reference(*this, Idx);
+        -:  457:  }
+        -:  458:
+function _ZNK4llvm14SmallBitVectorixEj called 0 returned 0% blocks executed 0%
+    #####:  459:  bool operator[](unsigned Idx) const {
+    #####:  460:    assert(Idx < size() && "Out-of-bounds Bit access.");
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  461:    if (isSmall())
+branch  0 never executed
+branch  1 never executed
+    #####:  462:      return ((getSmallBits() >> Idx) & 1) != 0;
+call    0 never executed
+    #####:  463:    return getPointer()->operator[](Idx);
+call    0 never executed
+        -:  464:  }
+        -:  465:
+        -:  466:  /// Return the last element in the vector.
+        -:  467:  bool back() const {
+        -:  468:    assert(!empty() && "Getting last element of empty vector.");
+        -:  469:    return (*this)[size() - 1];
+        -:  470:  }
+        -:  471:
+        -:  472:  bool test(unsigned Idx) const {
+        -:  473:    return (*this)[Idx];
+        -:  474:  }
+        -:  475:
+        -:  476:  // Push single bit to end of vector.
+        -:  477:  void push_back(bool Val) {
+        -:  478:    resize(size() + 1, Val);
+        -:  479:  }
+        -:  480:
+        -:  481:  /// Pop one bit from the end of the vector.
+        -:  482:  void pop_back() {
+        -:  483:    assert(!empty() && "Empty vector has no element to pop.");
+        -:  484:    resize(size() - 1);
+        -:  485:  }
+        -:  486:
+        -:  487:  /// Test if any common bits are set.
+        -:  488:  bool anyCommon(const SmallBitVector &RHS) const {
+        -:  489:    if (isSmall() && RHS.isSmall())
+        -:  490:      return (getSmallBits() & RHS.getSmallBits()) != 0;
+        -:  491:    if (!isSmall() && !RHS.isSmall())
+        -:  492:      return getPointer()->anyCommon(*RHS.getPointer());
+        -:  493:
+        -:  494:    for (unsigned i = 0, e = std::min(size(), RHS.size()); i != e; ++i)
+        -:  495:      if (test(i) && RHS.test(i))
+        -:  496:        return true;
+        -:  497:    return false;
+        -:  498:  }
+        -:  499:
+        -:  500:  // Comparison operators.
+        -:  501:  bool operator==(const SmallBitVector &RHS) const {
+        -:  502:    if (size() != RHS.size())
+        -:  503:      return false;
+        -:  504:    if (isSmall() && RHS.isSmall())
+        -:  505:      return getSmallBits() == RHS.getSmallBits();
+        -:  506:    else if (!isSmall() && !RHS.isSmall())
+        -:  507:      return *getPointer() == *RHS.getPointer();
+        -:  508:    else {
+        -:  509:      for (size_type I = 0, E = size(); I != E; ++I) {
+        -:  510:        if ((*this)[I] != RHS[I])
+        -:  511:          return false;
+        -:  512:      }
+        -:  513:      return true;
+        -:  514:    }
+        -:  515:  }
+        -:  516:
+        -:  517:  bool operator!=(const SmallBitVector &RHS) const {
+        -:  518:    return !(*this == RHS);
+        -:  519:  }
+        -:  520:
+        -:  521:  // Intersection, union, disjoint union.
+        -:  522:  // FIXME BitVector::operator&= does not resize the LHS but this does
+        -:  523:  SmallBitVector &operator&=(const SmallBitVector &RHS) {
+        -:  524:    resize(std::max(size(), RHS.size()));
+        -:  525:    if (isSmall() && RHS.isSmall())
+        -:  526:      setSmallBits(getSmallBits() & RHS.getSmallBits());
+        -:  527:    else if (!isSmall() && !RHS.isSmall())
+        -:  528:      getPointer()->operator&=(*RHS.getPointer());
+        -:  529:    else {
+        -:  530:      size_type I, E;
+        -:  531:      for (I = 0, E = std::min(size(), RHS.size()); I != E; ++I)
+        -:  532:        (*this)[I] = test(I) && RHS.test(I);
+        -:  533:      for (E = size(); I != E; ++I)
+        -:  534:        reset(I);
+        -:  535:    }
+        -:  536:    return *this;
+        -:  537:  }
+        -:  538:
+        -:  539:  /// Reset bits that are set in RHS. Same as *this &= ~RHS.
+        -:  540:  SmallBitVector &reset(const SmallBitVector &RHS) {
+        -:  541:    if (isSmall() && RHS.isSmall())
+        -:  542:      setSmallBits(getSmallBits() & ~RHS.getSmallBits());
+        -:  543:    else if (!isSmall() && !RHS.isSmall())
+        -:  544:      getPointer()->reset(*RHS.getPointer());
+        -:  545:    else
+        -:  546:      for (unsigned i = 0, e = std::min(size(), RHS.size()); i != e; ++i)
+        -:  547:        if (RHS.test(i))
+        -:  548:          reset(i);
+        -:  549:
+        -:  550:    return *this;
+        -:  551:  }
+        -:  552:
+        -:  553:  /// Check if (This - RHS) is zero. This is the same as reset(RHS) and any().
+        -:  554:  bool test(const SmallBitVector &RHS) const {
+        -:  555:    if (isSmall() && RHS.isSmall())
+        -:  556:      return (getSmallBits() & ~RHS.getSmallBits()) != 0;
+        -:  557:    if (!isSmall() && !RHS.isSmall())
+        -:  558:      return getPointer()->test(*RHS.getPointer());
+        -:  559:
+        -:  560:    unsigned i, e;
+        -:  561:    for (i = 0, e = std::min(size(), RHS.size()); i != e; ++i)
+        -:  562:      if (test(i) && !RHS.test(i))
+        -:  563:        return true;
+        -:  564:
+        -:  565:    for (e = size(); i != e; ++i)
+        -:  566:      if (test(i))
+        -:  567:        return true;
+        -:  568:
+        -:  569:    return false;
+        -:  570:  }
+        -:  571:
+        -:  572:  SmallBitVector &operator|=(const SmallBitVector &RHS) {
+        -:  573:    resize(std::max(size(), RHS.size()));
+        -:  574:    if (isSmall() && RHS.isSmall())
+        -:  575:      setSmallBits(getSmallBits() | RHS.getSmallBits());
+        -:  576:    else if (!isSmall() && !RHS.isSmall())
+        -:  577:      getPointer()->operator|=(*RHS.getPointer());
+        -:  578:    else {
+        -:  579:      for (size_type I = 0, E = RHS.size(); I != E; ++I)
+        -:  580:        (*this)[I] = test(I) || RHS.test(I);
+        -:  581:    }
+        -:  582:    return *this;
+        -:  583:  }
+        -:  584:
+        -:  585:  SmallBitVector &operator^=(const SmallBitVector &RHS) {
+        -:  586:    resize(std::max(size(), RHS.size()));
+        -:  587:    if (isSmall() && RHS.isSmall())
+        -:  588:      setSmallBits(getSmallBits() ^ RHS.getSmallBits());
+        -:  589:    else if (!isSmall() && !RHS.isSmall())
+        -:  590:      getPointer()->operator^=(*RHS.getPointer());
+        -:  591:    else {
+        -:  592:      for (size_type I = 0, E = RHS.size(); I != E; ++I)
+        -:  593:        (*this)[I] = test(I) != RHS.test(I);
+        -:  594:    }
+        -:  595:    return *this;
+        -:  596:  }
+        -:  597:
+        -:  598:  SmallBitVector &operator<<=(unsigned N) {
+        -:  599:    if (isSmall())
+        -:  600:      setSmallBits(getSmallBits() << N);
+        -:  601:    else
+        -:  602:      getPointer()->operator<<=(N);
+        -:  603:    return *this;
+        -:  604:  }
+        -:  605:
+        -:  606:  SmallBitVector &operator>>=(unsigned N) {
+        -:  607:    if (isSmall())
+        -:  608:      setSmallBits(getSmallBits() >> N);
+        -:  609:    else
+        -:  610:      getPointer()->operator>>=(N);
+        -:  611:    return *this;
+        -:  612:  }
+        -:  613:
+        -:  614:  // Assignment operator.
+        -:  615:  const SmallBitVector &operator=(const SmallBitVector &RHS) {
+        -:  616:    if (isSmall()) {
+        -:  617:      if (RHS.isSmall())
+        -:  618:        X = RHS.X;
+        -:  619:      else
+        -:  620:        switchToLarge(new BitVector(*RHS.getPointer()));
+        -:  621:    } else {
+        -:  622:      if (!RHS.isSmall())
+        -:  623:        *getPointer() = *RHS.getPointer();
+        -:  624:      else {
+        -:  625:        delete getPointer();
+        -:  626:        X = RHS.X;
+        -:  627:      }
+        -:  628:    }
+        -:  629:    return *this;
+        -:  630:  }
+        -:  631:
+        -:  632:  const SmallBitVector &operator=(SmallBitVector &&RHS) {
+        -:  633:    if (this != &RHS) {
+        -:  634:      clear();
+        -:  635:      swap(RHS);
+        -:  636:    }
+        -:  637:    return *this;
+        -:  638:  }
+        -:  639:
+        -:  640:  void swap(SmallBitVector &RHS) {
+        -:  641:    std::swap(X, RHS.X);
+        -:  642:  }
+        -:  643:
+        -:  644:  /// Add '1' bits from Mask to this vector. Don't resize.
+        -:  645:  /// This computes "*this |= Mask".
+        -:  646:  void setBitsInMask(const uint32_t *Mask, unsigned MaskWords = ~0u) {
+        -:  647:    if (isSmall())
+        -:  648:      applyMask<true, false>(Mask, MaskWords);
+        -:  649:    else
+        -:  650:      getPointer()->setBitsInMask(Mask, MaskWords);
+        -:  651:  }
+        -:  652:
+        -:  653:  /// Clear any bits in this vector that are set in Mask. Don't resize.
+        -:  654:  /// This computes "*this &= ~Mask".
+        -:  655:  void clearBitsInMask(const uint32_t *Mask, unsigned MaskWords = ~0u) {
+        -:  656:    if (isSmall())
+        -:  657:      applyMask<false, false>(Mask, MaskWords);
+        -:  658:    else
+        -:  659:      getPointer()->clearBitsInMask(Mask, MaskWords);
+        -:  660:  }
+        -:  661:
+        -:  662:  /// Add a bit to this vector for every '0' bit in Mask. Don't resize.
+        -:  663:  /// This computes "*this |= ~Mask".
+        -:  664:  void setBitsNotInMask(const uint32_t *Mask, unsigned MaskWords = ~0u) {
+        -:  665:    if (isSmall())
+        -:  666:      applyMask<true, true>(Mask, MaskWords);
+        -:  667:    else
+        -:  668:      getPointer()->setBitsNotInMask(Mask, MaskWords);
+        -:  669:  }
+        -:  670:
+        -:  671:  /// Clear a bit in this vector for every '0' bit in Mask. Don't resize.
+        -:  672:  /// This computes "*this &= Mask".
+        -:  673:  void clearBitsNotInMask(const uint32_t *Mask, unsigned MaskWords = ~0u) {
+        -:  674:    if (isSmall())
+        -:  675:      applyMask<false, true>(Mask, MaskWords);
+        -:  676:    else
+        -:  677:      getPointer()->clearBitsNotInMask(Mask, MaskWords);
+        -:  678:  }
+        -:  679:
+        -:  680:  void invalid() {
+        -:  681:    assert(empty());
+        -:  682:    X = (uintptr_t)-1;
+        -:  683:  }
+        -:  684:  bool isInvalid() const { return X == (uintptr_t)-1; }
+        -:  685:
+        -:  686:  ArrayRef<uintptr_t> getData(uintptr_t &Store) const {
+        -:  687:    if (!isSmall())
+        -:  688:      return getPointer()->getData();
+        -:  689:    Store = getSmallBits();
+        -:  690:    return makeArrayRef(Store);
+        -:  691:  }
+        -:  692:
+        -:  693:private:
+        -:  694:  template <bool AddBits, bool InvertMask>
+        -:  695:  void applyMask(const uint32_t *Mask, unsigned MaskWords) {
+        -:  696:    assert(MaskWords <= sizeof(uintptr_t) && "Mask is larger than base!");
+        -:  697:    uintptr_t M = Mask[0];
+        -:  698:    if (NumBaseBits == 64)
+        -:  699:      M |= uint64_t(Mask[1]) << 32;
+        -:  700:    if (InvertMask)
+        -:  701:      M = ~M;
+        -:  702:    if (AddBits)
+        -:  703:      setSmallBits(getSmallBits() | M);
+        -:  704:    else
+        -:  705:      setSmallBits(getSmallBits() & ~M);
+        -:  706:  }
+        -:  707:};
+        -:  708:
+        -:  709:inline SmallBitVector
+        -:  710:operator&(const SmallBitVector &LHS, const SmallBitVector &RHS) {
+        -:  711:  SmallBitVector Result(LHS);
+        -:  712:  Result &= RHS;
+        -:  713:  return Result;
+        -:  714:}
+        -:  715:
+        -:  716:inline SmallBitVector
+        -:  717:operator|(const SmallBitVector &LHS, const SmallBitVector &RHS) {
+        -:  718:  SmallBitVector Result(LHS);
+        -:  719:  Result |= RHS;
+        -:  720:  return Result;
+        -:  721:}
+        -:  722:
+        -:  723:inline SmallBitVector
+        -:  724:operator^(const SmallBitVector &LHS, const SmallBitVector &RHS) {
+        -:  725:  SmallBitVector Result(LHS);
+        -:  726:  Result ^= RHS;
+        -:  727:  return Result;
+        -:  728:}
+        -:  729:
+        -:  730:template <> struct DenseMapInfo<SmallBitVector> {
+        -:  731:  static inline SmallBitVector getEmptyKey() { return SmallBitVector(); }
+        -:  732:  static inline SmallBitVector getTombstoneKey() {
+        -:  733:    SmallBitVector V;
+        -:  734:    V.invalid();
+        -:  735:    return V;
+        -:  736:  }
+        -:  737:  static unsigned getHashValue(const SmallBitVector &V) {
+        -:  738:    uintptr_t Store;
+        -:  739:    return DenseMapInfo<
+        -:  740:        std::pair<SmallBitVector::size_type, ArrayRef<uintptr_t>>>::
+        -:  741:        getHashValue(std::make_pair(V.size(), V.getData(Store)));
+        -:  742:  }
+        -:  743:  static bool isEqual(const SmallBitVector &LHS, const SmallBitVector &RHS) {
+        -:  744:    if (LHS.isInvalid() || RHS.isInvalid())
+        -:  745:      return LHS.isInvalid() == RHS.isInvalid();
+        -:  746:    return LHS == RHS;
+        -:  747:  }
+        -:  748:};
+        -:  749:} // end namespace llvm
+        -:  750:
+        -:  751:namespace std {
+        -:  752:
+        -:  753:/// Implement std::swap in terms of BitVector swap.
+        -:  754:inline void
+        -:  755:swap(llvm::SmallBitVector &LHS, llvm::SmallBitVector &RHS) {
+        -:  756:  LHS.swap(RHS);
+        -:  757:}
+        -:  758:
+        -:  759:} // end namespace std
+        -:  760:
+        -:  761:#endif // LLVM_ADT_SMALLBITVECTOR_H

@@ -1,0 +1,686 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/IR/Verifier.cpp
+        -:    0:Graph:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/Verifier.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/Verifier.cpp.gcda
+        -:    0:Runs:116164
+        -:    1://===- Verifier.cpp - MLIR Verifier Implementation ------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the verify() methods on the various IR types, performing
+        -:   10:// (potentially expensive) checks on the holistic structure of the code.  This
+        -:   11:// can be used for detecting bugs in compiler transformations and hand written
+        -:   12:// .mlir files.
+        -:   13://
+        -:   14:// The checks in this file are only for things that can occur as part of IR
+        -:   15:// transformations: e.g. violation of dominance information, malformed operation
+        -:   16:// attributes, etc.  MLIR supports transformations moving IR through locally
+        -:   17:// invalid states (e.g. unlinking an operation from a block before re-inserting
+        -:   18:// it in a new place), but each transformation must complete with the IR in a
+        -:   19:// valid form.
+        -:   20://
+        -:   21:// This should not check for things that are always wrong by construction (e.g.
+        -:   22:// attributes or other immutable structures that are incorrect), because those
+        -:   23:// are not mutable and can be checked at time of construction.
+        -:   24://
+        -:   25://===----------------------------------------------------------------------===//
+        -:   26:
+        -:   27:#include "mlir/IR/Verifier.h"
+        -:   28:#include "mlir/IR/Attributes.h"
+        -:   29:#include "mlir/IR/Dialect.h"
+        -:   30:#include "mlir/IR/Dominance.h"
+        -:   31:#include "mlir/IR/Operation.h"
+        -:   32:#include "mlir/IR/RegionKindInterface.h"
+        -:   33:#include "mlir/IR/Threading.h"
+        -:   34:#include "llvm/ADT/StringMap.h"
+        -:   35:#include "llvm/Support/FormatVariadic.h"
+        -:   36:#include "llvm/Support/PrettyStackTrace.h"
+        -:   37:#include "llvm/Support/Regex.h"
+        -:   38:#include <atomic>
+        -:   39:
+        -:   40:using namespace mlir;
+        -:   41:
+        -:   42:namespace {
+        -:   43:/// This class encapsulates all the state used to verify an operation region.
+        -:   44:class OperationVerifier {
+        -:   45:public:
+        -:   46:  /// If `verifyRecursively` is true, then this will also recursively verify
+        -:   47:  /// nested operations.
+  3689130:   48:  explicit OperationVerifier(bool verifyRecursively)
+  3689130:   49:      : verifyRecursively(verifyRecursively) {}
+        -:   50:
+        -:   51:  /// Verify the given operation.
+        -:   52:  LogicalResult verifyOpAndDominance(Operation &op);
+        -:   53:
+        -:   54:private:
+        -:   55:  /// Any ops that have regions and are marked as "isolated from above" will be
+        -:   56:  /// returned in the opsWithIsolatedRegions vector.
+        -:   57:  LogicalResult
+        -:   58:  verifyBlock(Block &block,
+        -:   59:              SmallVectorImpl<Operation *> &opsWithIsolatedRegions);
+        -:   60:
+        -:   61:  /// Verify the properties and dominance relationships of this operation.
+        -:   62:  LogicalResult verifyOperation(Operation &op);
+        -:   63:
+        -:   64:  /// Verify the dominance property of regions contained within the given
+        -:   65:  /// Operation.
+        -:   66:  LogicalResult verifyDominanceOfContainedRegions(Operation &op,
+        -:   67:                                                  DominanceInfo &domInfo);
+        -:   68:
+        -:   69:  /// A flag indicating if this verifier should recursively verify nested
+        -:   70:  /// operations.
+        -:   71:  bool verifyRecursively;
+        -:   72:};
+        -:   73:} // namespace
+        -:   74:
+function _ZN12_GLOBAL__N_117OperationVerifier20verifyOpAndDominanceERN4mlir9OperationE called 4076673 returned 100% blocks executed 100%
+  4076673:   75:LogicalResult OperationVerifier::verifyOpAndDominance(Operation &op) {
+        -:   76:  // Verify the operation first, collecting any IsolatedFromAbove operations.
+  4076673:   77:  if (failed(verifyOperation(op)))
+call    0 returned 100%
+branch  1 taken 2% (fallthrough)
+branch  2 taken 98%
+    73789:   78:    return failure();
+        -:   79:
+        -:   80:  // Since everything looks structurally ok to this point, we do a dominance
+        -:   81:  // check for any nested regions. We do this as a second pass since malformed
+        -:   82:  // CFG's can cause dominator analysis construction to crash and we want the
+        -:   83:  // verifier to be resilient to malformed code.
+  3998952:   84:  if (op.getNumRegions() != 0) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+  7996630:   85:    DominanceInfo domInfo;
+call    0 returned 100%
+  3998730:   86:    if (failed(verifyDominanceOfContainedRegions(op, domInfo)))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+      490:   87:      return failure();
+call    0 returned 100%
+        -:   88:  }
+        -:   89:
+  3997704:   90:  return success();
+        -:   91:}
+        -:   92:
+        -:   93:/// Returns true if this block may be valid without terminator. That is if:
+        -:   94:/// - it does not have a parent region.
+        -:   95:/// - Or the parent region have a single block and:
+        -:   96:///    - This region does not have a parent op.
+        -:   97:///    - Or the parent op is unregistered.
+        -:   98:///    - Or the parent op has the NoTerminator trait.
+function _ZL27mayBeValidWithoutTerminatorPN4mlir5BlockE called 458171539 returned 100% blocks executed 100%
+458171539:   99:static bool mayBeValidWithoutTerminator(Block *block) {
+458171539:  100:  if (!block->getParent())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  101:    return true;
+458171498:  102:  if (!llvm::hasSingleElement(*block->getParent()))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken -0%
+        -:  103:    return false;
+458150833:  104:  Operation *op = block->getParentOp();
+call    0 returned 100%
+916302400:  105:  return !op || op->mightHaveTrait<OpTrait::NoTerminator>();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+        -:  106:}
+        -:  107:
+function _ZN12_GLOBAL__N_117OperationVerifier11verifyBlockERN4mlir5BlockERN4llvm15SmallVectorImplIPNS1_9OperationEEE called 458214270 returned 100% blocks executed 65%
+458214270:  108:LogicalResult OperationVerifier::verifyBlock(
+        -:  109:    Block &block, SmallVectorImpl<Operation *> &opsWithIsolatedRegions) {
+        -:  110:
+945687183:  111:  for (auto arg : block.getArguments())
+branch  0 taken 52% (fallthrough)
+branch  1 taken 48%
+487472913:  112:    if (arg.getOwner() != &block)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  113:      return emitError(arg.getLoc(), "block argument not owned by block");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  114:
+        -:  115:  // Verify that this block has a terminator.
+458214270:  116:  if (block.empty()) {
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+     2892:  117:    if (mayBeValidWithoutTerminator(&block))
+call    0 returned 100%
+branch  1 taken 86% (fallthrough)
+branch  2 taken 14%
+     2500:  118:      return success();
+      784:  119:    return emitError(block.getParent()->getLoc(),
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+      392:  120:                     "empty block: expect at least a terminator");
+call    0 returned 100%
+        -:  121:  }
+        -:  122:
+        -:  123:  // Check each operation, and make sure there are no branches out of the
+        -:  124:  // middle of this block.
+10402236676:  125:  for (Operation &op : block) {
+branch  0 taken 96% (fallthrough)
+branch  1 taken 4%
+call    2 returned 100%
+        -:  126:    // Only the last instructions is allowed to have successors.
+9944085308:  127:    if (op.getNumSuccessors() != 0 && &op != &block.back())
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+    #####:  128:      return op.emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  129:          "operation with block successors must terminate its parent block");
+call    0 never executed
+        -:  130:
+        -:  131:    // If we aren't verifying recursievly, there is nothing left to check.
+9944067787*:  132:    if (!verifyRecursively)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  133:      continue;
+        -:  134:
+        -:  135:    // If this operation has regions and is IsolatedFromAbove, we defer
+        -:  136:    // checking.  This allows us to parallelize verification better.
+9944067787:  137:    if (op.getNumRegions() != 0 &&
+branch  0 taken 3% (fallthrough)
+branch  1 taken 97%
+329642035:  138:        op.hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+   394274:  139:      opsWithIsolatedRegions.push_back(&op);
+call    0 returned 100%
+        -:  140:
+        -:  141:      // Otherwise, check the operation inline.
+9943673568:  142:    } else if (failed(verifyOperation(op))) {
+call    0 returned 100%
+branch  1 taken 1%
+branch  2 taken 100%
+    42402:  143:      return failure();
+        -:  144:    }
+        -:  145:  }
+        -:  146:
+        -:  147:  // Verify that this block is not branching to a block of a different
+        -:  148:  // region.
+458192053:  149:  for (Block *successor : block.getSuccessors())
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+    23437:  150:    if (successor->getParent() != block.getParent())
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0%
+branch  3 taken 100%
+    #####:  151:      return block.back().emitOpError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  152:          "branching to block of a different region");
+call    0 never executed
+        -:  153:
+        -:  154:  // If this block doesn't have to have a terminator, don't require it.
+458168633:  155:  if (mayBeValidWithoutTerminator(&block))
+call    0 returned 100%
+branch  1 taken 1%
+branch  2 taken 100%
+   325337:  156:    return success();
+        -:  157:
+457843887:  158:  Operation &terminator = block.back();
+call    0 returned 100%
+457843819:  159:  if (!terminator.mightHaveTrait<OpTrait::IsTerminator>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  160:    return block.back().emitError("block with no terminator, has ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  161:           << terminator;
+call    0 never executed
+        -:  162:
+457843928:  163:  return success();
+        -:  164:}
+        -:  165:
+        -:  166:/// Verify the properties and dominance relationships of this operation,
+        -:  167:/// stopping region recursion at any "isolated from above operations".  Any such
+        -:  168:/// ops are returned in the opsWithIsolatedRegions vector.
+function _ZN12_GLOBAL__N_117OperationVerifier15verifyOperationERN4mlir9OperationE called 9947745921 returned 100% blocks executed 58%
+9947745921:  169:LogicalResult OperationVerifier::verifyOperation(Operation &op) {
+        -:  170:  // Check that operands are non-nil and structurally ok.
+33265179419:  171:  for (auto operand : op.getOperands())
+call    0 returned 100%
+branch  1 taken 30% (fallthrough)
+branch  2 taken 70%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+23317433498:  172:    if (!operand)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  173:      return op.emitError("null operand found");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  174:
+        -:  175:  /// Verify that all of the attributes are okay.
+15264920789:  176:  for (auto attr : op.getAttrs()) {
+call    0 returned 100%
+branch  1 taken 35% (fallthrough)
+branch  2 taken 65%
+        -:  177:    // Check for any optional dialect specific attributes.
+5317188150:  178:    if (auto *dialect = attr.getNameDialect())
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 99%
+ 57852562:  179:      if (failed(dialect->verifyOperationAttribute(&op, attr)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  180:        return failure();
+        -:  181:  }
+        -:  182:
+        -:  183:  // If we can get operation info for this, check the custom hook.
+9947729793:  184:  OperationName opName = op.getName();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+9947729793:  185:  Optional<RegisteredOperationName> registeredInfo = opName.getRegisteredInfo();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+9947729793:  186:  if (registeredInfo && failed(registeredInfo->verifyInvariants(&op)))
+branch  0 taken 100% (fallthrough)
+branch  1 taken -0%
+call    2 returned 100%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 1%
+    60642:  187:    return failure();
+        -:  188:
+9947695451:  189:  SmallVector<Operation *> opsWithIsolatedRegions;
+branch  0 taken 3%
+branch  1 taken 97%
+        -:  190:
+9947695451:  191:  if (unsigned numRegions = op.getNumRegions()) {
+branch  0 taken 3%
+branch  1 taken 97%
+333276467:  192:    auto kindInterface = dyn_cast<RegionKindInterface>(op);
+call    0 returned 100%
+        -:  193:
+        -:  194:    // Verify that all child regions are ok.
+333278503:  195:    MutableArrayRef<Region> regions = op.getRegions();
+branch  0 taken 16% (fallthrough)
+branch  1 taken 84%
+799013542:  196:    for (unsigned i = 0; i < numRegions; ++i) {
+branch  0 taken 58% (fallthrough)
+branch  1 taken 42%
+465777548:  197:      Region &region = regions[i];
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+465777548:  198:      RegionKind kind =
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+465777548:  199:          kindInterface ? kindInterface.getRegionKind(i) : RegionKind::SSACFG;
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+        -:  200:      // Check that Graph Regions only have a single basic block. This is
+        -:  201:      // similar to the code in SingleBlockImplicitTerminator, but doesn't
+        -:  202:      // require the trait to be specified. This arbitrary limitation is
+        -:  203:      // designed to limit the number of cases that have to be handled by
+        -:  204:      // transforms and conversions.
+465777533:  205:      if (op.isRegistered() && kind == RegionKind::Graph) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+        -:  206:        // Non-empty regions must contain a single basic block.
+  356931*:  207:        if (!region.empty() && !region.hasOneBlock())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    #####:  208:          return op.emitOpError("expects graph region #")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  209:                 << i << " to have 0 or 1 blocks";
+call    0 never executed
+call    1 never executed
+        -:  210:      }
+        -:  211:
+465777533:  212:      if (region.empty())
+branch  0 taken 2% (fallthrough)
+branch  1 taken 98%
+  7551514:  213:        continue;
+        -:  214:
+        -:  215:      // Verify the first block has no predecessors.
+458226019:  216:      Block *firstBB = &region.front();
+call    0 returned 100%
+458225972:  217:      if (!firstBB->hasNoPredecessors())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  218:        return emitError(op.getLoc(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  219:                         "entry block of region may not have predecessors");
+call    0 never executed
+        -:  220:
+        -:  221:      // Verify each of the blocks within the region if we are verifying
+        -:  222:      // recursively.
+458225972:  223:      if (verifyRecursively) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+916368320:  224:        for (Block &block : region)
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+458214188:  225:          if (failed(verifyBlock(block, opsWithIsolatedRegions)))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+    42794:  226:            return failure();
+        -:  227:      }
+        -:  228:    }
+        -:  229:  }
+        -:  230:
+        -:  231:  // Verify the nested ops that are able to be verified in parallel.
+9947654978:  232:  if (failed(failableParallelForEach(
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 100%
+        -:  233:          op.getContext(), opsWithIsolatedRegions,
+function _ZZN12_GLOBAL__N_117OperationVerifier15verifyOperationERN4mlir9OperationEENKUlPS2_E_clES4_.isra.0 called 318498 returned 100% blocks executed 100%
+   387598:  234:          [&](Operation *op) { return verifyOpAndDominance(*op); })))
+call    0 returned 100%
+call    1 returned 93%
+     4121:  235:    return failure();
+        -:  236:
+        -:  237:  // After the region ops are verified, run the verifiers that have additional
+        -:  238:  // region invariants need to veirfy.
+9947647965:  239:  if (registeredInfo && failed(registeredInfo->verifyRegionInvariants(&op)))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 1%
+     8633:  240:    return failure();
+        -:  241:
+        -:  242:  // If this is a registered operation, there is nothing left to do.
+9947624127:  243:  if (registeredInfo)
+branch  0 taken 100%
+branch  1 taken 0%
+9947624127:  244:    return success();
+        -:  245:
+        -:  246:  // Otherwise, verify that the parent dialect allows un-registered operations.
+    #####:  247:  Dialect *dialect = opName.getDialect();
+branch  0 never executed
+branch  1 never executed
+    #####:  248:  if (!dialect) {
+branch  0 never executed
+branch  1 never executed
+    #####:  249:    if (!op.getContext()->allowsUnregisteredDialects()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  250:      return op.emitOpError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  251:             << "created with unregistered dialect. If this is "
+        -:  252:                "intended, please call allowUnregisteredDialects() on the "
+        -:  253:                "MLIRContext, or use -allow-unregistered-dialect with "
+    #####:  254:                "the MLIR opt tool used";
+call    0 never executed
+        -:  255:    }
+    #####:  256:    return success();
+        -:  257:  }
+        -:  258:
+    #####:  259:  if (!dialect->allowsUnknownOperations()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  260:    return op.emitError("unregistered operation '")
+call    0 never executed
+call    1 never executed
+    #####:  261:           << op.getName() << "' found in dialect ('" << dialect->getNamespace()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  262:           << "') that does not allow unknown operations";
+call    0 never executed
+        -:  263:  }
+        -:  264:
+9947679675*:  265:  return success();
+branch  0 taken 1% (fallthrough)
+branch  1 taken 100%
+        -:  266:}
+        -:  267:
+        -:  268://===----------------------------------------------------------------------===//
+        -:  269:// Dominance Checking
+        -:  270://===----------------------------------------------------------------------===//
+        -:  271:
+        -:  272:/// Emit an error when the specified operand of the specified operation is an
+        -:  273:/// invalid use because of dominance properties.
+function _ZL31diagnoseInvalidOperandDominanceRN4mlir9OperationEj called 490 returned 100% blocks executed 82%
+      490:  274:static void diagnoseInvalidOperandDominance(Operation &op, unsigned operandNo) {
+      490:  275:  InFlightDiagnostic diag = op.emitError("operand #")
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      494:  276:                            << operandNo << " does not dominate this use";
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  277:
+      490:  278:  Value operand = op.getOperand(operandNo);
+call    0 returned 100%
+        -:  279:
+        -:  280:  /// Attach a note to an in-flight diagnostic that provide more information
+        -:  281:  /// about where an op operand is defined.
+      490:  282:  if (auto *useOp = operand.getDefiningOp()) {
+call    0 returned 100%
+branch  1 taken 99% (fallthrough)
+branch  2 taken 1%
+      486:  283:    Diagnostic &note = diag.attachNote(useOp->getLoc());
+call    0 returned 100%
+      486:  284:    note << "operand defined here";
+call    0 returned 100%
+      486:  285:    Block *block1 = op.getBlock();
+call    0 returned 100%
+      486:  286:    Block *block2 = useOp->getBlock();
+      486:  287:    Region *region1 = block1->getParent();
+call    0 returned 100%
+      486:  288:    Region *region2 = block2->getParent();
+call    0 returned 100%
+      486:  289:    if (block1 == block2)
+branch  0 taken 73% (fallthrough)
+branch  1 taken 27%
+      356:  290:      note << " (op in the same block)";
+call    0 returned 100%
+      130:  291:    else if (region1 == region2)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  292:      note << " (op in the same region)";
+call    0 never executed
+      130:  293:    else if (region2->isProperAncestor(region1))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  294:      note << " (op in a parent region)";
+call    0 never executed
+      130:  295:    else if (region1->isProperAncestor(region2))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+      130:  296:      note << " (op in a child region)";
+call    0 returned 100%
+        -:  297:    else
+    #####:  298:      note << " (op is neither in a parent nor in a child region)";
+call    0 never executed
+      486:  299:    return;
+call    0 returned 100%
+        -:  300:  }
+        -:  301:  // Block argument case.
+        4:  302:  Block *block1 = op.getBlock();
+call    0 returned 100%
+        4:  303:  Block *block2 = operand.cast<BlockArgument>().getOwner();
+call    0 returned 100%
+call    1 returned 100%
+        4:  304:  Region *region1 = block1->getParent();
+call    0 returned 100%
+        4:  305:  Region *region2 = block2->getParent();
+call    0 returned 100%
+        4:  306:  Location loc = UnknownLoc::get(op.getContext());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        4:  307:  if (block2->getParentOp())
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        4:  308:    loc = block2->getParentOp()->getLoc();
+call    0 returned 100%
+        4:  309:  Diagnostic &note = diag.attachNote(loc);
+call    0 returned 100%
+        4:  310:  if (!region2) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  311:    note << " (block without parent)";
+    #####:  312:    return;
+call    0 never executed
+        -:  313:  }
+        4:  314:  if (block1 == block2)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  315:    llvm::report_fatal_error("Internal error in dominance verification");
+call    0 never executed
+        4:  316:  int index = std::distance(region2->begin(), block2->getIterator());
+        4:  317:  note << "operand defined as a block argument (block #" << index;
+call    0 returned 100%
+call    1 returned 100%
+        4:  318:  if (region1 == region2)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  319:    note << " in the same region)";
+call    0 never executed
+        4:  320:  else if (region2->isProperAncestor(region1))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  321:    note << " in a parent region)";
+call    0 never executed
+        4:  322:  else if (region1->isProperAncestor(region2))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        4:  323:    note << " in a child region)";
+call    0 returned 100%
+        -:  324:  else
+    #####:  325:    note << " neither in a parent nor in a child region)";
+call    0 never executed
+        -:  326:}
+        -:  327:
+        -:  328:/// Verify the dominance of each of the nested blocks within the given operation
+        -:  329:LogicalResult
+function _ZN12_GLOBAL__N_117OperationVerifier33verifyDominanceOfContainedRegionsERN4mlir9OperationERNS1_13DominanceInfoE called 331192310 returned 100% blocks executed 94%
+331192310:  330:OperationVerifier::verifyDominanceOfContainedRegions(Operation &op,
+        -:  331:                                                     DominanceInfo &domInfo) {
+847159353:  332:  for (Region &region : op.getRegions()) {
+branch  0 taken 16% (fallthrough)
+branch  1 taken 84%
+branch  2 taken 58% (fallthrough)
+branch  3 taken 42%
+        -:  333:    // Verify the dominance of each of the held operations.
+918490967:  334:    for (Block &block : region) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  335:      // Dominance is only meaningful inside reachable blocks.
+455485869:  336:      bool isReachable = domInfo.isReachableFromEntry(&block);
+call    0 returned 100%
+        -:  337:
+10351573071:  338:      for (Operation &op : block) {
+branch  0 taken 96% (fallthrough)
+branch  1 taken 4%
+call    2 returned 100%
+9896087488:  339:        if (isReachable) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+        -:  340:          // Check that operands properly dominate this use.
+66183713688:  341:          for (const auto &operand : llvm::enumerate(op.getOperands())) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+call    3 returned 100%
+23195773137:  342:            if (domInfo.properlyDominates(operand.value(), &op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+23195772921:  343:              continue;
+call    0 returned 100%
+        -:  344:
+      490:  345:            diagnoseInvalidOperandDominance(op, operand.index());
+call    0 returned 100%
+      490:  346:            return failure();
+        -:  347:          }
+        -:  348:        }
+        -:  349:
+        -:  350:        // Recursively verify dominance within each operation in the block, even
+        -:  351:        // if the block itself is not reachable, or we are in a region which
+        -:  352:        // doesn't respect dominance.
+9896087091:  353:        if (verifyRecursively && op.getNumRegions() != 0) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+branch  2 taken 3% (fallthrough)
+branch  3 taken 97%
+        -:  354:          // If this operation is IsolatedFromAbove, then we'll handle it in the
+        -:  355:          // outer verification loop.
+327567176:  356:          if (op.hasTrait<OpTrait::IsIsolatedFromAbove>())
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+   373553:  357:            continue;
+        -:  358:
+327193625:  359:          if (failed(verifyDominanceOfContainedRegions(op, domInfo)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  360:            return failure();
+        -:  361:        }
+        -:  362:      }
+        -:  363:    }
+        -:  364:  }
+331191635:  365:  return success();
+        -:  366:}
+        -:  367:
+        -:  368://===----------------------------------------------------------------------===//
+        -:  369:// Entrypoint
+        -:  370://===----------------------------------------------------------------------===//
+        -:  371:
+function _ZN4mlir6verifyEPNS_9OperationEb called 3689130 returned 100% blocks executed 100%
+  3689130:  372:LogicalResult mlir::verify(Operation *op, bool verifyRecursively) {
+  3689130:  373:  OperationVerifier verifier(verifyRecursively);
+  3689130:  374:  return verifier.verifyOpAndDominance(*op);
+call    0 returned 100%
+        -:  375:}

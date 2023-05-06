@@ -1,0 +1,690 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/llvm/include/llvm/ADT/Hashing.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:116169
+        -:    1://===-- llvm/ADT/Hashing.h - Utilities for hashing --------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the newly proposed standard C++ interfaces for hashing
+        -:   10:// arbitrary data and building hash functions for user-defined types. This
+        -:   11:// interface was originally proposed in N3333[1] and is currently under review
+        -:   12:// for inclusion in a future TR and/or standard.
+        -:   13://
+        -:   14:// The primary interfaces provide are comprised of one type and three functions:
+        -:   15://
+        -:   16://  -- 'hash_code' class is an opaque type representing the hash code for some
+        -:   17://     data. It is the intended product of hashing, and can be used to implement
+        -:   18://     hash tables, checksumming, and other common uses of hashes. It is not an
+        -:   19://     integer type (although it can be converted to one) because it is risky
+        -:   20://     to assume much about the internals of a hash_code. In particular, each
+        -:   21://     execution of the program has a high probability of producing a different
+        -:   22://     hash_code for a given input. Thus their values are not stable to save or
+        -:   23://     persist, and should only be used during the execution for the
+        -:   24://     construction of hashing datastructures.
+        -:   25://
+        -:   26://  -- 'hash_value' is a function designed to be overloaded for each
+        -:   27://     user-defined type which wishes to be used within a hashing context. It
+        -:   28://     should be overloaded within the user-defined type's namespace and found
+        -:   29://     via ADL. Overloads for primitive types are provided by this library.
+        -:   30://
+        -:   31://  -- 'hash_combine' and 'hash_combine_range' are functions designed to aid
+        -:   32://      programmers in easily and intuitively combining a set of data into
+        -:   33://      a single hash_code for their object. They should only logically be used
+        -:   34://      within the implementation of a 'hash_value' routine or similar context.
+        -:   35://
+        -:   36:// Note that 'hash_combine_range' contains very special logic for hashing
+        -:   37:// a contiguous array of integers or pointers. This logic is *extremely* fast,
+        -:   38:// on a modern Intel "Gainestown" Xeon (Nehalem uarch) @2.2 GHz, these were
+        -:   39:// benchmarked at over 6.5 GiB/s for large keys, and <20 cycles/hash for keys
+        -:   40:// under 32-bytes.
+        -:   41://
+        -:   42://===----------------------------------------------------------------------===//
+        -:   43:
+        -:   44:#ifndef LLVM_ADT_HASHING_H
+        -:   45:#define LLVM_ADT_HASHING_H
+        -:   46:
+        -:   47:#include "llvm/Support/DataTypes.h"
+        -:   48:#include "llvm/Support/ErrorHandling.h"
+        -:   49:#include "llvm/Support/SwapByteOrder.h"
+        -:   50:#include "llvm/Support/type_traits.h"
+        -:   51:#include <algorithm>
+        -:   52:#include <cassert>
+        -:   53:#include <cstring>
+        -:   54:#include <string>
+        -:   55:#include <tuple>
+        -:   56:#include <utility>
+        -:   57:
+        -:   58:namespace llvm {
+        -:   59:template <typename T, typename Enable> struct DenseMapInfo;
+        -:   60:
+        -:   61:/// An opaque object representing a hash code.
+        -:   62:///
+        -:   63:/// This object represents the result of hashing some entity. It is intended to
+        -:   64:/// be used to implement hashtables or other hashing-based data structures.
+        -:   65:/// While it wraps and exposes a numeric value, this value should not be
+        -:   66:/// trusted to be stable or predictable across processes or executions.
+        -:   67:///
+        -:   68:/// In order to obtain the hash_code for an object 'x':
+        -:   69:/// \code
+        -:   70:///   using llvm::hash_value;
+        -:   71:///   llvm::hash_code code = hash_value(x);
+        -:   72:/// \endcode
+        -:   73:class hash_code {
+        -:   74:  size_t value;
+        -:   75:
+        -:   76:public:
+        -:   77:  /// Default construct a hash_code.
+        -:   78:  /// Note that this leaves the value uninitialized.
+        -:   79:  hash_code() = default;
+        -:   80:
+        -:   81:  /// Form a hash code directly from a numerical value.
+    #####:   82:  hash_code(size_t value) : value(value) {}
+        -:   83:
+        -:   84:  /// Convert the hash code to its numerical value for use.
+    #####:   85:  /*explicit*/ operator size_t() const { return value; }
+        -:   86:
+        -:   87:  friend bool operator==(const hash_code &lhs, const hash_code &rhs) {
+        -:   88:    return lhs.value == rhs.value;
+        -:   89:  }
+        -:   90:  friend bool operator!=(const hash_code &lhs, const hash_code &rhs) {
+        -:   91:    return lhs.value != rhs.value;
+        -:   92:  }
+        -:   93:
+        -:   94:  /// Allow a hash_code to be directly run through hash_value.
+        -:   95:  friend size_t hash_value(const hash_code &code) { return code.value; }
+        -:   96:};
+        -:   97:
+        -:   98:/// Compute a hash_code for any integer value.
+        -:   99:///
+        -:  100:/// Note that this function is intended to compute the same hash_code for
+        -:  101:/// a particular value without regard to the pre-promotion type. This is in
+        -:  102:/// contrast to hash_combine which may produce different hash_codes for
+        -:  103:/// differing argument types even if they would implicit promote to a common
+        -:  104:/// type without changing the value.
+        -:  105:template <typename T>
+        -:  106:std::enable_if_t<is_integral_or_enum<T>::value, hash_code> hash_value(T value);
+        -:  107:
+        -:  108:/// Compute a hash_code for a pointer's address.
+        -:  109:///
+        -:  110:/// N.B.: This hashes the *address*. Not the value and not the type.
+        -:  111:template <typename T> hash_code hash_value(const T *ptr);
+        -:  112:
+        -:  113:/// Compute a hash_code for a pair of objects.
+        -:  114:template <typename T, typename U>
+        -:  115:hash_code hash_value(const std::pair<T, U> &arg);
+        -:  116:
+        -:  117:/// Compute a hash_code for a tuple.
+        -:  118:template <typename... Ts>
+        -:  119:hash_code hash_value(const std::tuple<Ts...> &arg);
+        -:  120:
+        -:  121:/// Compute a hash_code for a standard string.
+        -:  122:template <typename T>
+        -:  123:hash_code hash_value(const std::basic_string<T> &arg);
+        -:  124:
+        -:  125:
+        -:  126:/// Override the execution seed with a fixed value.
+        -:  127:///
+        -:  128:/// This hashing library uses a per-execution seed designed to change on each
+        -:  129:/// run with high probability in order to ensure that the hash codes are not
+        -:  130:/// attackable and to ensure that output which is intended to be stable does
+        -:  131:/// not rely on the particulars of the hash codes produced.
+        -:  132:///
+        -:  133:/// That said, there are use cases where it is important to be able to
+        -:  134:/// reproduce *exactly* a specific behavior. To that end, we provide a function
+        -:  135:/// which will forcibly set the seed to a fixed value. This must be done at the
+        -:  136:/// start of the program, before any hashes are computed. Also, it cannot be
+        -:  137:/// undone. This makes it thread-hostile and very hard to use outside of
+        -:  138:/// immediately on start of a simple program designed for reproducible
+        -:  139:/// behavior.
+        -:  140:void set_fixed_execution_hash_seed(uint64_t fixed_value);
+        -:  141:
+        -:  142:
+        -:  143:// All of the implementation details of actually computing the various hash
+        -:  144:// code values are held within this namespace. These routines are included in
+        -:  145:// the header file mainly to allow inlining and constant propagation.
+        -:  146:namespace hashing {
+        -:  147:namespace detail {
+        -:  148:
+        -:  149:inline uint64_t fetch64(const char *p) {
+        -:  150:  uint64_t result;
+        -:  151:  memcpy(&result, p, sizeof(result));
+        -:  152:  if (sys::IsBigEndianHost)
+        -:  153:    sys::swapByteOrder(result);
+        -:  154:  return result;
+        -:  155:}
+        -:  156:
+    #####:  157:inline uint32_t fetch32(const char *p) {
+    #####:  158:  uint32_t result;
+    #####:  159:  memcpy(&result, p, sizeof(result));
+    #####:  160:  if (sys::IsBigEndianHost)
+        -:  161:    sys::swapByteOrder(result);
+    #####:  162:  return result;
+        -:  163:}
+        -:  164:
+        -:  165:/// Some primes between 2^63 and 2^64 for various uses.
+        -:  166:static constexpr uint64_t k0 = 0xc3a5c85c97cb3127ULL;
+        -:  167:static constexpr uint64_t k1 = 0xb492b66fbe98f273ULL;
+        -:  168:static constexpr uint64_t k2 = 0x9ae16a3b2f90404fULL;
+        -:  169:static constexpr uint64_t k3 = 0xc949d7c7509e6557ULL;
+        -:  170:
+        -:  171:/// Bitwise right rotate.
+        -:  172:/// Normally this will compile to a single instruction, especially if the
+        -:  173:/// shift is a manifest constant.
+        -:  174:inline uint64_t rotate(uint64_t val, size_t shift) {
+        -:  175:  // Avoid shifting by 64: doing so yields an undefined result.
+        -:  176:  return shift == 0 ? val : ((val >> shift) | (val << (64 - shift)));
+        -:  177:}
+        -:  178:
+        -:  179:inline uint64_t shift_mix(uint64_t val) {
+        -:  180:  return val ^ (val >> 47);
+        -:  181:}
+        -:  182:
+    #####:  183:inline uint64_t hash_16_bytes(uint64_t low, uint64_t high) {
+        -:  184:  // Murmur-inspired hashing.
+    #####:  185:  const uint64_t kMul = 0x9ddfea08eb382d69ULL;
+    #####:  186:  uint64_t a = (low ^ high) * kMul;
+    #####:  187:  a ^= (a >> 47);
+    #####:  188:  uint64_t b = (high ^ a) * kMul;
+    #####:  189:  b ^= (b >> 47);
+    #####:  190:  b *= kMul;
+    #####:  191:  return b;
+        -:  192:}
+        -:  193:
+        -:  194:inline uint64_t hash_1to3_bytes(const char *s, size_t len, uint64_t seed) {
+        -:  195:  uint8_t a = s[0];
+        -:  196:  uint8_t b = s[len >> 1];
+        -:  197:  uint8_t c = s[len - 1];
+        -:  198:  uint32_t y = static_cast<uint32_t>(a) + (static_cast<uint32_t>(b) << 8);
+        -:  199:  uint32_t z = static_cast<uint32_t>(len) + (static_cast<uint32_t>(c) << 2);
+        -:  200:  return shift_mix(y * k2 ^ z * k3 ^ seed) * k2;
+        -:  201:}
+        -:  202:
+        -:  203:inline uint64_t hash_4to8_bytes(const char *s, size_t len, uint64_t seed) {
+        -:  204:  uint64_t a = fetch32(s);
+        -:  205:  return hash_16_bytes(len + (a << 3), seed ^ fetch32(s + len - 4));
+        -:  206:}
+        -:  207:
+        -:  208:inline uint64_t hash_9to16_bytes(const char *s, size_t len, uint64_t seed) {
+        -:  209:  uint64_t a = fetch64(s);
+        -:  210:  uint64_t b = fetch64(s + len - 8);
+        -:  211:  return hash_16_bytes(seed ^ a, rotate(b + len, len)) ^ b;
+        -:  212:}
+        -:  213:
+        -:  214:inline uint64_t hash_17to32_bytes(const char *s, size_t len, uint64_t seed) {
+        -:  215:  uint64_t a = fetch64(s) * k1;
+        -:  216:  uint64_t b = fetch64(s + 8);
+        -:  217:  uint64_t c = fetch64(s + len - 8) * k2;
+        -:  218:  uint64_t d = fetch64(s + len - 16) * k0;
+        -:  219:  return hash_16_bytes(rotate(a - b, 43) + rotate(c ^ seed, 30) + d,
+        -:  220:                       a + rotate(b ^ k3, 20) - c + len + seed);
+        -:  221:}
+        -:  222:
+        -:  223:inline uint64_t hash_33to64_bytes(const char *s, size_t len, uint64_t seed) {
+        -:  224:  uint64_t z = fetch64(s + 24);
+        -:  225:  uint64_t a = fetch64(s) + (len + fetch64(s + len - 16)) * k0;
+        -:  226:  uint64_t b = rotate(a + z, 52);
+        -:  227:  uint64_t c = rotate(a, 37);
+        -:  228:  a += fetch64(s + 8);
+        -:  229:  c += rotate(a, 7);
+        -:  230:  a += fetch64(s + 16);
+        -:  231:  uint64_t vf = a + z;
+        -:  232:  uint64_t vs = b + rotate(a, 31) + c;
+        -:  233:  a = fetch64(s + 16) + fetch64(s + len - 32);
+        -:  234:  z = fetch64(s + len - 8);
+        -:  235:  b = rotate(a + z, 52);
+        -:  236:  c = rotate(a, 37);
+        -:  237:  a += fetch64(s + len - 24);
+        -:  238:  c += rotate(a, 7);
+        -:  239:  a += fetch64(s + len - 16);
+        -:  240:  uint64_t wf = a + z;
+        -:  241:  uint64_t ws = b + rotate(a, 31) + c;
+        -:  242:  uint64_t r = shift_mix((vf + ws) * k2 + (wf + vs) * k0);
+        -:  243:  return shift_mix((seed ^ (r * k0)) + vs) * k2;
+        -:  244:}
+        -:  245:
+        -:  246:inline uint64_t hash_short(const char *s, size_t length, uint64_t seed) {
+        -:  247:  if (length >= 4 && length <= 8)
+        -:  248:    return hash_4to8_bytes(s, length, seed);
+        -:  249:  if (length > 8 && length <= 16)
+        -:  250:    return hash_9to16_bytes(s, length, seed);
+        -:  251:  if (length > 16 && length <= 32)
+        -:  252:    return hash_17to32_bytes(s, length, seed);
+        -:  253:  if (length > 32)
+        -:  254:    return hash_33to64_bytes(s, length, seed);
+        -:  255:  if (length != 0)
+        -:  256:    return hash_1to3_bytes(s, length, seed);
+        -:  257:
+        -:  258:  return k2 ^ seed;
+        -:  259:}
+        -:  260:
+        -:  261:/// The intermediate state used during hashing.
+        -:  262:/// Currently, the algorithm for computing hash codes is based on CityHash and
+        -:  263:/// keeps 56 bytes of arbitrary state.
+        -:  264:struct hash_state {
+        -:  265:  uint64_t h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0;
+        -:  266:
+        -:  267:  /// Create a new hash_state structure and initialize it based on the
+        -:  268:  /// seed and the first 64-byte chunk.
+        -:  269:  /// This effectively performs the initial mix.
+        -:  270:  static hash_state create(const char *s, uint64_t seed) {
+        -:  271:    hash_state state = {
+        -:  272:      0, seed, hash_16_bytes(seed, k1), rotate(seed ^ k1, 49),
+        -:  273:      seed * k1, shift_mix(seed), 0 };
+        -:  274:    state.h6 = hash_16_bytes(state.h4, state.h5);
+        -:  275:    state.mix(s);
+        -:  276:    return state;
+        -:  277:  }
+        -:  278:
+        -:  279:  /// Mix 32-bytes from the input sequence into the 16-bytes of 'a'
+        -:  280:  /// and 'b', including whatever is already in 'a' and 'b'.
+        -:  281:  static void mix_32_bytes(const char *s, uint64_t &a, uint64_t &b) {
+        -:  282:    a += fetch64(s);
+        -:  283:    uint64_t c = fetch64(s + 24);
+        -:  284:    b = rotate(b + a + c, 21);
+        -:  285:    uint64_t d = a;
+        -:  286:    a += fetch64(s + 8) + fetch64(s + 16);
+        -:  287:    b += rotate(a, 44) + d;
+        -:  288:    a += c;
+        -:  289:  }
+        -:  290:
+        -:  291:  /// Mix in a 64-byte buffer of data.
+        -:  292:  /// We mix all 64 bytes even when the chunk length is smaller, but we
+        -:  293:  /// record the actual length.
+        -:  294:  void mix(const char *s) {
+        -:  295:    h0 = rotate(h0 + h1 + h3 + fetch64(s + 8), 37) * k1;
+        -:  296:    h1 = rotate(h1 + h4 + fetch64(s + 48), 42) * k1;
+        -:  297:    h0 ^= h6;
+        -:  298:    h1 += h3 + fetch64(s + 40);
+        -:  299:    h2 = rotate(h2 + h5, 33) * k1;
+        -:  300:    h3 = h4 * k1;
+        -:  301:    h4 = h0 + h5;
+        -:  302:    mix_32_bytes(s, h3, h4);
+        -:  303:    h5 = h2 + h6;
+        -:  304:    h6 = h1 + fetch64(s + 16);
+        -:  305:    mix_32_bytes(s + 32, h5, h6);
+        -:  306:    std::swap(h2, h0);
+        -:  307:  }
+        -:  308:
+        -:  309:  /// Compute the final 64-bit hash code value based on the current
+        -:  310:  /// state and the length of bytes hashed.
+        -:  311:  uint64_t finalize(size_t length) {
+        -:  312:    return hash_16_bytes(hash_16_bytes(h3, h5) + shift_mix(h1) * k1 + h2,
+        -:  313:                         hash_16_bytes(h4, h6) + shift_mix(length) * k1 + h0);
+        -:  314:  }
+        -:  315:};
+        -:  316:
+        -:  317:
+        -:  318:/// A global, fixed seed-override variable.
+        -:  319:///
+        -:  320:/// This variable can be set using the \see llvm::set_fixed_execution_seed
+        -:  321:/// function. See that function for details. Do not, under any circumstances,
+        -:  322:/// set or read this variable.
+        -:  323:extern uint64_t fixed_seed_override;
+        -:  324:
+function _ZN4llvm7hashing6detail18get_execution_seedEv called 0 returned 0% blocks executed 0%
+    #####:  325:inline uint64_t get_execution_seed() {
+        -:  326:  // FIXME: This needs to be a per-execution seed. This is just a placeholder
+        -:  327:  // implementation. Switching to a per-execution seed is likely to flush out
+        -:  328:  // instability bugs and so will happen as its own commit.
+        -:  329:  //
+        -:  330:  // However, if there is a fixed seed override set the first time this is
+        -:  331:  // called, return that instead of the per-execution seed.
+    #####:  332:  const uint64_t seed_prime = 0xff51afd7ed558ccdULL;
+    #####:  333:  static uint64_t seed = fixed_seed_override ? fixed_seed_override : seed_prime;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+    #####:  334:  return seed;
+        -:  335:}
+        -:  336:
+        -:  337:
+        -:  338:/// Trait to indicate whether a type's bits can be hashed directly.
+        -:  339:///
+        -:  340:/// A type trait which is true if we want to combine values for hashing by
+        -:  341:/// reading the underlying data. It is false if values of this type must
+        -:  342:/// first be passed to hash_value, and the resulting hash_codes combined.
+        -:  343://
+        -:  344:// FIXME: We want to replace is_integral_or_enum and is_pointer here with
+        -:  345:// a predicate which asserts that comparing the underlying storage of two
+        -:  346:// values of the type for equality is equivalent to comparing the two values
+        -:  347:// for equality. For all the platforms we care about, this holds for integers
+        -:  348:// and pointers, but there are platforms where it doesn't and we would like to
+        -:  349:// support user-defined types which happen to satisfy this property.
+        -:  350:template <typename T> struct is_hashable_data
+        -:  351:  : std::integral_constant<bool, ((is_integral_or_enum<T>::value ||
+        -:  352:                                   std::is_pointer<T>::value) &&
+        -:  353:                                  64 % sizeof(T) == 0)> {};
+        -:  354:
+        -:  355:// Special case std::pair to detect when both types are viable and when there
+        -:  356:// is no alignment-derived padding in the pair. This is a bit of a lie because
+        -:  357:// std::pair isn't truly POD, but it's close enough in all reasonable
+        -:  358:// implementations for our use case of hashing the underlying data.
+        -:  359:template <typename T, typename U> struct is_hashable_data<std::pair<T, U> >
+        -:  360:  : std::integral_constant<bool, (is_hashable_data<T>::value &&
+        -:  361:                                  is_hashable_data<U>::value &&
+        -:  362:                                  (sizeof(T) + sizeof(U)) ==
+        -:  363:                                   sizeof(std::pair<T, U>))> {};
+        -:  364:
+        -:  365:/// Helper to get the hashable data representation for a type.
+        -:  366:/// This variant is enabled when the type itself can be used.
+        -:  367:template <typename T>
+        -:  368:std::enable_if_t<is_hashable_data<T>::value, T>
+        -:  369:get_hashable_data(const T &value) {
+        -:  370:  return value;
+        -:  371:}
+        -:  372:/// Helper to get the hashable data representation for a type.
+        -:  373:/// This variant is enabled when we must first call hash_value and use the
+        -:  374:/// result as our data.
+        -:  375:template <typename T>
+        -:  376:std::enable_if_t<!is_hashable_data<T>::value, size_t>
+        -:  377:get_hashable_data(const T &value) {
+        -:  378:  using ::llvm::hash_value;
+        -:  379:  return hash_value(value);
+        -:  380:}
+        -:  381:
+        -:  382:/// Helper to store data from a value into a buffer and advance the
+        -:  383:/// pointer into that buffer.
+        -:  384:///
+        -:  385:/// This routine first checks whether there is enough space in the provided
+        -:  386:/// buffer, and if not immediately returns false. If there is space, it
+        -:  387:/// copies the underlying bytes of value into the buffer, advances the
+        -:  388:/// buffer_ptr past the copied bytes, and returns true.
+        -:  389:template <typename T>
+        -:  390:bool store_and_advance(char *&buffer_ptr, char *buffer_end, const T& value,
+        -:  391:                       size_t offset = 0) {
+        -:  392:  size_t store_size = sizeof(value) - offset;
+        -:  393:  if (buffer_ptr + store_size > buffer_end)
+        -:  394:    return false;
+        -:  395:  const char *value_data = reinterpret_cast<const char *>(&value);
+        -:  396:  memcpy(buffer_ptr, value_data + offset, store_size);
+        -:  397:  buffer_ptr += store_size;
+        -:  398:  return true;
+        -:  399:}
+        -:  400:
+        -:  401:/// Implement the combining of integral values into a hash_code.
+        -:  402:///
+        -:  403:/// This overload is selected when the value type of the iterator is
+        -:  404:/// integral. Rather than computing a hash_code for each object and then
+        -:  405:/// combining them, this (as an optimization) directly combines the integers.
+        -:  406:template <typename InputIteratorT>
+        -:  407:hash_code hash_combine_range_impl(InputIteratorT first, InputIteratorT last) {
+        -:  408:  const uint64_t seed = get_execution_seed();
+        -:  409:  char buffer[64], *buffer_ptr = buffer;
+        -:  410:  char *const buffer_end = std::end(buffer);
+        -:  411:  while (first != last && store_and_advance(buffer_ptr, buffer_end,
+        -:  412:                                            get_hashable_data(*first)))
+        -:  413:    ++first;
+        -:  414:  if (first == last)
+        -:  415:    return hash_short(buffer, buffer_ptr - buffer, seed);
+        -:  416:  assert(buffer_ptr == buffer_end);
+        -:  417:
+        -:  418:  hash_state state = state.create(buffer, seed);
+        -:  419:  size_t length = 64;
+        -:  420:  while (first != last) {
+        -:  421:    // Fill up the buffer. We don't clear it, which re-mixes the last round
+        -:  422:    // when only a partial 64-byte chunk is left.
+        -:  423:    buffer_ptr = buffer;
+        -:  424:    while (first != last && store_and_advance(buffer_ptr, buffer_end,
+        -:  425:                                              get_hashable_data(*first)))
+        -:  426:      ++first;
+        -:  427:
+        -:  428:    // Rotate the buffer if we did a partial fill in order to simulate doing
+        -:  429:    // a mix of the last 64-bytes. That is how the algorithm works when we
+        -:  430:    // have a contiguous byte sequence, and we want to emulate that here.
+        -:  431:    std::rotate(buffer, buffer_ptr, buffer_end);
+        -:  432:
+        -:  433:    // Mix this chunk into the current state.
+        -:  434:    state.mix(buffer);
+        -:  435:    length += buffer_ptr - buffer;
+        -:  436:  };
+        -:  437:
+        -:  438:  return state.finalize(length);
+        -:  439:}
+        -:  440:
+        -:  441:/// Implement the combining of integral values into a hash_code.
+        -:  442:///
+        -:  443:/// This overload is selected when the value type of the iterator is integral
+        -:  444:/// and when the input iterator is actually a pointer. Rather than computing
+        -:  445:/// a hash_code for each object and then combining them, this (as an
+        -:  446:/// optimization) directly combines the integers. Also, because the integers
+        -:  447:/// are stored in contiguous memory, this routine avoids copying each value
+        -:  448:/// and directly reads from the underlying memory.
+        -:  449:template <typename ValueT>
+        -:  450:std::enable_if_t<is_hashable_data<ValueT>::value, hash_code>
+        -:  451:hash_combine_range_impl(ValueT *first, ValueT *last) {
+        -:  452:  const uint64_t seed = get_execution_seed();
+        -:  453:  const char *s_begin = reinterpret_cast<const char *>(first);
+        -:  454:  const char *s_end = reinterpret_cast<const char *>(last);
+        -:  455:  const size_t length = std::distance(s_begin, s_end);
+        -:  456:  if (length <= 64)
+        -:  457:    return hash_short(s_begin, length, seed);
+        -:  458:
+        -:  459:  const char *s_aligned_end = s_begin + (length & ~63);
+        -:  460:  hash_state state = state.create(s_begin, seed);
+        -:  461:  s_begin += 64;
+        -:  462:  while (s_begin != s_aligned_end) {
+        -:  463:    state.mix(s_begin);
+        -:  464:    s_begin += 64;
+        -:  465:  }
+        -:  466:  if (length & 63)
+        -:  467:    state.mix(s_end - 64);
+        -:  468:
+        -:  469:  return state.finalize(length);
+        -:  470:}
+        -:  471:
+        -:  472:} // namespace detail
+        -:  473:} // namespace hashing
+        -:  474:
+        -:  475:
+        -:  476:/// Compute a hash_code for a sequence of values.
+        -:  477:///
+        -:  478:/// This hashes a sequence of values. It produces the same hash_code as
+        -:  479:/// 'hash_combine(a, b, c, ...)', but can run over arbitrary sized sequences
+        -:  480:/// and is significantly faster given pointers and types which can be hashed as
+        -:  481:/// a sequence of bytes.
+        -:  482:template <typename InputIteratorT>
+        -:  483:hash_code hash_combine_range(InputIteratorT first, InputIteratorT last) {
+        -:  484:  return ::llvm::hashing::detail::hash_combine_range_impl(first, last);
+        -:  485:}
+        -:  486:
+        -:  487:
+        -:  488:// Implementation details for hash_combine.
+        -:  489:namespace hashing {
+        -:  490:namespace detail {
+        -:  491:
+        -:  492:/// Helper class to manage the recursive combining of hash_combine
+        -:  493:/// arguments.
+        -:  494:///
+        -:  495:/// This class exists to manage the state and various calls involved in the
+        -:  496:/// recursive combining of arguments used in hash_combine. It is particularly
+        -:  497:/// useful at minimizing the code in the recursive calls to ease the pain
+        -:  498:/// caused by a lack of variadic functions.
+        -:  499:struct hash_combine_recursive_helper {
+        -:  500:  char buffer[64] = {};
+        -:  501:  hash_state state;
+        -:  502:  const uint64_t seed;
+        -:  503:
+        -:  504:public:
+        -:  505:  /// Construct a recursive hash combining helper.
+        -:  506:  ///
+        -:  507:  /// This sets up the state for a recursive hash combine, including getting
+        -:  508:  /// the seed and buffer setup.
+        -:  509:  hash_combine_recursive_helper()
+        -:  510:    : seed(get_execution_seed()) {}
+        -:  511:
+        -:  512:  /// Combine one chunk of data into the current in-flight hash.
+        -:  513:  ///
+        -:  514:  /// This merges one chunk of data into the hash. First it tries to buffer
+        -:  515:  /// the data. If the buffer is full, it hashes the buffer into its
+        -:  516:  /// hash_state, empties it, and then merges the new chunk in. This also
+        -:  517:  /// handles cases where the data straddles the end of the buffer.
+        -:  518:  template <typename T>
+        -:  519:  char *combine_data(size_t &length, char *buffer_ptr, char *buffer_end, T data) {
+        -:  520:    if (!store_and_advance(buffer_ptr, buffer_end, data)) {
+        -:  521:      // Check for skew which prevents the buffer from being packed, and do
+        -:  522:      // a partial store into the buffer to fill it. This is only a concern
+        -:  523:      // with the variadic combine because that formation can have varying
+        -:  524:      // argument types.
+        -:  525:      size_t partial_store_size = buffer_end - buffer_ptr;
+        -:  526:      memcpy(buffer_ptr, &data, partial_store_size);
+        -:  527:
+        -:  528:      // If the store fails, our buffer is full and ready to hash. We have to
+        -:  529:      // either initialize the hash state (on the first full buffer) or mix
+        -:  530:      // this buffer into the existing hash state. Length tracks the *hashed*
+        -:  531:      // length, not the buffered length.
+        -:  532:      if (length == 0) {
+        -:  533:        state = state.create(buffer, seed);
+        -:  534:        length = 64;
+        -:  535:      } else {
+        -:  536:        // Mix this chunk into the current state and bump length up by 64.
+        -:  537:        state.mix(buffer);
+        -:  538:        length += 64;
+        -:  539:      }
+        -:  540:      // Reset the buffer_ptr to the head of the buffer for the next chunk of
+        -:  541:      // data.
+        -:  542:      buffer_ptr = buffer;
+        -:  543:
+        -:  544:      // Try again to store into the buffer -- this cannot fail as we only
+        -:  545:      // store types smaller than the buffer.
+        -:  546:      if (!store_and_advance(buffer_ptr, buffer_end, data,
+        -:  547:                             partial_store_size))
+        -:  548:        llvm_unreachable("buffer smaller than stored type");
+        -:  549:    }
+        -:  550:    return buffer_ptr;
+        -:  551:  }
+        -:  552:
+        -:  553:  /// Recursive, variadic combining method.
+        -:  554:  ///
+        -:  555:  /// This function recurses through each argument, combining that argument
+        -:  556:  /// into a single hash.
+        -:  557:  template <typename T, typename ...Ts>
+        -:  558:  hash_code combine(size_t length, char *buffer_ptr, char *buffer_end,
+        -:  559:                    const T &arg, const Ts &...args) {
+        -:  560:    buffer_ptr = combine_data(length, buffer_ptr, buffer_end, get_hashable_data(arg));
+        -:  561:
+        -:  562:    // Recurse to the next argument.
+        -:  563:    return combine(length, buffer_ptr, buffer_end, args...);
+        -:  564:  }
+        -:  565:
+        -:  566:  /// Base case for recursive, variadic combining.
+        -:  567:  ///
+        -:  568:  /// The base case when combining arguments recursively is reached when all
+        -:  569:  /// arguments have been handled. It flushes the remaining buffer and
+        -:  570:  /// constructs a hash_code.
+        -:  571:  hash_code combine(size_t length, char *buffer_ptr, char *buffer_end) {
+        -:  572:    // Check whether the entire set of values fit in the buffer. If so, we'll
+        -:  573:    // use the optimized short hashing routine and skip state entirely.
+        -:  574:    if (length == 0)
+        -:  575:      return hash_short(buffer, buffer_ptr - buffer, seed);
+        -:  576:
+        -:  577:    // Mix the final buffer, rotating it if we did a partial fill in order to
+        -:  578:    // simulate doing a mix of the last 64-bytes. That is how the algorithm
+        -:  579:    // works when we have a contiguous byte sequence, and we want to emulate
+        -:  580:    // that here.
+        -:  581:    std::rotate(buffer, buffer_ptr, buffer_end);
+        -:  582:
+        -:  583:    // Mix this chunk into the current state.
+        -:  584:    state.mix(buffer);
+        -:  585:    length += buffer_ptr - buffer;
+        -:  586:
+        -:  587:    return state.finalize(length);
+        -:  588:  }
+        -:  589:};
+        -:  590:
+        -:  591:} // namespace detail
+        -:  592:} // namespace hashing
+        -:  593:
+        -:  594:/// Combine values into a single hash_code.
+        -:  595:///
+        -:  596:/// This routine accepts a varying number of arguments of any type. It will
+        -:  597:/// attempt to combine them into a single hash_code. For user-defined types it
+        -:  598:/// attempts to call a \see hash_value overload (via ADL) for the type. For
+        -:  599:/// integer and pointer types it directly combines their data into the
+        -:  600:/// resulting hash_code.
+        -:  601:///
+        -:  602:/// The result is suitable for returning from a user's hash_value
+        -:  603:/// *implementation* for their user-defined type. Consumers of a type should
+        -:  604:/// *not* call this routine, they should instead call 'hash_value'.
+        -:  605:template <typename ...Ts> hash_code hash_combine(const Ts &...args) {
+        -:  606:  // Recursively hash each argument using a helper class.
+        -:  607:  ::llvm::hashing::detail::hash_combine_recursive_helper helper;
+        -:  608:  return helper.combine(0, helper.buffer, helper.buffer + 64, args...);
+        -:  609:}
+        -:  610:
+        -:  611:// Implementation details for implementations of hash_value overloads provided
+        -:  612:// here.
+        -:  613:namespace hashing {
+        -:  614:namespace detail {
+        -:  615:
+        -:  616:/// Helper to hash the value of a single integer.
+        -:  617:///
+        -:  618:/// Overloads for smaller integer types are not provided to ensure consistent
+        -:  619:/// behavior in the presence of integral promotions. Essentially,
+        -:  620:/// "hash_value('4')" and "hash_value('0' + 4)" should be the same.
+function _ZN4llvm7hashing6detail18hash_integer_valueEm called 0 returned 0% blocks executed 0%
+    #####:  621:inline hash_code hash_integer_value(uint64_t value) {
+        -:  622:  // Similar to hash_4to8_bytes but using a seed instead of length.
+    #####:  623:  const uint64_t seed = get_execution_seed();
+call    0 never executed
+    #####:  624:  const char *s = reinterpret_cast<const char *>(&value);
+    #####:  625:  const uint64_t a = fetch32(s);
+    #####:  626:  return hash_16_bytes(seed + (a << 3), fetch32(s + 4));
+        -:  627:}
+        -:  628:
+        -:  629:} // namespace detail
+        -:  630:} // namespace hashing
+        -:  631:
+        -:  632:// Declared and documented above, but defined here so that any of the hashing
+        -:  633:// infrastructure is available.
+        -:  634:template <typename T>
+        -:  635:std::enable_if_t<is_integral_or_enum<T>::value, hash_code> hash_value(T value) {
+        -:  636:  return ::llvm::hashing::detail::hash_integer_value(
+        -:  637:      static_cast<uint64_t>(value));
+        -:  638:}
+        -:  639:
+        -:  640:// Declared and documented above, but defined here so that any of the hashing
+        -:  641:// infrastructure is available.
+    #####:  642:template <typename T> hash_code hash_value(const T *ptr) {
+    #####:  643:  return ::llvm::hashing::detail::hash_integer_value(
+call    0 never executed
+        -:  644:    reinterpret_cast<uintptr_t>(ptr));
+        -:  645:}
+        -:  646:
+        -:  647:// Declared and documented above, but defined here so that any of the hashing
+        -:  648:// infrastructure is available.
+        -:  649:template <typename T, typename U>
+        -:  650:hash_code hash_value(const std::pair<T, U> &arg) {
+        -:  651:  return hash_combine(arg.first, arg.second);
+        -:  652:}
+        -:  653:
+        -:  654:template <typename... Ts> hash_code hash_value(const std::tuple<Ts...> &arg) {
+        -:  655:  return std::apply([](const auto &...xs) { return hash_combine(xs...); }, arg);
+        -:  656:}
+        -:  657:
+        -:  658:// Declared and documented above, but defined here so that any of the hashing
+        -:  659:// infrastructure is available.
+        -:  660:template <typename T>
+        -:  661:hash_code hash_value(const std::basic_string<T> &arg) {
+        -:  662:  return hash_combine_range(arg.begin(), arg.end());
+        -:  663:}
+        -:  664:
+        -:  665:template <> struct DenseMapInfo<hash_code, void> {
+        -:  666:  static inline hash_code getEmptyKey() { return hash_code(-1); }
+        -:  667:  static inline hash_code getTombstoneKey() { return hash_code(-2); }
+        -:  668:  static unsigned getHashValue(hash_code val) { return val; }
+        -:  669:  static bool isEqual(hash_code LHS, hash_code RHS) { return LHS == RHS; }
+        -:  670:};
+        -:  671:
+        -:  672:} // namespace llvm
+        -:  673:
+        -:  674:#endif

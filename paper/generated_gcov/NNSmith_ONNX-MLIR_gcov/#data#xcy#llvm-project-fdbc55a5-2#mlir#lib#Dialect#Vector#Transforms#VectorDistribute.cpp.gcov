@@ -1,0 +1,2181 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Vector/Transforms/VectorDistribute.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Vector/Transforms/CMakeFiles/obj.MLIRVectorTransforms.dir/VectorDistribute.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Vector/Transforms/CMakeFiles/obj.MLIRVectorTransforms.dir/VectorDistribute.cpp.gcda
+        -:    0:Runs:128654
+        -:    1://===- VectorDistribute.cpp - patterns to do vector distribution ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   10:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   11:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   12:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   13:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   14:#include "mlir/Dialect/Vector/Transforms/VectorDistribution.h"
+        -:   15:#include "mlir/IR/AffineExpr.h"
+        -:   16:#include "mlir/Transforms/SideEffectUtils.h"
+        -:   17:#include "llvm/ADT/SetVector.h"
+        -:   18:#include <utility>
+        -:   19:
+        -:   20:using namespace mlir;
+        -:   21:using namespace mlir::vector;
+        -:   22:
+        -:   23:/// Currently the distribution map is implicit based on the vector shape. In the
+        -:   24:/// future it will be part of the op.
+        -:   25:/// Example:
+        -:   26:/// ```
+        -:   27:/// %0 = vector.warp_execute_on_lane_0(%arg0) -> (vector<1x16x2xf32>) {
+        -:   28:///   ...
+        -:   29:///   vector.yield %3 : vector<32x16x64xf32>
+        -:   30:/// }
+        -:   31:/// ```
+        -:   32:/// Would have an implicit map of:
+        -:   33:/// `(d0, d1, d2) -> (d0, d2)`
+function _ZL20calculateImplicitMapN4mlir10VectorTypeES0_ called 0 returned 0% blocks executed 0%
+    #####:   34:static AffineMap calculateImplicitMap(VectorType sequentialType,
+        -:   35:                                      VectorType distributedType) {
+    #####:   36:  SmallVector<AffineExpr> perm;
+call    0 never executed
+    #####:   37:  perm.reserve(1);
+call    0 never executed
+        -:   38:  // Check which dimensions of the sequential type are different than the
+        -:   39:  // dimensions of the distributed type to know the distributed dimensions. Then
+        -:   40:  // associate each distributed dimension to an ID in order.
+    #####:   41:  for (unsigned i = 0, e = sequentialType.getRank(); i < e; i++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   42:    if (sequentialType.getDimSize(i) != distributedType.getDimSize(i))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   43:      perm.push_back(getAffineDimExpr(i, distributedType.getContext()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:   44:  }
+    #####:   45:  auto map = AffineMap::get(sequentialType.getRank(), 0, perm,
+    #####:   46:                            distributedType.getContext());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   47:  assert(map.getNumResults() <= 1 &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:   48:         "only support distribution along one dimension for now.");
+    #####:   49:  return map;
+branch  0 never executed
+branch  1 never executed
+        -:   50:}
+        -:   51:
+        -:   52:namespace {
+        -:   53:
+        -:   54:/// Helper struct to create the load / store operations that permit transit
+        -:   55:/// through the parallel / sequential and the sequential / parallel boundaries
+        -:   56:/// when performing `rewriteWarpOpToScfFor`.
+        -:   57:///
+        -:   58:/// The vector distribution dimension is inferred from the vector types.
+        -:   59:struct DistributedLoadStoreHelper {
+function _ZN12_GLOBAL__N_126DistributedLoadStoreHelperC2EN4mlir5ValueES2_S2_S2_ called 0 returned 0% blocks executed 0%
+    #####:   60:  DistributedLoadStoreHelper(Value sequentialVal, Value distributedVal,
+        -:   61:                             Value laneId, Value zero)
+    #####:   62:      : sequentialVal(sequentialVal), distributedVal(distributedVal),
+    #####:   63:        laneId(laneId), zero(zero) {
+call    0 never executed
+    #####:   64:    sequentialVectorType = sequentialVal.getType().dyn_cast<VectorType>();
+call    0 never executed
+    #####:   65:    distributedVectorType = distributedVal.getType().dyn_cast<VectorType>();
+call    0 never executed
+    #####:   66:    if (sequentialVectorType && distributedVectorType)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   67:      distributionMap =
+    #####:   68:          calculateImplicitMap(sequentialVectorType, distributedVectorType);
+call    0 never executed
+    #####:   69:  }
+        -:   70:
+function _ZN12_GLOBAL__N_126DistributedLoadStoreHelper22buildDistributedOffsetERN4mlir12RewriterBaseENS1_8LocationEl called 0 returned 0% blocks executed 0%
+    #####:   71:  Value buildDistributedOffset(RewriterBase &b, Location loc, int64_t index) {
+    #####:   72:    int64_t distributedSize = distributedVectorType.getDimSize(index);
+call    0 never executed
+    #####:   73:    AffineExpr tid = getAffineSymbolExpr(0, b.getContext());
+call    0 never executed
+    #####:   74:    return b.createOrFold<AffineApplyOp>(loc, tid * distributedSize,
+    #####:   75:                                         ArrayRef<Value>{laneId});
+call    0 never executed
+call    1 never executed
+        -:   76:  }
+        -:   77:
+        -:   78:  /// Create a store during the process of distributing the
+        -:   79:  /// `vector.warp_execute_on_thread_0` op.
+        -:   80:  /// Vector distribution assumes the following convention regarding the
+        -:   81:  /// temporary buffers that are created to transition values. This **must**
+        -:   82:  /// be properly specified in the `options.warpAllocationFn`:
+        -:   83:  ///   1. scalars of type T transit through a memref<1xT>.
+        -:   84:  ///   2. vectors of type V<shapexT> transit through a memref<shapexT>
+function _ZN12_GLOBAL__N_126DistributedLoadStoreHelper10buildStoreERN4mlir12RewriterBaseENS1_8LocationENS1_5ValueES5_ called 0 returned 0% blocks executed 0%
+    #####:   85:  Operation *buildStore(RewriterBase &b, Location loc, Value val,
+        -:   86:                        Value buffer) {
+    #####:   87:    assert((val == distributedVal || val == sequentialVal) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:   88:           "Must store either the preregistered distributed or the "
+        -:   89:           "preregistered sequential value.");
+        -:   90:    // Scalar case can directly use memref.store.
+    #####:   91:    if (!val.getType().isa<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   92:      return b.create<memref::StoreOp>(loc, val, buffer, zero);
+call    0 never executed
+        -:   93:
+        -:   94:    // Vector case must use vector::TransferWriteOp which will later lower to
+        -:   95:    //   vector.store of memref.store depending on further lowerings.
+    #####:   96:    int64_t rank = sequentialVectorType.getRank();
+call    0 never executed
+    #####:   97:    SmallVector<Value> indices(rank, zero);
+call    0 never executed
+    #####:   98:    if (val == distributedVal) {
+branch  0 never executed
+branch  1 never executed
+    #####:   99:      for (auto dimExpr : distributionMap.getResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  100:        int64_t index = dimExpr.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  101:        indices[index] = buildDistributedOffset(b, loc, index);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  102:      }
+        -:  103:    }
+    #####:  104:    SmallVector<bool> inBounds(indices.size(), true);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  105:    return b.create<vector::TransferWriteOp>(
+branch  0 never executed
+branch  1 never executed
+        -:  106:        loc, val, buffer, indices,
+    #####:  107:        ArrayRef<bool>(inBounds.begin(), inBounds.end()));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  108:  }
+        -:  109:
+        -:  110:  /// Create a load during the process of distributing the
+        -:  111:  /// `vector.warp_execute_on_thread_0` op.
+        -:  112:  /// Vector distribution assumes the following convention regarding the
+        -:  113:  /// temporary buffers that are created to transition values. This **must**
+        -:  114:  /// be properly specified in the `options.warpAllocationFn`:
+        -:  115:  ///   1. scalars of type T transit through a memref<1xT>.
+        -:  116:  ///   2. vectors of type V<shapexT> transit through a memref<shapexT>
+        -:  117:  ///
+        -:  118:  /// When broadcastMode is true, the load is not distributed to account for
+        -:  119:  /// the broadcast semantics of the `vector.warp_execute_on_lane_0` op.
+        -:  120:  ///
+        -:  121:  /// Example:
+        -:  122:  ///
+        -:  123:  /// ```
+        -:  124:  ///   %r = vector.warp_execute_on_lane_0(...) -> (f32) {
+        -:  125:  ///     vector.yield %cst : f32
+        -:  126:  ///   }
+        -:  127:  ///   // Both types are f32. The constant %cst is broadcasted to all lanes.
+        -:  128:  /// ```
+        -:  129:  /// This behavior described in more detail in the documentation of the op.
+function _ZN12_GLOBAL__N_126DistributedLoadStoreHelper9buildLoadERN4mlir12RewriterBaseENS1_8LocationENS1_4TypeENS1_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  130:  Value buildLoad(RewriterBase &b, Location loc, Type type, Value buffer) {
+        -:  131:
+        -:  132:    // Scalar case can directly use memref.store.
+    #####:  133:    if (!type.isa<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  134:      return b.create<memref::LoadOp>(loc, buffer, zero);
+call    0 never executed
+        -:  135:
+        -:  136:    // Other cases must be vector atm.
+        -:  137:    // Vector case must use vector::TransferReadOp which will later lower to
+        -:  138:    //   vector.read of memref.read depending on further lowerings.
+    #####:  139:    assert((type == distributedVectorType || type == sequentialVectorType) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  140:           "Must store either the preregistered distributed or the "
+        -:  141:           "preregistered sequential type.");
+    #####:  142:    SmallVector<Value> indices(sequentialVectorType.getRank(), zero);
+call    0 never executed
+call    1 never executed
+    #####:  143:    if (type == distributedVectorType) {
+branch  0 never executed
+branch  1 never executed
+    #####:  144:      for (auto dimExpr : distributionMap.getResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:        int64_t index = dimExpr.cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  146:        indices[index] = buildDistributedOffset(b, loc, index);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  147:      }
+        -:  148:    }
+    #####:  149:    SmallVector<bool> inBounds(indices.size(), true);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  150:    return b.create<vector::TransferReadOp>(
+    #####:  151:        loc, type.cast<VectorType>(), buffer, indices,
+branch  0 never executed
+branch  1 never executed
+    #####:  152:        ArrayRef<bool>(inBounds.begin(), inBounds.end()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  153:  }
+        -:  154:
+        -:  155:  Value sequentialVal, distributedVal, laneId, zero;
+        -:  156:  VectorType sequentialVectorType, distributedVectorType;
+        -:  157:  AffineMap distributionMap;
+        -:  158:};
+        -:  159:
+        -:  160:} // namespace
+        -:  161:
+        -:  162:/// Helper to create a new WarpExecuteOnLane0Op with different signature.
+function _ZL38moveRegionToNewWarpOpAndReplaceReturnsRN4mlir12RewriterBaseENS_6vector20WarpExecuteOnLane0OpENS_10ValueRangeENS_9TypeRangeE called 0 returned 0% blocks executed 0%
+    #####:  163:static WarpExecuteOnLane0Op moveRegionToNewWarpOpAndReplaceReturns(
+        -:  164:    RewriterBase &rewriter, WarpExecuteOnLane0Op warpOp,
+        -:  165:    ValueRange newYieldedValues, TypeRange newReturnTypes) {
+        -:  166:  // Create a new op before the existing one, with the extra operands.
+    #####:  167:  OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+    #####:  168:  rewriter.setInsertionPoint(warpOp);
+call    0 never executed
+    #####:  169:  auto newWarpOp = rewriter.create<WarpExecuteOnLane0Op>(
+    #####:  170:      warpOp.getLoc(), newReturnTypes, warpOp.getLaneid(), warpOp.getWarpSize(),
+call    0 never executed
+call    1 never executed
+    #####:  171:      warpOp.getArgs(), warpOp.getBody()->getArgumentTypes());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  172:
+    #####:  173:  Region &opBody = warpOp.getBodyRegion();
+call    0 never executed
+    #####:  174:  Region &newOpBody = newWarpOp.getBodyRegion();
+call    0 never executed
+    #####:  175:  Block &newOpFirstBlock = newOpBody.front();
+call    0 never executed
+    #####:  176:  rewriter.inlineRegionBefore(opBody, newOpBody, newOpBody.begin());
+call    0 never executed
+    #####:  177:  rewriter.eraseBlock(&newOpFirstBlock);
+call    0 never executed
+    #####:  178:  assert(newWarpOp.getWarpRegion().hasOneBlock() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  179:         "expected WarpOp with single block");
+        -:  180:
+    #####:  181:  auto yield =
+call    0 never executed
+    #####:  182:      cast<vector::YieldOp>(newOpBody.getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  183:
+    #####:  184:  rewriter.updateRootInPlace(
+call    0 never executed
+function _ZZL38moveRegionToNewWarpOpAndReplaceReturnsRN4mlir12RewriterBaseENS_6vector20WarpExecuteOnLane0OpENS_10ValueRangeENS_9TypeRangeEENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  185:      yield, [&]() { yield.operandsMutable().assign(newYieldedValues); });
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  186:  return newWarpOp;
+branch  0 never executed
+branch  1 never executed
+        -:  187:}
+        -:  188:
+        -:  189:/// Helper to create a new WarpExecuteOnLane0Op region with extra outputs.
+        -:  190:/// `indices` return the index of each new output.
+function _ZL37moveRegionToNewWarpOpAndAppendReturnsRN4mlir12RewriterBaseENS_6vector20WarpExecuteOnLane0OpENS_10ValueRangeENS_9TypeRangeERN4llvm11SmallVectorImLj6EEE called 0 returned 0% blocks executed 0%
+    #####:  191:static WarpExecuteOnLane0Op moveRegionToNewWarpOpAndAppendReturns(
+        -:  192:    RewriterBase &rewriter, WarpExecuteOnLane0Op warpOp,
+        -:  193:    ValueRange newYieldedValues, TypeRange newReturnTypes,
+        -:  194:    llvm::SmallVector<size_t> &indices) {
+    #####:  195:  SmallVector<Type> types(warpOp.getResultTypes().begin(),
+branch  0 never executed
+branch  1 never executed
+    #####:  196:                          warpOp.getResultTypes().end());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  197:  auto yield = cast<vector::YieldOp>(
+call    0 never executed
+    #####:  198:      warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  199:  llvm::SmallSetVector<Value, 32> yieldValues(yield.getOperands().begin(),
+call    0 never executed
+    #####:  200:                                              yield.getOperands().end());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  201:  for (auto newRet : llvm::zip(newYieldedValues, newReturnTypes)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  202:    if (yieldValues.insert(std::get<0>(newRet))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  203:      types.push_back(std::get<1>(newRet));
+call    0 never executed
+    #####:  204:      indices.push_back(yieldValues.size() - 1);
+call    0 never executed
+        -:  205:    } else {
+        -:  206:      // If the value already exit the region don't create a new output.
+    #####:  207:      for (auto &yieldOperand : llvm::enumerate(yieldValues.getArrayRef())) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  208:        if (yieldOperand.value() == std::get<0>(newRet)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  209:          indices.push_back(yieldOperand.index());
+call    0 never executed
+    #####:  210:          break;
+call    0 never executed
+        -:  211:        }
+        -:  212:      }
+        -:  213:    }
+        -:  214:  }
+    #####:  215:  yieldValues.insert(newYieldedValues.begin(), newYieldedValues.end());
+call    0 never executed
+    #####:  216:  WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndReplaceReturns(
+call    0 never executed
+    #####:  217:      rewriter, warpOp, yieldValues.getArrayRef(), types);
+call    0 never executed
+call    1 never executed
+    #####:  218:  rewriter.replaceOp(warpOp,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  219:                     newWarpOp.getResults().take_front(warpOp.getNumResults()));
+call    0 never executed
+call    1 never executed
+    #####:  220:  return newWarpOp;
+call    0 never executed
+        -:  221:}
+        -:  222:
+        -:  223:/// Helper to know if an op can be hoisted out of the region.
+function _ZL12canBeHoistedPN4mlir9OperationEN4llvm12function_refIFbNS_5ValueEEEE called 0 returned 0% blocks executed 0%
+    #####:  224:static bool canBeHoisted(Operation *op,
+        -:  225:                         function_ref<bool(Value)> definedOutside) {
+    #####:  226:  return llvm::all_of(op->getOperands(), definedOutside) &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  227:         isMemoryEffectFree(op) && op->getNumRegions() == 0;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  228:}
+        -:  229:
+        -:  230:/// Return a value yielded by `warpOp` which statifies the filter lamdba
+        -:  231:/// condition and is not dead.
+function _ZL13getWarpResultN4mlir6vector20WarpExecuteOnLane0OpERKSt8functionIFbPNS_9OperationEEE called 0 returned 0% blocks executed 0%
+    #####:  232:static OpOperand *getWarpResult(WarpExecuteOnLane0Op warpOp,
+        -:  233:                                const std::function<bool(Operation *)> &fn) {
+    #####:  234:  auto yield = cast<vector::YieldOp>(
+call    0 never executed
+    #####:  235:      warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  236:  for (OpOperand &yieldOperand : yield->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  237:    Value yieldValues = yieldOperand.get();
+call    0 never executed
+    #####:  238:    Operation *definedOp = yieldValues.getDefiningOp();
+call    0 never executed
+    #####:  239:    if (definedOp && fn(definedOp)) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  240:      if (!warpOp.getResult(yieldOperand.getOperandNumber()).use_empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  241:        return &yieldOperand;
+        -:  242:    }
+        -:  243:  }
+    #####:  244:  return {};
+        -:  245:}
+        -:  246:
+        -:  247:// Clones `op` into a new operation that takes `operands` and returns
+        -:  248:// `resultTypes`.
+function _ZL27cloneOpWithOperandsAndTypesRN4mlir12RewriterBaseENS_8LocationEPNS_9OperationEN4llvm8ArrayRefINS_5ValueEEENS6_INS_4TypeEEE called 0 returned 0% blocks executed 0%
+    #####:  249:static Operation *cloneOpWithOperandsAndTypes(RewriterBase &rewriter,
+        -:  250:                                              Location loc, Operation *op,
+        -:  251:                                              ArrayRef<Value> operands,
+        -:  252:                                              ArrayRef<Type> resultTypes) {
+    #####:  253:  OperationState res(loc, op->getName().getStringRef(), operands, resultTypes,
+call    0 never executed
+    #####:  254:                     op->getAttrs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  255:  return rewriter.create(res);
+call    0 never executed
+        -:  256:}
+        -:  257:
+        -:  258:namespace {
+        -:  259:
+        -:  260:/// Rewrite a WarpExecuteOnLane0Op into a predicated scf.if op where the single
+        -:  261:/// thread `laneId` executes the entirety of the computation.
+        -:  262:///
+        -:  263:/// After the transformation:
+        -:  264:///   - the IR within the scf.if op can be thought of as executing sequentially
+        -:  265:///     (from the point of view of threads along `laneId`).
+        -:  266:///   - the IR outside of the scf.if op can be thought of as executing in
+        -:  267:///     parallel (from the point of view of threads along `laneId`).
+        -:  268:///
+        -:  269:/// Values that need to transit through the parallel / sequential and the
+        -:  270:/// sequential / parallel boundaries do so via reads and writes to a temporary
+        -:  271:/// memory location.
+        -:  272:///
+        -:  273:/// The transformation proceeds in multiple steps:
+        -:  274:///   1. Create the scf.if op.
+        -:  275:///   2. Insert appropriate (alloc, write)-pairs before the scf.if and reads
+        -:  276:///      within the scf.if to transit the values captured from above.
+        -:  277:///   3. Synchronize before the scf.if to ensure all writes inserted in 2. are
+        -:  278:///      consistent within the scf.if.
+        -:  279:///   4. Move the body of the WarpExecuteOnLane0Op inside the scf.if.
+        -:  280:///   5. Insert appropriate writes within scf.if and reads after the scf.if to
+        -:  281:///      transit the values returned by the op.
+        -:  282:///   6. Synchronize after the scf.if to ensure all writes inserted in 5. are
+        -:  283:///      consistent after the scf.if.
+        -:  284:///   7. Perform late cleanups.
+        -:  285:///
+        -:  286:/// All this assumes the vector distribution occurs along the most minor
+        -:  287:/// distributed vector dimension.
+        -:  288:struct WarpOpToScfIfPattern : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  289:  WarpOpToScfIfPattern(MLIRContext *context,
+        -:  290:                       const WarpExecuteOnLane0LoweringOptions &options,
+        -:  291:                       PatternBenefit benefit = 1)
+        -:  292:      : OpRewritePattern<WarpExecuteOnLane0Op>(context, benefit),
+        -:  293:        options(options) {}
+        -:  294:
+function _ZNK12_GLOBAL__N_120WarpOpToScfIfPattern15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  295:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  296:                                PatternRewriter &rewriter) const override {
+    #####:  297:    assert(warpOp.getBodyRegion().hasOneBlock() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  298:           "expected WarpOp with single block");
+    #####:  299:    Block *warpOpBody = &warpOp.getBodyRegion().front();
+call    0 never executed
+    #####:  300:    Location loc = warpOp.getLoc();
+call    0 never executed
+        -:  301:
+        -:  302:    // Passed all checks. Start rewriting.
+    #####:  303:    OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+    #####:  304:    rewriter.setInsertionPoint(warpOp);
+call    0 never executed
+        -:  305:
+        -:  306:    // Step 1: Create scf.if op.
+    #####:  307:    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+call    1 never executed
+    #####:  308:    Value isLane0 = rewriter.create<arith::CmpIOp>(
+    #####:  309:        loc, arith::CmpIPredicate::eq, warpOp.getLaneid(), c0);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  310:    auto ifOp = rewriter.create<scf::IfOp>(loc, isLane0,
+    #####:  311:                                           /*withElseRegion=*/false);
+call    0 never executed
+    #####:  312:    rewriter.eraseOp(ifOp.thenBlock()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  313:
+        -:  314:    // Step 2: insert appropriate (alloc, write)-pairs before the scf.if and
+        -:  315:    // reads within the scf.if to transit the values captured from above.
+    #####:  316:    SmallVector<Value> bbArgReplacements;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  317:    for (const auto &it : llvm::enumerate(warpOp.getArgs())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  318:      Value sequentialVal = warpOpBody->getArgument(it.index());
+call    0 never executed
+    #####:  319:      Value distributedVal = it.value();
+call    0 never executed
+    #####:  320:      DistributedLoadStoreHelper helper(sequentialVal, distributedVal,
+    #####:  321:                                        warpOp.getLaneid(), c0);
+call    0 never executed
+call    1 never executed
+        -:  322:
+        -:  323:      // Create buffer before the ifOp.
+    #####:  324:      rewriter.setInsertionPoint(ifOp);
+call    0 never executed
+    #####:  325:      Value buffer = options.warpAllocationFn(loc, rewriter, warpOp,
+    #####:  326:                                              sequentialVal.getType());
+branch  0 never executed
+branch  1 never executed
+        -:  327:      // Store distributed vector into buffer, before the ifOp.
+    #####:  328:      helper.buildStore(rewriter, loc, distributedVal, buffer);
+call    0 never executed
+        -:  329:      // Load sequential vector from buffer, inside the ifOp.
+    #####:  330:      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+call    0 never executed
+call    1 never executed
+    #####:  331:      bbArgReplacements.push_back(
+call    0 never executed
+call    1 never executed
+        -:  332:          helper.buildLoad(rewriter, loc, sequentialVal.getType(), buffer));
+        -:  333:    }
+        -:  334:
+        -:  335:    // Step 3. Insert sync after all the stores and before all the loads.
+    #####:  336:    if (!warpOp.getArgs().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  337:      rewriter.setInsertionPoint(ifOp);
+call    0 never executed
+    #####:  338:      options.warpSyncronizationFn(loc, rewriter, warpOp);
+branch  0 never executed
+branch  1 never executed
+        -:  339:    }
+        -:  340:
+        -:  341:    // Step 4. Move body of warpOp to ifOp.
+    #####:  342:    rewriter.mergeBlocks(warpOpBody, ifOp.thenBlock(), bbArgReplacements);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  343:
+        -:  344:    // Step 5. Insert appropriate writes within scf.if and reads after the
+        -:  345:    // scf.if to transit the values returned by the op.
+        -:  346:    // TODO: at this point, we can reuse the shared memory from previous
+        -:  347:    // buffers.
+    #####:  348:    SmallVector<Value> replacements;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  349:    auto yieldOp = cast<vector::YieldOp>(ifOp.thenBlock()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  350:    Location yieldLoc = yieldOp.getLoc();
+call    0 never executed
+    #####:  351:    for (const auto &it : llvm::enumerate(yieldOp.operands())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  352:      Value sequentialVal = it.value();
+branch  0 never executed
+branch  1 never executed
+    #####:  353:      Value distributedVal = warpOp->getResult(it.index());
+branch  0 never executed
+branch  1 never executed
+    #####:  354:      DistributedLoadStoreHelper helper(sequentialVal, distributedVal,
+    #####:  355:                                        warpOp.getLaneid(), c0);
+call    0 never executed
+call    1 never executed
+        -:  356:
+        -:  357:      // Create buffer before the ifOp.
+    #####:  358:      rewriter.setInsertionPoint(ifOp);
+call    0 never executed
+    #####:  359:      Value buffer = options.warpAllocationFn(loc, rewriter, warpOp,
+    #####:  360:                                              sequentialVal.getType());
+branch  0 never executed
+branch  1 never executed
+        -:  361:
+        -:  362:      // Store yielded value into buffer, inside the ifOp, before the
+        -:  363:      // terminator.
+    #####:  364:      rewriter.setInsertionPoint(yieldOp);
+call    0 never executed
+    #####:  365:      helper.buildStore(rewriter, loc, sequentialVal, buffer);
+call    0 never executed
+        -:  366:
+        -:  367:      // Load distributed value from buffer, after  the warpOp.
+    #####:  368:      rewriter.setInsertionPointAfter(ifOp);
+call    0 never executed
+        -:  369:      // Result type and yielded value type are the same. This is a broadcast.
+        -:  370:      // E.g.:
+        -:  371:      // %r = vector.warp_execute_on_lane_0(...) -> (f32) {
+        -:  372:      //   vector.yield %cst : f32
+        -:  373:      // }
+        -:  374:      // Both types are f32. The constant %cst is broadcasted to all lanes.
+        -:  375:      // This is described in more detail in the documentation of the op.
+    #####:  376:      replacements.push_back(
+call    0 never executed
+call    1 never executed
+        -:  377:          helper.buildLoad(rewriter, loc, distributedVal.getType(), buffer));
+        -:  378:    }
+        -:  379:
+        -:  380:    // Step 6. Insert sync after all the stores and before all the loads.
+    #####:  381:    if (!yieldOp.operands().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  382:      rewriter.setInsertionPointAfter(ifOp);
+call    0 never executed
+    #####:  383:      options.warpSyncronizationFn(loc, rewriter, warpOp);
+branch  0 never executed
+branch  1 never executed
+        -:  384:    }
+        -:  385:
+        -:  386:    // Step 7. Delete terminator and add empty scf.yield.
+    #####:  387:    rewriter.eraseOp(yieldOp);
+call    0 never executed
+    #####:  388:    rewriter.setInsertionPointToEnd(ifOp.thenBlock());
+call    0 never executed
+call    1 never executed
+    #####:  389:    rewriter.create<scf::YieldOp>(yieldLoc);
+call    0 never executed
+        -:  390:
+        -:  391:    // Compute replacements for WarpOp results.
+    #####:  392:    rewriter.replaceOp(warpOp, replacements);
+call    0 never executed
+call    1 never executed
+        -:  393:
+    #####:  394:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  395:  }
+        -:  396:
+        -:  397:private:
+        -:  398:  const WarpExecuteOnLane0LoweringOptions &options;
+        -:  399:};
+        -:  400:
+        -:  401:/// Clone `writeOp` assumed to be nested under `warpOp` into a new warp execute
+        -:  402:/// op with the proper return type.
+        -:  403:/// The new write op is updated to write the result of the new warp execute op.
+        -:  404:/// The old `writeOp` is deleted.
+function _ZN12_GLOBAL__N_1L12cloneWriteOpERN4mlir12RewriterBaseENS0_6vector20WarpExecuteOnLane0OpENS3_15TransferWriteOpENS0_10VectorTypeE called 0 returned 0% blocks executed 0%
+    #####:  405:static vector::TransferWriteOp cloneWriteOp(RewriterBase &rewriter,
+        -:  406:                                            WarpExecuteOnLane0Op warpOp,
+        -:  407:                                            vector::TransferWriteOp writeOp,
+        -:  408:                                            VectorType targetType) {
+    #####:  409:  assert(writeOp->getParentOp() == warpOp &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  410:         "write must be nested immediately under warp");
+    #####:  411:  OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+    #####:  412:  SmallVector<size_t> newRetIndices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  413:  WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+    #####:  414:      rewriter, warpOp, ValueRange{{writeOp.getVector()}},
+    #####:  415:      TypeRange{targetType}, newRetIndices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  416:  rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  417:  auto newWriteOp =
+    #####:  418:      cast<vector::TransferWriteOp>(rewriter.clone(*writeOp.getOperation()));
+call    0 never executed
+call    1 never executed
+    #####:  419:  rewriter.eraseOp(writeOp);
+call    0 never executed
+    #####:  420:  newWriteOp.getVectorMutable().assign(newWarpOp.getResult(newRetIndices[0]));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  421:  return newWriteOp;
+branch  0 never executed
+branch  1 never executed
+        -:  422:}
+        -:  423:
+        -:  424:/// Distribute transfer_write ops based on the affine map returned by
+        -:  425:/// `distributionMapFn`.
+        -:  426:/// Example:
+        -:  427:/// ```
+        -:  428:/// %0 = vector.warp_execute_on_lane_0(%id){
+        -:  429:///   ...
+        -:  430:///   vector.transfer_write %v, %A[%c0] : vector<32xf32>, memref<128xf32>
+        -:  431:///   vector.yield
+        -:  432:/// }
+        -:  433:/// ```
+        -:  434:/// To
+        -:  435:/// ```
+        -:  436:/// %r:3 = vector.warp_execute_on_lane_0(%id) -> (vector<1xf32>) {
+        -:  437:///   ...
+        -:  438:///   vector.yield %v : vector<32xf32>
+        -:  439:/// }
+        -:  440:/// vector.transfer_write %v, %A[%id] : vector<1xf32>, memref<128xf32>
+        -:  441:struct WarpOpTransferWrite : public OpRewritePattern<vector::TransferWriteOp> {
+function _ZN12_GLOBAL__N_119WarpOpTransferWriteC2EPN4mlir11MLIRContextESt8functionIFNS1_9AffineMapENS1_6vector15TransferWriteOpEEENS1_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####:  442:  WarpOpTransferWrite(MLIRContext *ctx, DistributionMapFn fn,
+        -:  443:                      PatternBenefit b = 1)
+    #####:  444:      : OpRewritePattern<vector::TransferWriteOp>(ctx, b),
+    #####:  445:        distributionMapFn(std::move(fn)) {}
+call    0 never executed
+        -:  446:
+        -:  447:  /// Distribute the TransferWriteOp. Only 1D distributions and vector dims that
+        -:  448:  /// are multiples of the distribution ratio are supported at the moment.
+function _ZNK12_GLOBAL__N_119WarpOpTransferWrite15tryDistributeOpERN4mlir12RewriterBaseENS1_6vector15TransferWriteOpENS4_20WarpExecuteOnLane0OpE called 0 returned 0% blocks executed 0%
+    #####:  449:  LogicalResult tryDistributeOp(RewriterBase &rewriter,
+        -:  450:                                vector::TransferWriteOp writeOp,
+        -:  451:                                WarpExecuteOnLane0Op warpOp) const {
+    #####:  452:    VectorType writtenVectorType = writeOp.getVectorType();
+call    0 never executed
+        -:  453:
+        -:  454:    // 1. If the write is 0-D, we just clone it into a new WarpExecuteOnLane0Op
+        -:  455:    // to separate it from the rest.
+    #####:  456:    if (writtenVectorType.getRank() == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  457:      return failure();
+        -:  458:
+        -:  459:    // 2. Compute the distribution map.
+    #####:  460:    AffineMap map = distributionMapFn(writeOp);
+branch  0 never executed
+branch  1 never executed
+    #####:  461:    if (map.getNumResults() != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  462:      return writeOp->emitError("multi-dim distribution not implemented yet");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  463:
+        -:  464:    // 3. Compute the targetType using the distribution map.
+    #####:  465:    SmallVector<int64_t> targetShape(writtenVectorType.getShape().begin(),
+call    0 never executed
+    #####:  466:                                     writtenVectorType.getShape().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  467:    for (unsigned i = 0, e = map.getNumResults(); i < e; i++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  468:      unsigned position = map.getDimPosition(i);
+call    0 never executed
+    #####:  469:      if (targetShape[position] % warpOp.getWarpSize() != 0)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  470:        return failure();
+    #####:  471:      targetShape[position] = targetShape[position] / warpOp.getWarpSize();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  472:    }
+    #####:  473:    VectorType targetType =
+    #####:  474:        VectorType::get(targetShape, writtenVectorType.getElementType());
+call    0 never executed
+call    1 never executed
+        -:  475:
+        -:  476:    // 4. clone the write into a new WarpExecuteOnLane0Op to separate it from
+        -:  477:    // the rest.
+    #####:  478:    vector::TransferWriteOp newWriteOp =
+    #####:  479:        cloneWriteOp(rewriter, warpOp, writeOp, targetType);
+call    0 never executed
+        -:  480:
+        -:  481:    // 5. Reindex the write using the distribution map.
+    #####:  482:    auto newWarpOp =
+    #####:  483:        newWriteOp.getVector().getDefiningOp<WarpExecuteOnLane0Op>();
+call    0 never executed
+call    1 never executed
+    #####:  484:    rewriter.setInsertionPoint(newWriteOp);
+call    0 never executed
+    #####:  485:    AffineMap indexMap = map.compose(newWriteOp.getPermutationMap());
+call    0 never executed
+call    1 never executed
+    #####:  486:    Location loc = newWriteOp.getLoc();
+call    0 never executed
+    #####:  487:    SmallVector<Value> indices(newWriteOp.getIndices().begin(),
+call    0 never executed
+    #####:  488:                               newWriteOp.getIndices().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  489:    for (auto it : llvm::zip(indexMap.getResults(), map.getResults())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  490:      AffineExpr d0, d1;
+    #####:  491:      bindDims(newWarpOp.getContext(), d0, d1);
+call    0 never executed
+call    1 never executed
+    #####:  492:      auto indexExpr = std::get<0>(it).dyn_cast<AffineDimExpr>();
+call    0 never executed
+    #####:  493:      if (!indexExpr)
+branch  0 never executed
+branch  1 never executed
+    #####:  494:        continue;
+    #####:  495:      unsigned indexPos = indexExpr.getPosition();
+call    0 never executed
+    #####:  496:      unsigned vectorPos = std::get<1>(it).cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  497:      auto scale = rewriter.getAffineConstantExpr(targetShape[vectorPos]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  498:      indices[indexPos] =
+branch  0 never executed
+branch  1 never executed
+    #####:  499:          makeComposedAffineApply(rewriter, loc, d0 + scale * d1,
+    #####:  500:                                  {indices[indexPos], newWarpOp.getLaneid()});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+        -:  501:    }
+    #####:  502:    newWriteOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  503:
+    #####:  504:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  505:  }
+        -:  506:
+        -:  507:  /// Extract TransferWriteOps of vector<1x> into a separate warp op.
+        -:  508:  LogicalResult tryExtractOp(RewriterBase &rewriter,
+        -:  509:                             vector::TransferWriteOp writeOp,
+        -:  510:                             WarpExecuteOnLane0Op warpOp) const {
+        -:  511:    Location loc = writeOp.getLoc();
+        -:  512:    VectorType vecType = writeOp.getVectorType();
+        -:  513:
+        -:  514:    // Only sink out vector of 1 element for now to not serialize large vector
+        -:  515:    // store. This can later be controlled by user.
+        -:  516:    if (vecType.getNumElements() != 1)
+        -:  517:      return failure();
+        -:  518:
+        -:  519:    // Do not process warp ops that contain only TransferWriteOps.
+        -:  520:    if (llvm::all_of(warpOp.getOps(), [](Operation &op) {
+        -:  521:          return isa<vector::TransferWriteOp, vector::YieldOp>(&op);
+        -:  522:        }))
+        -:  523:      return failure();
+        -:  524:
+        -:  525:    SmallVector<Value> yieldValues = {writeOp.getVector()};
+        -:  526:    SmallVector<Type> retTypes = {vecType};
+        -:  527:    SmallVector<size_t> newRetIndices;
+        -:  528:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+        -:  529:        rewriter, warpOp, yieldValues, retTypes, newRetIndices);
+        -:  530:    rewriter.setInsertionPointAfter(newWarpOp);
+        -:  531:
+        -:  532:    // Create a second warp op that contains only writeOp.
+        -:  533:    auto secondWarpOp = rewriter.create<WarpExecuteOnLane0Op>(
+        -:  534:        loc, TypeRange(), newWarpOp.getLaneid(), newWarpOp.getWarpSize());
+        -:  535:    Block &body = secondWarpOp.getBodyRegion().front();
+        -:  536:    rewriter.setInsertionPointToStart(&body);
+        -:  537:    auto newWriteOp =
+        -:  538:        cast<vector::TransferWriteOp>(rewriter.clone(*writeOp.getOperation()));
+        -:  539:    newWriteOp.getVectorMutable().assign(newWarpOp.getResult(newRetIndices[0]));
+        -:  540:    rewriter.eraseOp(writeOp);
+        -:  541:    rewriter.create<vector::YieldOp>(newWarpOp.getLoc());
+        -:  542:    return success();
+        -:  543:  }
+        -:  544:
+function _ZNK12_GLOBAL__N_119WarpOpTransferWrite15matchAndRewriteEN4mlir6vector15TransferWriteOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  545:  LogicalResult matchAndRewrite(vector::TransferWriteOp writeOp,
+        -:  546:                                PatternRewriter &rewriter) const override {
+        -:  547:    // Ops with mask not supported yet.
+    #####:  548:    if (writeOp.getMask())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  549:      return failure();
+        -:  550:
+    #####:  551:    auto warpOp = dyn_cast<WarpExecuteOnLane0Op>(writeOp->getParentOp());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  552:    if (!warpOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  553:      return failure();
+        -:  554:
+        -:  555:    // There must be no op with a side effect after writeOp.
+    #####:  556:    Operation *nextOp = writeOp.getOperation();
+    #####:  557:    while ((nextOp = nextOp->getNextNode()))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  558:      if (!isMemoryEffectFree(nextOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  559:        return failure();
+        -:  560:
+function _ZZNK12_GLOBAL__N_119WarpOpTransferWrite15matchAndRewriteEN4mlir6vector15TransferWriteOpERNS1_15PatternRewriterEENKUlNS1_5ValueEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  561:    if (!llvm::all_of(writeOp->getOperands(), [&](Value value) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  562:          return writeOp.getVector() == value ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  563:                 warpOp.isDefinedOutsideOfRegion(value);
+call    0 never executed
+        -:  564:        }))
+    #####:  565:      return failure();
+        -:  566:
+    #####:  567:    if (succeeded(tryDistributeOp(rewriter, writeOp, warpOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  568:      return success();
+        -:  569:
+    #####:  570:    if (succeeded(tryExtractOp(rewriter, writeOp, warpOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  571:      return success();
+        -:  572:
+    #####:  573:    return failure();
+        -:  574:  }
+        -:  575:
+        -:  576:private:
+        -:  577:  DistributionMapFn distributionMapFn;
+        -:  578:};
+        -:  579:
+        -:  580:/// Sink out elementwise op feeding into a warp op yield.
+        -:  581:/// ```
+        -:  582:/// %0 = vector.warp_execute_on_lane_0(%arg0) -> (vector<1xf32>) {
+        -:  583:///   ...
+        -:  584:///   %3 = arith.addf %1, %2 : vector<32xf32>
+        -:  585:///   vector.yield %3 : vector<32xf32>
+        -:  586:/// }
+        -:  587:/// ```
+        -:  588:/// To
+        -:  589:/// ```
+        -:  590:/// %r:3 = vector.warp_execute_on_lane_0(%arg0) -> (vector<1xf32>,
+        -:  591:/// vector<1xf32>, vector<1xf32>) {
+        -:  592:///   ...
+        -:  593:///   %4 = arith.addf %2, %3 : vector<32xf32>
+        -:  594:///   vector.yield %4, %2, %3 : vector<32xf32>, vector<32xf32>,
+        -:  595:///   vector<32xf32>
+        -:  596:/// }
+        -:  597:/// %0 = arith.addf %r#1, %r#2 : vector<1xf32>
+        -:  598:struct WarpOpElementwise : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  599:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_117WarpOpElementwise15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  600:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  601:                                PatternRewriter &rewriter) const override {
+    #####:  602:    OpOperand *yieldOperand = getWarpResult(warpOp, [](Operation *op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  603:      return OpTrait::hasElementwiseMappableTraits(op);
+call    0 never executed
+        -:  604:    });
+    #####:  605:    if (!yieldOperand)
+branch  0 never executed
+branch  1 never executed
+    #####:  606:      return failure();
+    #####:  607:    Operation *elementWise = yieldOperand->get().getDefiningOp();
+call    0 never executed
+    #####:  608:    unsigned operandIndex = yieldOperand->getOperandNumber();
+call    0 never executed
+    #####:  609:    Value distributedVal = warpOp.getResult(operandIndex);
+branch  0 never executed
+branch  1 never executed
+    #####:  610:    SmallVector<Value> yieldValues;
+call    0 never executed
+    #####:  611:    SmallVector<Type> retTypes;
+branch  0 never executed
+branch  1 never executed
+    #####:  612:    Location loc = warpOp.getLoc();
+call    0 never executed
+    #####:  613:    for (OpOperand &operand : elementWise->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  614:      Type targetType;
+    #####:  615:      if (auto vecType = distributedVal.getType().dyn_cast<VectorType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  616:        // If the result type is a vector, the operands must also be vectors.
+    #####:  617:        auto operandType = operand.get().getType().cast<VectorType>();
+call    0 never executed
+    #####:  618:        targetType =
+    #####:  619:            VectorType::get(vecType.getShape(), operandType.getElementType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  620:      } else {
+    #####:  621:        auto operandType = operand.get().getType();
+call    0 never executed
+    #####:  622:        assert(!operandType.isa<VectorType>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  623:               "unexpected yield of vector from op with scalar result type");
+    #####:  624:        targetType = operandType;
+        -:  625:      }
+    #####:  626:      retTypes.push_back(targetType);
+call    0 never executed
+    #####:  627:      yieldValues.push_back(operand.get());
+call    0 never executed
+        -:  628:    }
+    #####:  629:    SmallVector<size_t> newRetIndices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  630:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+call    0 never executed
+    #####:  631:        rewriter, warpOp, yieldValues, retTypes, newRetIndices);
+call    0 never executed
+call    1 never executed
+    #####:  632:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  633:    SmallVector<Value> newOperands(elementWise->getOperands().begin(),
+call    0 never executed
+    #####:  634:                                   elementWise->getOperands().end());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  635:    for (unsigned i : llvm::seq(unsigned(0), elementWise->getNumOperands())) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  636:      newOperands[i] = newWarpOp.getResult(newRetIndices[i]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  637:    }
+    #####:  638:    OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  639:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  640:    Operation *newOp = cloneOpWithOperandsAndTypes(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  641:        rewriter, loc, elementWise, newOperands,
+    #####:  642:        {newWarpOp.getResult(operandIndex).getType()});
+call    0 never executed
+    #####:  643:    newWarpOp.getResult(operandIndex).replaceAllUsesWith(newOp->getResult(0));
+call    0 never executed
+    #####:  644:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  645:  }
+        -:  646:};
+        -:  647:
+        -:  648:/// Sink out splat constant op feeding into a warp op yield.
+        -:  649:/// ```
+        -:  650:/// %0 = vector.warp_execute_on_lane_0(%arg0) -> (vector<1xf32>) {
+        -:  651:///   ...
+        -:  652:///   %cst = arith.constant dense<2.0> : vector<32xf32>
+        -:  653:///   vector.yield %cst : vector<32xf32>
+        -:  654:/// }
+        -:  655:/// ```
+        -:  656:/// To
+        -:  657:/// ```
+        -:  658:/// vector.warp_execute_on_lane_0(%arg0 {
+        -:  659:///   ...
+        -:  660:/// }
+        -:  661:/// %0 = arith.constant dense<2.0> : vector<1xf32>
+        -:  662:struct WarpOpConstant : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  663:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_114WarpOpConstant15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  664:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  665:                                PatternRewriter &rewriter) const override {
+    #####:  666:    OpOperand *yieldOperand = getWarpResult(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  667:        warpOp, [](Operation *op) { return isa<arith::ConstantOp>(op); });
+call    0 never executed
+    #####:  668:    if (!yieldOperand)
+branch  0 never executed
+branch  1 never executed
+    #####:  669:      return failure();
+    #####:  670:    auto constantOp = yieldOperand->get().getDefiningOp<arith::ConstantOp>();
+call    0 never executed
+    #####:  671:    auto dense = constantOp.getValue().dyn_cast<SplatElementsAttr>();
+call    0 never executed
+call    1 never executed
+    #####:  672:    if (!dense)
+branch  0 never executed
+branch  1 never executed
+    #####:  673:      return failure();
+    #####:  674:    unsigned operandIndex = yieldOperand->getOperandNumber();
+call    0 never executed
+    #####:  675:    Attribute scalarAttr = dense.getSplatValue<Attribute>();
+call    0 never executed
+    #####:  676:    Attribute newAttr = DenseElementsAttr::get(
+branch  0 never executed
+branch  1 never executed
+    #####:  677:        warpOp.getResult(operandIndex).getType(), scalarAttr);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  678:    Location loc = warpOp.getLoc();
+call    0 never executed
+    #####:  679:    rewriter.setInsertionPointAfter(warpOp);
+call    0 never executed
+    #####:  680:    Value distConstant = rewriter.create<arith::ConstantOp>(loc, newAttr);
+call    0 never executed
+call    1 never executed
+    #####:  681:    warpOp.getResult(operandIndex).replaceAllUsesWith(distConstant);
+call    0 never executed
+    #####:  682:    return success();
+        -:  683:  }
+        -:  684:};
+        -:  685:
+        -:  686:/// Sink out transfer_read op feeding into a warp op yield.
+        -:  687:/// ```
+        -:  688:/// %0 = vector.warp_execute_on_lane_0(%arg0) -> (vector<1xf32>) {
+        -:  689:///   ...
+        -:  690://    %2 = vector.transfer_read %src[%c0], %cst : memref<1024xf32>,
+        -:  691://    vector<32xf32>
+        -:  692:///   vector.yield %2 : vector<32xf32>
+        -:  693:/// }
+        -:  694:/// ```
+        -:  695:/// To
+        -:  696:/// ```
+        -:  697:/// %dead = vector.warp_execute_on_lane_0(%arg0) -> (vector<1xf32>,
+        -:  698:/// vector<1xf32>, vector<1xf32>) {
+        -:  699:///   ...
+        -:  700:///   %2 = vector.transfer_read %src[%c0], %cst : memref<1024xf32>,
+        -:  701:///   vector<32xf32> vector.yield %2 : vector<32xf32>
+        -:  702:/// }
+        -:  703:/// %0 = vector.transfer_read %src[%c0], %cst : memref<1024xf32>, vector<1xf32>
+        -:  704:struct WarpOpTransferRead : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  705:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_118WarpOpTransferRead15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  706:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  707:                                PatternRewriter &rewriter) const override {
+    #####:  708:    OpOperand *operand = getWarpResult(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  709:        warpOp, [](Operation *op) { return isa<vector::TransferReadOp>(op); });
+call    0 never executed
+    #####:  710:    if (!operand)
+branch  0 never executed
+branch  1 never executed
+    #####:  711:      return failure();
+    #####:  712:    auto read = operand->get().getDefiningOp<vector::TransferReadOp>();
+call    0 never executed
+        -:  713:    // Don't duplicate transfer_read ops when distributing.
+    #####:  714:    if (!read.getResult().hasOneUse())
+branch  0 never executed
+branch  1 never executed
+    #####:  715:      return failure();
+    #####:  716:    unsigned operandIndex = operand->getOperandNumber();
+call    0 never executed
+    #####:  717:    Value distributedVal = warpOp.getResult(operandIndex);
+branch  0 never executed
+branch  1 never executed
+        -:  718:
+    #####:  719:    SmallVector<Value, 4> indices(read.getIndices().begin(),
+call    0 never executed
+    #####:  720:                                  read.getIndices().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  721:    auto sequentialType = read.getResult().getType().cast<VectorType>();
+call    0 never executed
+    #####:  722:    auto distributedType = distributedVal.getType().cast<VectorType>();
+call    0 never executed
+    #####:  723:    AffineMap map = calculateImplicitMap(sequentialType, distributedType);
+call    0 never executed
+    #####:  724:    AffineMap indexMap = map.compose(read.getPermutationMap());
+call    0 never executed
+call    1 never executed
+    #####:  725:    OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  726:    rewriter.setInsertionPointAfter(warpOp);
+call    0 never executed
+    #####:  727:    for (auto it : llvm::zip(indexMap.getResults(), map.getResults())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  728:      AffineExpr d0, d1;
+    #####:  729:      bindDims(read.getContext(), d0, d1);
+call    0 never executed
+call    1 never executed
+    #####:  730:      auto indexExpr = std::get<0>(it).dyn_cast<AffineDimExpr>();
+call    0 never executed
+    #####:  731:      if (!indexExpr)
+branch  0 never executed
+branch  1 never executed
+    #####:  732:        continue;
+    #####:  733:      unsigned indexPos = indexExpr.getPosition();
+call    0 never executed
+    #####:  734:      unsigned vectorPos = std::get<1>(it).cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  735:      int64_t scale =
+    #####:  736:          distributedVal.getType().cast<VectorType>().getDimSize(vectorPos);
+call    0 never executed
+call    1 never executed
+    #####:  737:      indices[indexPos] =
+branch  0 never executed
+branch  1 never executed
+    #####:  738:          makeComposedAffineApply(rewriter, read.getLoc(), d0 + scale * d1,
+    #####:  739:                                  {indices[indexPos], warpOp.getLaneid()});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+        -:  740:    }
+    #####:  741:    Value newRead = rewriter.create<vector::TransferReadOp>(
+    #####:  742:        read.getLoc(), distributedVal.getType(), read.getSource(), indices,
+call    0 never executed
+call    1 never executed
+    #####:  743:        read.getPermutationMapAttr(), read.getPadding(), read.getMask(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  744:        read.getInBoundsAttr());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  745:    distributedVal.replaceAllUsesWith(newRead);
+call    0 never executed
+    #####:  746:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  747:  }
+        -:  748:};
+        -:  749:
+        -:  750:/// Remove any result that has no use along with the matching yieldOp operand.
+        -:  751:// TODO: Move this in WarpExecuteOnLane0Op canonicalization.
+        -:  752:struct WarpOpDeadResult : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  753:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_116WarpOpDeadResult15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  754:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  755:                                PatternRewriter &rewriter) const override {
+    #####:  756:    SmallVector<Type> newResultTypes;
+branch  0 never executed
+branch  1 never executed
+    #####:  757:    newResultTypes.reserve(warpOp->getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  758:    SmallVector<Value> newYieldValues;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  759:    newYieldValues.reserve(warpOp->getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  760:    DenseMap<Value, int64_t> dedupYieldOperandPositionMap;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  761:    DenseMap<OpResult, int64_t> dedupResultPositionMap;
+call    0 never executed
+call    1 never executed
+    #####:  762:    auto yield = cast<vector::YieldOp>(
+call    0 never executed
+    #####:  763:        warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  764:
+        -:  765:    // Some values may be yielded multiple times and correspond to multiple
+        -:  766:    // results. Deduplicating occurs by taking each result with its matching
+        -:  767:    // yielded value, and:
+        -:  768:    //   1. recording the unique first position at which the value is yielded.
+        -:  769:    //   2. recording for the result, the first position at which the dedup'ed
+        -:  770:    //      value is yielded.
+        -:  771:    //   3. skipping from the new result types / new yielded values any result
+        -:  772:    //      that has no use or whose yielded value has already been seen.
+    #####:  773:    for (OpResult result : warpOp.getResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  774:      Value yieldOperand = yield.getOperand(result.getResultNumber());
+call    0 never executed
+call    1 never executed
+    #####:  775:      auto it = dedupYieldOperandPositionMap.insert(
+    #####:  776:          std::make_pair(yieldOperand, newResultTypes.size()));
+call    0 never executed
+    #####:  777:      dedupResultPositionMap.insert(std::make_pair(result, it.first->second));
+call    0 never executed
+call    1 never executed
+    #####:  778:      if (result.use_empty() || !it.second)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  779:        continue;
+    #####:  780:      newResultTypes.push_back(result.getType());
+call    0 never executed
+    #####:  781:      newYieldValues.push_back(yieldOperand);
+call    0 never executed
+        -:  782:    }
+        -:  783:    // No modification, exit early.
+    #####:  784:    if (yield.getNumOperands() == newYieldValues.size())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  785:      return failure();
+        -:  786:    // Move the body of the old warpOp to a new warpOp.
+    #####:  787:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndReplaceReturns(
+call    0 never executed
+    #####:  788:        rewriter, warpOp, newYieldValues, newResultTypes);
+call    0 never executed
+call    1 never executed
+        -:  789:    // Replace results of the old warpOp by the new, deduplicated results.
+    #####:  790:    SmallVector<Value> newValues;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  791:    newValues.reserve(warpOp->getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  792:    for (OpResult result : warpOp.getResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  793:      if (result.use_empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  794:        newValues.push_back(Value());
+call    0 never executed
+        -:  795:      else
+    #####:  796:        newValues.push_back(
+call    0 never executed
+call    1 never executed
+    #####:  797:            newWarpOp.getResult(dedupResultPositionMap.lookup(result)));
+branch  0 never executed
+branch  1 never executed
+        -:  798:    }
+    #####:  799:    rewriter.replaceOp(warpOp, newValues);
+call    0 never executed
+call    1 never executed
+    #####:  800:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  801:  }
+        -:  802:};
+        -:  803:
+        -:  804:// If an operand is directly yielded out of the region we can forward it
+        -:  805:// directly and it doesn't need to go through the region.
+        -:  806:struct WarpOpForwardOperand : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  807:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_120WarpOpForwardOperand15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  808:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  809:                                PatternRewriter &rewriter) const override {
+    #####:  810:    SmallVector<Type> resultTypes;
+call    0 never executed
+    #####:  811:    SmallVector<Value> yieldValues;
+    #####:  812:    auto yield = cast<vector::YieldOp>(
+call    0 never executed
+    #####:  813:        warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  814:    Value valForwarded;
+    #####:  815:    unsigned resultIndex;
+    #####:  816:    for (OpOperand &operand : yield->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  817:      Value result = warpOp.getResult(operand.getOperandNumber());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  818:      if (result.use_empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  819:        continue;
+        -:  820:
+        -:  821:      // Assume all the values coming from above are uniform.
+    #####:  822:      if (!warpOp.getBodyRegion().isAncestor(operand.get().getParentRegion())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  823:        if (result.getType() != operand.get().getType())
+branch  0 never executed
+branch  1 never executed
+    #####:  824:          continue;
+    #####:  825:        valForwarded = operand.get();
+call    0 never executed
+    #####:  826:        resultIndex = operand.getOperandNumber();
+    #####:  827:        break;
+call    0 never executed
+        -:  828:      }
+    #####:  829:      auto arg = operand.get().dyn_cast<BlockArgument>();
+call    0 never executed
+    #####:  830:      if (!arg || arg.getOwner()->getParentOp() != warpOp.getOperation())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  831:        continue;
+    #####:  832:      Value warpOperand = warpOp.getArgs()[arg.getArgNumber()];
+call    0 never executed
+call    1 never executed
+    #####:  833:      if (result.getType() != warpOperand.getType())
+branch  0 never executed
+branch  1 never executed
+    #####:  834:        continue;
+    #####:  835:      valForwarded = warpOperand;
+    #####:  836:      resultIndex = operand.getOperandNumber();
+    #####:  837:      break;
+call    0 never executed
+        -:  838:    }
+    #####:  839:    if (!valForwarded)
+branch  0 never executed
+branch  1 never executed
+    #####:  840:      return failure();
+    #####:  841:    warpOp.getResult(resultIndex).replaceAllUsesWith(valForwarded);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  842:    return success();
+        -:  843:  }
+        -:  844:};
+        -:  845:
+        -:  846:struct WarpOpBroadcast : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  847:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_115WarpOpBroadcast15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  848:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  849:                                PatternRewriter &rewriter) const override {
+    #####:  850:    OpOperand *operand = getWarpResult(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  851:        warpOp, [](Operation *op) { return isa<vector::BroadcastOp>(op); });
+call    0 never executed
+    #####:  852:    if (!operand)
+branch  0 never executed
+branch  1 never executed
+    #####:  853:      return failure();
+    #####:  854:    unsigned int operandNumber = operand->getOperandNumber();
+call    0 never executed
+    #####:  855:    auto broadcastOp = operand->get().getDefiningOp<vector::BroadcastOp>();
+call    0 never executed
+    #####:  856:    Location loc = broadcastOp.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  857:    auto destVecType =
+    #####:  858:        warpOp->getResultTypes()[operandNumber].cast<VectorType>();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  859:    SmallVector<size_t> newRetIndices;
+call    0 never executed
+    #####:  860:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+    #####:  861:        rewriter, warpOp, {broadcastOp.getSource()},
+    #####:  862:        {broadcastOp.getSource().getType()}, newRetIndices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  863:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  864:    Value broadcasted = rewriter.create<vector::BroadcastOp>(
+    #####:  865:        loc, destVecType, newWarpOp->getResult(newRetIndices[0]));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  866:    newWarpOp->getResult(operandNumber).replaceAllUsesWith(broadcasted);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  867:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  868:  }
+        -:  869:};
+        -:  870:
+        -:  871:/// Pattern to move out vector.extract of single element vector. Those don't
+        -:  872:/// need to be distributed and can just be propagated outside of the region.
+        -:  873:struct WarpOpExtract : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  874:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_113WarpOpExtract15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  875:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  876:                                PatternRewriter &rewriter) const override {
+    #####:  877:    OpOperand *operand = getWarpResult(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  878:        warpOp, [](Operation *op) { return isa<vector::ExtractOp>(op); });
+call    0 never executed
+    #####:  879:    if (!operand)
+branch  0 never executed
+branch  1 never executed
+    #####:  880:      return failure();
+    #####:  881:    unsigned int operandNumber = operand->getOperandNumber();
+call    0 never executed
+    #####:  882:    auto extractOp = operand->get().getDefiningOp<vector::ExtractOp>();
+call    0 never executed
+    #####:  883:    if (extractOp.getVectorType().getNumElements() != 1)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  884:      return failure();
+    #####:  885:    Location loc = extractOp.getLoc();
+call    0 never executed
+    #####:  886:    SmallVector<size_t> newRetIndices;
+call    0 never executed
+    #####:  887:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+    #####:  888:        rewriter, warpOp, {extractOp.getVector()}, {extractOp.getVectorType()},
+call    0 never executed
+    #####:  889:        newRetIndices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  890:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  891:    Value newExtract = rewriter.create<vector::ExtractOp>(
+    #####:  892:        loc, newWarpOp->getResult(newRetIndices[0]), extractOp.getPosition());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  893:    newWarpOp->getResult(operandNumber).replaceAllUsesWith(newExtract);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  894:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  895:  }
+        -:  896:};
+        -:  897:
+        -:  898:/// Pattern to move out vector.extractelement of 0-D tensors. Those don't
+        -:  899:/// need to be distributed and can just be propagated outside of the region.
+        -:  900:struct WarpOpExtractElement : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  901:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_120WarpOpExtractElement15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  902:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  903:                                PatternRewriter &rewriter) const override {
+    #####:  904:    OpOperand *operand = getWarpResult(warpOp, [](Operation *op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  905:      return isa<vector::ExtractElementOp>(op);
+call    0 never executed
+        -:  906:    });
+    #####:  907:    if (!operand)
+branch  0 never executed
+branch  1 never executed
+    #####:  908:      return failure();
+    #####:  909:    unsigned int operandNumber = operand->getOperandNumber();
+call    0 never executed
+    #####:  910:    auto extractOp = operand->get().getDefiningOp<vector::ExtractElementOp>();
+call    0 never executed
+    #####:  911:    if (extractOp.getVectorType().getRank() != 0)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  912:      return failure();
+    #####:  913:    Location loc = extractOp.getLoc();
+call    0 never executed
+    #####:  914:    SmallVector<size_t> newRetIndices;
+call    0 never executed
+    #####:  915:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+    #####:  916:        rewriter, warpOp, {extractOp.getVector()}, {extractOp.getVectorType()},
+call    0 never executed
+    #####:  917:        newRetIndices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  918:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+    #####:  919:    Value newExtract = rewriter.create<vector::ExtractElementOp>(
+    #####:  920:        loc, newWarpOp->getResult(newRetIndices[0]));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  921:    newWarpOp->getResult(operandNumber).replaceAllUsesWith(newExtract);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  922:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  923:  }
+        -:  924:};
+        -:  925:
+        -:  926:/// Sink scf.for region out of WarpExecuteOnLane0Op. This can be done only if
+        -:  927:/// the scf.ForOp is the last operation in the region so that it doesn't change
+        -:  928:/// the order of execution. This creates a new scf.for region after the
+        -:  929:/// WarpExecuteOnLane0Op. The new scf.for region will contain a new
+        -:  930:/// WarpExecuteOnLane0Op region. Example:
+        -:  931:/// ```
+        -:  932:/// %w = vector.warp_execute_on_lane_0(%laneid) -> (vector<4xf32>) {
+        -:  933:///   ...
+        -:  934:///   %v1 = scf.for %arg3 = %c0 to %c128 step %c1 iter_args(%arg4 = %v)
+        -:  935:///   -> (vector<128xf32>) {
+        -:  936:///     ...
+        -:  937:///     scf.yield %r : vector<128xf32>
+        -:  938:///   }
+        -:  939:///   vector.yield %v1 : vector<128xf32>
+        -:  940:/// }
+        -:  941:/// ```
+        -:  942:/// To:
+        -:  943:/// %w0 = vector.warp_execute_on_lane_0(%arg0) -> (vector<4xf32>) {
+        -:  944:///   ...
+        -:  945:///   vector.yield %v : vector<128xf32>
+        -:  946:/// }
+        -:  947:/// %w = scf.for %arg3 = %c0 to %c128 step %c1 iter_args(%varg = %q0)
+        -:  948:///   -> (vector<4xf32>) {
+        -:  949:///     %iw = vector.warp_execute_on_lane_0(%laneid)
+        -:  950:///     args(%varg : vector<4xf32>) -> (vector<4xf32>) {
+        -:  951:///     ^bb0(%arg: vector<128xf32>):
+        -:  952:///       ...
+        -:  953:///       vector.yield %ir : vector<128xf32>
+        -:  954:///     }
+        -:  955:///     scf.yield %iw : vector<4xf32>
+        -:  956:///  }
+        -:  957:/// ```
+        -:  958:struct WarpOpScfForOp : public OpRewritePattern<WarpExecuteOnLane0Op> {
+        -:  959:  using OpRewritePattern<WarpExecuteOnLane0Op>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_114WarpOpScfForOp15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  960:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -:  961:                                PatternRewriter &rewriter) const override {
+    #####:  962:    auto yield = cast<vector::YieldOp>(
+call    0 never executed
+    #####:  963:        warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  964:    // Only pick up forOp if it is the last op in the region.
+    #####:  965:    Operation *lastNode = yield->getPrevNode();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  966:    auto forOp = dyn_cast_or_null<scf::ForOp>(lastNode);
+branch  0 never executed
+branch  1 never executed
+    #####:  967:    if (!forOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  968:      return failure();
+    #####:  969:    SmallVector<Value> newOperands;
+call    0 never executed
+    #####:  970:    SmallVector<unsigned> resultIdx;
+branch  0 never executed
+branch  1 never executed
+        -:  971:    // Collect all the outputs coming from the forOp.
+    #####:  972:    for (OpOperand &yieldOperand : yield->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  973:      if (yieldOperand.get().getDefiningOp() != forOp.getOperation())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  974:        continue;
+    #####:  975:      auto forResult = yieldOperand.get().cast<OpResult>();
+call    0 never executed
+    #####:  976:      newOperands.push_back(warpOp.getResult(yieldOperand.getOperandNumber()));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  977:      yieldOperand.set(forOp.getIterOperands()[forResult.getResultNumber()]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  978:      resultIdx.push_back(yieldOperand.getOperandNumber());
+call    0 never executed
+call    1 never executed
+        -:  979:    }
+    #####:  980:    OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  981:    rewriter.setInsertionPointAfter(warpOp);
+call    0 never executed
+        -:  982:    // Create a new for op outside the region with a WarpExecuteOnLane0Op region
+        -:  983:    // inside.
+    #####:  984:    auto newForOp = rewriter.create<scf::ForOp>(
+    #####:  985:        forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
+call    0 never executed
+call    1 never executed
+    #####:  986:        forOp.getStep(), newOperands);
+call    0 never executed
+call    1 never executed
+    #####:  987:    rewriter.setInsertionPoint(newForOp.getBody(), newForOp.getBody()->begin());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  988:    auto innerWarp = rewriter.create<WarpExecuteOnLane0Op>(
+    #####:  989:        warpOp.getLoc(), newForOp.getResultTypes(), warpOp.getLaneid(),
+branch  0 never executed
+branch  1 never executed
+    #####:  990:        warpOp.getWarpSize(), newForOp.getRegionIterArgs(),
+call    0 never executed
+call    1 never executed
+    #####:  991:        forOp.getResultTypes());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  992:
+    #####:  993:    SmallVector<Value> argMapping;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  994:    argMapping.push_back(newForOp.getInductionVar());
+call    0 never executed
+call    1 never executed
+    #####:  995:    for (Value args : innerWarp.getBody()->getArguments()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  996:      argMapping.push_back(args);
+call    0 never executed
+        -:  997:    }
+    #####:  998:    SmallVector<Value> yieldOperands;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  999:    for (Value operand : forOp.getBody()->getTerminator()->getOperands())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####: 1000:      yieldOperands.push_back(operand);
+call    0 never executed
+    #####: 1001:    rewriter.eraseOp(forOp.getBody()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1002:    rewriter.mergeBlocks(forOp.getBody(), innerWarp.getBody(), argMapping);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1003:    rewriter.setInsertionPoint(innerWarp.getBody(), innerWarp.getBody()->end());
+call    0 never executed
+call    1 never executed
+    #####: 1004:    rewriter.create<vector::YieldOp>(innerWarp.getLoc(), yieldOperands);
+call    0 never executed
+    #####: 1005:    rewriter.setInsertionPointAfter(innerWarp);
+call    0 never executed
+    #####: 1006:    if (!innerWarp.getResults().empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1007:      rewriter.create<scf::YieldOp>(forOp.getLoc(), innerWarp.getResults());
+call    0 never executed
+call    1 never executed
+    #####: 1008:    rewriter.eraseOp(forOp);
+call    0 never executed
+        -: 1009:    // Replace the warpOp result coming from the original ForOp.
+    #####: 1010:    for (const auto &res : llvm::enumerate(resultIdx)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1011:      warpOp.getResult(res.value())
+branch  0 never executed
+branch  1 never executed
+    #####: 1012:          .replaceAllUsesWith(newForOp.getResult(res.index()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1013:      newForOp->setOperand(res.index() + 3, warpOp.getResult(res.value()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1014:    }
+    #####: 1015:    return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1016:  }
+        -: 1017:};
+        -: 1018:
+        -: 1019:/// A pattern that extracts vector.reduction ops from a WarpExecuteOnLane0Op.
+        -: 1020:/// The vector is reduced in parallel. Currently limited to vector size matching
+        -: 1021:/// the warpOp size. E.g.:
+        -: 1022:/// ```
+        -: 1023:/// %r = vector_ext.warp_execute_on_lane_0(%laneid)[32] -> (f32) {
+        -: 1024:///   %0 = "some_def"() : () -> (vector<32xf32>)
+        -: 1025:///   %1 = vector.reduction "add", %0 : vector<32xf32> into f32
+        -: 1026:///   vector_ext.yield %1 : f32
+        -: 1027:/// }
+        -: 1028:/// ```
+        -: 1029:/// is lowered to:
+        -: 1030:/// ```
+        -: 1031:/// %0 = vector_ext.warp_execute_on_lane_0(%laneid)[32] -> (vector<1xf32>) {
+        -: 1032:///   %1 = "some_def"() : () -> (vector<32xf32>)
+        -: 1033:///   vector_ext.yield %1 : vector<32xf32>
+        -: 1034:/// }
+        -: 1035:/// %a = vector.extract %0[0] : vector<1xf32>
+        -: 1036:/// %r = ("warp.reduction %a")
+        -: 1037:/// ```
+        -: 1038:struct WarpOpReduction : public OpRewritePattern<WarpExecuteOnLane0Op> {
+function _ZN12_GLOBAL__N_115WarpOpReductionC2EPN4mlir11MLIRContextESt8functionIFNS1_5ValueENS1_8LocationERNS1_9OpBuilderES5_NS1_6vector13CombiningKindEjEENS1_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1039:  WarpOpReduction(MLIRContext *context,
+        -: 1040:                  DistributedReductionFn distributedReductionFn,
+        -: 1041:                  PatternBenefit benefit = 1)
+    #####: 1042:      : OpRewritePattern<WarpExecuteOnLane0Op>(context, benefit),
+    #####: 1043:        distributedReductionFn(std::move(distributedReductionFn)) {}
+call    0 never executed
+        -: 1044:
+function _ZNK12_GLOBAL__N_115WarpOpReduction15matchAndRewriteEN4mlir6vector20WarpExecuteOnLane0OpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1045:  LogicalResult matchAndRewrite(WarpExecuteOnLane0Op warpOp,
+        -: 1046:                                PatternRewriter &rewriter) const override {
+    #####: 1047:    OpOperand *yieldOperand = getWarpResult(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1048:        warpOp, [](Operation *op) { return isa<vector::ReductionOp>(op); });
+call    0 never executed
+    #####: 1049:    if (!yieldOperand)
+branch  0 never executed
+branch  1 never executed
+    #####: 1050:      return failure();
+        -: 1051:
+    #####: 1052:    auto reductionOp =
+    #####: 1053:        cast<vector::ReductionOp>(yieldOperand->get().getDefiningOp());
+call    0 never executed
+call    1 never executed
+    #####: 1054:    auto vectorType = reductionOp.getVector().getType().cast<VectorType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1055:    // Only rank 1 vectors supported.
+    #####: 1056:    if (vectorType.getRank() != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1057:      return rewriter.notifyMatchFailure(
+    #####: 1058:          warpOp, "Only rank 1 reductions can be distributed.");
+call    0 never executed
+        -: 1059:    // Only warp_size-sized vectors supported.
+    #####: 1060:    if (vectorType.getShape()[0] % warpOp.getWarpSize() != 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1061:      return rewriter.notifyMatchFailure(
+    #####: 1062:          warpOp, "Reduction vector dimension must match was size.");
+call    0 never executed
+        -: 1063:    // Only f32 and i32 element types are supported.
+    #####: 1064:    if (!reductionOp.getType().isF32() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1065:        !reductionOp.getType().isSignlessInteger(32))
+call    0 never executed
+    #####: 1066:      return rewriter.notifyMatchFailure(
+        -: 1067:          warpOp,
+    #####: 1068:          "Reduction distribution currently only supports 32bits types.");
+call    0 never executed
+        -: 1069:
+    #####: 1070:    int64_t numElements = vectorType.getShape()[0] / warpOp.getWarpSize();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -: 1071:    // Return vector that will be reduced from the WarpExecuteOnLane0Op.
+    #####: 1072:    unsigned operandIndex = yieldOperand->getOperandNumber();
+call    0 never executed
+    #####: 1073:    SmallVector<Value> yieldValues = {reductionOp.getVector()};
+call    0 never executed
+call    1 never executed
+    #####: 1074:    SmallVector<Type> retTypes = {
+call    0 never executed
+    #####: 1075:        VectorType::get({numElements}, reductionOp.getType())};
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1076:    if (reductionOp.getAcc()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1077:      yieldValues.push_back(reductionOp.getAcc());
+call    0 never executed
+call    1 never executed
+    #####: 1078:      retTypes.push_back(reductionOp.getAcc().getType());
+call    0 never executed
+call    1 never executed
+        -: 1079:    }
+    #####: 1080:    SmallVector<size_t> newRetIndices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1081:    WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+call    0 never executed
+    #####: 1082:        rewriter, warpOp, yieldValues, retTypes, newRetIndices);
+call    0 never executed
+call    1 never executed
+    #####: 1083:    rewriter.setInsertionPointAfter(newWarpOp);
+call    0 never executed
+        -: 1084:
+    #####: 1085:    Value laneValVec = newWarpOp.getResult(newRetIndices[0]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1086:    // First reduce on a single thread.
+    #####: 1087:    Value perLaneReduction = rewriter.create<vector::ReductionOp>(
+    #####: 1088:        reductionOp.getLoc(), reductionOp.getKind(), laneValVec);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1089:    // Then distribute across threads.
+    #####: 1090:    Value fullReduce =
+        -: 1091:        distributedReductionFn(reductionOp.getLoc(), rewriter, perLaneReduction,
+    #####: 1092:                               reductionOp.getKind(), newWarpOp.getWarpSize());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1093:    if (reductionOp.getAcc()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1094:      fullReduce = vector::makeArithReduction(
+branch  0 never executed
+branch  1 never executed
+        -: 1095:          rewriter, reductionOp.getLoc(), reductionOp.getKind(), fullReduce,
+    #####: 1096:          newWarpOp.getResult(newRetIndices[1]));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1097:    }
+    #####: 1098:    newWarpOp.getResult(operandIndex).replaceAllUsesWith(fullReduce);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1099:    return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1100:  }
+        -: 1101:
+        -: 1102:private:
+        -: 1103:  DistributedReductionFn distributedReductionFn;
+        -: 1104:};
+        -: 1105:
+        -: 1106:} // namespace
+        -: 1107:
+function _ZN4mlir6vector43populateWarpExecuteOnLane0OpToScfForPatternERNS_17RewritePatternSetERKNS0_33WarpExecuteOnLane0LoweringOptionsENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1108:void mlir::vector::populateWarpExecuteOnLane0OpToScfForPattern(
+        -: 1109:    RewritePatternSet &patterns,
+        -: 1110:    const WarpExecuteOnLane0LoweringOptions &options, PatternBenefit benefit) {
+    #####: 1111:  patterns.add<WarpOpToScfIfPattern>(patterns.getContext(), options, benefit);
+call    0 never executed
+    #####: 1112:}
+        -: 1113:
+function _ZN4mlir6vector41populateDistributeTransferWriteOpPatternsERNS_17RewritePatternSetERKSt8functionIFNS_9AffineMapENS0_15TransferWriteOpEEENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1114:void mlir::vector::populateDistributeTransferWriteOpPatterns(
+        -: 1115:    RewritePatternSet &patterns, const DistributionMapFn &distributionMapFn,
+        -: 1116:    PatternBenefit benefit) {
+    #####: 1117:  patterns.add<WarpOpTransferWrite>(patterns.getContext(), distributionMapFn,
+call    0 never executed
+    #####: 1118:                                    benefit);
+call    0 never executed
+    #####: 1119:}
+        -: 1120:
+function _ZN4mlir6vector47populatePropagateWarpVectorDistributionPatternsERNS_17RewritePatternSetENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1121:void mlir::vector::populatePropagateWarpVectorDistributionPatterns(
+        -: 1122:    RewritePatternSet &patterns, PatternBenefit benefit) {
+    #####: 1123:  patterns.add<WarpOpElementwise, WarpOpTransferRead, WarpOpDeadResult,
+        -: 1124:               WarpOpBroadcast, WarpOpExtract, WarpOpExtractElement,
+        -: 1125:               WarpOpForwardOperand, WarpOpScfForOp, WarpOpConstant>(
+    #####: 1126:      patterns.getContext(), benefit);
+call    0 never executed
+    #####: 1127:}
+        -: 1128:
+function _ZN4mlir6vector27populateDistributeReductionERNS_17RewritePatternSetERKSt8functionIFNS_5ValueENS_8LocationERNS_9OpBuilderES4_NS0_13CombiningKindEjEENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1129:void mlir::vector::populateDistributeReduction(
+        -: 1130:    RewritePatternSet &patterns,
+        -: 1131:    const DistributedReductionFn &distributedReductionFn,
+        -: 1132:    PatternBenefit benefit) {
+    #####: 1133:  patterns.add<WarpOpReduction>(patterns.getContext(), distributedReductionFn,
+call    0 never executed
+    #####: 1134:                                benefit);
+call    0 never executed
+    #####: 1135:}
+        -: 1136:
+function _ZN4mlir6vector21moveScalarUniformCodeENS0_20WarpExecuteOnLane0OpE called 0 returned 0% blocks executed 0%
+    #####: 1137:void mlir::vector::moveScalarUniformCode(WarpExecuteOnLane0Op warpOp) {
+    #####: 1138:  Block *body = warpOp.getBody();
+call    0 never executed
+        -: 1139:
+        -: 1140:  // Keep track of the ops we want to hoist.
+    #####: 1141:  llvm::SmallSetVector<Operation *, 8> opsToMove;
+call    0 never executed
+        -: 1142:
+        -: 1143:  // Helper to check if a value is or will be defined outside of the region.
+function _ZZN4mlir6vector21moveScalarUniformCodeENS0_20WarpExecuteOnLane0OpEENKUlNS_5ValueEE_clES2_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1144:  auto isDefinedOutsideOfBody = [&](Value value) {
+    #####: 1145:    auto *definingOp = value.getDefiningOp();
+call    0 never executed
+    #####: 1146:    return (definingOp && opsToMove.count(definingOp)) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1147:           warpOp.isDefinedOutsideOfRegion(value);
+call    0 never executed
+    #####: 1148:  };
+        -: 1149:
+        -: 1150:  // Do not use walk here, as we do not want to go into nested regions and hoist
+        -: 1151:  // operations from there.
+    #####: 1152:  for (auto &op : body->without_terminator()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1153:    bool hasVectorResult = llvm::any_of(op.getResults(), [](Value result) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1154:      return result.getType().isa<VectorType>();
+        -: 1155:    });
+    #####: 1156:    if (!hasVectorResult && canBeHoisted(&op, isDefinedOutsideOfBody))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1157:      opsToMove.insert(&op);
+call    0 never executed
+        -: 1158:  }
+        -: 1159:
+        -: 1160:  // Move all the ops marked as uniform outside of the region.
+    #####: 1161:  for (Operation *op : opsToMove)
+branch  0 never executed
+branch  1 never executed
+    #####: 1162:    op->moveBefore(warpOp);
+call    0 never executed
+    #####: 1163:}

@@ -1,0 +1,411 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/IR/UseDefLists.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:325580
+        -:    1://===- UseDefLists.h --------------------------------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines generic use/def list machinery and manipulation utilities.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef MLIR_IR_USEDEFLISTS_H
+        -:   14:#define MLIR_IR_USEDEFLISTS_H
+        -:   15:
+        -:   16:#include "mlir/IR/Location.h"
+        -:   17:#include "llvm/ADT/PointerIntPair.h"
+        -:   18:#include "llvm/ADT/iterator_range.h"
+        -:   19:
+        -:   20:namespace mlir {
+        -:   21:
+        -:   22:class Operation;
+        -:   23:template <typename OperandType>
+        -:   24:class ValueUseIterator;
+        -:   25:template <typename OperandType>
+        -:   26:class FilteredValueUseIterator;
+        -:   27:template <typename UseIteratorT, typename OperandType>
+        -:   28:class ValueUserIterator;
+        -:   29:
+        -:   30://===----------------------------------------------------------------------===//
+        -:   31:// IROperand
+        -:   32://===----------------------------------------------------------------------===//
+        -:   33:
+        -:   34:namespace detail {
+        -:   35:/// This class is the base for IROperand, and provides all of the non-templated
+        -:   36:/// facilities for operand use management.
+        -:   37:class IROperandBase {
+        -:   38:public:
+        -:   39:  /// Return the owner of this operand.
+        -:   40:  Operation *getOwner() const { return owner; }
+        -:   41:
+        -:   42:  /// Return the next operand on the use-list of the value we are referring to.
+        -:   43:  /// This should generally only be used by the internal implementation details
+        -:   44:  /// of the SSA machinery.
+        -:   45:  IROperandBase *getNextOperandUsingThisValue() { return nextUse; }
+        -:   46:
+        -:   47:protected:
+        -:   48:  IROperandBase(Operation *owner) : owner(owner) {}
+        -:   49:  IROperandBase(IROperandBase &&other) : owner(other.owner) {
+        -:   50:    *this = std::move(other);
+        -:   51:  }
+        -:   52:  IROperandBase &operator=(IROperandBase &&other) {
+        -:   53:    removeFromCurrent();
+        -:   54:    other.removeFromCurrent();
+        -:   55:    other.back = nullptr;
+        -:   56:    nextUse = nullptr;
+        -:   57:    back = nullptr;
+        -:   58:    return *this;
+        -:   59:  }
+        -:   60:  /// Operands are not copyable or assignable.
+        -:   61:  IROperandBase(const IROperandBase &use) = delete;
+        -:   62:  IROperandBase &operator=(const IROperandBase &use) = delete;
+        -:   63:
+        -:   64:  ~IROperandBase() { removeFromCurrent(); }
+        -:   65:
+        -:   66:  /// Remove this use of the operand.
+        -:   67:  void drop() {
+        -:   68:    removeFromCurrent();
+        -:   69:    nextUse = nullptr;
+        -:   70:    back = nullptr;
+        -:   71:  }
+        -:   72:
+        -:   73:  /// Remove this operand from the current use list.
+        -:   74:  void removeFromCurrent() {
+        -:   75:    if (!back)
+        -:   76:      return;
+        -:   77:    *back = nextUse;
+        -:   78:    if (nextUse)
+        -:   79:      nextUse->back = back;
+        -:   80:  }
+        -:   81:
+        -:   82:  /// Insert this operand into the given use list.
+        -:   83:  template <typename UseListT>
+        -:   84:  void insertInto(UseListT *useList) {
+        -:   85:    back = &useList->firstUse;
+        -:   86:    nextUse = useList->firstUse;
+        -:   87:    if (nextUse)
+        -:   88:      nextUse->back = &nextUse;
+        -:   89:    useList->firstUse = this;
+        -:   90:  }
+        -:   91:
+        -:   92:  /// The next operand in the use-chain.
+        -:   93:  IROperandBase *nextUse = nullptr;
+        -:   94:
+        -:   95:  /// This points to the previous link in the use-chain.
+        -:   96:  IROperandBase **back = nullptr;
+        -:   97:
+        -:   98:private:
+        -:   99:  /// The operation owner of this operand.
+        -:  100:  Operation *const owner;
+        -:  101:};
+        -:  102:} // namespace detail
+        -:  103:
+        -:  104://===----------------------------------------------------------------------===//
+        -:  105:// IROperand
+        -:  106://===----------------------------------------------------------------------===//
+        -:  107:
+        -:  108:/// A reference to a value, suitable for use as an operand of an operation.
+        -:  109:/// IRValueT is the root type to use for values this tracks. Derived operand
+        -:  110:/// types are expected to provide the following:
+        -:  111:///  * static IRObjectWithUseList *getUseList(IRValueT value);
+        -:  112:///    - Provide the use list that is attached to the given value.
+        -:  113:template <typename DerivedT, typename IRValueT>
+        -:  114:class IROperand : public detail::IROperandBase {
+        -:  115:public:
+        -:  116:  IROperand(Operation *owner) : detail::IROperandBase(owner) {}
+        -:  117:  IROperand(Operation *owner, IRValueT value)
+        -:  118:      : detail::IROperandBase(owner), value(value) {
+        -:  119:    insertIntoCurrent();
+        -:  120:  }
+        -:  121:
+        -:  122:  /// We support a move constructor so IROperand's can be in vectors, but this
+        -:  123:  /// shouldn't be used by general clients.
+        -:  124:  IROperand(IROperand &&other) : detail::IROperandBase(std::move(other)) {
+        -:  125:    *this = std::move(other);
+        -:  126:  }
+        -:  127:  IROperand &operator=(IROperand &&other) {
+        -:  128:    detail::IROperandBase::operator=(std::move(other));
+        -:  129:    value = other.value;
+        -:  130:    other.value = nullptr;
+        -:  131:    if (value)
+        -:  132:      insertIntoCurrent();
+        -:  133:    return *this;
+        -:  134:  }
+        -:  135:
+        -:  136:  /// Return the current value being used by this operand.
+    #####:  137:  IRValueT get() const { return value; }
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+call   16 never executed
+call   17 never executed
+call   18 never executed
+call   19 never executed
+call   20 never executed
+call   21 never executed
+call   22 never executed
+call   23 never executed
+call   24 never executed
+call   25 never executed
+call   26 never executed
+call   27 never executed
+call   28 never executed
+call   29 never executed
+call   30 never executed
+call   31 never executed
+call   32 never executed
+call   33 never executed
+call   34 never executed
+call   35 never executed
+call   36 never executed
+call   37 never executed
+call   38 never executed
+call   39 never executed
+call   40 never executed
+call   41 never executed
+call   42 never executed
+call   43 never executed
+call   44 never executed
+call   45 never executed
+call   46 never executed
+call   47 never executed
+call   48 never executed
+call   49 never executed
+call   50 never executed
+call   51 never executed
+call   52 never executed
+call   53 never executed
+call   54 never executed
+call   55 never executed
+call   56 never executed
+call   57 never executed
+call   58 never executed
+call   59 never executed
+call   60 never executed
+call   61 never executed
+call   62 never executed
+call   63 never executed
+call   64 never executed
+call   65 never executed
+call   66 never executed
+call   67 never executed
+call   68 never executed
+call   69 never executed
+call   70 never executed
+call   71 never executed
+call   72 never executed
+call   73 never executed
+call   74 never executed
+call   75 never executed
+call   76 never executed
+call   77 never executed
+call   78 never executed
+call   79 never executed
+call   80 never executed
+call   81 never executed
+call   82 never executed
+call   83 never executed
+call   84 never executed
+call   85 never executed
+call   86 never executed
+call   87 never executed
+call   88 never executed
+call   89 never executed
+call   90 never executed
+call   91 never executed
+call   92 never executed
+call   93 never executed
+call   94 never executed
+call   95 never executed
+call   96 never executed
+call   97 never executed
+call   98 never executed
+call   99 never executed
+call   100 never executed
+        -:  138:
+        -:  139:  /// Set the current value being used by this operand.
+        -:  140:  void set(IRValueT newValue) {
+        -:  141:    // It isn't worth optimizing for the case of switching operands on a single
+        -:  142:    // value.
+        -:  143:    removeFromCurrent();
+        -:  144:    value = newValue;
+        -:  145:    insertIntoCurrent();
+        -:  146:  }
+        -:  147:
+        -:  148:  /// Returns true if this operand contains the given value.
+        -:  149:  bool is(IRValueT other) const { return value == other; }
+        -:  150:
+        -:  151:  /// \brief Remove this use of the operand.
+        -:  152:  void drop() {
+        -:  153:    detail::IROperandBase::drop();
+        -:  154:    value = nullptr;
+        -:  155:  }
+        -:  156:
+        -:  157:private:
+        -:  158:  /// The value used as this operand. This can be null when in a 'dropAllUses'
+        -:  159:  /// state.
+        -:  160:  IRValueT value = {};
+        -:  161:
+        -:  162:  /// Insert this operand into the given use list.
+        -:  163:  void insertIntoCurrent() { insertInto(DerivedT::getUseList(value)); }
+        -:  164:};
+        -:  165:
+        -:  166://===----------------------------------------------------------------------===//
+        -:  167:// IRObjectWithUseList
+        -:  168://===----------------------------------------------------------------------===//
+        -:  169:
+        -:  170:/// This class represents a single IR object that contains a use list.
+        -:  171:template <typename OperandType>
+        -:  172:class IRObjectWithUseList {
+        -:  173:public:
+        -:  174:  ~IRObjectWithUseList() {
+        -:  175:    assert(use_empty() && "Cannot destroy a value that still has uses!");
+        -:  176:  }
+        -:  177:
+        -:  178:  /// Drop all uses of this object from their respective owners.
+        -:  179:  void dropAllUses() {
+        -:  180:    while (!use_empty())
+        -:  181:      use_begin()->drop();
+        -:  182:  }
+        -:  183:
+        -:  184:  /// Replace all uses of 'this' value with the new value, updating anything in
+        -:  185:  /// the IR that uses 'this' to use the other value instead.  When this returns
+        -:  186:  /// there are zero uses of 'this'.
+        -:  187:  template <typename ValueT>
+        -:  188:  void replaceAllUsesWith(ValueT &&newValue) {
+        -:  189:    assert((!newValue || this != OperandType::getUseList(newValue)) &&
+        -:  190:           "cannot RAUW a value with itself");
+        -:  191:    while (!use_empty())
+        -:  192:      use_begin()->set(newValue);
+        -:  193:  }
+        -:  194:
+        -:  195:  //===--------------------------------------------------------------------===//
+        -:  196:  // Uses
+        -:  197:  //===--------------------------------------------------------------------===//
+        -:  198:
+        -:  199:  using use_iterator = ValueUseIterator<OperandType>;
+        -:  200:  using use_range = iterator_range<use_iterator>;
+        -:  201:
+        -:  202:  use_iterator use_begin() const { return use_iterator(firstUse); }
+        -:  203:  use_iterator use_end() const { return use_iterator(nullptr); }
+        -:  204:
+        -:  205:  /// Returns a range of all uses, which is useful for iterating over all uses.
+        -:  206:  use_range getUses() const { return {use_begin(), use_end()}; }
+        -:  207:
+        -:  208:  /// Returns true if this value has exactly one use.
+        -:  209:  bool hasOneUse() const {
+        -:  210:    return firstUse && firstUse->getNextOperandUsingThisValue() == nullptr;
+        -:  211:  }
+        -:  212:
+        -:  213:  /// Returns true if this value has no uses.
+        -:  214:  bool use_empty() const { return firstUse == nullptr; }
+        -:  215:
+        -:  216:  //===--------------------------------------------------------------------===//
+        -:  217:  // Users
+        -:  218:  //===--------------------------------------------------------------------===//
+        -:  219:
+        -:  220:  using user_iterator = ValueUserIterator<use_iterator, OperandType>;
+        -:  221:  using user_range = iterator_range<user_iterator>;
+        -:  222:
+        -:  223:  user_iterator user_begin() const { return user_iterator(use_begin()); }
+        -:  224:  user_iterator user_end() const { return user_iterator(use_end()); }
+        -:  225:
+        -:  226:  /// Returns a range of all users.
+        -:  227:  user_range getUsers() const { return {user_begin(), user_end()}; }
+        -:  228:
+        -:  229:protected:
+        -:  230:  IRObjectWithUseList() = default;
+        -:  231:
+        -:  232:  /// Return the first operand that is using this value, for use by custom
+        -:  233:  /// use/def iterators.
+        -:  234:  OperandType *getFirstUse() const { return (OperandType *)firstUse; }
+        -:  235:
+        -:  236:private:
+        -:  237:  detail::IROperandBase *firstUse = nullptr;
+        -:  238:
+        -:  239:  /// Allow access to `firstUse`.
+        -:  240:  friend detail::IROperandBase;
+        -:  241:};
+        -:  242:
+        -:  243://===----------------------------------------------------------------------===//
+        -:  244:// ValueUseIterator
+        -:  245://===----------------------------------------------------------------------===//
+        -:  246:
+        -:  247:/// An iterator class that allows for iterating over the uses of an IR operand
+        -:  248:/// type.
+        -:  249:template <typename OperandType>
+        -:  250:class ValueUseIterator
+        -:  251:    : public llvm::iterator_facade_base<ValueUseIterator<OperandType>,
+        -:  252:                                        std::forward_iterator_tag,
+        -:  253:                                        OperandType> {
+        -:  254:public:
+        -:  255:  ValueUseIterator(detail::IROperandBase *use = nullptr) : current(use) {}
+        -:  256:
+        -:  257:  /// Returns the operation that owns this use.
+        -:  258:  Operation *getUser() const { return current->getOwner(); }
+        -:  259:
+        -:  260:  /// Returns the current operands.
+        -:  261:  OperandType *getOperand() const { return (OperandType *)current; }
+        -:  262:  OperandType &operator*() const { return *getOperand(); }
+        -:  263:
+        -:  264:  using llvm::iterator_facade_base<ValueUseIterator<OperandType>,
+        -:  265:                                   std::forward_iterator_tag,
+        -:  266:                                   OperandType>::operator++;
+        -:  267:  ValueUseIterator &operator++() {
+        -:  268:    assert(current && "incrementing past end()!");
+        -:  269:    current = (OperandType *)current->getNextOperandUsingThisValue();
+        -:  270:    return *this;
+        -:  271:  }
+        -:  272:
+        -:  273:  bool operator==(const ValueUseIterator &rhs) const {
+        -:  274:    return current == rhs.current;
+        -:  275:  }
+        -:  276:
+        -:  277:protected:
+        -:  278:  detail::IROperandBase *current;
+        -:  279:};
+        -:  280:
+        -:  281://===----------------------------------------------------------------------===//
+        -:  282:// ValueUserIterator
+        -:  283://===----------------------------------------------------------------------===//
+        -:  284:
+        -:  285:/// An iterator over the users of an IRObject. This is a wrapper iterator around
+        -:  286:/// a specific use iterator.
+        -:  287:template <typename UseIteratorT, typename OperandType>
+        -:  288:class ValueUserIterator final
+        -:  289:    : public llvm::mapped_iterator_base<
+        -:  290:          ValueUserIterator<UseIteratorT, OperandType>, UseIteratorT,
+        -:  291:          Operation *> {
+        -:  292:public:
+        -:  293:  using llvm::mapped_iterator_base<ValueUserIterator<UseIteratorT, OperandType>,
+        -:  294:                                   UseIteratorT,
+        -:  295:                                   Operation *>::mapped_iterator_base;
+        -:  296:
+        -:  297:  /// Map the element to the iterator result type.
+        -:  298:  Operation *mapElement(OperandType &value) const { return value.getOwner(); }
+        -:  299:
+        -:  300:  /// Provide access to the underlying operation.
+        -:  301:  Operation *operator->() { return **this; }
+        -:  302:};
+        -:  303:
+        -:  304:} // namespace mlir
+        -:  305:
+        -:  306:#endif

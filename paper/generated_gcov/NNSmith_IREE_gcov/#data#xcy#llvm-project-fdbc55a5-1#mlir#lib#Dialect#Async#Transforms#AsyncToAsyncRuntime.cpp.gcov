@@ -1,0 +1,1705 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Async/Transforms/AsyncToAsyncRuntime.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Async/Transforms/CMakeFiles/obj.MLIRAsyncTransforms.dir/AsyncToAsyncRuntime.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Async/Transforms/CMakeFiles/obj.MLIRAsyncTransforms.dir/AsyncToAsyncRuntime.cpp.gcda
+        -:    0:Runs:325545
+        -:    1://===- AsyncToAsyncRuntime.cpp - Lower from Async to Async Runtime --------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements lowering from high level async operations to async.coro
+        -:   10:// and async.runtime operations.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Dialect/Async/Passes.h"
+        -:   15:
+        -:   16:#include "PassDetail.h"
+        -:   17:#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+        -:   18:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   19:#include "mlir/Dialect/Async/IR/Async.h"
+        -:   20:#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+        -:   21:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   22:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   23:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   24:#include "mlir/IR/ImplicitLocOpBuilder.h"
+        -:   25:#include "mlir/IR/PatternMatch.h"
+        -:   26:#include "mlir/Transforms/DialectConversion.h"
+        -:   27:#include "mlir/Transforms/RegionUtils.h"
+        -:   28:#include "llvm/ADT/SetVector.h"
+        -:   29:#include "llvm/Support/Debug.h"
+        -:   30:
+        -:   31:namespace mlir {
+        -:   32:#define GEN_PASS_DEF_ASYNCTOASYNCRUNTIME
+        -:   33:#include "mlir/Dialect/Async/Passes.h.inc"
+        -:   34:} // namespace mlir
+        -:   35:
+        -:   36:using namespace mlir;
+        -:   37:using namespace mlir::async;
+        -:   38:
+        -:   39:#define DEBUG_TYPE "async-to-async-runtime"
+        -:   40:// Prefix for functions outlined from `async.execute` op regions.
+        -:   41:static constexpr const char kAsyncFnPrefix[] = "async_execute_fn";
+        -:   42:
+        -:   43:namespace {
+        -:   44:
+    #####:   45:class AsyncToAsyncRuntimePass
+call    0 never executed
+        -:   46:    : public impl::AsyncToAsyncRuntimeBase<AsyncToAsyncRuntimePass> {
+        -:   47:public:
+   326625:   48:  AsyncToAsyncRuntimePass() = default;
+call    0 returned 100%
+        -:   49:  void runOnOperation() override;
+        -:   50:};
+        -:   51:
+        -:   52:} // namespace
+        -:   53:
+        -:   54://===----------------------------------------------------------------------===//
+        -:   55:// async.execute op outlining to the coroutine functions.
+        -:   56://===----------------------------------------------------------------------===//
+        -:   57:
+        -:   58:/// Function targeted for coroutine transformation has two additional blocks at
+        -:   59:/// the end: coroutine cleanup and coroutine suspension.
+        -:   60:///
+        -:   61:/// async.await op lowering additionaly creates a resume block for each
+        -:   62:/// operation to enable non-blocking waiting via coroutine suspension.
+        -:   63:namespace {
+    #####:   64:struct CoroMachinery {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+        -:   65:  func::FuncOp func;
+        -:   66:
+        -:   67:  // Async execute region returns a completion token, and an async value for
+        -:   68:  // each yielded value.
+        -:   69:  //
+        -:   70:  //   %token, %result = async.execute -> !async.value<T> {
+        -:   71:  //     %0 = arith.constant ... : T
+        -:   72:  //     async.yield %0 : T
+        -:   73:  //   }
+        -:   74:  Value asyncToken; // token representing completion of the async region
+        -:   75:  llvm::SmallVector<Value, 4> returnValues; // returned async values
+        -:   76:
+        -:   77:  Value coroHandle; // coroutine handle (!async.coro.getHandle value)
+        -:   78:  Block *entry;     // coroutine entry block
+        -:   79:  Block *setError;  // switch completion token and all values to error state
+        -:   80:  Block *cleanup;   // coroutine cleanup block
+        -:   81:  Block *suspend;   // coroutine suspension block
+        -:   82:};
+        -:   83:} // namespace
+        -:   84:
+        -:   85:/// Utility to partially update the regular function CFG to the coroutine CFG
+        -:   86:/// compatible with LLVM coroutines switched-resume lowering using
+        -:   87:/// `async.runtime.*` and `async.coro.*` operations. Adds a new entry block
+        -:   88:/// that branches into preexisting entry block. Also inserts trailing blocks.
+        -:   89:///
+        -:   90:/// The result types of the passed `func` must start with an `async.token`
+        -:   91:/// and be continued with some number of `async.value`s.
+        -:   92:///
+        -:   93:/// The func given to this function needs to have been preprocessed to have
+        -:   94:/// either branch or yield ops as terminators. Branches to the cleanup block are
+        -:   95:/// inserted after each yield.
+        -:   96:///
+        -:   97:/// See LLVM coroutines documentation: https://llvm.org/docs/Coroutines.html
+        -:   98:///
+        -:   99:///  - `entry` block sets up the coroutine.
+        -:  100:///  - `set_error` block sets completion token and async values state to error.
+        -:  101:///  - `cleanup` block cleans up the coroutine state.
+        -:  102:///  - `suspend block after the @llvm.coro.end() defines what value will be
+        -:  103:///    returned to the initial caller of a coroutine. Everything before the
+        -:  104:///    @llvm.coro.end() will be executed at every suspension point.
+        -:  105:///
+        -:  106:/// Coroutine structure (only the important bits):
+        -:  107:///
+        -:  108:///   func @some_fn(<function-arguments>) -> (!async.token, !async.value<T>)
+        -:  109:///   {
+        -:  110:///     ^entry(<function-arguments>):
+        -:  111:///       %token = <async token> : !async.token    // create async runtime token
+        -:  112:///       %value = <async value> : !async.value<T> // create async value
+        -:  113:///       %id = async.coro.getId                      // create a coroutine id
+        -:  114:///       %hdl = async.coro.begin %id              // create a coroutine handle
+        -:  115:///       cf.br ^preexisting_entry_block
+        -:  116:///
+        -:  117:///     /*  preexisting blocks modified to branch to the cleanup block */
+        -:  118:///
+        -:  119:///     ^set_error: // this block created lazily only if needed (see code below)
+        -:  120:///       async.runtime.set_error %token : !async.token
+        -:  121:///       async.runtime.set_error %value : !async.value<T>
+        -:  122:///       cf.br ^cleanup
+        -:  123:///
+        -:  124:///     ^cleanup:
+        -:  125:///       async.coro.free %hdl // delete the coroutine state
+        -:  126:///       cf.br ^suspend
+        -:  127:///
+        -:  128:///     ^suspend:
+        -:  129:///       async.coro.end %hdl // marks the end of a coroutine
+        -:  130:///       return %token, %value : !async.token, !async.value<T>
+        -:  131:///   }
+        -:  132:///
+function _ZL18setupCoroMachineryN4mlir4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  133:static CoroMachinery setupCoroMachinery(func::FuncOp func) {
+    #####:  134:  assert(!func.getBlocks().empty() && "Function must have an entry block");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  135:
+    #####:  136:  MLIRContext *ctx = func.getContext();
+call    0 never executed
+    #####:  137:  Block *entryBlock = &func.getBlocks().front();
+call    0 never executed
+call    1 never executed
+    #####:  138:  Block *originalEntryBlock =
+call    0 never executed
+    #####:  139:      entryBlock->splitBlock(entryBlock->getOperations().begin());
+call    0 never executed
+    #####:  140:  auto builder = ImplicitLocOpBuilder::atBlockBegin(func->getLoc(), entryBlock);
+call    0 never executed
+        -:  141:
+        -:  142:  // ------------------------------------------------------------------------ //
+        -:  143:  // Allocate async token/values that we will return from a ramp function.
+        -:  144:  // ------------------------------------------------------------------------ //
+    #####:  145:  auto retToken =
+    #####:  146:      builder.create<RuntimeCreateOp>(TokenType::get(ctx)).getResult();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  147:
+    #####:  148:  llvm::SmallVector<Value, 4> retValues;
+call    0 never executed
+    #####:  149:  for (auto resType : func.getCallableResults().drop_front())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  150:    retValues.emplace_back(
+call    0 never executed
+    #####:  151:        builder.create<RuntimeCreateOp>(resType).getResult());
+call    0 never executed
+call    1 never executed
+        -:  152:
+        -:  153:  // ------------------------------------------------------------------------ //
+        -:  154:  // Initialize coroutine: get coroutine id and coroutine handle.
+        -:  155:  // ------------------------------------------------------------------------ //
+    #####:  156:  auto coroIdOp = builder.create<CoroIdOp>(CoroIdType::get(ctx));
+call    0 never executed
+call    1 never executed
+    #####:  157:  auto coroHdlOp =
+    #####:  158:      builder.create<CoroBeginOp>(CoroHandleType::get(ctx), coroIdOp.getId());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  159:  builder.create<cf::BranchOp>(originalEntryBlock);
+call    0 never executed
+        -:  160:
+    #####:  161:  Block *cleanupBlock = func.addBlock();
+call    0 never executed
+    #####:  162:  Block *suspendBlock = func.addBlock();
+call    0 never executed
+        -:  163:
+        -:  164:  // ------------------------------------------------------------------------ //
+        -:  165:  // Coroutine cleanup block: deallocate coroutine frame, free the memory.
+        -:  166:  // ------------------------------------------------------------------------ //
+    #####:  167:  builder.setInsertionPointToStart(cleanupBlock);
+call    0 never executed
+    #####:  168:  builder.create<CoroFreeOp>(coroIdOp.getId(), coroHdlOp.getHandle());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  169:
+        -:  170:  // Branch into the suspend block.
+    #####:  171:  builder.create<cf::BranchOp>(suspendBlock);
+call    0 never executed
+        -:  172:
+        -:  173:  // ------------------------------------------------------------------------ //
+        -:  174:  // Coroutine suspend block: mark the end of a coroutine and return allocated
+        -:  175:  // async token.
+        -:  176:  // ------------------------------------------------------------------------ //
+    #####:  177:  builder.setInsertionPointToStart(suspendBlock);
+call    0 never executed
+        -:  178:
+        -:  179:  // Mark the end of a coroutine: async.coro.end
+    #####:  180:  builder.create<CoroEndOp>(coroHdlOp.getHandle());
+call    0 never executed
+call    1 never executed
+        -:  181:
+        -:  182:  // Return created `async.token` and `async.values` from the suspend block.
+        -:  183:  // This will be the return value of a coroutine ramp function.
+    #####:  184:  SmallVector<Value, 4> ret{retToken};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  185:  ret.insert(ret.end(), retValues.begin(), retValues.end());
+call    0 never executed
+    #####:  186:  builder.create<func::ReturnOp>(ret);
+call    0 never executed
+        -:  187:
+        -:  188:  // `async.await` op lowering will create resume blocks for async
+        -:  189:  // continuations, and will conditionally branch to cleanup or suspend blocks.
+        -:  190:
+    #####:  191:  for (Block &block : func.getBody().getBlocks()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  192:    if (&block == entryBlock || &block == cleanupBlock ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  193:        &block == suspendBlock)
+branch  0 never executed
+branch  1 never executed
+    #####:  194:      continue;
+    #####:  195:    Operation *terminator = block.getTerminator();
+call    0 never executed
+    #####:  196:    if (auto yield = dyn_cast<YieldOp>(terminator)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  197:      builder.setInsertionPointToEnd(&block);
+call    0 never executed
+    #####:  198:      builder.create<cf::BranchOp>(cleanupBlock);
+call    0 never executed
+        -:  199:    }
+        -:  200:  }
+        -:  201:
+        -:  202:  // The switch-resumed API based coroutine should be marked with
+        -:  203:  // coroutine.presplit attribute to mark the function as a coroutine.
+    #####:  204:  func->setAttr("passthrough", builder.getArrayAttr(
+call    0 never executed
+call    1 never executed
+    #####:  205:                                   StringAttr::get(ctx, "presplitcoroutine")));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  206:
+    #####:  207:  CoroMachinery machinery;
+call    0 never executed
+    #####:  208:  machinery.func = func;
+    #####:  209:  machinery.asyncToken = retToken;
+    #####:  210:  machinery.returnValues = retValues;
+call    0 never executed
+    #####:  211:  machinery.coroHandle = coroHdlOp.getHandle();
+call    0 never executed
+    #####:  212:  machinery.entry = entryBlock;
+    #####:  213:  machinery.setError = nullptr; // created lazily only if needed
+    #####:  214:  machinery.cleanup = cleanupBlock;
+    #####:  215:  machinery.suspend = suspendBlock;
+    #####:  216:  return machinery;
+branch  0 never executed
+branch  1 never executed
+        -:  217:}
+        -:  218:
+        -:  219:// Lazily creates `set_error` block only if it is required for lowering to the
+        -:  220:// runtime operations (see for example lowering of assert operation).
+function _ZL18setupSetErrorBlockRN12_GLOBAL__N_113CoroMachineryE called 0 returned 0% blocks executed 0%
+    #####:  221:static Block *setupSetErrorBlock(CoroMachinery &coro) {
+    #####:  222:  if (coro.setError)
+branch  0 never executed
+branch  1 never executed
+        -:  223:    return coro.setError;
+        -:  224:
+    #####:  225:  coro.setError = coro.func.addBlock();
+call    0 never executed
+    #####:  226:  coro.setError->moveBefore(coro.cleanup);
+call    0 never executed
+        -:  227:
+    #####:  228:  auto builder =
+    #####:  229:      ImplicitLocOpBuilder::atBlockBegin(coro.func->getLoc(), coro.setError);
+call    0 never executed
+        -:  230:
+        -:  231:  // Coroutine set_error block: set error on token and all returned values.
+    #####:  232:  builder.create<RuntimeSetErrorOp>(coro.asyncToken);
+call    0 never executed
+    #####:  233:  for (Value retValue : coro.returnValues)
+branch  0 never executed
+branch  1 never executed
+    #####:  234:    builder.create<RuntimeSetErrorOp>(retValue);
+call    0 never executed
+        -:  235:
+        -:  236:  // Branch into the cleanup block.
+    #####:  237:  builder.create<cf::BranchOp>(coro.cleanup);
+call    0 never executed
+        -:  238:
+    #####:  239:  return coro.setError;
+        -:  240:}
+        -:  241:
+        -:  242:/// Outline the body region attached to the `async.execute` op into a standalone
+        -:  243:/// function.
+        -:  244:///
+        -:  245:/// Note that this is not reversible transformation.
+        -:  246:static std::pair<func::FuncOp, CoroMachinery>
+function _ZL16outlineExecuteOpRN4mlir11SymbolTableENS_5async9ExecuteOpE called 0 returned 0% blocks executed 0%
+    #####:  247:outlineExecuteOp(SymbolTable &symbolTable, ExecuteOp execute) {
+    #####:  248:  ModuleOp module = execute->getParentOfType<ModuleOp>();
+call    0 never executed
+        -:  249:
+    #####:  250:  MLIRContext *ctx = module.getContext();
+call    0 never executed
+    #####:  251:  Location loc = execute.getLoc();
+call    0 never executed
+        -:  252:
+        -:  253:  // Make sure that all constants will be inside the outlined async function to
+        -:  254:  // reduce the number of function arguments.
+    #####:  255:  cloneConstantsIntoTheRegion(execute.getBodyRegion());
+call    0 never executed
+call    1 never executed
+        -:  256:
+        -:  257:  // Collect all outlined function inputs.
+    #####:  258:  SetVector<mlir::Value> functionInputs(execute.getDependencies().begin(),
+call    0 never executed
+    #####:  259:                                        execute.getDependencies().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  260:  functionInputs.insert(execute.getBodyOperands().begin(),
+call    0 never executed
+call    1 never executed
+    #####:  261:                        execute.getBodyOperands().end());
+call    0 never executed
+    #####:  262:  getUsedValuesDefinedAbove(execute.getBodyRegion(), functionInputs);
+call    0 never executed
+call    1 never executed
+        -:  263:
+        -:  264:  // Collect types for the outlined function inputs and outputs.
+    #####:  265:  auto typesRange = llvm::map_range(
+    #####:  266:      functionInputs, [](Value value) { return value.getType(); });
+call    0 never executed
+    #####:  267:  SmallVector<Type, 4> inputTypes(typesRange.begin(), typesRange.end());
+call    0 never executed
+call    1 never executed
+    #####:  268:  auto outputTypes = execute.getResultTypes();
+branch  0 never executed
+branch  1 never executed
+        -:  269:
+    #####:  270:  auto funcType = FunctionType::get(ctx, inputTypes, outputTypes);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  271:  auto funcAttrs = ArrayRef<NamedAttribute>();
+        -:  272:
+        -:  273:  // TODO: Derive outlined function name from the parent FuncOp (support
+        -:  274:  // multiple nested async.execute operations).
+    #####:  275:  func::FuncOp func =
+call    0 never executed
+    #####:  276:      func::FuncOp::create(loc, kAsyncFnPrefix, funcType, funcAttrs);
+call    0 never executed
+    #####:  277:  symbolTable.insert(func);
+call    0 never executed
+        -:  278:
+    #####:  279:  SymbolTable::setSymbolVisibility(func, SymbolTable::Visibility::Private);
+call    0 never executed
+    #####:  280:  auto builder = ImplicitLocOpBuilder::atBlockBegin(loc, func.addEntryBlock());
+call    0 never executed
+        -:  281:
+        -:  282:  // Prepare for coroutine conversion by creating the body of the function.
+    #####:  283:  {
+    #####:  284:    size_t numDependencies = execute.getDependencies().size();
+call    0 never executed
+call    1 never executed
+    #####:  285:    size_t numOperands = execute.getBodyOperands().size();
+call    0 never executed
+        -:  286:
+        -:  287:    // Await on all dependencies before starting to execute the body region.
+    #####:  288:    for (size_t i = 0; i < numDependencies; ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  289:      builder.create<AwaitOp>(func.getArgument(i));
+call    0 never executed
+call    1 never executed
+        -:  290:
+        -:  291:    // Await on all async value operands and unwrap the payload.
+    #####:  292:    SmallVector<Value, 4> unwrappedOperands(numOperands);
+call    0 never executed
+    #####:  293:    for (size_t i = 0; i < numOperands; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  294:      Value operand = func.getArgument(numDependencies + i);
+call    0 never executed
+    #####:  295:      unwrappedOperands[i] = builder.create<AwaitOp>(loc, operand).getResult();
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  296:    }
+        -:  297:
+        -:  298:    // Map from function inputs defined above the execute op to the function
+        -:  299:    // arguments.
+    #####:  300:    BlockAndValueMapping valueMapping;
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  301:    valueMapping.map(functionInputs, func.getArguments());
+call    0 never executed
+call    1 never executed
+    #####:  302:    valueMapping.map(execute.getBodyRegion().getArguments(), unwrappedOperands);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  303:
+        -:  304:    // Clone all operations from the execute operation body into the outlined
+        -:  305:    // function body.
+    #####:  306:    for (Operation &op : execute.getBodyRegion().getOps())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  307:      builder.clone(op, valueMapping);
+call    0 never executed
+        -:  308:  }
+        -:  309:
+        -:  310:  // Adding entry/cleanup/suspend blocks.
+    #####:  311:  CoroMachinery coro = setupCoroMachinery(func);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  312:
+        -:  313:  // Suspend async function at the end of an entry block, and resume it using
+        -:  314:  // Async resume operation (execution will be resumed in a thread managed by
+        -:  315:  // the async runtime).
+    #####:  316:  {
+    #####:  317:    cf::BranchOp branch = cast<cf::BranchOp>(coro.entry->getTerminator());
+call    0 never executed
+call    1 never executed
+    #####:  318:    builder.setInsertionPointToEnd(coro.entry);
+call    0 never executed
+        -:  319:
+        -:  320:    // Save the coroutine state: async.coro.save
+    #####:  321:    auto coroSaveOp =
+    #####:  322:        builder.create<CoroSaveOp>(CoroStateType::get(ctx), coro.coroHandle);
+call    0 never executed
+call    1 never executed
+        -:  323:
+        -:  324:    // Pass coroutine to the runtime to be resumed on a runtime managed
+        -:  325:    // thread.
+    #####:  326:    builder.create<RuntimeResumeOp>(coro.coroHandle);
+call    0 never executed
+        -:  327:
+        -:  328:    // Add async.coro.suspend as a suspended block terminator.
+    #####:  329:    builder.create<CoroSuspendOp>(coroSaveOp.getState(), coro.suspend,
+call    0 never executed
+    #####:  330:                                  branch.getDest(), coro.cleanup);
+call    0 never executed
+call    1 never executed
+        -:  331:
+    #####:  332:    branch.erase();
+call    0 never executed
+        -:  333:  }
+        -:  334:
+        -:  335:  // Replace the original `async.execute` with a call to outlined function.
+    #####:  336:  {
+    #####:  337:    ImplicitLocOpBuilder callBuilder(loc, execute);
+call    0 never executed
+    #####:  338:    auto callOutlinedFunc = callBuilder.create<func::CallOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  339:        func.getName(), execute.getResultTypes(), functionInputs.getArrayRef());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  340:    execute.replaceAllUsesWith(callOutlinedFunc.getResults());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  341:    execute.erase();
+call    0 never executed
+        -:  342:  }
+        -:  343:
+    #####:  344:  return {func, coro};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  345:}
+        -:  346:
+        -:  347://===----------------------------------------------------------------------===//
+        -:  348:// Convert async.create_group operation to async.runtime.create_group
+        -:  349://===----------------------------------------------------------------------===//
+        -:  350:
+        -:  351:namespace {
+        -:  352:class CreateGroupOpLowering : public OpConversionPattern<CreateGroupOp> {
+        -:  353:public:
+        -:  354:  using OpConversionPattern::OpConversionPattern;
+        -:  355:
+        -:  356:  LogicalResult
+function _ZNK12_GLOBAL__N_121CreateGroupOpLowering15matchAndRewriteEN4mlir5async13CreateGroupOpENS2_20CreateGroupOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  357:  matchAndRewrite(CreateGroupOp op, OpAdaptor adaptor,
+        -:  358:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  359:    rewriter.replaceOpWithNewOp<RuntimeCreateGroupOp>(
+    #####:  360:        op, GroupType::get(op->getContext()), adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  361:    return success();
+        -:  362:  }
+        -:  363:};
+        -:  364:} // namespace
+        -:  365:
+        -:  366://===----------------------------------------------------------------------===//
+        -:  367:// Convert async.add_to_group operation to async.runtime.add_to_group.
+        -:  368://===----------------------------------------------------------------------===//
+        -:  369:
+        -:  370:namespace {
+        -:  371:class AddToGroupOpLowering : public OpConversionPattern<AddToGroupOp> {
+        -:  372:public:
+        -:  373:  using OpConversionPattern::OpConversionPattern;
+        -:  374:
+        -:  375:  LogicalResult
+function _ZNK12_GLOBAL__N_120AddToGroupOpLowering15matchAndRewriteEN4mlir5async12AddToGroupOpENS2_19AddToGroupOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  376:  matchAndRewrite(AddToGroupOp op, OpAdaptor adaptor,
+        -:  377:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  378:    rewriter.replaceOpWithNewOp<RuntimeAddToGroupOp>(
+    #####:  379:        op, rewriter.getIndexType(), adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  380:    return success();
+        -:  381:  }
+        -:  382:};
+        -:  383:} // namespace
+        -:  384:
+        -:  385://===----------------------------------------------------------------------===//
+        -:  386:// Convert async.await and async.await_all operations to the async.runtime.await
+        -:  387:// or async.runtime.await_and_resume operations.
+        -:  388://===----------------------------------------------------------------------===//
+        -:  389:
+        -:  390:namespace {
+        -:  391:template <typename AwaitType, typename AwaitableType>
+        -:  392:class AwaitOpLoweringBase : public OpConversionPattern<AwaitType> {
+        -:  393:  using AwaitAdaptor = typename AwaitType::Adaptor;
+        -:  394:
+        -:  395:public:
+        -:  396:  AwaitOpLoweringBase(
+        -:  397:      MLIRContext *ctx,
+        -:  398:      llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions)
+        -:  399:      : OpConversionPattern<AwaitType>(ctx),
+        -:  400:        outlinedFunctions(outlinedFunctions) {}
+        -:  401:
+        -:  402:  LogicalResult
+    #####:  403:  matchAndRewrite(AwaitType op, typename AwaitType::Adaptor adaptor,
+        -:  404:                  ConversionPatternRewriter &rewriter) const override {
+        -:  405:    // We can only await on one the `AwaitableType` (for `await` it can be
+        -:  406:    // a `token` or a `value`, for `await_all` it must be a `group`).
+    #####:  407:    if (!op.getOperand().getType().template isa<AwaitableType>())
+    #####:  408:      return rewriter.notifyMatchFailure(op, "unsupported awaitable type");
+        -:  409:
+        -:  410:    // Check if await operation is inside the outlined coroutine function.
+    #####:  411:    auto func = op->template getParentOfType<func::FuncOp>();
+    #####:  412:    auto outlined = outlinedFunctions.find(func);
+    #####:  413:    const bool isInCoroutine = outlined != outlinedFunctions.end();
+        -:  414:
+    #####:  415:    Location loc = op->getLoc();
+    #####:  416:    Value operand = adaptor.getOperand();
+        -:  417:
+    #####:  418:    Type i1 = rewriter.getI1Type();
+        -:  419:
+        -:  420:    // Inside regular functions we use the blocking wait operation to wait for
+        -:  421:    // the async object (token, value or group) to become available.
+    #####:  422:    if (!isInCoroutine) {
+    #####:  423:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+    #####:  424:      builder.create<RuntimeAwaitOp>(loc, operand);
+        -:  425:
+        -:  426:      // Assert that the awaited operands is not in the error state.
+    #####:  427:      Value isError = builder.create<RuntimeIsErrorOp>(i1, operand);
+    #####:  428:      Value notError = builder.create<arith::XOrIOp>(
+    #####:  429:          isError, builder.create<arith::ConstantOp>(
+    #####:  430:                       loc, i1, builder.getIntegerAttr(i1, 1)));
+        -:  431:
+    #####:  432:      builder.create<cf::AssertOp>(notError,
+        -:  433:                                   "Awaited async operand is in error state");
+        -:  434:    }
+        -:  435:
+        -:  436:    // Inside the coroutine we convert await operation into coroutine suspension
+        -:  437:    // point, and resume execution asynchronously.
+    #####:  438:    if (isInCoroutine) {
+    #####:  439:      CoroMachinery &coro = outlined->getSecond();
+    #####:  440:      Block *suspended = op->getBlock();
+        -:  441:
+    #####:  442:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+    #####:  443:      MLIRContext *ctx = op->getContext();
+        -:  444:
+        -:  445:      // Save the coroutine state and resume on a runtime managed thread when
+        -:  446:      // the operand becomes available.
+        -:  447:      auto coroSaveOp =
+    #####:  448:          builder.create<CoroSaveOp>(CoroStateType::get(ctx), coro.coroHandle);
+    #####:  449:      builder.create<RuntimeAwaitAndResumeOp>(operand, coro.coroHandle);
+        -:  450:
+        -:  451:      // Split the entry block before the await operation.
+    #####:  452:      Block *resume = rewriter.splitBlock(suspended, Block::iterator(op));
+        -:  453:
+        -:  454:      // Add async.coro.suspend as a suspended block terminator.
+    #####:  455:      builder.setInsertionPointToEnd(suspended);
+    #####:  456:      builder.create<CoroSuspendOp>(coroSaveOp.getState(), coro.suspend, resume,
+    #####:  457:                                    coro.cleanup);
+        -:  458:
+        -:  459:      // Split the resume block into error checking and continuation.
+    #####:  460:      Block *continuation = rewriter.splitBlock(resume, Block::iterator(op));
+        -:  461:
+        -:  462:      // Check if the awaited value is in the error state.
+    #####:  463:      builder.setInsertionPointToStart(resume);
+    #####:  464:      auto isError = builder.create<RuntimeIsErrorOp>(loc, i1, operand);
+    #####:  465:      builder.create<cf::CondBranchOp>(isError,
+    #####:  466:                                       /*trueDest=*/setupSetErrorBlock(coro),
+        -:  467:                                       /*trueArgs=*/ArrayRef<Value>(),
+        -:  468:                                       /*falseDest=*/continuation,
+        -:  469:                                       /*falseArgs=*/ArrayRef<Value>());
+        -:  470:
+        -:  471:      // Make sure that replacement value will be constructed in the
+        -:  472:      // continuation block.
+    #####:  473:      rewriter.setInsertionPointToStart(continuation);
+        -:  474:    }
+        -:  475:
+        -:  476:    // Erase or replace the await operation with the new value.
+    #####:  477:    if (Value replaceWith = getReplacementValue(op, operand, rewriter))
+    #####:  478:      rewriter.replaceOp(op, replaceWith);
+        -:  479:    else
+    #####:  480:      rewriter.eraseOp(op);
+        -:  481:
+    #####:  482:    return success();
+        -:  483:  }
+------------------
+_ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9TokenTypeEE15matchAndRewriteES3_NS2_14AwaitOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9TokenTypeEE15matchAndRewriteES3_NS2_14AwaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  403:  matchAndRewrite(AwaitType op, typename AwaitType::Adaptor adaptor,
+        -:  404:                  ConversionPatternRewriter &rewriter) const override {
+        -:  405:    // We can only await on one the `AwaitableType` (for `await` it can be
+        -:  406:    // a `token` or a `value`, for `await_all` it must be a `group`).
+    #####:  407:    if (!op.getOperand().getType().template isa<AwaitableType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  408:      return rewriter.notifyMatchFailure(op, "unsupported awaitable type");
+call    0 never executed
+        -:  409:
+        -:  410:    // Check if await operation is inside the outlined coroutine function.
+    #####:  411:    auto func = op->template getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  412:    auto outlined = outlinedFunctions.find(func);
+call    0 never executed
+    #####:  413:    const bool isInCoroutine = outlined != outlinedFunctions.end();
+call    0 never executed
+call    1 never executed
+        -:  414:
+    #####:  415:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  416:    Value operand = adaptor.getOperand();
+call    0 never executed
+        -:  417:
+    #####:  418:    Type i1 = rewriter.getI1Type();
+call    0 never executed
+        -:  419:
+        -:  420:    // Inside regular functions we use the blocking wait operation to wait for
+        -:  421:    // the async object (token, value or group) to become available.
+    #####:  422:    if (!isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  423:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  424:      builder.create<RuntimeAwaitOp>(loc, operand);
+call    0 never executed
+call    1 never executed
+        -:  425:
+        -:  426:      // Assert that the awaited operands is not in the error state.
+    #####:  427:      Value isError = builder.create<RuntimeIsErrorOp>(i1, operand);
+call    0 never executed
+    #####:  428:      Value notError = builder.create<arith::XOrIOp>(
+call    0 never executed
+    #####:  429:          isError, builder.create<arith::ConstantOp>(
+call    0 never executed
+call    1 never executed
+    #####:  430:                       loc, i1, builder.getIntegerAttr(i1, 1)));
+call    0 never executed
+call    1 never executed
+        -:  431:
+    #####:  432:      builder.create<cf::AssertOp>(notError,
+        -:  433:                                   "Awaited async operand is in error state");
+        -:  434:    }
+        -:  435:
+        -:  436:    // Inside the coroutine we convert await operation into coroutine suspension
+        -:  437:    // point, and resume execution asynchronously.
+    #####:  438:    if (isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  439:      CoroMachinery &coro = outlined->getSecond();
+call    0 never executed
+call    1 never executed
+    #####:  440:      Block *suspended = op->getBlock();
+call    0 never executed
+        -:  441:
+    #####:  442:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  443:      MLIRContext *ctx = op->getContext();
+call    0 never executed
+        -:  444:
+        -:  445:      // Save the coroutine state and resume on a runtime managed thread when
+        -:  446:      // the operand becomes available.
+        -:  447:      auto coroSaveOp =
+    #####:  448:          builder.create<CoroSaveOp>(CoroStateType::get(ctx), coro.coroHandle);
+call    0 never executed
+call    1 never executed
+    #####:  449:      builder.create<RuntimeAwaitAndResumeOp>(operand, coro.coroHandle);
+call    0 never executed
+        -:  450:
+        -:  451:      // Split the entry block before the await operation.
+    #####:  452:      Block *resume = rewriter.splitBlock(suspended, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  453:
+        -:  454:      // Add async.coro.suspend as a suspended block terminator.
+    #####:  455:      builder.setInsertionPointToEnd(suspended);
+    #####:  456:      builder.create<CoroSuspendOp>(coroSaveOp.getState(), coro.suspend, resume,
+call    0 never executed
+    #####:  457:                                    coro.cleanup);
+call    0 never executed
+        -:  458:
+        -:  459:      // Split the resume block into error checking and continuation.
+    #####:  460:      Block *continuation = rewriter.splitBlock(resume, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+        -:  461:
+        -:  462:      // Check if the awaited value is in the error state.
+    #####:  463:      builder.setInsertionPointToStart(resume);
+call    0 never executed
+    #####:  464:      auto isError = builder.create<RuntimeIsErrorOp>(loc, i1, operand);
+call    0 never executed
+    #####:  465:      builder.create<cf::CondBranchOp>(isError,
+call    0 never executed
+    #####:  466:                                       /*trueDest=*/setupSetErrorBlock(coro),
+call    0 never executed
+call    1 never executed
+        -:  467:                                       /*trueArgs=*/ArrayRef<Value>(),
+        -:  468:                                       /*falseDest=*/continuation,
+        -:  469:                                       /*falseArgs=*/ArrayRef<Value>());
+        -:  470:
+        -:  471:      // Make sure that replacement value will be constructed in the
+        -:  472:      // continuation block.
+    #####:  473:      rewriter.setInsertionPointToStart(continuation);
+        -:  474:    }
+        -:  475:
+        -:  476:    // Erase or replace the await operation with the new value.
+    #####:  477:    if (Value replaceWith = getReplacementValue(op, operand, rewriter))
+        -:  478:      rewriter.replaceOp(op, replaceWith);
+        -:  479:    else
+    #####:  480:      rewriter.eraseOp(op);
+call    0 never executed
+        -:  481:
+    #####:  482:    return success();
+        -:  483:  }
+------------------
+_ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9ValueTypeEE15matchAndRewriteES3_NS2_14AwaitOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9ValueTypeEE15matchAndRewriteES3_NS2_14AwaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  403:  matchAndRewrite(AwaitType op, typename AwaitType::Adaptor adaptor,
+        -:  404:                  ConversionPatternRewriter &rewriter) const override {
+        -:  405:    // We can only await on one the `AwaitableType` (for `await` it can be
+        -:  406:    // a `token` or a `value`, for `await_all` it must be a `group`).
+    #####:  407:    if (!op.getOperand().getType().template isa<AwaitableType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  408:      return rewriter.notifyMatchFailure(op, "unsupported awaitable type");
+call    0 never executed
+        -:  409:
+        -:  410:    // Check if await operation is inside the outlined coroutine function.
+    #####:  411:    auto func = op->template getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  412:    auto outlined = outlinedFunctions.find(func);
+call    0 never executed
+    #####:  413:    const bool isInCoroutine = outlined != outlinedFunctions.end();
+call    0 never executed
+call    1 never executed
+        -:  414:
+    #####:  415:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  416:    Value operand = adaptor.getOperand();
+call    0 never executed
+        -:  417:
+    #####:  418:    Type i1 = rewriter.getI1Type();
+call    0 never executed
+        -:  419:
+        -:  420:    // Inside regular functions we use the blocking wait operation to wait for
+        -:  421:    // the async object (token, value or group) to become available.
+    #####:  422:    if (!isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  423:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  424:      builder.create<RuntimeAwaitOp>(loc, operand);
+call    0 never executed
+call    1 never executed
+        -:  425:
+        -:  426:      // Assert that the awaited operands is not in the error state.
+    #####:  427:      Value isError = builder.create<RuntimeIsErrorOp>(i1, operand);
+call    0 never executed
+    #####:  428:      Value notError = builder.create<arith::XOrIOp>(
+call    0 never executed
+    #####:  429:          isError, builder.create<arith::ConstantOp>(
+call    0 never executed
+call    1 never executed
+    #####:  430:                       loc, i1, builder.getIntegerAttr(i1, 1)));
+call    0 never executed
+call    1 never executed
+        -:  431:
+    #####:  432:      builder.create<cf::AssertOp>(notError,
+        -:  433:                                   "Awaited async operand is in error state");
+        -:  434:    }
+        -:  435:
+        -:  436:    // Inside the coroutine we convert await operation into coroutine suspension
+        -:  437:    // point, and resume execution asynchronously.
+    #####:  438:    if (isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  439:      CoroMachinery &coro = outlined->getSecond();
+call    0 never executed
+call    1 never executed
+    #####:  440:      Block *suspended = op->getBlock();
+call    0 never executed
+        -:  441:
+    #####:  442:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  443:      MLIRContext *ctx = op->getContext();
+call    0 never executed
+        -:  444:
+        -:  445:      // Save the coroutine state and resume on a runtime managed thread when
+        -:  446:      // the operand becomes available.
+        -:  447:      auto coroSaveOp =
+    #####:  448:          builder.create<CoroSaveOp>(CoroStateType::get(ctx), coro.coroHandle);
+call    0 never executed
+call    1 never executed
+    #####:  449:      builder.create<RuntimeAwaitAndResumeOp>(operand, coro.coroHandle);
+call    0 never executed
+        -:  450:
+        -:  451:      // Split the entry block before the await operation.
+    #####:  452:      Block *resume = rewriter.splitBlock(suspended, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  453:
+        -:  454:      // Add async.coro.suspend as a suspended block terminator.
+    #####:  455:      builder.setInsertionPointToEnd(suspended);
+    #####:  456:      builder.create<CoroSuspendOp>(coroSaveOp.getState(), coro.suspend, resume,
+call    0 never executed
+    #####:  457:                                    coro.cleanup);
+call    0 never executed
+        -:  458:
+        -:  459:      // Split the resume block into error checking and continuation.
+    #####:  460:      Block *continuation = rewriter.splitBlock(resume, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+        -:  461:
+        -:  462:      // Check if the awaited value is in the error state.
+    #####:  463:      builder.setInsertionPointToStart(resume);
+call    0 never executed
+    #####:  464:      auto isError = builder.create<RuntimeIsErrorOp>(loc, i1, operand);
+call    0 never executed
+    #####:  465:      builder.create<cf::CondBranchOp>(isError,
+call    0 never executed
+    #####:  466:                                       /*trueDest=*/setupSetErrorBlock(coro),
+call    0 never executed
+call    1 never executed
+        -:  467:                                       /*trueArgs=*/ArrayRef<Value>(),
+        -:  468:                                       /*falseDest=*/continuation,
+        -:  469:                                       /*falseArgs=*/ArrayRef<Value>());
+        -:  470:
+        -:  471:      // Make sure that replacement value will be constructed in the
+        -:  472:      // continuation block.
+    #####:  473:      rewriter.setInsertionPointToStart(continuation);
+        -:  474:    }
+        -:  475:
+        -:  476:    // Erase or replace the await operation with the new value.
+    #####:  477:    if (Value replaceWith = getReplacementValue(op, operand, rewriter))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  478:      rewriter.replaceOp(op, replaceWith);
+call    0 never executed
+        -:  479:    else
+    #####:  480:      rewriter.eraseOp(op);
+call    0 never executed
+        -:  481:
+    #####:  482:    return success();
+        -:  483:  }
+------------------
+_ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async10AwaitAllOpENS2_9GroupTypeEE15matchAndRewriteES3_NS2_17AwaitAllOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async10AwaitAllOpENS2_9GroupTypeEE15matchAndRewriteES3_NS2_17AwaitAllOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  403:  matchAndRewrite(AwaitType op, typename AwaitType::Adaptor adaptor,
+        -:  404:                  ConversionPatternRewriter &rewriter) const override {
+        -:  405:    // We can only await on one the `AwaitableType` (for `await` it can be
+        -:  406:    // a `token` or a `value`, for `await_all` it must be a `group`).
+    #####:  407:    if (!op.getOperand().getType().template isa<AwaitableType>())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  408:      return rewriter.notifyMatchFailure(op, "unsupported awaitable type");
+call    0 never executed
+        -:  409:
+        -:  410:    // Check if await operation is inside the outlined coroutine function.
+    #####:  411:    auto func = op->template getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  412:    auto outlined = outlinedFunctions.find(func);
+call    0 never executed
+    #####:  413:    const bool isInCoroutine = outlined != outlinedFunctions.end();
+call    0 never executed
+call    1 never executed
+        -:  414:
+    #####:  415:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  416:    Value operand = adaptor.getOperand();
+call    0 never executed
+        -:  417:
+    #####:  418:    Type i1 = rewriter.getI1Type();
+call    0 never executed
+        -:  419:
+        -:  420:    // Inside regular functions we use the blocking wait operation to wait for
+        -:  421:    // the async object (token, value or group) to become available.
+    #####:  422:    if (!isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  423:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  424:      builder.create<RuntimeAwaitOp>(loc, operand);
+call    0 never executed
+call    1 never executed
+        -:  425:
+        -:  426:      // Assert that the awaited operands is not in the error state.
+    #####:  427:      Value isError = builder.create<RuntimeIsErrorOp>(i1, operand);
+call    0 never executed
+    #####:  428:      Value notError = builder.create<arith::XOrIOp>(
+call    0 never executed
+    #####:  429:          isError, builder.create<arith::ConstantOp>(
+call    0 never executed
+call    1 never executed
+    #####:  430:                       loc, i1, builder.getIntegerAttr(i1, 1)));
+call    0 never executed
+call    1 never executed
+        -:  431:
+    #####:  432:      builder.create<cf::AssertOp>(notError,
+        -:  433:                                   "Awaited async operand is in error state");
+        -:  434:    }
+        -:  435:
+        -:  436:    // Inside the coroutine we convert await operation into coroutine suspension
+        -:  437:    // point, and resume execution asynchronously.
+    #####:  438:    if (isInCoroutine) {
+branch  0 never executed
+branch  1 never executed
+    #####:  439:      CoroMachinery &coro = outlined->getSecond();
+call    0 never executed
+call    1 never executed
+    #####:  440:      Block *suspended = op->getBlock();
+call    0 never executed
+        -:  441:
+    #####:  442:      ImplicitLocOpBuilder builder(loc, op, rewriter.getListener());
+call    0 never executed
+    #####:  443:      MLIRContext *ctx = op->getContext();
+call    0 never executed
+        -:  444:
+        -:  445:      // Save the coroutine state and resume on a runtime managed thread when
+        -:  446:      // the operand becomes available.
+        -:  447:      auto coroSaveOp =
+    #####:  448:          builder.create<CoroSaveOp>(CoroStateType::get(ctx), coro.coroHandle);
+call    0 never executed
+call    1 never executed
+    #####:  449:      builder.create<RuntimeAwaitAndResumeOp>(operand, coro.coroHandle);
+call    0 never executed
+        -:  450:
+        -:  451:      // Split the entry block before the await operation.
+    #####:  452:      Block *resume = rewriter.splitBlock(suspended, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  453:
+        -:  454:      // Add async.coro.suspend as a suspended block terminator.
+    #####:  455:      builder.setInsertionPointToEnd(suspended);
+    #####:  456:      builder.create<CoroSuspendOp>(coroSaveOp.getState(), coro.suspend, resume,
+call    0 never executed
+    #####:  457:                                    coro.cleanup);
+call    0 never executed
+        -:  458:
+        -:  459:      // Split the resume block into error checking and continuation.
+    #####:  460:      Block *continuation = rewriter.splitBlock(resume, Block::iterator(op));
+call    0 never executed
+call    1 never executed
+        -:  461:
+        -:  462:      // Check if the awaited value is in the error state.
+    #####:  463:      builder.setInsertionPointToStart(resume);
+call    0 never executed
+    #####:  464:      auto isError = builder.create<RuntimeIsErrorOp>(loc, i1, operand);
+call    0 never executed
+    #####:  465:      builder.create<cf::CondBranchOp>(isError,
+call    0 never executed
+    #####:  466:                                       /*trueDest=*/setupSetErrorBlock(coro),
+call    0 never executed
+call    1 never executed
+        -:  467:                                       /*trueArgs=*/ArrayRef<Value>(),
+        -:  468:                                       /*falseDest=*/continuation,
+        -:  469:                                       /*falseArgs=*/ArrayRef<Value>());
+        -:  470:
+        -:  471:      // Make sure that replacement value will be constructed in the
+        -:  472:      // continuation block.
+    #####:  473:      rewriter.setInsertionPointToStart(continuation);
+        -:  474:    }
+        -:  475:
+        -:  476:    // Erase or replace the await operation with the new value.
+    #####:  477:    if (Value replaceWith = getReplacementValue(op, operand, rewriter))
+        -:  478:      rewriter.replaceOp(op, replaceWith);
+        -:  479:    else
+    #####:  480:      rewriter.eraseOp(op);
+call    0 never executed
+        -:  481:
+    #####:  482:    return success();
+        -:  483:  }
+------------------
+        -:  484:
+    #####:  485:  virtual Value getReplacementValue(AwaitType op, Value operand,
+call    0 never executed
+call    1 never executed
+        -:  486:                                    ConversionPatternRewriter &rewriter) const {
+    #####:  487:    return Value();
+call    0 never executed
+call    1 never executed
+        -:  488:  }
+------------------
+_ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9TokenTypeEE19getReplacementValueES3_NS1_5ValueERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async7AwaitOpENS2_9TokenTypeEE19getReplacementValueES3_NS1_5ValueERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  485:  virtual Value getReplacementValue(AwaitType op, Value operand,
+        -:  486:                                    ConversionPatternRewriter &rewriter) const {
+    #####:  487:    return Value();
+        -:  488:  }
+------------------
+_ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async10AwaitAllOpENS2_9GroupTypeEE19getReplacementValueES3_NS1_5ValueERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_119AwaitOpLoweringBaseIN4mlir5async10AwaitAllOpENS2_9GroupTypeEE19getReplacementValueES3_NS1_5ValueERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  485:  virtual Value getReplacementValue(AwaitType op, Value operand,
+        -:  486:                                    ConversionPatternRewriter &rewriter) const {
+    #####:  487:    return Value();
+        -:  488:  }
+------------------
+        -:  489:
+        -:  490:private:
+        -:  491:  llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions;
+        -:  492:};
+        -:  493:
+        -:  494:/// Lowering for `async.await` with a token operand.
+        -:  495:class AwaitTokenOpLowering : public AwaitOpLoweringBase<AwaitOp, TokenType> {
+        -:  496:  using Base = AwaitOpLoweringBase<AwaitOp, TokenType>;
+        -:  497:
+        -:  498:public:
+        -:  499:  using Base::Base;
+        -:  500:};
+        -:  501:
+        -:  502:/// Lowering for `async.await` with a value operand.
+        -:  503:class AwaitValueOpLowering : public AwaitOpLoweringBase<AwaitOp, ValueType> {
+        -:  504:  using Base = AwaitOpLoweringBase<AwaitOp, ValueType>;
+        -:  505:
+        -:  506:public:
+        -:  507:  using Base::Base;
+        -:  508:
+        -:  509:  Value
+function _ZNK12_GLOBAL__N_120AwaitValueOpLowering19getReplacementValueEN4mlir5async7AwaitOpENS1_5ValueERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  510:  getReplacementValue(AwaitOp op, Value operand,
+        -:  511:                      ConversionPatternRewriter &rewriter) const override {
+        -:  512:    // Load from the async value storage.
+    #####:  513:    auto valueType = operand.getType().cast<ValueType>().getValueType();
+call    0 never executed
+call    1 never executed
+    #####:  514:    return rewriter.create<RuntimeLoadOp>(op->getLoc(), valueType, operand);
+call    0 never executed
+        -:  515:  }
+        -:  516:};
+        -:  517:
+        -:  518:/// Lowering for `async.await_all` operation.
+        -:  519:class AwaitAllOpLowering : public AwaitOpLoweringBase<AwaitAllOp, GroupType> {
+        -:  520:  using Base = AwaitOpLoweringBase<AwaitAllOp, GroupType>;
+        -:  521:
+        -:  522:public:
+        -:  523:  using Base::Base;
+        -:  524:};
+        -:  525:
+        -:  526:} // namespace
+        -:  527:
+        -:  528://===----------------------------------------------------------------------===//
+        -:  529:// Convert async.yield operation to async.runtime operations.
+        -:  530://===----------------------------------------------------------------------===//
+        -:  531:
+        -:  532:class YieldOpLowering : public OpConversionPattern<async::YieldOp> {
+        -:  533:public:
+        -:  534:  YieldOpLowering(
+        -:  535:      MLIRContext *ctx,
+        -:  536:      const llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions)
+        -:  537:      : OpConversionPattern<async::YieldOp>(ctx),
+        -:  538:        outlinedFunctions(outlinedFunctions) {}
+        -:  539:
+        -:  540:  LogicalResult
+function _ZNK15YieldOpLowering15matchAndRewriteEN4mlir5async7YieldOpENS1_14YieldOpAdaptorERNS0_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  541:  matchAndRewrite(async::YieldOp op, OpAdaptor adaptor,
+        -:  542:                  ConversionPatternRewriter &rewriter) const override {
+        -:  543:    // Check if yield operation is inside the async coroutine function.
+    #####:  544:    auto func = op->template getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  545:    auto outlined = outlinedFunctions.find(func);
+call    0 never executed
+    #####:  546:    if (outlined == outlinedFunctions.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  547:      return rewriter.notifyMatchFailure(
+    #####:  548:          op, "operation is not inside the async coroutine function");
+call    0 never executed
+        -:  549:
+    #####:  550:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  551:    const CoroMachinery &coro = outlined->getSecond();
+call    0 never executed
+call    1 never executed
+        -:  552:
+        -:  553:    // Store yielded values into the async values storage and switch async
+        -:  554:    // values state to available.
+    #####:  555:    for (auto tuple : llvm::zip(adaptor.getOperands(), coro.returnValues)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  556:      Value yieldValue = std::get<0>(tuple);
+call    0 never executed
+    #####:  557:      Value asyncValue = std::get<1>(tuple);
+call    0 never executed
+    #####:  558:      rewriter.create<RuntimeStoreOp>(loc, yieldValue, asyncValue);
+call    0 never executed
+    #####:  559:      rewriter.create<RuntimeSetAvailableOp>(loc, asyncValue);
+call    0 never executed
+        -:  560:    }
+        -:  561:
+        -:  562:    // Switch the coroutine completion token to available state.
+    #####:  563:    rewriter.replaceOpWithNewOp<RuntimeSetAvailableOp>(op, coro.asyncToken);
+call    0 never executed
+        -:  564:
+    #####:  565:    return success();
+        -:  566:  }
+        -:  567:
+        -:  568:private:
+        -:  569:  const llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions;
+        -:  570:};
+        -:  571:
+        -:  572://===----------------------------------------------------------------------===//
+        -:  573:// Convert cf.assert operation to cf.cond_br into `set_error` block.
+        -:  574://===----------------------------------------------------------------------===//
+        -:  575:
+        -:  576:class AssertOpLowering : public OpConversionPattern<cf::AssertOp> {
+        -:  577:public:
+        -:  578:  AssertOpLowering(
+        -:  579:      MLIRContext *ctx,
+        -:  580:      llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions)
+        -:  581:      : OpConversionPattern<cf::AssertOp>(ctx),
+        -:  582:        outlinedFunctions(outlinedFunctions) {}
+        -:  583:
+        -:  584:  LogicalResult
+function _ZNK16AssertOpLowering15matchAndRewriteEN4mlir2cf8AssertOpENS1_15AssertOpAdaptorERNS0_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  585:  matchAndRewrite(cf::AssertOp op, OpAdaptor adaptor,
+        -:  586:                  ConversionPatternRewriter &rewriter) const override {
+        -:  587:    // Check if assert operation is inside the async coroutine function.
+    #####:  588:    auto func = op->template getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  589:    auto outlined = outlinedFunctions.find(func);
+call    0 never executed
+    #####:  590:    if (outlined == outlinedFunctions.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  591:      return rewriter.notifyMatchFailure(
+    #####:  592:          op, "operation is not inside the async coroutine function");
+call    0 never executed
+        -:  593:
+    #####:  594:    Location loc = op->getLoc();
+call    0 never executed
+    #####:  595:    CoroMachinery &coro = outlined->getSecond();
+call    0 never executed
+call    1 never executed
+        -:  596:
+    #####:  597:    Block *cont = rewriter.splitBlock(op->getBlock(), Block::iterator(op));
+call    0 never executed
+call    1 never executed
+    #####:  598:    rewriter.setInsertionPointToEnd(cont->getPrevNode());
+call    0 never executed
+call    1 never executed
+    #####:  599:    rewriter.create<cf::CondBranchOp>(loc, adaptor.getArg(),
+call    0 never executed
+        -:  600:                                      /*trueDest=*/cont,
+    #####:  601:                                      /*trueArgs=*/ArrayRef<Value>(),
+    #####:  602:                                      /*falseDest=*/setupSetErrorBlock(coro),
+call    0 never executed
+call    1 never executed
+    #####:  603:                                      /*falseArgs=*/ArrayRef<Value>());
+call    0 never executed
+call    1 never executed
+    #####:  604:    rewriter.eraseOp(op);
+call    0 never executed
+        -:  605:
+    #####:  606:    return success();
+        -:  607:  }
+        -:  608:
+        -:  609:private:
+        -:  610:  llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions;
+        -:  611:};
+        -:  612:
+        -:  613://===----------------------------------------------------------------------===//
+        -:  614:
+        -:  615:/// Rewrite a func as a coroutine by:
+        -:  616:/// 1) Wrapping the results into `async.value`.
+        -:  617:/// 2) Prepending the results with `async.token`.
+        -:  618:/// 3) Setting up coroutine blocks.
+        -:  619:/// 4) Rewriting return ops as yield op and branch op into the suspend block.
+function _ZL22rewriteFuncAsCoroutineN4mlir4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  620:static CoroMachinery rewriteFuncAsCoroutine(func::FuncOp func) {
+    #####:  621:  auto *ctx = func->getContext();
+call    0 never executed
+    #####:  622:  auto loc = func.getLoc();
+call    0 never executed
+    #####:  623:  SmallVector<Type> resultTypes;
+call    0 never executed
+    #####:  624:  resultTypes.reserve(func.getCallableResults().size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  625:  llvm::transform(func.getCallableResults(), std::back_inserter(resultTypes),
+call    0 never executed
+    #####:  626:                  [](Type type) { return ValueType::get(type); });
+call    0 never executed
+call    1 never executed
+    #####:  627:  func.setType(
+call    0 never executed
+    #####:  628:      FunctionType::get(ctx, func.getFunctionType().getInputs(), resultTypes));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  629:  func.insertResult(0, TokenType::get(ctx), {});
+call    0 never executed
+call    1 never executed
+    #####:  630:  for (Block &block : func.getBlocks()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  631:    Operation *terminator = block.getTerminator();
+call    0 never executed
+    #####:  632:    if (auto returnOp = dyn_cast<func::ReturnOp>(*terminator)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  633:      ImplicitLocOpBuilder builder(loc, returnOp);
+call    0 never executed
+    #####:  634:      builder.create<YieldOp>(returnOp.getOperands());
+call    0 never executed
+call    1 never executed
+    #####:  635:      returnOp.erase();
+call    0 never executed
+        -:  636:    }
+        -:  637:  }
+    #####:  638:  return setupCoroMachinery(func);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  639:}
+        -:  640:
+        -:  641:/// Rewrites a call into a function that has been rewritten as a coroutine.
+        -:  642:///
+        -:  643:/// The invocation of this function is safe only when call ops are traversed in
+        -:  644:/// reverse order of how they appear in a single block. See `funcsToCoroutines`.
+function _ZL27rewriteCallsiteForCoroutineN4mlir4func6CallOpENS0_6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  645:static void rewriteCallsiteForCoroutine(func::CallOp oldCall,
+        -:  646:                                        func::FuncOp func) {
+    #####:  647:  auto loc = func.getLoc();
+call    0 never executed
+    #####:  648:  ImplicitLocOpBuilder callBuilder(loc, oldCall);
+call    0 never executed
+    #####:  649:  auto newCall = callBuilder.create<func::CallOp>(
+    #####:  650:      func.getName(), func.getCallableResults(), oldCall.getArgOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  651:
+        -:  652:  // Await on the async token and all the value results and unwrap the latter.
+    #####:  653:  callBuilder.create<AwaitOp>(loc, newCall.getResults().front());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  654:  SmallVector<Value> unwrappedResults;
+branch  0 never executed
+branch  1 never executed
+    #####:  655:  unwrappedResults.reserve(newCall->getResults().size() - 1);
+branch  0 never executed
+branch  1 never executed
+    #####:  656:  for (Value result : newCall.getResults().drop_front())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  657:    unwrappedResults.push_back(
+call    0 never executed
+call    1 never executed
+    #####:  658:        callBuilder.create<AwaitOp>(loc, result).getResult());
+call    0 never executed
+        -:  659:  // Careful, when result of a call is piped into another call this could lead
+        -:  660:  // to a dangling pointer.
+    #####:  661:  oldCall.replaceAllUsesWith(unwrappedResults);
+branch  0 never executed
+branch  1 never executed
+    #####:  662:  oldCall.erase();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  663:}
+        -:  664:
+    #####:  665:static bool isAllowedToBlock(func::FuncOp func) {
+    #####:  666:  return !!func->getAttrOfType<UnitAttr>(AsyncDialect::kAllowedToBlockAttrName);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  667:}
+        -:  668:
+function _ZL17funcsToCoroutinesN4mlir8ModuleOpERN4llvm8DenseMapINS_4func6FuncOpEN12_GLOBAL__N_113CoroMachineryENS1_12DenseMapInfoIS4_vEENS1_6detail12DenseMapPairIS4_S6_EEEE called 0 returned 0% blocks executed 0%
+    #####:  669:static LogicalResult funcsToCoroutines(
+        -:  670:    ModuleOp module,
+        -:  671:    llvm::DenseMap<func::FuncOp, CoroMachinery> &outlinedFunctions) {
+        -:  672:  // The following code supports the general case when 2 functions mutually
+        -:  673:  // recurse into each other. Because of this and that we are relying on
+        -:  674:  // SymbolUserMap to find pointers to calling FuncOps, we cannot simply erase
+        -:  675:  // a FuncOp while inserting an equivalent coroutine, because that could lead
+        -:  676:  // to dangling pointers.
+        -:  677:
+    #####:  678:  SmallVector<func::FuncOp> funcWorklist;
+call    0 never executed
+        -:  679:
+        -:  680:  // Careful, it's okay to add a func to the worklist multiple times if and only
+        -:  681:  // if the loop processing the worklist will skip the functions that have
+        -:  682:  // already been converted to coroutines.
+function _ZZL17funcsToCoroutinesN4mlir8ModuleOpERN4llvm8DenseMapINS_4func6FuncOpEN12_GLOBAL__N_113CoroMachineryENS1_12DenseMapInfoIS4_vEENS1_6detail12DenseMapPairIS4_S6_EEEEENKUlS4_E_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  683:  auto addToWorklist = [&](func::FuncOp func) {
+    #####:  684:    if (isAllowedToBlock(func))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  685:      return;
+        -:  686:    // N.B. To refactor this code into a separate pass the lookup in
+        -:  687:    // outlinedFunctions is the most obvious obstacle. Looking at an arbitrary
+        -:  688:    // func and recognizing if it has a coroutine structure is messy. Passing
+        -:  689:    // this dict between the passes is ugly.
+    #####:  690:    if (isAllowedToBlock(func) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  691:        outlinedFunctions.find(func) == outlinedFunctions.end()) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  692:      for (Operation &op : func.getBody().getOps()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  693:        if (isa<AwaitOp, AwaitAllOp>(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  694:          funcWorklist.push_back(func);
+    #####:  695:          break;
+call    0 never executed
+        -:  696:        }
+        -:  697:      }
+        -:  698:    }
+    #####:  699:  };
+        -:  700:
+        -:  701:  // Traverse in post-order collecting for each func op the await ops it has.
+    #####:  702:  for (func::FuncOp func : module.getOps<func::FuncOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  703:    addToWorklist(func);
+call    0 never executed
+        -:  704:
+    #####:  705:  SymbolTableCollection symbolTable;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  706:  SymbolUserMap symbolUserMap(symbolTable, module);
+call    0 never executed
+call    1 never executed
+        -:  707:
+        -:  708:  // Rewrite funcs, while updating call sites and adding them to the worklist.
+    #####:  709:  while (!funcWorklist.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  710:    auto func = funcWorklist.pop_back_val();
+call    0 never executed
+    #####:  711:    auto insertion = outlinedFunctions.insert({func, CoroMachinery{}});
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  712:    if (!insertion.second)
+branch  0 never executed
+branch  1 never executed
+        -:  713:      // This function has already been processed because this is either
+        -:  714:      // the corecursive case, or a caller with multiple calls to a newly
+        -:  715:      // created corouting. Either way, skip updating the call sites.
+    #####:  716:      continue;
+    #####:  717:    insertion.first->second = rewriteFuncAsCoroutine(func);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  718:    SmallVector<Operation *> users(symbolUserMap.getUsers(func).begin(),
+call    0 never executed
+    #####:  719:                                   symbolUserMap.getUsers(func).end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  720:    // If there are multiple calls from the same block they need to be traversed
+        -:  721:    // in reverse order so that symbolUserMap references are not invalidated
+        -:  722:    // when updating the users of the call op which is earlier in the block.
+    #####:  723:    llvm::sort(users, [](Operation *a, Operation *b) {
+call    0 never executed
+        -:  724:      Block *blockA = a->getBlock();
+        -:  725:      Block *blockB = b->getBlock();
+        -:  726:      // Impose arbitrary order on blocks so that there is a well-defined order.
+        -:  727:      return blockA > blockB || (blockA == blockB && !a->isBeforeInBlock(b));
+        -:  728:    });
+        -:  729:    // Rewrite the callsites to await on results of the newly created coroutine.
+    #####:  730:    for (Operation *op : users) {
+branch  0 never executed
+branch  1 never executed
+    #####:  731:      if (func::CallOp call = dyn_cast<func::CallOp>(*op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  732:        func::FuncOp caller = call->getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  733:        rewriteCallsiteForCoroutine(call, func); // Careful, erases the call op.
+call    0 never executed
+    #####:  734:        addToWorklist(caller);
+call    0 never executed
+        -:  735:      } else {
+    #####:  736:        op->emitError("Unexpected reference to func referenced by symbol");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  737:        return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  738:      }
+        -:  739:    }
+        -:  740:  }
+    #####:  741:  return success();
+call    0 never executed
+        -:  742:}
+        -:  743:
+        -:  744://===----------------------------------------------------------------------===//
+function _ZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEv called 884 returned 100% blocks executed 65%
+      884:  745:void AsyncToAsyncRuntimePass::runOnOperation() {
+      884:  746:  ModuleOp module = getOperation();
+call    0 returned 100%
+     1768:  747:  SymbolTable symbolTable(module);
+call    0 returned 100%
+        -:  748:
+        -:  749:  // Outline all `async.execute` body regions into async functions (coroutines).
+     1768:  750:  llvm::DenseMap<func::FuncOp, CoroMachinery> outlinedFunctions;
+call    0 returned 100%
+call    1 returned 100%
+        -:  751:
+function _ZZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEvENKUlN4mlir5async9ExecuteOpEE_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+     884*:  752:  module.walk([&](ExecuteOp execute) {
+call    0 returned 100%
+    #####:  753:    outlinedFunctions.insert(outlineExecuteOp(symbolTable, execute));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  754:  });
+        -:  755:
+     884*:  756:  LLVM_DEBUG({
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  757:    llvm::dbgs() << "Outlined " << outlinedFunctions.size()
+        -:  758:                 << " functions built from async.execute operations\n";
+        -:  759:  });
+        -:  760:
+        -:  761:  // Returns true if operation is inside the coroutine.
+function _ZZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEvENKUlPN4mlir9OperationEE0_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+     884*:  762:  auto isInCoroutine = [&](Operation *op) -> bool {
+    #####:  763:    auto parentFunc = op->getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  764:    return outlinedFunctions.find(parentFunc) != outlinedFunctions.end();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+      884:  765:  };
+        -:  766:
+     884*:  767:  if (eliminateBlockingAwaitOps &&
+     884*:  768:      failed(funcsToCoroutines(module, outlinedFunctions))) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  769:    signalPassFailure();
+    #####:  770:    return;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  771:  }
+        -:  772:
+        -:  773:  // Lower async operations to async.runtime operations.
+      884:  774:  MLIRContext *ctx = module->getContext();
+call    0 returned 100%
+     1768:  775:  RewritePatternSet asyncPatterns(ctx);
+call    0 returned 100%
+call    1 returned 100%
+        -:  776:
+        -:  777:  // Conversion to async runtime augments original CFG with the coroutine CFG,
+        -:  778:  // and we have to make sure that structured control flow operations with async
+        -:  779:  // operations in nested regions will be converted to branch-based control flow
+        -:  780:  // before we add the coroutine basic blocks.
+      884:  781:  populateSCFToControlFlowConversionPatterns(asyncPatterns);
+call    0 returned 100%
+        -:  782:
+        -:  783:  // Async lowering does not use type converter because it must preserve all
+        -:  784:  // types for async.runtime operations.
+      884:  785:  asyncPatterns.add<CreateGroupOpLowering, AddToGroupOpLowering>(ctx);
+call    0 returned 100%
+      884:  786:  asyncPatterns.add<AwaitTokenOpLowering, AwaitValueOpLowering,
+        -:  787:                    AwaitAllOpLowering, YieldOpLowering>(ctx,
+      884:  788:                                                         outlinedFunctions);
+call    0 returned 100%
+        -:  789:
+        -:  790:  // Lower assertions to conditional branches into error blocks.
+      884:  791:  asyncPatterns.add<AssertOpLowering>(ctx, outlinedFunctions);
+call    0 returned 100%
+        -:  792:
+        -:  793:  // All high level async operations must be lowered to the runtime operations.
+     1768:  794:  ConversionTarget runtimeTarget(*ctx);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      884:  795:  runtimeTarget.addLegalDialect<AsyncDialect>();
+call    0 returned 100%
+      884:  796:  runtimeTarget.addIllegalOp<CreateGroupOp, AddToGroupOp>();
+call    0 returned 100%
+      884:  797:  runtimeTarget.addIllegalOp<ExecuteOp, AwaitOp, AwaitAllOp, async::YieldOp>();
+call    0 returned 100%
+        -:  798:
+        -:  799:  // Decide if structured control flow has to be lowered to branch-based CFG.
+     884*:  800:  runtimeTarget.addDynamicallyLegalDialect<scf::SCFDialect>([&](Operation *op) {
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0%
+function _ZZZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEvENKUlPN4mlir9OperationEE1_clES3_ENKUlS3_E_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  801:    auto walkResult = op->walk([&](Operation *nested) {
+    #####:  802:      bool isAsync = isa<async::AsyncDialect>(nested->getDialect());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  803:      return isAsync && isInCoroutine(nested) ? WalkResult::interrupt()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  804:                                              : WalkResult::advance();
+    #####:  805:    });
+call    0 never executed
+    #####:  806:    return !walkResult.wasInterrupted();
+        -:  807:  });
+      884:  808:  runtimeTarget.addLegalOp<cf::AssertOp, arith::XOrIOp, arith::ConstantOp,
+call    0 returned 100%
+      884:  809:                           func::ConstantOp, cf::BranchOp, cf::CondBranchOp>();
+        -:  810:
+        -:  811:  // Assertions must be converted to runtime errors inside async functions.
+      884:  812:  runtimeTarget.addDynamicallyLegalOp<cf::AssertOp>(
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEvENKUlN4mlir2cf8AssertOpEE2_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  813:      [&](cf::AssertOp op) -> bool {
+    #####:  814:        auto func = op->getParentOfType<func::FuncOp>();
+call    0 never executed
+    #####:  815:        return outlinedFunctions.find(func) == outlinedFunctions.end();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  816:      });
+        -:  817:
+      884:  818:  if (eliminateBlockingAwaitOps)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  819:    runtimeTarget.addDynamicallyLegalOp<RuntimeAwaitOp>(
+call    0 never executed
+function _ZZN12_GLOBAL__N_123AsyncToAsyncRuntimePass14runOnOperationEvENKUlN4mlir5async14RuntimeAwaitOpEE3_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  820:        [&](RuntimeAwaitOp op) -> bool {
+    #####:  821:          return isAllowedToBlock(op->getParentOfType<func::FuncOp>());
+call    0 never executed
+        -:  822:        });
+        -:  823:
+      884:  824:  if (failed(applyPartialConversion(module, runtimeTarget,
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+      884:  825:                                    std::move(asyncPatterns)))) {
+call    0 returned 100%
+    #####:  826:    signalPassFailure();
+call    0 never executed
+    #####:  827:    return;
+call    0 never executed
+call    1 never executed
+        -:  828:  }
+        -:  829:}
+        -:  830:
+function _ZN4mlir29createAsyncToAsyncRuntimePassEv called 326625 returned 100% blocks executed 100%
+   326625:  831:std::unique_ptr<OperationPass<ModuleOp>> mlir::createAsyncToAsyncRuntimePass() {
+   326625:  832:  return std::make_unique<AsyncToAsyncRuntimePass>();
+call    0 returned 100%
+        -:  833:}

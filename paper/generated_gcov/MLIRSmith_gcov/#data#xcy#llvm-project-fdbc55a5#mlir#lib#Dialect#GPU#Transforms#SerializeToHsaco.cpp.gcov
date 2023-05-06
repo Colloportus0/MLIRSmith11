@@ -1,0 +1,976 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/GPU/Transforms/SerializeToHsaco.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/GPU/CMakeFiles/obj.MLIRGPUTransforms.dir/Transforms/SerializeToHsaco.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/GPU/CMakeFiles/obj.MLIRGPUTransforms.dir/Transforms/SerializeToHsaco.cpp.gcda
+        -:    0:Runs:116158
+        -:    1://===- LowerGPUToHSACO.cpp - Convert GPU kernel to HSACO blob -------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass that serializes a gpu module into HSAco blob and
+        -:   10:// adds that blob as a string attribute of the module.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Dialect/GPU/Transforms/Passes.h"
+        -:   15:#include "mlir/IR/Location.h"
+        -:   16:#include "mlir/IR/MLIRContext.h"
+        -:   17:
+        -:   18:#if MLIR_GPU_TO_HSACO_PASS_ENABLE
+        -:   19:#include "mlir/ExecutionEngine/OptUtils.h"
+        -:   20:#include "mlir/Pass/Pass.h"
+        -:   21:#include "mlir/Support/FileUtilities.h"
+        -:   22:#include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
+        -:   23:#include "mlir/Target/LLVMIR/Export.h"
+        -:   24:
+        -:   25:#include "llvm/IR/Constants.h"
+        -:   26:#include "llvm/IR/GlobalVariable.h"
+        -:   27:#include "llvm/IR/Module.h"
+        -:   28:#include "llvm/IRReader/IRReader.h"
+        -:   29:#include "llvm/Linker/Linker.h"
+        -:   30:
+        -:   31:#include "llvm/MC/MCAsmBackend.h"
+        -:   32:#include "llvm/MC/MCAsmInfo.h"
+        -:   33:#include "llvm/MC/MCCodeEmitter.h"
+        -:   34:#include "llvm/MC/MCContext.h"
+        -:   35:#include "llvm/MC/MCInstrInfo.h"
+        -:   36:#include "llvm/MC/MCObjectFileInfo.h"
+        -:   37:#include "llvm/MC/MCObjectWriter.h"
+        -:   38:#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+        -:   39:#include "llvm/MC/MCRegisterInfo.h"
+        -:   40:#include "llvm/MC/MCStreamer.h"
+        -:   41:#include "llvm/MC/MCSubtargetInfo.h"
+        -:   42:#include "llvm/MC/TargetRegistry.h"
+        -:   43:
+        -:   44:#include "llvm/Support/CommandLine.h"
+        -:   45:#include "llvm/Support/FileUtilities.h"
+        -:   46:#include "llvm/Support/Path.h"
+        -:   47:#include "llvm/Support/Program.h"
+        -:   48:#include "llvm/Support/SourceMgr.h"
+        -:   49:#include "llvm/Support/TargetSelect.h"
+        -:   50:#include "llvm/Support/WithColor.h"
+        -:   51:
+        -:   52:#include "llvm/Target/TargetMachine.h"
+        -:   53:#include "llvm/Target/TargetOptions.h"
+        -:   54:
+        -:   55:#include "llvm/Transforms/IPO/Internalize.h"
+        -:   56:
+        -:   57:#include <mutex>
+        -:   58:
+        -:   59:using namespace mlir;
+        -:   60:
+        -:   61:namespace {
+        -:   62:class SerializeToHsacoPass
+        -:   63:    : public PassWrapper<SerializeToHsacoPass, gpu::SerializeToBlobPass> {
+        -:   64:public:
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass13resolveTypeIDEv called 116158 returned 100% blocks executed 100%
+   116158:   65:  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SerializeToHsacoPass)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+call    5 returned 100%
+        -:   66:
+        -:   67:  SerializeToHsacoPass(StringRef triple, StringRef arch, StringRef features,
+        -:   68:                       int optLevel);
+        -:   69:  SerializeToHsacoPass(const SerializeToHsacoPass &other);
+function _ZNK12_GLOBAL__N_120SerializeToHsacoPass11getArgumentEv called 116158 returned 100% blocks executed 100%
+   116158:   70:  StringRef getArgument() const override { return "gpu-to-hsaco"; }
+function _ZNK12_GLOBAL__N_120SerializeToHsacoPass14getDescriptionEv called 116158 returned 100% blocks executed 100%
+   116158:   71:  StringRef getDescription() const override {
+   116158:   72:    return "Lower GPU kernel function to HSACO binary annotations";
+        -:   73:  }
+        -:   74:
+        -:   75:protected:
+        -:   76:  Option<int> optLevel{
+        -:   77:      *this, "opt-level",
+        -:   78:      llvm::cl::desc("Optimization level for HSACO compilation"),
+        -:   79:      llvm::cl::init(2)};
+        -:   80:
+        -:   81:  Option<std::string> rocmPath{*this, "rocm-path",
+        -:   82:                               llvm::cl::desc("Path to ROCm install")};
+        -:   83:
+        -:   84:  // Overload to allow linking in device libs
+        -:   85:  std::unique_ptr<llvm::Module>
+        -:   86:  translateToLLVMIR(llvm::LLVMContext &llvmContext) override;
+        -:   87:
+        -:   88:  /// Adds LLVM optimization passes
+        -:   89:  LogicalResult optimizeLlvm(llvm::Module &llvmModule,
+        -:   90:                             llvm::TargetMachine &targetMachine) override;
+        -:   91:
+        -:   92:private:
+        -:   93:  void getDependentDialects(DialectRegistry &registry) const override;
+        -:   94:
+        -:   95:  // Loads LLVM bitcode libraries
+        -:   96:  Optional<SmallVector<std::unique_ptr<llvm::Module>, 3>>
+        -:   97:  loadLibraries(SmallVectorImpl<char> &path,
+        -:   98:                SmallVectorImpl<StringRef> &libraries,
+        -:   99:                llvm::LLVMContext &context);
+        -:  100:
+        -:  101:  // Serializes ROCDL to HSACO.
+        -:  102:  std::unique_ptr<std::vector<char>>
+        -:  103:  serializeISA(const std::string &isa) override;
+        -:  104:
+        -:  105:  std::unique_ptr<SmallVectorImpl<char>> assembleIsa(const std::string &isa);
+        -:  106:  std::unique_ptr<std::vector<char>>
+        -:  107:  createHsaco(const SmallVectorImpl<char> &isaBinary);
+        -:  108:
+        -:  109:  std::string getRocmPath();
+        -:  110:};
+        -:  111:} // namespace
+        -:  112:
+function _ZN12_GLOBAL__N_120SerializeToHsacoPassC2ERKS0_ called 0 returned 0% blocks executed 0%
+    #####:  113:SerializeToHsacoPass::SerializeToHsacoPass(const SerializeToHsacoPass &other)
+    #####:  114:    : PassWrapper<SerializeToHsacoPass, gpu::SerializeToBlobPass>(other) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  115:
+        -:  116:/// Get a user-specified path to ROCm
+        -:  117:// Tries, in order, the --rocm-path option, the ROCM_PATH environment variable
+        -:  118:// and a compile-time default
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass11getRocmPathEv called 0 returned 0% blocks executed 0%
+    #####:  119:std::string SerializeToHsacoPass::getRocmPath() {
+    #####:  120:  if (rocmPath.getNumOccurrences() > 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  121:    return rocmPath.getValue();
+call    0 never executed
+        -:  122:
+    #####:  123:  return __DEFAULT_ROCM_PATH__;
+call    0 never executed
+        -:  124:}
+        -:  125:
+        -:  126:// Sets the 'option' to 'value' unless it already has a value.
+function _ZL14maybeSetOptionRN4mlir4Pass6OptionINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEN4llvm2cl6parserIS7_EEEENS8_12function_refIFS7_vEEE called 348474 returned 100% blocks executed 100%
+   348474:  127:static void maybeSetOption(Pass::Option<std::string> &option,
+        -:  128:                           function_ref<std::string()> getValue) {
+   348474:  129:  if (!option.hasValue())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+   464632:  130:    option = getValue();
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 33% (fallthrough)
+branch  3 taken 67%
+   348474:  131:}
+        -:  132:
+function _ZN12_GLOBAL__N_120SerializeToHsacoPassC2EN4llvm9StringRefES2_S2_i called 116158 returned 100% blocks executed 100%
+   116158:  133:SerializeToHsacoPass::SerializeToHsacoPass(StringRef triple, StringRef arch,
+   116158:  134:                                           StringRef features, int optLevel) {
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+   232316:  135:  maybeSetOption(this->triple, [&triple] { return triple.str(); });
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+   232316:  136:  maybeSetOption(this->chip, [&arch] { return arch.str(); });
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+   232316:  137:  maybeSetOption(this->features, [&features] { return features.str(); });
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 returned 100%
+   116158:  138:  if (this->optLevel.getNumOccurrences() == 0)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+   116158:  139:    this->optLevel.setValue(optLevel);
+   116158:  140:}
+        -:  141:
+function _ZNK12_GLOBAL__N_120SerializeToHsacoPass20getDependentDialectsERN4mlir15DialectRegistryE called 0 returned 0% blocks executed 0%
+    #####:  142:void SerializeToHsacoPass::getDependentDialects(
+        -:  143:    DialectRegistry &registry) const {
+    #####:  144:  registerROCDLDialectTranslation(registry);
+call    0 never executed
+    #####:  145:  gpu::SerializeToBlobPass::getDependentDialects(registry);
+call    0 never executed
+    #####:  146:}
+        -:  147:
+        -:  148:Optional<SmallVector<std::unique_ptr<llvm::Module>, 3>>
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass13loadLibrariesERN4llvm15SmallVectorImplIcEERNS2_INS1_9StringRefEEERNS1_11LLVMContextE called 0 returned 0% blocks executed 0%
+    #####:  149:SerializeToHsacoPass::loadLibraries(SmallVectorImpl<char> &path,
+        -:  150:                                    SmallVectorImpl<StringRef> &libraries,
+        -:  151:                                    llvm::LLVMContext &context) {
+    #####:  152:  SmallVector<std::unique_ptr<llvm::Module>, 3> ret;
+call    0 never executed
+    #####:  153:  size_t dirLength = path.size();
+call    0 never executed
+        -:  154:
+    #####:  155:  if (!llvm::sys::fs::is_directory(path)) {
+call    0 never executed
+call    1 never executed
+    #####:  156:    getOperation().emitRemark() << "Bitcode path: " << path
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  157:                                << " does not exist or is not a directory\n";
+call    0 never executed
+    #####:  158:    return llvm::None;
+        -:  159:  }
+        -:  160:
+    #####:  161:  for (const StringRef file : libraries) {
+branch  0 never executed
+branch  1 never executed
+    #####:  162:    llvm::SMDiagnostic error;
+call    0 never executed
+    #####:  163:    llvm::sys::path::append(path, file);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  164:    llvm::StringRef pathRef(path.data(), path.size());
+call    0 never executed
+    #####:  165:    std::unique_ptr<llvm::Module> library =
+    #####:  166:        llvm::getLazyIRFileModule(pathRef, error, context);
+call    0 never executed
+call    1 never executed
+    #####:  167:    path.truncate(dirLength);
+call    0 never executed
+    #####:  168:    if (!library) {
+branch  0 never executed
+branch  1 never executed
+    #####:  169:      getOperation().emitError() << "Failed to load library " << file
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  170:                                 << " from " << path << error.getMessage();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  171:      return llvm::None;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  172:    }
+        -:  173:    // Some ROCM builds don't strip this like they should
+    #####:  174:    if (auto *openclVersion = library->getNamedMetadata("opencl.ocl.version"))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  175:      library->eraseNamedMetadata(openclVersion);
+call    0 never executed
+        -:  176:    // Stop spamming us with clang version numbers
+    #####:  177:    if (auto *ident = library->getNamedMetadata("llvm.ident"))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  178:      library->eraseNamedMetadata(ident);
+call    0 never executed
+    #####:  179:    ret.push_back(std::move(library));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  180:  }
+        -:  181:
+    #####:  182:  return ret;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  183:}
+        -:  184:
+        -:  185:std::unique_ptr<llvm::Module>
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass17translateToLLVMIRERN4llvm11LLVMContextE called 0 returned 0% blocks executed 0%
+    #####:  186:SerializeToHsacoPass::translateToLLVMIR(llvm::LLVMContext &llvmContext) {
+        -:  187:  // MLIR -> LLVM translation
+    #####:  188:  std::unique_ptr<llvm::Module> ret =
+    #####:  189:      gpu::SerializeToBlobPass::translateToLLVMIR(llvmContext);
+call    0 never executed
+        -:  190:
+    #####:  191:  if (!ret) {
+branch  0 never executed
+branch  1 never executed
+    #####:  192:    getOperation().emitOpError("Module lowering failed");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  193:    return ret;
+        -:  194:  }
+        -:  195:  // Walk the LLVM module in order to determine if we need to link in device
+        -:  196:  // libs
+    #####:  197:  bool needOpenCl = false;
+    #####:  198:  bool needOckl = false;
+    #####:  199:  bool needOcml = false;
+    #####:  200:  for (llvm::Function &f : ret->functions()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  201:    if (f.hasExternalLinkage() && f.hasName() && !f.hasExactDefinition()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  202:      StringRef funcName = f.getName();
+call    0 never executed
+    #####:  203:      if ("printf" == funcName)
+branch  0 never executed
+branch  1 never executed
+        -:  204:        needOpenCl = true;
+    #####:  205:      if (funcName.startswith("__ockl_"))
+branch  0 never executed
+branch  1 never executed
+    #####:  206:        needOckl = true;
+    #####:  207:      if (funcName.startswith("__ocml_"))
+branch  0 never executed
+branch  1 never executed
+    #####:  208:        needOcml = true;
+        -:  209:    }
+        -:  210:  }
+        -:  211:
+    #####:  212:  if (needOpenCl)
+branch  0 never executed
+branch  1 never executed
+    #####:  213:    needOcml = needOckl = true;
+        -:  214:
+        -:  215:  // No libraries needed (the typical case)
+    #####:  216:  if (!(needOpenCl || needOcml || needOckl))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  217:    return ret;
+        -:  218:
+        -:  219:  // Define one of the control constants the ROCm device libraries expect to be
+        -:  220:  // present These constants can either be defined in the module or can be
+        -:  221:  // imported by linking in bitcode that defines the constant. To simplify our
+        -:  222:  // logic, we define the constants into the module we are compiling
+function _ZZN12_GLOBAL__N_120SerializeToHsacoPass17translateToLLVMIRERN4llvm11LLVMContextEENKUlNS1_9StringRefEjjE_clES4_jj.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  223:  auto addControlConstant = [&module = *ret](StringRef name, uint32_t value,
+branch  0 never executed
+branch  1 never executed
+    #####:  224:                                             uint32_t bitwidth) {
+    #####:  225:    using llvm::GlobalVariable;
+    #####:  226:    if (module.getNamedGlobal(name)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  227:      return;
+        -:  228:    }
+    #####:  229:    llvm::IntegerType *type =
+    #####:  230:        llvm::IntegerType::getIntNTy(module.getContext(), bitwidth);
+call    0 never executed
+    #####:  231:    auto *initializer = llvm::ConstantInt::get(type, value, /*isSigned=*/false);
+call    0 never executed
+    #####:  232:    auto *constant = new GlobalVariable(
+        -:  233:        module, type,
+        -:  234:        /*isConstant=*/true, GlobalVariable::LinkageTypes::LinkOnceODRLinkage,
+        -:  235:        initializer, name,
+        -:  236:        /*before=*/nullptr,
+        -:  237:        /*threadLocalMode=*/GlobalVariable::ThreadLocalMode::NotThreadLocal,
+    #####:  238:        /*addressSpace=*/4);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  239:    constant->setUnnamedAddr(GlobalVariable::UnnamedAddr::Local);
+call    0 never executed
+    #####:  240:    constant->setVisibility(
+call    0 never executed
+        -:  241:        GlobalVariable::VisibilityTypes::ProtectedVisibility);
+    #####:  242:    constant->setAlignment(llvm::MaybeAlign(bitwidth / 8));
+call    0 never executed
+call    1 never executed
+    #####:  243:  };
+        -:  244:
+        -:  245:  // Set up control variables in the module instead of linking in tiny bitcode
+    #####:  246:  if (needOcml) {
+branch  0 never executed
+branch  1 never executed
+        -:  247:    // TODO(kdrewnia): Enable math optimizations once we have support for
+        -:  248:    // `-ffast-math`-like options
+    #####:  249:    addControlConstant("__oclc_finite_only_opt", 0, 8);
+call    0 never executed
+    #####:  250:    addControlConstant("__oclc_daz_opt", 0, 8);
+call    0 never executed
+    #####:  251:    addControlConstant("__oclc_correctly_rounded_sqrt32", 1, 8);
+call    0 never executed
+    #####:  252:    addControlConstant("__oclc_unsafe_math_opt", 0, 8);
+call    0 never executed
+        -:  253:  }
+    #####:  254:  if (needOcml || needOckl) {
+branch  0 never executed
+branch  1 never executed
+    #####:  255:    addControlConstant("__oclc_wavefrontsize64", 1, 8);
+call    0 never executed
+    #####:  256:    StringRef chipSet = this->chip.getValue();
+branch  0 never executed
+branch  1 never executed
+    #####:  257:    if (chipSet.startswith("gfx"))
+branch  0 never executed
+branch  1 never executed
+    #####:  258:      chipSet = chipSet.substr(3);
+branch  0 never executed
+branch  1 never executed
+    #####:  259:    uint32_t minor =
+    #####:  260:        llvm::APInt(32, chipSet.substr(chipSet.size() - 2), 16).getZExtValue();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  261:    uint32_t major = llvm::APInt(32, chipSet.substr(0, chipSet.size() - 2), 10)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  262:                         .getZExtValue();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  263:    uint32_t isaNumber = minor + 1000 * major;
+    #####:  264:    addControlConstant("__oclc_ISA_version", isaNumber, 32);
+call    0 never executed
+        -:  265:
+        -:  266:    // This constant must always match the default code object ABI version
+        -:  267:    // of the AMDGPU backend.
+    #####:  268:    addControlConstant("__oclc_ABI_version", 400, 32);
+call    0 never executed
+        -:  269:  }
+        -:  270:
+        -:  271:  // Determine libraries we need to link - order matters due to dependencies
+    #####:  272:  llvm::SmallVector<StringRef, 4> libraries;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  273:  if (needOpenCl)
+branch  0 never executed
+branch  1 never executed
+    #####:  274:    libraries.push_back("opencl.bc");
+call    0 never executed
+    #####:  275:  if (needOcml)
+branch  0 never executed
+branch  1 never executed
+    #####:  276:    libraries.push_back("ocml.bc");
+call    0 never executed
+    #####:  277:  if (needOckl)
+branch  0 never executed
+branch  1 never executed
+    #####:  278:    libraries.push_back("ockl.bc");
+call    0 never executed
+        -:  279:
+    #####:  280:  Optional<SmallVector<std::unique_ptr<llvm::Module>, 3>> mbModules;
+branch  0 never executed
+branch  1 never executed
+    #####:  281:  std::string theRocmPath = getRocmPath();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  282:  llvm::SmallString<32> bitcodePath(theRocmPath);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  283:  llvm::sys::path::append(bitcodePath, "amdgcn", "bitcode");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  284:  mbModules = loadLibraries(bitcodePath, libraries, llvmContext);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  285:
+    #####:  286:  if (!mbModules) {
+branch  0 never executed
+branch  1 never executed
+    #####:  287:    getOperation()
+call    0 never executed
+    #####:  288:            .emitWarning("Could not load required device libraries")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  289:            .attachNote()
+call    0 never executed
+call    1 never executed
+    #####:  290:        << "This will probably cause link-time or run-time failures";
+call    0 never executed
+    #####:  291:    return ret; // We can still abort here
+        -:  292:  }
+        -:  293:
+    #####:  294:  llvm::Linker linker(*ret);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  295:  for (std::unique_ptr<llvm::Module> &libModule : *mbModules) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  296:    // This bitcode linking code is substantially similar to what is used in
+        -:  297:    // hip-clang It imports the library functions into the module, allowing LLVM
+        -:  298:    // optimization passes (which must run after linking) to optimize across the
+        -:  299:    // libraries and the module's code. We also only import symbols if they are
+        -:  300:    // referenced by the module or a previous library since there will be no
+        -:  301:    // other source of references to those symbols in this compilation and since
+        -:  302:    // we don't want to bloat the resulting code object.
+    #####:  303:    bool err = linker.linkInModule(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  304:        std::move(libModule), llvm::Linker::Flags::LinkOnlyNeeded,
+call    0 never executed
+function _ZZN12_GLOBAL__N_120SerializeToHsacoPass17translateToLLVMIRERN4llvm11LLVMContextEENKUlRNS1_6ModuleERKNS1_9StringSetINS1_15MallocAllocatorEEEE0_clES5_SA_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  305:        [](llvm::Module &m, const StringSet<> &gvs) {
+function _ZZZN12_GLOBAL__N_120SerializeToHsacoPass17translateToLLVMIRERN4llvm11LLVMContextEENKUlRNS1_6ModuleERKNS1_9StringSetINS1_15MallocAllocatorEEEE0_clES5_SA_ENKUlRKNS1_11GlobalValueEE_clESE_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  306:          llvm::internalizeModule(m, [&gvs](const llvm::GlobalValue &gv) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  307:            return !gv.hasName() || (gvs.count(gv.getName()) == 0);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  308:          });
+    #####:  309:        });
+        -:  310:    // True is linker failure
+    #####:  311:    if (err) {
+branch  0 never executed
+branch  1 never executed
+    #####:  312:      getOperation().emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  313:          "Unrecoverable failure during device library linking.");
+        -:  314:      // We have no guaranties about the state of `ret`, so bail
+    #####:  315:      return nullptr;
+        -:  316:    }
+        -:  317:  }
+        -:  318:
+    #####:  319:  return ret;
+call    0 never executed
+        -:  320:}
+        -:  321:
+        -:  322:LogicalResult
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass12optimizeLlvmERN4llvm6ModuleERNS1_13TargetMachineE called 0 returned 0% blocks executed 0%
+    #####:  323:SerializeToHsacoPass::optimizeLlvm(llvm::Module &llvmModule,
+        -:  324:                                   llvm::TargetMachine &targetMachine) {
+    #####:  325:  int optLevel = this->optLevel.getValue();
+branch  0 never executed
+branch  1 never executed
+    #####:  326:  if (optLevel < 0 || optLevel > 3)
+branch  0 never executed
+branch  1 never executed
+    #####:  327:    return getOperation().emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  328:           << "Invalid HSA optimization level" << optLevel << "\n";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  329:
+    #####:  330:  targetMachine.setOptLevel(static_cast<llvm::CodeGenOpt::Level>(optLevel));
+call    0 never executed
+        -:  331:
+    #####:  332:  auto transformer =
+    #####:  333:      makeOptimizingTransformer(optLevel, /*sizeLevel=*/0, &targetMachine);
+call    0 never executed
+    #####:  334:  auto error = transformer(&llvmModule);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  335:  if (error) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  336:    InFlightDiagnostic mlirError = getOperation()->emitError();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  337:    llvm::handleAllErrors(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+function _ZZN12_GLOBAL__N_120SerializeToHsacoPass12optimizeLlvmERN4llvm6ModuleERNS1_13TargetMachineEENKUlRKNS1_13ErrorInfoBaseEE_clES8_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  338:        std::move(error), [&mlirError](const llvm::ErrorInfoBase &ei) {
+call    0 never executed
+    #####:  339:          mlirError << "Could not optimize LLVM IR: " << ei.message() << "\n";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  340:        });
+    #####:  341:    return mlirError;
+call    0 never executed
+        -:  342:  }
+    #####:  343:  return success();
+call    0 never executed
+        -:  344:}
+        -:  345:
+        -:  346:std::unique_ptr<SmallVectorImpl<char>>
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass11assembleIsaERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE called 0 returned 0% blocks executed 0%
+    #####:  347:SerializeToHsacoPass::assembleIsa(const std::string &isa) {
+    #####:  348:  auto loc = getOperation().getLoc();
+call    0 never executed
+call    1 never executed
+        -:  349:
+    #####:  350:  SmallVector<char, 0> result;
+call    0 never executed
+    #####:  351:  llvm::raw_svector_ostream os(result);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  352:
+    #####:  353:  llvm::Triple triple(llvm::Triple::normalize(this->triple));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  354:  std::string error;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  355:  const llvm::Target *target =
+call    0 never executed
+    #####:  356:      llvm::TargetRegistry::lookupTarget(triple.normalize(), error);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  357:  if (!target) {
+branch  0 never executed
+branch  1 never executed
+    #####:  358:    emitError(loc, Twine("failed to lookup target: ") + error);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  359:    return {};
+        -:  360:  }
+        -:  361:
+    #####:  362:  llvm::SourceMgr srcMgr;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  363:  srcMgr.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBuffer(isa), SMLoc());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  364:
+    #####:  365:  const llvm::MCTargetOptions mcOptions;
+call    0 never executed
+call    1 never executed
+    #####:  366:  std::unique_ptr<llvm::MCRegisterInfo> mri(
+    #####:  367:      target->createMCRegInfo(this->triple));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  368:  std::unique_ptr<llvm::MCAsmInfo> mai(
+    #####:  369:      target->createMCAsmInfo(*mri, this->triple, mcOptions));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  370:  mai->setRelaxELFRelocations(true);
+call    0 never executed
+    #####:  371:  std::unique_ptr<llvm::MCSubtargetInfo> sti(
+    #####:  372:      target->createMCSubtargetInfo(this->triple, this->chip, this->features));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  373:
+    #####:  374:  llvm::MCContext ctx(triple, mai.get(), mri.get(), sti.get(), &srcMgr,
+    #####:  375:                      &mcOptions);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  376:  std::unique_ptr<llvm::MCObjectFileInfo> mofi(target->createMCObjectFileInfo(
+    #####:  377:      ctx, /*PIC=*/false, /*LargeCodeModel=*/false));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  378:  ctx.setObjectFileInfo(mofi.get());
+call    0 never executed
+        -:  379:
+    #####:  380:  SmallString<128> cwd;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  381:  if (!llvm::sys::fs::current_path(cwd))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  382:    ctx.setCompilationDir(cwd);
+call    0 never executed
+        -:  383:
+    #####:  384:  std::unique_ptr<llvm::MCStreamer> mcStreamer;
+branch  0 never executed
+branch  1 never executed
+    #####:  385:  std::unique_ptr<llvm::MCInstrInfo> mcii(target->createMCInstrInfo());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  386:
+    #####:  387:  llvm::MCCodeEmitter *ce = target->createMCCodeEmitter(*mcii, ctx);
+branch  0 never executed
+branch  1 never executed
+    #####:  388:  llvm::MCAsmBackend *mab = target->createMCAsmBackend(*sti, *mri, mcOptions);
+branch  0 never executed
+branch  1 never executed
+    #####:  389:  mcStreamer.reset(target->createMCObjectStreamer(
+branch  0 never executed
+branch  1 never executed
+    #####:  390:      triple, ctx, std::unique_ptr<llvm::MCAsmBackend>(mab),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  391:      mab->createObjectWriter(os), std::unique_ptr<llvm::MCCodeEmitter>(ce),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  392:      *sti, mcOptions.MCRelaxAll, mcOptions.MCIncrementalLinkerCompatible,
+call    0 never executed
+        -:  393:      /*DWARFMustBeAtTheEnd*/ false));
+    #####:  394:  mcStreamer->setUseAssemblerInfoForParsing(true);
+call    0 never executed
+        -:  395:
+    #####:  396:  std::unique_ptr<llvm::MCAsmParser> parser(
+call    0 never executed
+    #####:  397:      createMCAsmParser(srcMgr, ctx, *mcStreamer, *mai));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  398:  std::unique_ptr<llvm::MCTargetAsmParser> tap(
+branch  0 never executed
+branch  1 never executed
+    #####:  399:      target->createMCAsmParser(*sti, *parser, *mcii, mcOptions));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  400:
+    #####:  401:  if (!tap) {
+branch  0 never executed
+branch  1 never executed
+    #####:  402:    emitError(loc, "assembler initialization error");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  403:    return {};
+branch  0 never executed
+branch  1 never executed
+        -:  404:  }
+        -:  405:
+    #####:  406:  parser->setTargetParser(*tap);
+call    0 never executed
+    #####:  407:  parser->Run(false);
+call    0 never executed
+        -:  408:
+    #####:  409:  return std::make_unique<SmallVector<char, 0>>(std::move(result));
+call    0 never executed
+        -:  410:}
+        -:  411:
+        -:  412:std::unique_ptr<std::vector<char>>
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass11createHsacoERKN4llvm15SmallVectorImplIcEE called 0 returned 0% blocks executed 0%
+    #####:  413:SerializeToHsacoPass::createHsaco(const SmallVectorImpl<char> &isaBinary) {
+    #####:  414:  auto loc = getOperation().getLoc();
+call    0 never executed
+call    1 never executed
+        -:  415:
+        -:  416:  // Save the ISA binary to a temp file.
+    #####:  417:  int tempIsaBinaryFd = -1;
+    #####:  418:  SmallString<128> tempIsaBinaryFilename;
+call    0 never executed
+    #####:  419:  if (llvm::sys::fs::createTemporaryFile("kernel", "o", tempIsaBinaryFd,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  420:                                         tempIsaBinaryFilename)) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  421:    emitError(loc, "temporary file for ISA binary creation error");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  422:    return {};
+branch  0 never executed
+branch  1 never executed
+        -:  423:  }
+    #####:  424:  llvm::FileRemover cleanupIsaBinary(tempIsaBinaryFilename);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  425:  llvm::raw_fd_ostream tempIsaBinaryOs(tempIsaBinaryFd, true);
+call    0 never executed
+    #####:  426:  tempIsaBinaryOs << StringRef(isaBinary.data(), isaBinary.size());
+call    0 never executed
+    #####:  427:  tempIsaBinaryOs.close();
+call    0 never executed
+        -:  428:
+        -:  429:  // Create a temp file for HSA code object.
+    #####:  430:  int tempHsacoFD = -1;
+    #####:  431:  SmallString<128> tempHsacoFilename;
+call    0 never executed
+call    1 never executed
+    #####:  432:  if (llvm::sys::fs::createTemporaryFile("kernel", "hsaco", tempHsacoFD,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  433:                                         tempHsacoFilename)) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  434:    emitError(loc, "temporary file for HSA code object creation error");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  435:    return {};
+branch  0 never executed
+branch  1 never executed
+        -:  436:  }
+    #####:  437:  llvm::FileRemover cleanupHsaco(tempHsacoFilename);
+call    0 never executed
+call    1 never executed
+        -:  438:
+    #####:  439:  std::string theRocmPath = getRocmPath();
+call    0 never executed
+call    1 never executed
+    #####:  440:  llvm::SmallString<32> lldPath(theRocmPath);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  441:  llvm::sys::path::append(lldPath, "llvm", "bin", "ld.lld");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  442:  int lldResult = llvm::sys::ExecuteAndWait(
+call    0 never executed
+        -:  443:      lldPath,
+    #####:  444:      {"ld.lld", "-shared", tempIsaBinaryFilename, "-o", tempHsacoFilename});
+call    0 never executed
+    #####:  445:  if (lldResult != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  446:    emitError(loc, "lld invocation error");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  447:    return {};
+        -:  448:  }
+        -:  449:
+        -:  450:  // Load the HSA code object.
+    #####:  451:  auto hsacoFile = openInputFile(tempHsacoFilename);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  452:  if (!hsacoFile) {
+branch  0 never executed
+branch  1 never executed
+    #####:  453:    emitError(loc, "read HSA code object from temp file error");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  454:    return {};
+branch  0 never executed
+branch  1 never executed
+        -:  455:  }
+        -:  456:
+    #####:  457:  StringRef buffer = hsacoFile->getBuffer();
+call    0 never executed
+    #####:  458:  return std::make_unique<std::vector<char>>(buffer.begin(), buffer.end());
+call    0 never executed
+        -:  459:}
+        -:  460:
+        -:  461:std::unique_ptr<std::vector<char>>
+function _ZN12_GLOBAL__N_120SerializeToHsacoPass12serializeISAERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE called 0 returned 0% blocks executed 0%
+    #####:  462:SerializeToHsacoPass::serializeISA(const std::string &isa) {
+    #####:  463:  auto isaBinary = assembleIsa(isa);
+call    0 never executed
+    #####:  464:  if (!isaBinary)
+branch  0 never executed
+branch  1 never executed
+    #####:  465:    return {};
+branch  0 never executed
+branch  1 never executed
+    #####:  466:  return createHsaco(*isaBinary);
+call    0 never executed
+        -:  467:}
+        -:  468:
+        -:  469:// Register pass to serialize GPU kernel functions to a HSACO binary annotation.
+function _ZN4mlir31registerGpuSerializeToHsacoPassEv called 116158 returned 100% blocks executed 100%
+   116158:  470:void mlir::registerGpuSerializeToHsacoPass() {
+function _ZZN4mlir31registerGpuSerializeToHsacoPassEvENKUlvE_clEv.isra.0 called 116158 returned 100% blocks executed 100%
+   116158:  471:  PassRegistration<SerializeToHsacoPass> registerSerializeToHSACO([] {
+        -:  472:    // Initialize LLVM AMDGPU backend.
+   116158:  473:    LLVMInitializeAMDGPUAsmParser();
+call    0 returned 100%
+   116158:  474:    LLVMInitializeAMDGPUAsmPrinter();
+call    0 returned 100%
+   116158:  475:    LLVMInitializeAMDGPUTarget();
+call    0 returned 100%
+   116158:  476:    LLVMInitializeAMDGPUTargetInfo();
+call    0 returned 100%
+   116158:  477:    LLVMInitializeAMDGPUTargetMC();
+call    0 returned 100%
+        -:  478:
+   116158:  479:    return std::make_unique<SerializeToHsacoPass>("amdgcn-amd-amdhsa", "", "",
+   116158:  480:                                                  2);
+call    0 returned 100%
+   116158:  481:  });
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+   116158:  482:}
+        -:  483:
+        -:  484:/// Create an instance of the GPU kernel function to HSAco binary serialization
+        -:  485:/// pass.
+function _ZN4mlir29createGpuSerializeToHsacoPassEN4llvm9StringRefES1_S1_i called 0 returned 0% blocks executed 0%
+    #####:  486:std::unique_ptr<Pass> mlir::createGpuSerializeToHsacoPass(StringRef triple,
+        -:  487:                                                          StringRef arch,
+        -:  488:                                                          StringRef features,
+        -:  489:                                                          int optLevel) {
+    #####:  490:  return std::make_unique<SerializeToHsacoPass>(triple, arch, features,
+call    0 never executed
+    #####:  491:                                                optLevel);
+        -:  492:}
+        -:  493:
+        -:  494:#else  // MLIR_GPU_TO_HSACO_PASS_ENABLE
+        -:  495:void mlir::registerGpuSerializeToHsacoPass() {}
+        -:  496:#endif // MLIR_GPU_TO_HSACO_PASS_ENABLE

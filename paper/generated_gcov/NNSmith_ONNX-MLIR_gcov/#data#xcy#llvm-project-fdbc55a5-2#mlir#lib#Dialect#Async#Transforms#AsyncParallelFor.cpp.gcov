@@ -1,0 +1,1689 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Async/Transforms/AsyncParallelFor.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Async/Transforms/CMakeFiles/obj.MLIRAsyncTransforms.dir/AsyncParallelFor.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Async/Transforms/CMakeFiles/obj.MLIRAsyncTransforms.dir/AsyncParallelFor.cpp.gcda
+        -:    0:Runs:128624
+        -:    1://===- AsyncParallelFor.cpp - Implementation of Async Parallel For --------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements scf.parallel to scf.for + async.execute conversion pass.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Async/Passes.h"
+        -:   14:
+        -:   15:#include "PassDetail.h"
+        -:   16:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   17:#include "mlir/Dialect/Async/IR/Async.h"
+        -:   18:#include "mlir/Dialect/Async/Transforms.h"
+        -:   19:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   20:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   21:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   22:#include "mlir/IR/ImplicitLocOpBuilder.h"
+        -:   23:#include "mlir/IR/Matchers.h"
+        -:   24:#include "mlir/IR/PatternMatch.h"
+        -:   25:#include "mlir/Support/LLVM.h"
+        -:   26:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   27:#include "mlir/Transforms/RegionUtils.h"
+        -:   28:#include <utility>
+        -:   29:
+        -:   30:namespace mlir {
+        -:   31:#define GEN_PASS_DEF_ASYNCPARALLELFOR
+        -:   32:#include "mlir/Dialect/Async/Passes.h.inc"
+        -:   33:} // namespace mlir
+        -:   34:
+        -:   35:using namespace mlir;
+        -:   36:using namespace mlir::async;
+        -:   37:
+        -:   38:#define DEBUG_TYPE "async-parallel-for"
+        -:   39:
+        -:   40:namespace {
+        -:   41:
+        -:   42:// Rewrite scf.parallel operation into multiple concurrent async.execute
+        -:   43:// operations over non overlapping subranges of the original loop.
+        -:   44://
+        -:   45:// Example:
+        -:   46://
+        -:   47://   scf.parallel (%i, %j) = (%lbi, %lbj) to (%ubi, %ubj) step (%si, %sj) {
+        -:   48://     "do_some_compute"(%i, %j): () -> ()
+        -:   49://   }
+        -:   50://
+        -:   51:// Converted to:
+        -:   52://
+        -:   53://   // Parallel compute function that executes the parallel body region for
+        -:   54://   // a subset of the parallel iteration space defined by the one-dimensional
+        -:   55://   // compute block index.
+        -:   56://   func parallel_compute_function(%block_index : index, %block_size : index,
+        -:   57://                                  <parallel operation properties>, ...) {
+        -:   58://     // Compute multi-dimensional loop bounds for %block_index.
+        -:   59://     %block_lbi, %block_lbj = ...
+        -:   60://     %block_ubi, %block_ubj = ...
+        -:   61://
+        -:   62://     // Clone parallel operation body into the scf.for loop nest.
+        -:   63://     scf.for %i = %blockLbi to %blockUbi {
+        -:   64://       scf.for %j = block_lbj to %block_ubj {
+        -:   65://         "do_some_compute"(%i, %j): () -> ()
+        -:   66://       }
+        -:   67://     }
+        -:   68://   }
+        -:   69://
+        -:   70:// And a dispatch function depending on the `asyncDispatch` option.
+        -:   71://
+        -:   72:// When async dispatch is on: (pseudocode)
+        -:   73://
+        -:   74://   %block_size = ... compute parallel compute block size
+        -:   75://   %block_count = ... compute the number of compute blocks
+        -:   76://
+        -:   77://   func @async_dispatch(%block_start : index, %block_end : index, ...) {
+        -:   78://     // Keep splitting block range until we reached a range of size 1.
+        -:   79://     while (%block_end - %block_start > 1) {
+        -:   80://       %mid_index = block_start + (block_end - block_start) / 2;
+        -:   81://       async.execute { call @async_dispatch(%mid_index, %block_end); }
+        -:   82://       %block_end = %mid_index
+        -:   83://     }
+        -:   84://
+        -:   85://     // Call parallel compute function for a single block.
+        -:   86://     call @parallel_compute_fn(%block_start, %block_size, ...);
+        -:   87://   }
+        -:   88://
+        -:   89://   // Launch async dispatch for [0, block_count) range.
+        -:   90://   call @async_dispatch(%c0, %block_count);
+        -:   91://
+        -:   92:// When async dispatch is off:
+        -:   93://
+        -:   94://   %block_size = ... compute parallel compute block size
+        -:   95://   %block_count = ... compute the number of compute blocks
+        -:   96://
+        -:   97://   scf.for %block_index = %c0 to %block_count {
+        -:   98://      call @parallel_compute_fn(%block_index, %block_size, ...)
+        -:   99://   }
+        -:  100://
+    #####:  101:struct AsyncParallelForPass
+call    0 never executed
+        -:  102:    : public impl::AsyncParallelForBase<AsyncParallelForPass> {
+   129232:  103:  AsyncParallelForPass() = default;
+call    0 returned 100%
+        -:  104:
+function _ZN12_GLOBAL__N_120AsyncParallelForPassC2Ebii called 0 returned 0% blocks executed 0%
+    #####:  105:  AsyncParallelForPass(bool asyncDispatch, int32_t numWorkerThreads,
+    #####:  106:                       int32_t minTaskSize) {
+call    0 never executed
+    #####:  107:    this->asyncDispatch = asyncDispatch;
+branch  0 never executed
+branch  1 never executed
+    #####:  108:    this->numWorkerThreads = numWorkerThreads;
+branch  0 never executed
+branch  1 never executed
+    #####:  109:    this->minTaskSize = minTaskSize;
+branch  0 never executed
+branch  1 never executed
+    #####:  110:  }
+        -:  111:
+        -:  112:  void runOnOperation() override;
+        -:  113:};
+        -:  114:
+        -:  115:struct AsyncParallelForRewrite : public OpRewritePattern<scf::ParallelOp> {
+        -:  116:public:
+function _ZN12_GLOBAL__N_123AsyncParallelForRewriteC2EPN4mlir11MLIRContextEbiSt8functionIFNS1_5ValueENS1_20ImplicitLocOpBuilderENS1_3scf10ParallelOpEEE called 540 returned 100% blocks executed 100%
+      540:  117:  AsyncParallelForRewrite(
+        -:  118:      MLIRContext *ctx, bool asyncDispatch, int32_t numWorkerThreads,
+        -:  119:      AsyncMinTaskSizeComputationFunction computeMinTaskSize)
+      540:  120:      : OpRewritePattern(ctx), asyncDispatch(asyncDispatch),
+        -:  121:        numWorkerThreads(numWorkerThreads),
+      540:  122:        computeMinTaskSize(std::move(computeMinTaskSize)) {}
+call    0 returned 100%
+call    1 returned 100%
+        -:  123:
+        -:  124:  LogicalResult matchAndRewrite(scf::ParallelOp op,
+        -:  125:                                PatternRewriter &rewriter) const override;
+        -:  126:
+        -:  127:private:
+        -:  128:  bool asyncDispatch;
+        -:  129:  int32_t numWorkerThreads;
+        -:  130:  AsyncMinTaskSizeComputationFunction computeMinTaskSize;
+        -:  131:};
+        -:  132:
+    #####:  133:struct ParallelComputeFunctionType {
+        -:  134:  FunctionType type;
+        -:  135:  SmallVector<Value> captures;
+        -:  136:};
+        -:  137:
+        -:  138:// Helper struct to parse parallel compute function argument list.
+        -:  139:struct ParallelComputeFunctionArgs {
+        -:  140:  BlockArgument blockIndex();
+        -:  141:  BlockArgument blockSize();
+        -:  142:  ArrayRef<BlockArgument> tripCounts();
+        -:  143:  ArrayRef<BlockArgument> lowerBounds();
+        -:  144:  ArrayRef<BlockArgument> upperBounds();
+        -:  145:  ArrayRef<BlockArgument> steps();
+        -:  146:  ArrayRef<BlockArgument> captures();
+        -:  147:
+        -:  148:  unsigned numLoops;
+        -:  149:  ArrayRef<BlockArgument> args;
+        -:  150:};
+        -:  151:
+        -:  152:struct ParallelComputeFunctionBounds {
+        -:  153:  SmallVector<IntegerAttr> tripCounts;
+        -:  154:  SmallVector<IntegerAttr> lowerBounds;
+        -:  155:  SmallVector<IntegerAttr> upperBounds;
+        -:  156:  SmallVector<IntegerAttr> steps;
+        -:  157:};
+        -:  158:
+    #####:  159:struct ParallelComputeFunction {
+        -:  160:  unsigned numLoops;
+        -:  161:  func::FuncOp func;
+        -:  162:  llvm::SmallVector<Value> captures;
+        -:  163:};
+        -:  164:
+        -:  165:} // namespace
+        -:  166:
+    #####:  167:BlockArgument ParallelComputeFunctionArgs::blockIndex() { return args[0]; }
+    #####:  168:BlockArgument ParallelComputeFunctionArgs::blockSize() { return args[1]; }
+        -:  169:
+function _ZN12_GLOBAL__N_127ParallelComputeFunctionArgs10tripCountsEv called 0 returned 0% blocks executed 0%
+    #####:  170:ArrayRef<BlockArgument> ParallelComputeFunctionArgs::tripCounts() {
+    #####:  171:  return args.drop_front(2).take_front(numLoops);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  172:}
+        -:  173:
+function _ZN12_GLOBAL__N_127ParallelComputeFunctionArgs11lowerBoundsEv called 0 returned 0% blocks executed 0%
+    #####:  174:ArrayRef<BlockArgument> ParallelComputeFunctionArgs::lowerBounds() {
+    #####:  175:  return args.drop_front(2 + 1 * numLoops).take_front(numLoops);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  176:}
+        -:  177:
+        -:  178:ArrayRef<BlockArgument> ParallelComputeFunctionArgs::upperBounds() {
+        -:  179:  return args.drop_front(2 + 2 * numLoops).take_front(numLoops);
+        -:  180:}
+        -:  181:
+function _ZN12_GLOBAL__N_127ParallelComputeFunctionArgs5stepsEv called 0 returned 0% blocks executed 0%
+    #####:  182:ArrayRef<BlockArgument> ParallelComputeFunctionArgs::steps() {
+    #####:  183:  return args.drop_front(2 + 3 * numLoops).take_front(numLoops);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  184:}
+        -:  185:
+    #####:  186:ArrayRef<BlockArgument> ParallelComputeFunctionArgs::captures() {
+    #####:  187:  return args.drop_front(2 + 4 * numLoops);
+        -:  188:}
+        -:  189:
+        -:  190:template <typename ValueRange>
+    #####:  191:static SmallVector<IntegerAttr> integerConstants(ValueRange values) {
+    #####:  192:  SmallVector<IntegerAttr> attrs(values.size());
+    #####:  193:  for (unsigned i = 0; i < values.size(); ++i)
+    #####:  194:    matchPattern(values[i], m_Constant(&attrs[i]));
+    #####:  195:  return attrs;
+        -:  196:}
+------------------
+_Z16integerConstantsIN4mlir12OperandRangeEEN4llvm11SmallVectorINS0_11IntegerAttrELj6EEET_:
+function _Z16integerConstantsIN4mlir12OperandRangeEEN4llvm11SmallVectorINS0_11IntegerAttrELj6EEET_ called 0 returned 0% blocks executed 0%
+    #####:  191:static SmallVector<IntegerAttr> integerConstants(ValueRange values) {
+    #####:  192:  SmallVector<IntegerAttr> attrs(values.size());
+call    0 never executed
+    #####:  193:  for (unsigned i = 0; i < values.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  194:    matchPattern(values[i], m_Constant(&attrs[i]));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  195:  return attrs;
+        -:  196:}
+------------------
+_Z16integerConstantsIN4llvm11SmallVectorIN4mlir5ValueELj6EEEENS1_INS2_11IntegerAttrELj6EEET_:
+function _Z16integerConstantsIN4llvm11SmallVectorIN4mlir5ValueELj6EEEENS1_INS2_11IntegerAttrELj6EEET_ called 0 returned 0% blocks executed 0%
+    #####:  191:static SmallVector<IntegerAttr> integerConstants(ValueRange values) {
+    #####:  192:  SmallVector<IntegerAttr> attrs(values.size());
+call    0 never executed
+    #####:  193:  for (unsigned i = 0; i < values.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  194:    matchPattern(values[i], m_Constant(&attrs[i]));
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  195:  return attrs;
+        -:  196:}
+------------------
+        -:  197:
+        -:  198:// Converts one-dimensional iteration index in the [0, tripCount) interval
+        -:  199:// into multidimensional iteration coordinate.
+function _ZL11delinearizeRN4mlir20ImplicitLocOpBuilderENS_5ValueEN4llvm8ArrayRefIS2_EE called 0 returned 0% blocks executed 0%
+    #####:  200:static SmallVector<Value> delinearize(ImplicitLocOpBuilder &b, Value index,
+        -:  201:                                      ArrayRef<Value> tripCounts) {
+    #####:  202:  SmallVector<Value> coords(tripCounts.size());
+call    0 never executed
+    #####:  203:  assert(!tripCounts.empty() && "tripCounts must be not empty");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  204:
+    #####:  205:  for (ssize_t i = tripCounts.size() - 1; i >= 0; --i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  206:    coords[i] = b.create<arith::RemSIOp>(index, tripCounts[i]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  207:    index = b.create<arith::DivSIOp>(index, tripCounts[i]);
+call    0 never executed
+        -:  208:  }
+        -:  209:
+    #####:  210:  return coords;
+        -:  211:}
+        -:  212:
+        -:  213:// Returns a function type and implicit captures for a parallel compute
+        -:  214:// function. We'll need a list of implicit captures to setup block and value
+        -:  215:// mapping when we'll clone the body of the parallel operation.
+        -:  216:static ParallelComputeFunctionType
+function _ZL30getParallelComputeFunctionTypeN4mlir3scf10ParallelOpERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  217:getParallelComputeFunctionType(scf::ParallelOp op, PatternRewriter &rewriter) {
+        -:  218:  // Values implicitly captured by the parallel operation.
+    #####:  219:  llvm::SetVector<Value> captures;
+call    0 never executed
+    #####:  220:  getUsedValuesDefinedAbove(op.getRegion(), op.getRegion(), captures);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  221:
+    #####:  222:  SmallVector<Type> inputs;
+call    0 never executed
+call    1 never executed
+    #####:  223:  inputs.reserve(2 + 4 * op.getNumLoops() + captures.size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  224:
+    #####:  225:  Type indexTy = rewriter.getIndexType();
+call    0 never executed
+        -:  226:
+        -:  227:  // One-dimensional iteration space defined by the block index and size.
+    #####:  228:  inputs.push_back(indexTy); // blockIndex
+call    0 never executed
+    #####:  229:  inputs.push_back(indexTy); // blockSize
+        -:  230:
+        -:  231:  // Multi-dimensional parallel iteration space defined by the loop trip counts.
+    #####:  232:  for (unsigned i = 0; i < op.getNumLoops(); ++i)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  233:    inputs.push_back(indexTy); // loop tripCount
+call    0 never executed
+        -:  234:
+        -:  235:  // Parallel operation lower bound, upper bound and step. Lower bound, upper
+        -:  236:  // bound and step passed as contiguous arguments:
+        -:  237:  //   call @compute(%lb0, %lb1, ..., %ub0, %ub1, ..., %step0, %step1, ...)
+    #####:  238:  for (unsigned i = 0; i < op.getNumLoops(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  239:    inputs.push_back(indexTy); // lower bound
+call    0 never executed
+    #####:  240:    inputs.push_back(indexTy); // upper bound
+call    0 never executed
+    #####:  241:    inputs.push_back(indexTy); // step
+call    0 never executed
+        -:  242:  }
+        -:  243:
+        -:  244:  // Types of the implicit captures.
+    #####:  245:  for (Value capture : captures)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  246:    inputs.push_back(capture.getType());
+call    0 never executed
+        -:  247:
+        -:  248:  // Convert captures to vector for later convenience.
+    #####:  249:  SmallVector<Value> capturesVector(captures.begin(), captures.end());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  250:  return {rewriter.getFunctionType(inputs, TypeRange()), capturesVector};
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  251:}
+        -:  252:
+        -:  253:// Create a parallel compute fuction from the parallel operation.
+function _ZL29createParallelComputeFunctionN4mlir3scf10ParallelOpERKN12_GLOBAL__N_129ParallelComputeFunctionBoundsEjRNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  254:static ParallelComputeFunction createParallelComputeFunction(
+        -:  255:    scf::ParallelOp op, const ParallelComputeFunctionBounds &bounds,
+        -:  256:    unsigned numBlockAlignedInnerLoops, PatternRewriter &rewriter) {
+    #####:  257:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  258:  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+call    0 never executed
+        -:  259:
+    #####:  260:  ModuleOp module = op->getParentOfType<ModuleOp>();
+call    0 never executed
+        -:  261:
+    #####:  262:  ParallelComputeFunctionType computeFuncType =
+    #####:  263:      getParallelComputeFunctionType(op, rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  264:
+    #####:  265:  FunctionType type = computeFuncType.type;
+    #####:  266:  func::FuncOp func = func::FuncOp::create(
+        -:  267:      op.getLoc(),
+    #####:  268:      numBlockAlignedInnerLoops > 0 ? "parallel_compute_fn_with_aligned_loops"
+branch  0 never executed
+branch  1 never executed
+        -:  269:                                    : "parallel_compute_fn",
+    #####:  270:      type);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  271:  func.setPrivate();
+call    0 never executed
+        -:  272:
+        -:  273:  // Insert function into the module symbol table and assign it unique name.
+    #####:  274:  SymbolTable symbolTable(module);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  275:  symbolTable.insert(func);
+call    0 never executed
+    #####:  276:  rewriter.getListener()->notifyOperationInserted(func);
+call    0 never executed
+        -:  277:
+        -:  278:  // Create function entry block.
+    #####:  279:  Block *block =
+    #####:  280:      b.createBlock(&func.getBody(), func.begin(), type.getInputs(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  281:                    SmallVector<Location>(type.getNumInputs(), op.getLoc()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  282:  b.setInsertionPointToEnd(block);
+call    0 never executed
+        -:  283:
+    #####:  284:  ParallelComputeFunctionArgs args = {op.getNumLoops(), func.getArguments()};
+call    0 never executed
+call    1 never executed
+        -:  285:
+        -:  286:  // Block iteration position defined by the block index and size.
+    #####:  287:  BlockArgument blockIndex = args.blockIndex();
+branch  0 never executed
+branch  1 never executed
+    #####:  288:  BlockArgument blockSize = args.blockSize();
+branch  0 never executed
+branch  1 never executed
+        -:  289:
+        -:  290:  // Constants used below.
+    #####:  291:  Value c0 = b.create<arith::ConstantIndexOp>(0);
+call    0 never executed
+call    1 never executed
+    #####:  292:  Value c1 = b.create<arith::ConstantIndexOp>(1);
+call    0 never executed
+call    1 never executed
+        -:  293:
+        -:  294:  // Materialize known constants as constant operation in the function body.
+function _ZZL29createParallelComputeFunctionN4mlir3scf10ParallelOpERKN12_GLOBAL__N_129ParallelComputeFunctionBoundsEjRNS_15PatternRewriterEENKUlN4llvm8ArrayRefINS_13BlockArgumentEEENS9_INS_11IntegerAttrEEEE_clESB_SD_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  295:  auto values = [&](ArrayRef<BlockArgument> args, ArrayRef<IntegerAttr> attrs) {
+    #####:  296:    return llvm::to_vector(
+function _ZZZL29createParallelComputeFunctionN4mlir3scf10ParallelOpERKN12_GLOBAL__N_129ParallelComputeFunctionBoundsEjRNS_15PatternRewriterEENKUlN4llvm8ArrayRefINS_13BlockArgumentEEENS9_INS_11IntegerAttrEEEE_clESB_SD_ENKUlT_E_clISt5tupleIJRKSA_RKSC_EEEENS_5ValueESF_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  297:        llvm::map_range(llvm::zip(args, attrs), [&](auto tuple) -> Value {
+call    0 never executed
+    #####:  298:          if (IntegerAttr attr = std::get<1>(tuple))
+branch  0 never executed
+branch  1 never executed
+    #####:  299:            return b.create<arith::ConstantOp>(attr);
+call    0 never executed
+    #####:  300:          return std::get<0>(tuple);
+    #####:  301:        }));
+    #####:  302:  };
+        -:  303:
+        -:  304:  // Multi-dimensional parallel iteration space defined by the loop trip counts.
+    #####:  305:  auto tripCounts = values(args.tripCounts(), bounds.tripCounts);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  306:
+        -:  307:  // Parallel operation lower bound and step.
+    #####:  308:  auto lowerBounds = values(args.lowerBounds(), bounds.lowerBounds);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  309:  auto steps = values(args.steps(), bounds.steps);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  310:
+        -:  311:  // Remaining arguments are implicit captures of the parallel operation.
+    #####:  312:  ArrayRef<BlockArgument> captures = args.captures();
+call    0 never executed
+        -:  313:
+        -:  314:  // Compute a product of trip counts to get the size of the flattened
+        -:  315:  // one-dimensional iteration space.
+    #####:  316:  Value tripCount = tripCounts[0];
+branch  0 never executed
+branch  1 never executed
+    #####:  317:  for (unsigned i = 1; i < tripCounts.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  318:    tripCount = b.create<arith::MulIOp>(tripCount, tripCounts[i]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  319:
+        -:  320:  // Find one-dimensional iteration bounds: [blockFirstIndex, blockLastIndex]:
+        -:  321:  //   blockFirstIndex = blockIndex * blockSize
+    #####:  322:  Value blockFirstIndex = b.create<arith::MulIOp>(blockIndex, blockSize);
+call    0 never executed
+call    1 never executed
+        -:  323:
+        -:  324:  // The last one-dimensional index in the block defined by the `blockIndex`:
+        -:  325:  //   blockLastIndex = min(blockFirstIndex + blockSize, tripCount) - 1
+    #####:  326:  Value blockEnd0 = b.create<arith::AddIOp>(blockFirstIndex, blockSize);
+call    0 never executed
+call    1 never executed
+    #####:  327:  Value blockEnd1 = b.create<arith::MinSIOp>(blockEnd0, tripCount);
+call    0 never executed
+call    1 never executed
+    #####:  328:  Value blockLastIndex = b.create<arith::SubIOp>(blockEnd1, c1);
+call    0 never executed
+call    1 never executed
+        -:  329:
+        -:  330:  // Convert one-dimensional indices to multi-dimensional coordinates.
+    #####:  331:  auto blockFirstCoord = delinearize(b, blockFirstIndex, tripCounts);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  332:  auto blockLastCoord = delinearize(b, blockLastIndex, tripCounts);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  333:
+        -:  334:  // Compute loops upper bounds derived from the block last coordinates:
+        -:  335:  //   blockEndCoord[i] = blockLastCoord[i] + 1
+        -:  336:  //
+        -:  337:  // Block first and last coordinates can be the same along the outer compute
+        -:  338:  // dimension when inner compute dimension contains multiple blocks.
+    #####:  339:  SmallVector<Value> blockEndCoord(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  340:  for (size_t i = 0; i < blockLastCoord.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  341:    blockEndCoord[i] = b.create<arith::AddIOp>(blockLastCoord[i], c1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  342:
+        -:  343:  // Construct a loop nest out of scf.for operations that will iterate over
+        -:  344:  // all coordinates in [blockFirstCoord, blockLastCoord] range.
+    #####:  345:  using LoopBodyBuilder =
+        -:  346:      std::function<void(OpBuilder &, Location, Value, ValueRange)>;
+    #####:  347:  using LoopNestBuilder = std::function<LoopBodyBuilder(size_t loopIdx)>;
+        -:  348:
+        -:  349:  // Parallel region induction variables computed from the multi-dimensional
+        -:  350:  // iteration coordinate using parallel operation bounds and step:
+        -:  351:  //
+        -:  352:  //   computeBlockInductionVars[loopIdx] =
+        -:  353:  //       lowerBound[loopIdx] + blockCoord[loopIdx] * step[loopIdx]
+    #####:  354:  SmallVector<Value> computeBlockInductionVars(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  355:
+        -:  356:  // We need to know if we are in the first or last iteration of the
+        -:  357:  // multi-dimensional loop for each loop in the nest, so we can decide what
+        -:  358:  // loop bounds should we use for the nested loops: bounds defined by compute
+        -:  359:  // block interval, or bounds defined by the parallel operation.
+        -:  360:  //
+        -:  361:  // Example: 2d parallel operation
+        -:  362:  //                   i   j
+        -:  363:  //   loop sizes:   [50, 50]
+        -:  364:  //   first coord:  [25, 25]
+        -:  365:  //   last coord:   [30, 30]
+        -:  366:  //
+        -:  367:  // If `i` is equal to 25 then iteration over `j` should start at 25, when `i`
+        -:  368:  // is between 25 and 30 it should start at 0. The upper bound for `j` should
+        -:  369:  // be 50, except when `i` is equal to 30, then it should also be 30.
+        -:  370:  //
+        -:  371:  // Value at ith position specifies if all loops in [0, i) range of the loop
+        -:  372:  // nest are in the first/last iteration.
+    #####:  373:  SmallVector<Value> isBlockFirstCoord(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  374:  SmallVector<Value> isBlockLastCoord(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  375:
+        -:  376:  // Builds inner loop nest inside async.execute operation that does all the
+        -:  377:  // work concurrently.
+function _ZZL29createParallelComputeFunctionN4mlir3scf10ParallelOpERKN12_GLOBAL__N_129ParallelComputeFunctionBoundsEjRNS_15PatternRewriterEENKUlmE0_clEm called 0 returned 0% blocks executed 0%
+    #####:  378:  LoopNestBuilder workLoopBuilder = [&](size_t loopIdx) -> LoopBodyBuilder {
+function _ZZZL29createParallelComputeFunctionN4mlir3scf10ParallelOpERKN12_GLOBAL__N_129ParallelComputeFunctionBoundsEjRNS_15PatternRewriterEENKUlmE0_clEmENKUlRNS_9OpBuilderENS_8LocationENS_5ValueENS_10ValueRangeEE_clESA_SB_SC_SD_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  379:    return [&, loopIdx](OpBuilder &nestedBuilder, Location loc, Value iv,
+    #####:  380:                        ValueRange args) {
+    #####:  381:      ImplicitLocOpBuilder b(loc, nestedBuilder);
+branch  0 never executed
+branch  1 never executed
+        -:  382:
+        -:  383:      // Compute induction variable for `loopIdx`.
+    #####:  384:      computeBlockInductionVars[loopIdx] = b.create<arith::AddIOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  385:          lowerBounds[loopIdx], b.create<arith::MulIOp>(iv, steps[loopIdx]));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+        -:  386:
+        -:  387:      // Check if we are inside first or last iteration of the loop.
+    #####:  388:      isBlockFirstCoord[loopIdx] = b.create<arith::CmpIOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  389:          arith::CmpIPredicate::eq, iv, blockFirstCoord[loopIdx]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  390:      isBlockLastCoord[loopIdx] = b.create<arith::CmpIOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  391:          arith::CmpIPredicate::eq, iv, blockLastCoord[loopIdx]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  392:
+        -:  393:      // Check if the previous loop is in its first or last iteration.
+    #####:  394:      if (loopIdx > 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  395:        isBlockFirstCoord[loopIdx] = b.create<arith::AndIOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  396:            isBlockFirstCoord[loopIdx], isBlockFirstCoord[loopIdx - 1]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  397:        isBlockLastCoord[loopIdx] = b.create<arith::AndIOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:  398:            isBlockLastCoord[loopIdx], isBlockLastCoord[loopIdx - 1]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  399:      }
+        -:  400:
+        -:  401:      // Keep building loop nest.
+    #####:  402:      if (loopIdx < op.getNumLoops() - 1) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  403:        if (loopIdx + 1 >= op.getNumLoops() - numBlockAlignedInnerLoops) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  404:          // For block aligned loops we always iterate starting from 0 up to
+        -:  405:          // the loop trip counts.
+    #####:  406:          b.create<scf::ForOp>(c0, tripCounts[loopIdx + 1], c1, ValueRange(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  407:                               workLoopBuilder(loopIdx + 1));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  408:
+        -:  409:        } else {
+        -:  410:          // Select nested loop lower/upper bounds depending on our position in
+        -:  411:          // the multi-dimensional iteration space.
+    #####:  412:          auto lb = b.create<arith::SelectOp>(isBlockFirstCoord[loopIdx],
+call    0 never executed
+    #####:  413:                                              blockFirstCoord[loopIdx + 1], c0);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  414:
+    #####:  415:          auto ub = b.create<arith::SelectOp>(isBlockLastCoord[loopIdx],
+call    0 never executed
+    #####:  416:                                              blockEndCoord[loopIdx + 1],
+branch  0 never executed
+branch  1 never executed
+    #####:  417:                                              tripCounts[loopIdx + 1]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  418:
+    #####:  419:          b.create<scf::ForOp>(lb, ub, c1, ValueRange(),
+call    0 never executed
+    #####:  420:                               workLoopBuilder(loopIdx + 1));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  421:        }
+        -:  422:
+    #####:  423:        b.create<scf::YieldOp>(loc);
+call    0 never executed
+    #####:  424:        return;
+        -:  425:      }
+        -:  426:
+        -:  427:      // Copy the body of the parallel op into the inner-most loop.
+    #####:  428:      BlockAndValueMapping mapping;
+call    0 never executed
+call    1 never executed
+    #####:  429:      mapping.map(op.getInductionVars(), computeBlockInductionVars);
+call    0 never executed
+call    1 never executed
+    #####:  430:      mapping.map(computeFuncType.captures, captures);
+call    0 never executed
+        -:  431:
+    #####:  432:      for (auto &bodyOp : op.getLoopBody().getOps())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  433:        b.clone(bodyOp, mapping);
+call    0 never executed
+    #####:  434:    };
+call    0 never executed
+    #####:  435:  };
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  436:
+    #####:  437:  b.create<scf::ForOp>(blockFirstCoord[0], blockEndCoord[0], c1, ValueRange(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+    #####:  438:                       workLoopBuilder(0));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  439:  b.create<func::ReturnOp>(ValueRange());
+call    0 never executed
+call    1 never executed
+        -:  440:
+    #####:  441:  return {op.getNumLoops(), func, std::move(computeFuncType.captures)};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  442:}
+        -:  443:
+        -:  444:// Creates recursive async dispatch function for the given parallel compute
+        -:  445:// function. Dispatch function keeps splitting block range into halves until it
+        -:  446:// reaches a single block, and then excecutes it inline.
+        -:  447://
+        -:  448:// Function pseudocode (mix of C++ and MLIR):
+        -:  449://
+        -:  450://   func @async_dispatch(%block_start : index, %block_end : index, ...) {
+        -:  451://
+        -:  452://     // Keep splitting block range until we reached a range of size 1.
+        -:  453://     while (%block_end - %block_start > 1) {
+        -:  454://       %mid_index = block_start + (block_end - block_start) / 2;
+        -:  455://       async.execute { call @async_dispatch(%mid_index, %block_end); }
+        -:  456://       %block_end = %mid_index
+        -:  457://     }
+        -:  458://
+        -:  459://     // Call parallel compute function for a single block.
+        -:  460://     call @parallel_compute_fn(%block_start, %block_size, ...);
+        -:  461://   }
+        -:  462://
+        -:  463:static func::FuncOp
+function _ZL27createAsyncDispatchFunctionRN12_GLOBAL__N_123ParallelComputeFunctionERN4mlir15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  464:createAsyncDispatchFunction(ParallelComputeFunction &computeFunc,
+        -:  465:                            PatternRewriter &rewriter) {
+    #####:  466:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  467:  Location loc = computeFunc.func.getLoc();
+call    0 never executed
+    #####:  468:  ImplicitLocOpBuilder b(loc, rewriter);
+call    0 never executed
+        -:  469:
+    #####:  470:  ModuleOp module = computeFunc.func->getParentOfType<ModuleOp>();
+call    0 never executed
+        -:  471:
+    #####:  472:  ArrayRef<Type> computeFuncInputTypes =
+    #####:  473:      computeFunc.func.getFunctionType().getInputs();
+call    0 never executed
+call    1 never executed
+        -:  474:
+        -:  475:  // Compared to the parallel compute function async dispatch function takes
+        -:  476:  // additional !async.group argument. Also instead of a single `blockIndex` it
+        -:  477:  // takes `blockStart` and `blockEnd` arguments to define the range of
+        -:  478:  // dispatched blocks.
+    #####:  479:  SmallVector<Type> inputTypes;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  480:  inputTypes.push_back(async::GroupType::get(rewriter.getContext()));
+call    0 never executed
+call    1 never executed
+    #####:  481:  inputTypes.push_back(rewriter.getIndexType()); // add blockStart argument
+call    0 never executed
+call    1 never executed
+    #####:  482:  inputTypes.append(computeFuncInputTypes.begin(), computeFuncInputTypes.end());
+call    0 never executed
+        -:  483:
+    #####:  484:  FunctionType type = rewriter.getFunctionType(inputTypes, TypeRange());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  485:  func::FuncOp func = func::FuncOp::create(loc, "async_dispatch_fn", type);
+call    0 never executed
+    #####:  486:  func.setPrivate();
+call    0 never executed
+        -:  487:
+        -:  488:  // Insert function into the module symbol table and assign it unique name.
+    #####:  489:  SymbolTable symbolTable(module);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  490:  symbolTable.insert(func);
+call    0 never executed
+    #####:  491:  rewriter.getListener()->notifyOperationInserted(func);
+call    0 never executed
+        -:  492:
+        -:  493:  // Create function entry block.
+    #####:  494:  Block *block = b.createBlock(&func.getBody(), func.begin(), type.getInputs(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  495:                               SmallVector<Location>(type.getNumInputs(), loc));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  496:  b.setInsertionPointToEnd(block);
+call    0 never executed
+        -:  497:
+    #####:  498:  Type indexTy = b.getIndexType();
+call    0 never executed
+    #####:  499:  Value c1 = b.create<arith::ConstantIndexOp>(1);
+call    0 never executed
+call    1 never executed
+    #####:  500:  Value c2 = b.create<arith::ConstantIndexOp>(2);
+call    0 never executed
+call    1 never executed
+        -:  501:
+        -:  502:  // Get the async group that will track async dispatch completion.
+    #####:  503:  Value group = block->getArgument(0);
+call    0 never executed
+        -:  504:
+        -:  505:  // Get the block iteration range: [blockStart, blockEnd)
+    #####:  506:  Value blockStart = block->getArgument(1);
+    #####:  507:  Value blockEnd = block->getArgument(2);
+        -:  508:
+        -:  509:  // Create a work splitting while loop for the [blockStart, blockEnd) range.
+    #####:  510:  SmallVector<Type> types = {indexTy, indexTy};
+call    0 never executed
+call    1 never executed
+    #####:  511:  SmallVector<Value> operands = {blockStart, blockEnd};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  512:  SmallVector<Location> locations = {loc, loc};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  513:
+        -:  514:  // Create a recursive dispatch loop.
+    #####:  515:  scf::WhileOp whileOp = b.create<scf::WhileOp>(types, operands);
+call    0 never executed
+    #####:  516:  Block *before = b.createBlock(&whileOp.getBefore(), {}, types, locations);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  517:  Block *after = b.createBlock(&whileOp.getAfter(), {}, types, locations);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  518:
+        -:  519:  // Setup dispatch loop condition block: decide if we need to go into the
+        -:  520:  // `after` block and launch one more async dispatch.
+    #####:  521:  {
+    #####:  522:    b.setInsertionPointToEnd(before);
+call    0 never executed
+    #####:  523:    Value start = before->getArgument(0);
+call    0 never executed
+    #####:  524:    Value end = before->getArgument(1);
+    #####:  525:    Value distance = b.create<arith::SubIOp>(end, start);
+call    0 never executed
+call    1 never executed
+    #####:  526:    Value dispatch =
+    #####:  527:        b.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, distance, c1);
+call    0 never executed
+call    1 never executed
+    #####:  528:    b.create<scf::ConditionOp>(dispatch, before->getArguments());
+call    0 never executed
+        -:  529:  }
+        -:  530:
+        -:  531:  // Setup the async dispatch loop body: recursively call dispatch function
+        -:  532:  // for the seconds half of the original range and go to the next iteration.
+    #####:  533:  {
+    #####:  534:    b.setInsertionPointToEnd(after);
+call    0 never executed
+    #####:  535:    Value start = after->getArgument(0);
+call    0 never executed
+    #####:  536:    Value end = after->getArgument(1);
+    #####:  537:    Value distance = b.create<arith::SubIOp>(end, start);
+call    0 never executed
+call    1 never executed
+    #####:  538:    Value halfDistance = b.create<arith::DivSIOp>(distance, c2);
+call    0 never executed
+call    1 never executed
+    #####:  539:    Value midIndex = b.create<arith::AddIOp>(start, halfDistance);
+call    0 never executed
+call    1 never executed
+        -:  540:
+        -:  541:    // Call parallel compute function inside the async.execute region.
+function _ZZL27createAsyncDispatchFunctionRN12_GLOBAL__N_123ParallelComputeFunctionERN4mlir15PatternRewriterEENKUlRNS2_9OpBuilderENS2_8LocationENS2_10ValueRangeEE_clES6_S7_S8_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  542:    auto executeBodyBuilder = [&](OpBuilder &executeBuilder,
+        -:  543:                                  Location executeLoc, ValueRange executeArgs) {
+        -:  544:      // Update the original `blockStart` and `blockEnd` with new range.
+    #####:  545:      SmallVector<Value> operands{block->getArguments().begin(),
+call    0 never executed
+    #####:  546:                                  block->getArguments().end()};
+call    0 never executed
+    #####:  547:      operands[1] = midIndex;
+branch  0 never executed
+branch  1 never executed
+    #####:  548:      operands[2] = end;
+branch  0 never executed
+branch  1 never executed
+        -:  549:
+    #####:  550:      executeBuilder.create<func::CallOp>(executeLoc, func.getSymName(),
+call    0 never executed
+    #####:  551:                                          func.getCallableResults(), operands);
+call    0 never executed
+call    1 never executed
+    #####:  552:      executeBuilder.create<async::YieldOp>(executeLoc, ValueRange());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  553:    };
+        -:  554:
+        -:  555:    // Create async.execute operation to dispatch half of the block range.
+    #####:  556:    auto execute = b.create<ExecuteOp>(TypeRange(), ValueRange(), ValueRange(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  557:                                       executeBodyBuilder);
+    #####:  558:    b.create<AddToGroupOp>(indexTy, execute.getToken(), group);
+call    0 never executed
+call    1 never executed
+    #####:  559:    b.create<scf::YieldOp>(ValueRange({start, midIndex}));
+call    0 never executed
+call    1 never executed
+        -:  560:  }
+        -:  561:
+        -:  562:  // After dispatching async operations to process the tail of the block range
+        -:  563:  // call the parallel compute function for the first block of the range.
+    #####:  564:  b.setInsertionPointAfter(whileOp);
+call    0 never executed
+        -:  565:
+        -:  566:  // Drop async dispatch specific arguments: async group, block start and end.
+    #####:  567:  auto forwardedInputs = block->getArguments().drop_front(3);
+call    0 never executed
+    #####:  568:  SmallVector<Value> computeFuncOperands = {blockStart};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  569:  computeFuncOperands.append(forwardedInputs.begin(), forwardedInputs.end());
+call    0 never executed
+        -:  570:
+    #####:  571:  b.create<func::CallOp>(computeFunc.func.getSymName(),
+call    0 never executed
+    #####:  572:                         computeFunc.func.getCallableResults(),
+call    0 never executed
+call    1 never executed
+    #####:  573:                         computeFuncOperands);
+    #####:  574:  b.create<func::ReturnOp>(ValueRange());
+call    0 never executed
+call    1 never executed
+        -:  575:
+    #####:  576:  return func;
+branch  0 never executed
+branch  1 never executed
+        -:  577:}
+        -:  578:
+        -:  579:// Launch async dispatch of the parallel compute function.
+function _ZL15doAsyncDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEE called 0 returned 0% blocks executed 0%
+    #####:  580:static void doAsyncDispatch(ImplicitLocOpBuilder &b, PatternRewriter &rewriter,
+        -:  581:                            ParallelComputeFunction &parallelComputeFunction,
+        -:  582:                            scf::ParallelOp op, Value blockSize,
+        -:  583:                            Value blockCount,
+        -:  584:                            const SmallVector<Value> &tripCounts) {
+    #####:  585:  MLIRContext *ctx = op->getContext();
+call    0 never executed
+        -:  586:
+        -:  587:  // Add one more level of indirection to dispatch parallel compute functions
+        -:  588:  // using async operations and recursive work splitting.
+    #####:  589:  func::FuncOp asyncDispatchFunction =
+    #####:  590:      createAsyncDispatchFunction(parallelComputeFunction, rewriter);
+call    0 never executed
+        -:  591:
+    #####:  592:  Value c0 = b.create<arith::ConstantIndexOp>(0);
+call    0 never executed
+call    1 never executed
+    #####:  593:  Value c1 = b.create<arith::ConstantIndexOp>(1);
+call    0 never executed
+call    1 never executed
+        -:  594:
+        -:  595:  // Appends operands shared by async dispatch and parallel compute functions to
+        -:  596:  // the given operands vector.
+function _ZZL15doAsyncDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlRSC_E_clESF_ called 0 returned 0% blocks executed 0%
+    #####:  597:  auto appendBlockComputeOperands = [&](SmallVector<Value> &operands) {
+    #####:  598:    operands.append(tripCounts);
+call    0 never executed
+    #####:  599:    operands.append(op.getLowerBound().begin(), op.getLowerBound().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  600:    operands.append(op.getUpperBound().begin(), op.getUpperBound().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  601:    operands.append(op.getStep().begin(), op.getStep().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  602:    operands.append(parallelComputeFunction.captures);
+call    0 never executed
+    #####:  603:  };
+        -:  604:
+        -:  605:  // Check if the block size is one, in this case we can skip the async dispatch
+        -:  606:  // completely. If this will be known statically, then canonicalization will
+        -:  607:  // erase async group operations.
+    #####:  608:  Value isSingleBlock =
+    #####:  609:      b.create<arith::CmpIOp>(arith::CmpIPredicate::eq, blockCount, c1);
+call    0 never executed
+call    1 never executed
+        -:  610:
+function _ZZL15doAsyncDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlRNS_9OpBuilderENS_8LocationEE0_clESG_SH_ called 0 returned 0% blocks executed 0%
+    #####:  611:  auto syncDispatch = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  612:    ImplicitLocOpBuilder b(loc, nestedBuilder);
+call    0 never executed
+        -:  613:
+        -:  614:    // Call parallel compute function for the single block.
+    #####:  615:    SmallVector<Value> operands = {c0, blockSize};
+call    0 never executed
+    #####:  616:    appendBlockComputeOperands(operands);
+call    0 never executed
+        -:  617:
+    #####:  618:    b.create<func::CallOp>(parallelComputeFunction.func.getSymName(),
+call    0 never executed
+    #####:  619:                           parallelComputeFunction.func.getCallableResults(),
+call    0 never executed
+call    1 never executed
+    #####:  620:                           operands);
+    #####:  621:    b.create<scf::YieldOp>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  622:  };
+        -:  623:
+function _ZZL15doAsyncDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlRNS_9OpBuilderENS_8LocationEE1_clESG_SH_ called 0 returned 0% blocks executed 0%
+    #####:  624:  auto asyncDispatch = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  625:    ImplicitLocOpBuilder b(loc, nestedBuilder);
+call    0 never executed
+        -:  626:
+        -:  627:    // Create an async.group to wait on all async tokens from the concurrent
+        -:  628:    // execution of multiple parallel compute function. First block will be
+        -:  629:    // executed synchronously in the caller thread.
+    #####:  630:    Value groupSize = b.create<arith::SubIOp>(blockCount, c1);
+call    0 never executed
+call    1 never executed
+    #####:  631:    Value group = b.create<CreateGroupOp>(GroupType::get(ctx), groupSize);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  632:
+        -:  633:    // Launch async dispatch function for [0, blockCount) range.
+    #####:  634:    SmallVector<Value> operands = {group, c0, blockCount, blockSize};
+call    0 never executed
+    #####:  635:    appendBlockComputeOperands(operands);
+call    0 never executed
+        -:  636:
+    #####:  637:    b.create<func::CallOp>(asyncDispatchFunction.getSymName(),
+call    0 never executed
+call    1 never executed
+    #####:  638:                           asyncDispatchFunction.getCallableResults(),
+call    0 never executed
+    #####:  639:                           operands);
+        -:  640:
+        -:  641:    // Wait for the completion of all parallel compute operations.
+    #####:  642:    b.create<AwaitAllOp>(group);
+call    0 never executed
+        -:  643:
+    #####:  644:    b.create<scf::YieldOp>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  645:  };
+        -:  646:
+        -:  647:  // Dispatch either single block compute function, or launch async dispatch.
+    #####:  648:  b.create<scf::IfOp>(TypeRange(), isSingleBlock, syncDispatch, asyncDispatch);
+call    0 never executed
+call    1 never executed
+    #####:  649:}
+        -:  650:
+        -:  651:// Dispatch parallel compute functions by submitting all async compute tasks
+        -:  652:// from a simple for loop in the caller thread.
+        -:  653:static void
+function _ZL20doSequentialDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEE called 0 returned 0% blocks executed 0%
+    #####:  654:doSequentialDispatch(ImplicitLocOpBuilder &b, PatternRewriter &rewriter,
+        -:  655:                     ParallelComputeFunction &parallelComputeFunction,
+        -:  656:                     scf::ParallelOp op, Value blockSize, Value blockCount,
+        -:  657:                     const SmallVector<Value> &tripCounts) {
+    #####:  658:  MLIRContext *ctx = op->getContext();
+call    0 never executed
+        -:  659:
+    #####:  660:  func::FuncOp compute = parallelComputeFunction.func;
+        -:  661:
+    #####:  662:  Value c0 = b.create<arith::ConstantIndexOp>(0);
+call    0 never executed
+call    1 never executed
+    #####:  663:  Value c1 = b.create<arith::ConstantIndexOp>(1);
+call    0 never executed
+call    1 never executed
+        -:  664:
+        -:  665:  // Create an async.group to wait on all async tokens from the concurrent
+        -:  666:  // execution of multiple parallel compute function. First block will be
+        -:  667:  // executed synchronously in the caller thread.
+    #####:  668:  Value groupSize = b.create<arith::SubIOp>(blockCount, c1);
+call    0 never executed
+call    1 never executed
+    #####:  669:  Value group = b.create<CreateGroupOp>(GroupType::get(ctx), groupSize);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  670:
+        -:  671:  // Call parallel compute function for all blocks.
+    #####:  672:  using LoopBodyBuilder =
+        -:  673:      std::function<void(OpBuilder &, Location, Value, ValueRange)>;
+        -:  674:
+        -:  675:  // Returns parallel compute function operands to process the given block.
+function _ZZL20doSequentialDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlS9_E_clES9_ called 0 returned 0% blocks executed 0%
+    #####:  676:  auto computeFuncOperands = [&](Value blockIndex) -> SmallVector<Value> {
+    #####:  677:    SmallVector<Value> computeFuncOperands = {blockIndex, blockSize};
+call    0 never executed
+    #####:  678:    computeFuncOperands.append(tripCounts);
+call    0 never executed
+    #####:  679:    computeFuncOperands.append(op.getLowerBound().begin(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  680:                               op.getLowerBound().end());
+call    0 never executed
+    #####:  681:    computeFuncOperands.append(op.getUpperBound().begin(),
+call    0 never executed
+call    1 never executed
+    #####:  682:                               op.getUpperBound().end());
+call    0 never executed
+    #####:  683:    computeFuncOperands.append(op.getStep().begin(), op.getStep().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  684:    computeFuncOperands.append(parallelComputeFunction.captures);
+call    0 never executed
+    #####:  685:    return computeFuncOperands;
+    #####:  686:  };
+        -:  687:
+        -:  688:  // Induction variable is the index of the block: [0, blockCount).
+function _ZZL20doSequentialDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlRNS_9OpBuilderENS_8LocationES9_NS_10ValueRangeEE0_clESG_SH_S9_SI_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  689:  LoopBodyBuilder loopBuilder = [&](OpBuilder &loopBuilder, Location loc,
+        -:  690:                                    Value iv, ValueRange args) {
+    #####:  691:    ImplicitLocOpBuilder b(loc, loopBuilder);
+call    0 never executed
+        -:  692:
+        -:  693:    // Call parallel compute function inside the async.execute region.
+function _ZZZL20doSequentialDispatchRN4mlir20ImplicitLocOpBuilderERNS_15PatternRewriterERN12_GLOBAL__N_123ParallelComputeFunctionENS_3scf10ParallelOpENS_5ValueES9_RKN4llvm11SmallVectorIS9_Lj6EEEENKUlRNS_9OpBuilderENS_8LocationES9_NS_10ValueRangeEE0_clESG_SH_S9_SI_ENKUlSG_SH_SI_E_clESG_SH_SI_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  694:    auto executeBodyBuilder = [&](OpBuilder &executeBuilder,
+        -:  695:                                  Location executeLoc, ValueRange executeArgs) {
+    #####:  696:      executeBuilder.create<func::CallOp>(executeLoc, compute.getSymName(),
+call    0 never executed
+    #####:  697:                                          compute.getCallableResults(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  698:                                          computeFuncOperands(iv));
+call    0 never executed
+call    1 never executed
+    #####:  699:      executeBuilder.create<async::YieldOp>(executeLoc, ValueRange());
+call    0 never executed
+call    1 never executed
+    #####:  700:    };
+        -:  701:
+        -:  702:    // Create async.execute operation to launch parallel computate function.
+    #####:  703:    auto execute = b.create<ExecuteOp>(TypeRange(), ValueRange(), ValueRange(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  704:                                       executeBodyBuilder);
+    #####:  705:    b.create<AddToGroupOp>(rewriter.getIndexType(), execute.getToken(), group);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  706:    b.create<scf::YieldOp>();
+call    0 never executed
+    #####:  707:  };
+call    0 never executed
+        -:  708:
+        -:  709:  // Iterate over all compute blocks and launch parallel compute operations.
+    #####:  710:  b.create<scf::ForOp>(c1, blockCount, c1, ValueRange(), loopBuilder);
+call    0 never executed
+call    1 never executed
+        -:  711:
+        -:  712:  // Call parallel compute function for the first block in the caller thread.
+    #####:  713:  b.create<func::CallOp>(compute.getSymName(), compute.getCallableResults(),
+call    0 never executed
+call    1 never executed
+    #####:  714:                         computeFuncOperands(c0));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  715:
+        -:  716:  // Wait for the completion of all async compute operations.
+    #####:  717:  b.create<AwaitAllOp>(group);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  718:}
+        -:  719:
+        -:  720:LogicalResult
+function _ZNK12_GLOBAL__N_123AsyncParallelForRewrite15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  721:AsyncParallelForRewrite::matchAndRewrite(scf::ParallelOp op,
+        -:  722:                                         PatternRewriter &rewriter) const {
+        -:  723:  // We do not currently support rewrite for parallel op with reductions.
+    #####:  724:  if (op.getNumReductions() != 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  725:    return failure();
+        -:  726:
+    #####:  727:  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+branch  0 never executed
+branch  1 never executed
+        -:  728:
+        -:  729:  // Computing minTaskSize emits IR and can be implemented as executing a cost
+        -:  730:  // model on the body of the scf.parallel. Thus it needs to be computed before
+        -:  731:  // the body of the scf.parallel has been manipulated.
+    #####:  732:  Value minTaskSize = computeMinTaskSize(b, op);
+branch  0 never executed
+branch  1 never executed
+        -:  733:
+        -:  734:  // Make sure that all constants will be inside the parallel operation body to
+        -:  735:  // reduce the number of parallel compute function arguments.
+    #####:  736:  cloneConstantsIntoTheRegion(op.getLoopBody(), rewriter);
+call    0 never executed
+call    1 never executed
+        -:  737:
+        -:  738:  // Compute trip count for each loop induction variable:
+        -:  739:  //   tripCount = ceil_div(upperBound - lowerBound, step);
+    #####:  740:  SmallVector<Value> tripCounts(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+    #####:  741:  for (size_t i = 0; i < op.getNumLoops(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  742:    auto lb = op.getLowerBound()[i];
+call    0 never executed
+call    1 never executed
+    #####:  743:    auto ub = op.getUpperBound()[i];
+call    0 never executed
+call    1 never executed
+    #####:  744:    auto step = op.getStep()[i];
+call    0 never executed
+call    1 never executed
+    #####:  745:    auto range = b.createOrFold<arith::SubIOp>(ub, lb);
+call    0 never executed
+    #####:  746:    tripCounts[i] = b.createOrFold<arith::CeilDivSIOp>(range, step);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  747:  }
+        -:  748:
+        -:  749:  // Compute a product of trip counts to get the 1-dimensional iteration space
+        -:  750:  // for the scf.parallel operation.
+    #####:  751:  Value tripCount = tripCounts[0];
+branch  0 never executed
+branch  1 never executed
+    #####:  752:  for (size_t i = 1; i < tripCounts.size(); ++i)
+branch  0 never executed
+branch  1 never executed
+    #####:  753:    tripCount = b.create<arith::MulIOp>(tripCount, tripCounts[i]);
+call    0 never executed
+        -:  754:
+        -:  755:  // Short circuit no-op parallel loops (zero iterations) that can arise from
+        -:  756:  // the memrefs with dynamic dimension(s) equal to zero.
+    #####:  757:  Value c0 = b.create<arith::ConstantIndexOp>(0);
+call    0 never executed
+call    1 never executed
+    #####:  758:  Value isZeroIterations =
+    #####:  759:      b.create<arith::CmpIOp>(arith::CmpIPredicate::eq, tripCount, c0);
+call    0 never executed
+call    1 never executed
+        -:  760:
+        -:  761:  // Do absolutely nothing if the trip count is zero.
+    #####:  762:  auto noOp = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  763:    nestedBuilder.create<scf::YieldOp>(loc);
+call    0 never executed
+        -:  764:  };
+        -:  765:
+        -:  766:  // Compute the parallel block size and dispatch concurrent tasks computing
+        -:  767:  // results for each block.
+function _ZZNK12_GLOBAL__N_123AsyncParallelForRewrite15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterEENKUlRNS1_9OpBuilderENS1_8LocationEE0_clES7_S8_ called 0 returned 0% blocks executed 0%
+    #####:  768:  auto dispatch = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  769:    ImplicitLocOpBuilder b(loc, nestedBuilder);
+branch  0 never executed
+branch  1 never executed
+        -:  770:
+        -:  771:    // Collect statically known constants defining the loop nest in the parallel
+        -:  772:    // compute function. LLVM can't always push constants across the non-trivial
+        -:  773:    // async dispatch call graph, by providing these values explicitly we can
+        -:  774:    // choose to build more efficient loop nest, and rely on a better constant
+        -:  775:    // folding, loop unrolling and vectorization.
+    #####:  776:    ParallelComputeFunctionBounds staticBounds = {
+    #####:  777:        integerConstants(tripCounts),
+branch  0 never executed
+branch  1 never executed
+    #####:  778:        integerConstants(op.getLowerBound()),
+        -:  779:        integerConstants(op.getUpperBound()),
+        -:  780:        integerConstants(op.getStep()),
+    #####:  781:    };
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  782:
+        -:  783:    // Find how many inner iteration dimensions are statically known, and their
+        -:  784:    // product is smaller than the `512`. We align the parallel compute block
+        -:  785:    // size by the product of statically known dimensions, so that we can
+        -:  786:    // guarantee that the inner loops executes from 0 to the loop trip counts
+        -:  787:    // and we can elide dynamic loop boundaries, and give LLVM an opportunity to
+        -:  788:    // unroll the loops. The constant `512` is arbitrary, it should depend on
+        -:  789:    // how many iterations LLVM will typically decide to unroll.
+    #####:  790:    static constexpr int64_t maxUnrollableIterations = 512;
+        -:  791:
+        -:  792:    // The number of inner loops with statically known number of iterations less
+        -:  793:    // than the `maxUnrollableIterations` value.
+    #####:  794:    int numUnrollableLoops = 0;
+        -:  795:
+    #####:  796:    auto getInt = [](IntegerAttr attr) { return attr ? attr.getInt() : 0; };
+call    0 never executed
+call    1 never executed
+        -:  797:
+    #####:  798:    SmallVector<int64_t> numIterations(op.getNumLoops());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  799:    numIterations.back() = getInt(staticBounds.tripCounts.back());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  800:
+    #####:  801:    for (int i = op.getNumLoops() - 2; i >= 0; --i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  802:      int64_t tripCount = getInt(staticBounds.tripCounts[i]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  803:      int64_t innerIterations = numIterations[i + 1];
+branch  0 never executed
+branch  1 never executed
+    #####:  804:      numIterations[i] = tripCount * innerIterations;
+branch  0 never executed
+branch  1 never executed
+        -:  805:
+        -:  806:      // Update the number of inner loops that we can potentially unroll.
+    #####:  807:      if (innerIterations > 0 && innerIterations <= maxUnrollableIterations)
+branch  0 never executed
+branch  1 never executed
+    #####:  808:        numUnrollableLoops++;
+        -:  809:    }
+        -:  810:
+    #####:  811:    Value numWorkerThreadsVal;
+    #####:  812:    if (numWorkerThreads >= 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  813:      numWorkerThreadsVal = b.create<arith::ConstantIndexOp>(numWorkerThreads);
+call    0 never executed
+        -:  814:    else
+    #####:  815:      numWorkerThreadsVal = b.create<async::RuntimeNumWorkerThreadsOp>();
+call    0 never executed
+        -:  816:
+        -:  817:    // With large number of threads the value of creating many compute blocks
+        -:  818:    // is reduced because the problem typically becomes memory bound. For this
+        -:  819:    // reason we scale the number of workers using an equivalent to the
+        -:  820:    // following logic:
+        -:  821:    //   float overshardingFactor = numWorkerThreads <= 4    ? 8.0
+        -:  822:    //                              : numWorkerThreads <= 8  ? 4.0
+        -:  823:    //                              : numWorkerThreads <= 16 ? 2.0
+        -:  824:    //                              : numWorkerThreads <= 32 ? 1.0
+        -:  825:    //                              : numWorkerThreads <= 64 ? 0.8
+        -:  826:    //                                                       : 0.6;
+        -:  827:
+        -:  828:    // Pairs of non-inclusive lower end of the bracket and factor that the
+        -:  829:    // number of workers needs to be scaled with if it falls in that bucket.
+    #####:  830:    const SmallVector<std::pair<int, float>> overshardingBrackets = {
+    #####:  831:        {4, 4.0f}, {8, 2.0f}, {16, 1.0f}, {32, 0.8f}, {64, 0.6f}};
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  832:    const float initialOvershardingFactor = 8.0f;
+        -:  833:
+    #####:  834:    Value scalingFactor = b.create<arith::ConstantFloatOp>(
+call    0 never executed
+    #####:  835:        llvm::APFloat(initialOvershardingFactor), b.getF32Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  836:    for (const std::pair<int, float> &p : overshardingBrackets) {
+branch  0 never executed
+branch  1 never executed
+    #####:  837:      Value bracketBegin = b.create<arith::ConstantIndexOp>(p.first);
+call    0 never executed
+call    1 never executed
+    #####:  838:      Value inBracket = b.create<arith::CmpIOp>(
+    #####:  839:          arith::CmpIPredicate::sgt, numWorkerThreadsVal, bracketBegin);
+call    0 never executed
+call    1 never executed
+    #####:  840:      Value bracketScalingFactor = b.create<arith::ConstantFloatOp>(
+call    0 never executed
+    #####:  841:          llvm::APFloat(p.second), b.getF32Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  842:      scalingFactor = b.create<arith::SelectOp>(inBracket, bracketScalingFactor,
+call    0 never executed
+    #####:  843:                                                scalingFactor);
+        -:  844:    }
+    #####:  845:    Value numWorkersIndex =
+    #####:  846:        b.create<arith::IndexCastOp>(b.getI32Type(), numWorkerThreadsVal);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  847:    Value numWorkersFloat =
+    #####:  848:        b.create<arith::SIToFPOp>(b.getF32Type(), numWorkersIndex);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  849:    Value scaledNumWorkers =
+call    0 never executed
+    #####:  850:        b.create<arith::MulFOp>(scalingFactor, numWorkersFloat);
+call    0 never executed
+    #####:  851:    Value scaledNumInt =
+    #####:  852:        b.create<arith::FPToSIOp>(b.getI32Type(), scaledNumWorkers);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  853:    Value scaledWorkers =
+    #####:  854:        b.create<arith::IndexCastOp>(b.getIndexType(), scaledNumInt);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  855:
+    #####:  856:    Value maxComputeBlocks = b.create<arith::MaxSIOp>(
+    #####:  857:        b.create<arith::ConstantIndexOp>(1), scaledWorkers);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  858:
+        -:  859:    // Compute parallel block size from the parallel problem size:
+        -:  860:    //   blockSize = min(tripCount,
+        -:  861:    //                   max(ceil_div(tripCount, maxComputeBlocks),
+        -:  862:    //                       minTaskSize))
+    #####:  863:    Value bs0 = b.create<arith::CeilDivSIOp>(tripCount, maxComputeBlocks);
+call    0 never executed
+call    1 never executed
+    #####:  864:    Value bs1 = b.create<arith::MaxSIOp>(bs0, minTaskSize);
+call    0 never executed
+call    1 never executed
+    #####:  865:    Value blockSize = b.create<arith::MinSIOp>(tripCount, bs1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  866:
+        -:  867:    // Dispatch parallel compute function using async recursive work splitting,
+        -:  868:    // or by submitting compute task sequentially from a caller thread.
+    #####:  869:    auto doDispatch = asyncDispatch ? doAsyncDispatch : doSequentialDispatch;
+branch  0 never executed
+branch  1 never executed
+        -:  870:
+        -:  871:    // Create a parallel compute function that takes a block id and computes
+        -:  872:    // the parallel operation body for a subset of iteration space.
+        -:  873:
+        -:  874:    // Compute the number of parallel compute blocks.
+    #####:  875:    Value blockCount = b.create<arith::CeilDivSIOp>(tripCount, blockSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  876:
+        -:  877:    // Dispatch parallel compute function without hints to unroll inner loops.
+function _ZZZNK12_GLOBAL__N_123AsyncParallelForRewrite15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterEENKUlRNS1_9OpBuilderENS1_8LocationEE0_clES7_S8_ENKUlS7_S8_E0_clES7_S8_ called 0 returned 0% blocks executed 0%
+    #####:  878:    auto dispatchDefault = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  879:      ParallelComputeFunction compute =
+    #####:  880:          createParallelComputeFunction(op, staticBounds, 0, rewriter);
+call    0 never executed
+        -:  881:
+    #####:  882:      ImplicitLocOpBuilder b(loc, nestedBuilder);
+call    0 never executed
+    #####:  883:      doDispatch(b, rewriter, compute, op, blockSize, blockCount, tripCounts);
+call    0 never executed
+    #####:  884:      b.create<scf::YieldOp>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  885:    };
+        -:  886:
+        -:  887:    // Dispatch parallel compute function with hints for unrolling inner loops.
+function _ZZZNK12_GLOBAL__N_123AsyncParallelForRewrite15matchAndRewriteEN4mlir3scf10ParallelOpERNS1_15PatternRewriterEENKUlRNS1_9OpBuilderENS1_8LocationEE0_clES7_S8_ENKUlS7_S8_E1_clES7_S8_ called 0 returned 0% blocks executed 0%
+    #####:  888:    auto dispatchBlockAligned = [&](OpBuilder &nestedBuilder, Location loc) {
+    #####:  889:      ParallelComputeFunction compute = createParallelComputeFunction(
+    #####:  890:          op, staticBounds, numUnrollableLoops, rewriter);
+call    0 never executed
+        -:  891:
+    #####:  892:      ImplicitLocOpBuilder b(loc, nestedBuilder);
+call    0 never executed
+        -:  893:      // Align the block size to be a multiple of the statically known
+        -:  894:      // number of iterations in the inner loops.
+    #####:  895:      Value numIters = b.create<arith::ConstantIndexOp>(
+    #####:  896:          numIterations[op.getNumLoops() - numUnrollableLoops]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  897:      Value alignedBlockSize = b.create<arith::MulIOp>(
+    #####:  898:          b.create<arith::CeilDivSIOp>(blockSize, numIters), numIters);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  899:      doDispatch(b, rewriter, compute, op, alignedBlockSize, blockCount,
+    #####:  900:                 tripCounts);
+call    0 never executed
+    #####:  901:      b.create<scf::YieldOp>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  902:    };
+        -:  903:
+        -:  904:    // Dispatch to block aligned compute function only if the computed block
+        -:  905:    // size is larger than the number of iterations in the unrollable inner
+        -:  906:    // loops, because otherwise it can reduce the available parallelism.
+    #####:  907:    if (numUnrollableLoops > 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  908:      Value numIters = b.create<arith::ConstantIndexOp>(
+call    0 never executed
+    #####:  909:          numIterations[op.getNumLoops() - numUnrollableLoops]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  910:      Value useBlockAlignedComputeFn = b.create<arith::CmpIOp>(
+    #####:  911:          arith::CmpIPredicate::sge, blockSize, numIters);
+call    0 never executed
+call    1 never executed
+        -:  912:
+    #####:  913:      b.create<scf::IfOp>(TypeRange(), useBlockAlignedComputeFn,
+call    0 never executed
+call    1 never executed
+    #####:  914:                          dispatchBlockAligned, dispatchDefault);
+    #####:  915:      b.create<scf::YieldOp>();
+call    0 never executed
+        -:  916:    } else {
+    #####:  917:      dispatchDefault(b, loc);
+call    0 never executed
+        -:  918:    }
+    #####:  919:  };
+        -:  920:
+        -:  921:  // Replace the `scf.parallel` operation with the parallel compute function.
+    #####:  922:  b.create<scf::IfOp>(TypeRange(), isZeroIterations, noOp, dispatch);
+call    0 never executed
+call    1 never executed
+        -:  923:
+        -:  924:  // Parallel operation was replaced with a block iteration loop.
+    #####:  925:  rewriter.eraseOp(op);
+call    0 never executed
+        -:  926:
+    #####:  927:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  928:}
+        -:  929:
+function _ZN12_GLOBAL__N_120AsyncParallelForPass14runOnOperationEv called 540 returned 100% blocks executed 92%
+      540:  930:void AsyncParallelForPass::runOnOperation() {
+      540:  931:  MLIRContext *ctx = &getContext();
+call    0 returned 100%
+        -:  932:
+      540:  933:  RewritePatternSet patterns(ctx);
+call    0 returned 100%
+      540:  934:  populateAsyncParallelForPatterns(
+call    0 returned 100%
+        -:  935:      patterns, asyncDispatch, numWorkerThreads,
+    #####:  936:      [&](ImplicitLocOpBuilder builder, scf::ParallelOp op) {
+    #####:  937:        return builder.create<arith::ConstantIndexOp>(minTaskSize);
+call    0 never executed
+      540:  938:      });
+      540:  939:  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+    #####:  940:    signalPassFailure();
+call    0 never executed
+      540:  941:}
+        -:  942:
+function _ZN4mlir26createAsyncParallelForPassEv called 129232 returned 100% blocks executed 100%
+   129232:  943:std::unique_ptr<Pass> mlir::createAsyncParallelForPass() {
+   129232:  944:  return std::make_unique<AsyncParallelForPass>();
+call    0 returned 100%
+        -:  945:}
+        -:  946:
+function _ZN4mlir26createAsyncParallelForPassEbii called 0 returned 0% blocks executed 0%
+    #####:  947:std::unique_ptr<Pass> mlir::createAsyncParallelForPass(bool asyncDispatch,
+        -:  948:                                                       int32_t numWorkerThreads,
+        -:  949:                                                       int32_t minTaskSize) {
+    #####:  950:  return std::make_unique<AsyncParallelForPass>(asyncDispatch, numWorkerThreads,
+call    0 never executed
+    #####:  951:                                                minTaskSize);
+        -:  952:}
+        -:  953:
+function _ZN4mlir5async32populateAsyncParallelForPatternsERNS_17RewritePatternSetEbiRKSt8functionIFNS_5ValueENS_20ImplicitLocOpBuilderENS_3scf10ParallelOpEEE called 0 returned 0% blocks executed 0%
+     540*:  954:void mlir::async::populateAsyncParallelForPatterns(
+        -:  955:    RewritePatternSet &patterns, bool asyncDispatch, int32_t numWorkerThreads,
+        -:  956:    const AsyncMinTaskSizeComputationFunction &computeMinTaskSize) {
+     540*:  957:  MLIRContext *ctx = patterns.getContext();
+call    0 never executed
+call    1 returned 100%
+     540*:  958:  patterns.add<AsyncParallelForRewrite>(ctx, asyncDispatch, numWorkerThreads,
+     540*:  959:                                        computeMinTaskSize);
+call    0 never executed
+call    1 returned 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+    #####:  960:}

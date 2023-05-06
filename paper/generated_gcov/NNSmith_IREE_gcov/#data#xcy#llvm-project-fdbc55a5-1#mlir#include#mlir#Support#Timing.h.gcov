@@ -1,0 +1,462 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/Support/Timing.h
+        -:    0:Graph:../tools/mlir/lib/Tools/mlir-opt/CMakeFiles/obj.MLIROptLib.dir/MlirOptMain.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Tools/mlir-opt/CMakeFiles/obj.MLIROptLib.dir/MlirOptMain.cpp.gcda
+        -:    0:Runs:325564
+        -:    1://===- Timing.h - Execution time measurement facilities ---------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// Facilities to measure and provide statistics on execution time.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef MLIR_SUPPORT_TIMING_H
+        -:   14:#define MLIR_SUPPORT_TIMING_H
+        -:   15:
+        -:   16:#include "mlir/Support/LLVM.h"
+        -:   17:#include "llvm/ADT/STLExtras.h"
+        -:   18:#include "llvm/ADT/StringMapEntry.h"
+        -:   19:#include "llvm/Support/raw_ostream.h"
+        -:   20:
+        -:   21:namespace mlir {
+        -:   22:
+        -:   23:class Timer;
+        -:   24:class TimingManager;
+        -:   25:class TimingScope;
+        -:   26:class DefaultTimingManager;
+        -:   27:namespace detail {
+        -:   28:class TimingManagerImpl;
+        -:   29:class DefaultTimingManagerImpl;
+        -:   30:} // namespace detail
+        -:   31:
+        -:   32://===----------------------------------------------------------------------===//
+        -:   33:// TimingIdentifier
+        -:   34://===----------------------------------------------------------------------===//
+        -:   35:
+        -:   36:/// This class represesents a uniqued string owned by a `TimingManager`. Most
+        -:   37:/// importantly, instances of this class provide a stable opaque pointer that
+        -:   38:/// is guaranteed to be reproduced by later interning of the same string. The
+        -:   39:/// `TimingManager` uses this mechanism to provide timers with an opaque id
+        -:   40:/// even when the user of the API merely provided a string as identification
+        -:   41:/// (instead of a pass for example).
+        -:   42:///
+        -:   43:/// This is a POD type with pointer size, so it should be passed around by
+        -:   44:/// value. The underlying data is owned by the `TimingManager`.
+        -:   45:class TimingIdentifier {
+        -:   46:  using EntryType = llvm::StringMapEntry<llvm::NoneType>;
+        -:   47:
+        -:   48:public:
+        -:   49:  TimingIdentifier(const TimingIdentifier &) = default;
+        -:   50:  TimingIdentifier &operator=(const TimingIdentifier &other) = default;
+        -:   51:
+        -:   52:  /// Return an identifier for the specified string.
+        -:   53:  static TimingIdentifier get(StringRef str, TimingManager &tm);
+        -:   54:
+        -:   55:  /// Return a `StringRef` for the string.
+     2466:   56:  StringRef strref() const { return entry->first(); }
+        -:   57:
+        -:   58:  /// Return an `std::string`.
+     2466:   59:  std::string str() const { return strref().str(); }
+        -:   60:
+        -:   61:  /// Return the opaque pointer that corresponds to this identifier.
+     2466:   62:  const void *getAsOpaquePointer() const {
+     2466:   63:    return static_cast<const void *>(entry);
+        -:   64:  }
+        -:   65:
+        -:   66:private:
+        -:   67:  const EntryType *entry;
+        -:   68:  explicit TimingIdentifier(const EntryType *entry) : entry(entry) {}
+        -:   69:};
+        -:   70:
+        -:   71://===----------------------------------------------------------------------===//
+        -:   72:// TimingManager
+        -:   73://===----------------------------------------------------------------------===//
+        -:   74:
+        -:   75:/// This class represents facilities to measure execution time.
+        -:   76:///
+        -:   77:/// Libraries and infrastructure code operate on opque `Timer` handles returned
+        -:   78:/// by various functions of this manager. Timers are started and stopped to
+        -:   79:/// demarcate regions in the code where execution time is of interest, and they
+        -:   80:/// can be nested to provide more detailed timing resolution. Calls to the timer
+        -:   81:/// start, stop, and nesting functions must be balanced. To facilitate this,
+        -:   82:/// users are encouraged to leverage the `TimingScope` RAII-style wrapper around
+        -:   83:/// `Timer`s.
+        -:   84:///
+        -:   85:/// Users can provide their own implementation of `TimingManager`, or use the
+        -:   86:/// default `DefaultTimingManager` implementation in MLIR. Implementations
+        -:   87:/// override the various protected virtual functions to create, nest, start, and
+        -:   88:/// stop timers. A common pattern is for subclasses to provide a custom timer
+        -:   89:/// class and simply pass pointers to instances of this class around as the
+        -:   90:/// opaque timer handle. The manager itself can then forward callbacks to the
+        -:   91:/// this class. Alternatively, external timing libraries may return their own
+        -:   92:/// opaque handles for timing scopes.
+        -:   93:///
+        -:   94:/// For example:
+        -:   95:/// ```
+        -:   96:/// void doWork(TimingManager &tm) {
+        -:   97:///   auto root = tm.getRootScope();
+        -:   98:///
+        -:   99:///   {
+        -:  100:///     auto scope = root.nest("First");
+        -:  101:///     doSomeWork();
+        -:  102:///     // <-- "First" timer stops here
+        -:  103:///   }
+        -:  104:///
+        -:  105:///   auto scope = root.nest("Second");
+        -:  106:///   doEvenMoreWork();
+        -:  107:///   scope.stop(); // <-- "Second" timer stops here
+        -:  108:///
+        -:  109:///   // <-- Root timer stops here
+        -:  110:/// }
+        -:  111:/// ```
+        -:  112:class TimingManager {
+        -:  113:public:
+        -:  114:  explicit TimingManager();
+        -:  115:  virtual ~TimingManager();
+        -:  116:
+        -:  117:  /// Get the root timer of this timing manager. The returned timer must be
+        -:  118:  /// started and stopped manually. Execution time can be measured by nesting
+        -:  119:  /// timers within this root timer and starting/stopping them as appropriate.
+        -:  120:  /// Use this function only if you need access to the timer itself. Otherwise
+        -:  121:  /// consider the more convenient `getRootScope()` which offers an RAII-style
+        -:  122:  /// wrapper around the timer.
+        -:  123:  Timer getRootTimer();
+        -:  124:
+        -:  125:  /// Get the root timer of this timing manager wrapped in a `TimingScope` for
+        -:  126:  /// convenience. Automatically starts the timer and stops it as soon as the
+        -:  127:  /// `TimingScope` is destroyed, e.g. when it goes out of scope.
+        -:  128:  TimingScope getRootScope();
+        -:  129:
+        -:  130:protected:
+        -:  131:  // Allow `Timer` access to the protected callbacks.
+        -:  132:  friend class Timer;
+        -:  133:
+        -:  134:  //===--------------------------------------------------------------------===//
+        -:  135:  // Callbacks
+        -:  136:  //
+        -:  137:  // See the corresponding functions in `Timer` for additional details.
+        -:  138:
+        -:  139:  /// Return the root timer. Implementations should return `llvm::None` if the
+        -:  140:  /// collection of timing samples is disabled. This will cause the timers
+        -:  141:  /// constructed from the manager to be tombstones which can be skipped
+        -:  142:  /// quickly.
+        -:  143:  virtual Optional<void *> rootTimer() = 0;
+        -:  144:
+        -:  145:  /// Start the timer with the given handle.
+        -:  146:  virtual void startTimer(void *handle) = 0;
+        -:  147:
+        -:  148:  /// Stop the timer with the given handle.
+        -:  149:  virtual void stopTimer(void *handle) = 0;
+        -:  150:
+        -:  151:  /// Create a child timer nested within the one with the given handle. The `id`
+        -:  152:  /// parameter is used to uniquely identify the timer within its parent.
+        -:  153:  /// Multiple calls to this function with the same `handle` and `id` should
+        -:  154:  /// return the same timer, or at least cause the samples of the returned
+        -:  155:  /// timers to be combined for the final timing results.
+        -:  156:  virtual void *nestTimer(void *handle, const void *id,
+        -:  157:                          function_ref<std::string()> nameBuilder) = 0;
+        -:  158:
+        -:  159:  /// Hide the timer in timing reports and directly show its children. This is
+        -:  160:  /// merely a hint that implementations are free to ignore.
+        -:  161:  virtual void hideTimer(void *handle) {}
+        -:  162:
+        -:  163:protected:
+        -:  164:  const std::unique_ptr<detail::TimingManagerImpl> impl;
+        -:  165:
+        -:  166:  // Allow `TimingIdentifier::get` access to the private impl details.
+        -:  167:  friend class TimingIdentifier;
+        -:  168:
+        -:  169:private:
+        -:  170:  // Disallow copying the manager.
+        -:  171:  TimingManager(const TimingManager &) = delete;
+        -:  172:  void operator=(const TimingManager &) = delete;
+        -:  173:};
+        -:  174:
+        -:  175://===----------------------------------------------------------------------===//
+        -:  176:// Timer
+        -:  177://===----------------------------------------------------------------------===//
+        -:  178:
+        -:  179:/// A handle for a timer in a `TimingManager`.
+        -:  180:///
+        -:  181:/// This class encapsulates a pointer to a `TimingManager` and an opaque handle
+        -:  182:/// to a timer running within that manager. Libraries and infrastructure code
+        -:  183:/// operate on `Timer` rather than any concrete classes handed out by custom
+        -:  184:/// manager implementations.
+        -:  185:class Timer {
+        -:  186:public:
+ 1259698*:  187:  Timer() = default;
+        -:  188:  Timer(const Timer &other) = default;
+   414535:  189:  Timer(Timer &&other) : Timer(other) {
+   414535:  190:    other.tm = nullptr;
+   414535:  191:    other.handle = nullptr;
+        -:  192:  }
+        -:  193:
+   847629:  194:  Timer &operator=(Timer &&other) {
+   847629:  195:    tm = other.tm;
+   847629:  196:    handle = other.handle;
+   847629:  197:    other.tm = nullptr;
+   847629:  198:    other.handle = nullptr;
+   847629:  199:    return *this;
+        -:  200:  }
+        -:  201:
+        -:  202:  /// Returns whether this is a valid timer handle. Invalid timer handles are
+        -:  203:  /// used when timing is disabled in the `TimingManager` to keep the impact on
+        -:  204:  /// performance low.
+   414535:  205:  explicit operator bool() const { return tm != nullptr; }
+        -:  206:
+        -:  207:  /// Start the timer. This must be accompanied by a corresponding call to
+        -:  208:  /// `stop()` at a later point.
+     2466:  209:  void start() {
+     2466:  210:    if (tm)
+     2466:  211:      tm->startTimer(handle);
+     2466:  212:  }
+        -:  213:
+        -:  214:  /// Stop the timer. This must have been preceded by a corresponding call to
+        -:  215:  /// `start()` at an earlier point.
+   847629:  216:  void stop() {
+   847629:  217:    if (tm)
+     4098:  218:      tm->stopTimer(handle);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  219:  }
+        -:  220:
+        -:  221:  /// Create a child timer nested within this one. Multiple calls to this
+        -:  222:  /// function with the same unique identifier `id` will return the same child
+        -:  223:  /// timer. The timer must have been started when calling this function.
+        -:  224:  ///
+        -:  225:  /// This function can be called from other threads, as long as this timer
+        -:  226:  /// is not stopped before any uses of the child timer on the other thread are
+        -:  227:  /// stopped.
+        -:  228:  ///
+        -:  229:  /// The `nameBuilder` function is not guaranteed to be called.
+     2466:  230:  Timer nest(const void *id, function_ref<std::string()> nameBuilder) {
+     2466:  231:    return tm ? Timer(*tm, tm->nestTimer(handle, id, nameBuilder)) : Timer();
+call    0 returned 100%
+        -:  232:  }
+        -:  233:
+        -:  234:  /// See above.
+function _ZN4mlir5Timer4nestENS_16TimingIdentifierE called 2466 returned 100% blocks executed 80%
+     2466:  235:  Timer nest(TimingIdentifier name) {
+     2466:  236:    return tm ? nest(name.getAsOpaquePointer(), [=]() { return name.str(); })
+call    0 returned 100%
+    2466*:  237:              : Timer();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+        -:  238:  }
+        -:  239:
+        -:  240:  /// See above.
+function _ZN4mlir5Timer4nestEN4llvm9StringRefE called 414535 returned 100% blocks executed 100%
+   414535:  241:  Timer nest(StringRef name) {
+   414535:  242:    return tm ? nest(TimingIdentifier::get(name, *tm)) : Timer();
+branch  0 taken 1% (fallthrough)
+branch  1 taken 99%
+call    2 returned 100%
+call    3 returned 100%
+        -:  243:  }
+        -:  244:
+        -:  245:  /// Hide the timer in timing reports and directly show its children.
+        -:  246:  void hide() {
+        -:  247:    if (tm)
+        -:  248:      tm->hideTimer(handle);
+        -:  249:  }
+        -:  250:
+        -:  251:protected:
+     2466:  252:  Timer(TimingManager &tm, void *handle) : tm(&tm), handle(handle) {}
+        -:  253:
+        -:  254:  // Allow the `TimingManager` access to the above constructor.
+        -:  255:  friend class TimingManager;
+        -:  256:
+        -:  257:private:
+        -:  258:  /// The associated timing manager.
+        -:  259:  TimingManager *tm = nullptr;
+        -:  260:  /// An opaque handle that identifies the timer in the timing manager
+        -:  261:  /// implementation.
+        -:  262:  void *handle = nullptr;
+        -:  263:};
+        -:  264:
+        -:  265://===----------------------------------------------------------------------===//
+        -:  266:// TimingScope
+        -:  267://===----------------------------------------------------------------------===//
+        -:  268:
+        -:  269:/// An RAII-style wrapper around a timer that ensures the timer is properly
+        -:  270:/// started and stopped.
+        -:  271:class TimingScope {
+        -:  272:public:
+        -:  273:  TimingScope() {}
+        -:  274:  TimingScope(const Timer &other) : timer(other) {
+        -:  275:    if (timer)
+        -:  276:      timer.start();
+        -:  277:  }
+   414535:  278:  TimingScope(Timer &&other) : timer(std::move(other)) {
+   414535:  279:    if (timer)
+branch  0 taken 1% (fallthrough)
+branch  1 taken 99%
+     2466:  280:      timer.start();
+call    0 returned 100%
+        -:  281:  }
+        -:  282:  TimingScope(TimingScope &&other) : timer(std::move(other.timer)) {}
+  1351758:  283:  ~TimingScope() { stop(); }
+        -:  284:
+        -:  285:  TimingScope &operator=(TimingScope &&other) {
+        -:  286:    stop();
+        -:  287:    timer = std::move(other.timer);
+        -:  288:    return *this;
+        -:  289:  }
+        -:  290:
+        -:  291:  /// Check if the timing scope actually contains a valid timer.
+        -:  292:  explicit operator bool() const { return bool(timer); }
+        -:  293:
+        -:  294:  // Disable copying of the `TimingScope`.
+        -:  295:  TimingScope(const TimingScope &) = delete;
+        -:  296:  TimingScope &operator=(const TimingScope &) = delete;
+        -:  297:
+        -:  298:  /// Manually stop the timer early.
+   847629:  299:  void stop() {
+   847629:  300:    timer.stop();
+branch  0 taken 1% (fallthrough)
+branch  1 taken 99%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 99%
+branch  4 taken 1% (fallthrough)
+branch  5 taken 100%
+branch  6 taken 1% (fallthrough)
+branch  7 taken 99%
+   847629:  301:    timer = Timer();
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  302:  }
+        -:  303:
+        -:  304:  /// Create a nested timing scope.
+        -:  305:  ///
+        -:  306:  /// This returns a new `TimingScope` with a timer nested within the current
+        -:  307:  /// scope. In this fashion, the time in this scope may be further subdivided
+        -:  308:  /// in a more fine-grained fashion.
+        -:  309:  template <typename... Args>
+function _ZN4mlir11TimingScope4nestIJPKcEEES0_DpT_ called 414535 returned 100% blocks executed 100%
+   414535:  310:  TimingScope nest(Args... args) {
+   829070:  311:    return TimingScope(std::move(timer.nest(std::forward<Args>(args)...)));
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 1% (fallthrough)
+branch  4 taken 99%
+        -:  312:  }
+        -:  313:
+        -:  314:  /// Hide the timer in timing reports and directly show its children.
+        -:  315:  void hide() { timer.hide(); }
+        -:  316:
+        -:  317:private:
+        -:  318:  /// The wrapped timer.
+        -:  319:  Timer timer;
+        -:  320:};
+        -:  321:
+        -:  322://===----------------------------------------------------------------------===//
+        -:  323:// DefaultTimingManager
+        -:  324://===----------------------------------------------------------------------===//
+        -:  325:
+        -:  326:/// Facilities for time measurement and report printing to an output stream.
+        -:  327:///
+        -:  328:/// This is MLIR's default implementation of a `TimingManager`. Prints an
+        -:  329:/// execution time report upon destruction, or manually through `print()`. By
+        -:  330:/// default the results are printed in `DisplayMode::Tree` mode to stderr.
+        -:  331:/// Use `setEnabled(true)` to enable collection of timing samples; it is
+        -:  332:/// disabled by default.
+        -:  333:///
+        -:  334:/// You should only instantiate a `DefaultTimingManager` if you are writing a
+        -:  335:/// tool and want to pass a timing manager to the remaining infrastructure. If
+        -:  336:/// you are writing library or infrastructure code, you should rather accept
+        -:  337:/// the `TimingManager` base class to allow for users of your code to substitute
+        -:  338:/// their own timing implementations. Also, if you only intend to collect time
+        -:  339:/// samples, consider accepting a `Timer` or `TimingScope` instead.
+        -:  340:class DefaultTimingManager : public TimingManager {
+        -:  341:public:
+        -:  342:  /// The different display modes for printing the timers.
+        -:  343:  enum class DisplayMode {
+        -:  344:    /// In this mode the results are displayed in a list sorted by total time,
+        -:  345:    /// with timers aggregated into one unique result per timer name.
+        -:  346:    List,
+        -:  347:
+        -:  348:    /// In this mode the results are displayed in a tree view, with child timers
+        -:  349:    /// nested under their parents.
+        -:  350:    Tree,
+        -:  351:  };
+        -:  352:
+        -:  353:  DefaultTimingManager();
+        -:  354:  DefaultTimingManager(DefaultTimingManager &&rhs);
+        -:  355:  ~DefaultTimingManager() override;
+        -:  356:
+        -:  357:  // Disable copying of the `DefaultTimingManager`.
+        -:  358:  DefaultTimingManager(const DefaultTimingManager &rhs) = delete;
+        -:  359:  DefaultTimingManager &operator=(const DefaultTimingManager &rhs) = delete;
+        -:  360:
+        -:  361:  /// Enable or disable execution time sampling.
+        -:  362:  void setEnabled(bool enabled);
+        -:  363:
+        -:  364:  /// Return whether execution time sampling is enabled.
+        -:  365:  bool isEnabled() const;
+        -:  366:
+        -:  367:  /// Change the display mode.
+        -:  368:  void setDisplayMode(DisplayMode displayMode);
+        -:  369:
+        -:  370:  /// Return the current display mode;
+        -:  371:  DisplayMode getDisplayMode() const;
+        -:  372:
+        -:  373:  /// Change the stream where the output will be printed to.
+        -:  374:  void setOutput(raw_ostream &os);
+        -:  375:
+        -:  376:  /// Return the current output stream where the output will be printed to.
+        -:  377:  raw_ostream &getOutput() const;
+        -:  378:
+        -:  379:  /// Print and clear the timing results. Only call this when there are no more
+        -:  380:  /// references to nested timers around, as printing post-processes and clears
+        -:  381:  /// the timers.
+        -:  382:  void print();
+        -:  383:
+        -:  384:  /// Clear the timing results. Only call this when there are no more references
+        -:  385:  /// to nested timers around, as clearing invalidates them.
+        -:  386:  void clear();
+        -:  387:
+        -:  388:  /// Debug print the timer data structures to an output stream.
+        -:  389:  void dumpTimers(raw_ostream &os = llvm::errs());
+        -:  390:
+        -:  391:  /// Debug print the timers as a list. Only call this when there are no more
+        -:  392:  /// references to nested timers around.
+        -:  393:  void dumpAsList(raw_ostream &os = llvm::errs());
+        -:  394:
+        -:  395:  /// Debug print the timers as a tree. Only call this when there are no
+        -:  396:  /// more references to nested timers around.
+        -:  397:  void dumpAsTree(raw_ostream &os = llvm::errs());
+        -:  398:
+        -:  399:protected:
+        -:  400:  // `TimingManager` callbacks
+        -:  401:  Optional<void *> rootTimer() override;
+        -:  402:  void startTimer(void *handle) override;
+        -:  403:  void stopTimer(void *handle) override;
+        -:  404:  void *nestTimer(void *handle, const void *id,
+        -:  405:                  function_ref<std::string()> nameBuilder) override;
+        -:  406:  void hideTimer(void *handle) override;
+        -:  407:
+        -:  408:private:
+        -:  409:  const std::unique_ptr<detail::DefaultTimingManagerImpl> impl;
+        -:  410:};
+        -:  411:
+        -:  412:/// Register a set of useful command-line options that can be used to configure
+        -:  413:/// a `DefaultTimingManager`. The values of these options can be applied via the
+        -:  414:/// `applyDefaultTimingManagerCLOptions` method.
+        -:  415:void registerDefaultTimingManagerCLOptions();
+        -:  416:
+        -:  417:/// Apply any values that were registered with
+        -:  418:/// 'registerDefaultTimingManagerOptions' to a `DefaultTimingManager`.
+        -:  419:void applyDefaultTimingManagerCLOptions(DefaultTimingManager &tm);
+        -:  420:
+        -:  421:} // namespace mlir
+        -:  422:
+        -:  423:#endif // MLIR_SUPPORT_TIMING_H

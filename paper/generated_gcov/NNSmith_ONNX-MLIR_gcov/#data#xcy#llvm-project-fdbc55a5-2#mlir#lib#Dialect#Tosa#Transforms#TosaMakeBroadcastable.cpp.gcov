@@ -1,0 +1,996 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Tosa/Transforms/TosaMakeBroadcastable.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Tosa/Transforms/CMakeFiles/obj.MLIRTosaTransforms.dir/TosaMakeBroadcastable.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Tosa/Transforms/CMakeFiles/obj.MLIRTosaTransforms.dir/TosaMakeBroadcastable.cpp.gcda
+        -:    0:Runs:128633
+        -:    1://===- TosaMakeBroadcastable.cpp ------------------------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// Insert reshape to binary op's input if needed to match rank
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   14:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   15:#include "mlir/Dialect/Tosa/IR/TosaOps.h"
+        -:   16:#include "mlir/Dialect/Tosa/Transforms/Passes.h"
+        -:   17:#include "mlir/Dialect/Tosa/Utils/QuantUtils.h"
+        -:   18:#include "mlir/Pass/Pass.h"
+        -:   19:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   20:
+        -:   21:namespace mlir {
+        -:   22:namespace tosa {
+        -:   23:#define GEN_PASS_DEF_TOSAMAKEBROADCASTABLE
+        -:   24:#include "mlir/Dialect/Tosa/Transforms/Passes.h.inc"
+        -:   25:} // namespace tosa
+        -:   26:} // namespace mlir
+        -:   27:
+        -:   28:using namespace mlir;
+        -:   29:using namespace mlir::tosa;
+        -:   30:
+        -:   31:/// There are two potential ways implementing broadcast:
+        -:   32:/// a. https://www.tensorflow.org/xla/broadcasting#formal_definition
+        -:   33:/// b. https://numpy.org/doc/stable/user/basics.broadcasting.html
+        -:   34:/// This pass implements b (numpy style) now.
+        -:   35:
+        -:   36:/// In this pass, we insert RESHAPE operators to increase the rank of the
+        -:   37:/// lower rank operand as a first step in the broadcasting process. The TOSA
+        -:   38:/// operators that support broadcast require that the rank of the operands
+        -:   39:/// are equal.
+        -:   40:
+        -:   41:// Examples:
+        -:   42:// If lower=[c], higher=[a, b, c], [c] reshaped into [1, 1, c].
+        -:   43:// If lower=[b, c], higher=[a, b, c], [b, c] reshaped into [1, b, c].
+        -:   44:// If lower=[a], higher=[a, a], [a] reshaped into [1, a].
+        -:   45:// If lower=[a], target=[a, b, a], [a] reshaped into [1, 1, a].
+        -:   46:// If lower=[], target=[a, b, c], [] reshaped into [1, 1, 1].
+        -:   47:
+        -:   48:static LogicalResult
+function _ZL20computeReshapeOutputN4llvm8ArrayRefIlEES1_RNS_15SmallVectorImplIlEE called 0 returned 0% blocks executed 0%
+    #####:   49:computeReshapeOutput(ArrayRef<int64_t> higherRankShape,
+        -:   50:                     ArrayRef<int64_t> lowerRankShape,
+        -:   51:                     SmallVectorImpl<int64_t> &reshapeOutputShape) {
+        -:   52:  // Initialize new shapes with [1] * higherRank.
+    #####:   53:  int64_t higherRank = higherRankShape.size();
+call    0 never executed
+    #####:   54:  int64_t lowerRank = lowerRankShape.size();
+        -:   55:
+    #####:   56:  reshapeOutputShape.assign(higherRank, 1);
+call    0 never executed
+        -:   57:
+    #####:   58:  int64_t higherRankDim;
+    #####:   59:  int64_t lowerRankDim;
+        -:   60:
+    #####:   61:  for (int64_t i = higherRank - 1, j = lowerRank - 1; i >= 0 && j >= 0;
+branch  0 never executed
+branch  1 never executed
+        -:   62:       i--, j--) {
+    #####:   63:    higherRankDim = higherRankShape[i];
+branch  0 never executed
+branch  1 never executed
+    #####:   64:    lowerRankDim = lowerRankShape[j];
+branch  0 never executed
+branch  1 never executed
+        -:   65:
+    #####:   66:    if (lowerRankDim == 1 && higherRankDim > 1)
+branch  0 never executed
+branch  1 never executed
+    #####:   67:      reshapeOutputShape[i] = 1;
+branch  0 never executed
+branch  1 never executed
+    #####:   68:    else if ((lowerRankDim > 1 && higherRankDim == 1) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:   69:             (lowerRankDim == higherRankDim))
+    #####:   70:      reshapeOutputShape[i] = lowerRankDim;
+branch  0 never executed
+branch  1 never executed
+    #####:   71:    else if (higherRankDim != lowerRankDim)
+    #####:   72:      return failure();
+        -:   73:  }
+    #####:   74:  return success();
+        -:   75:}
+        -:   76:
+        -:   77:/// Common code to create the reshape op where necessary to make the rank of the
+        -:   78:/// operations equal. Returns the updated input1 and input2 for the original
+        -:   79:/// input. The caller is expected to use these to rewrite the original operator
+        -:   80:/// with the RESHAPE now in the graph.
+function _ZL20reshapeLowerToHigherRN4mlir15PatternRewriterENS_8LocationENS_16RankedTensorTypeENS_5ValueES4_RS4_S5_ called 0 returned 0% blocks executed 0%
+    #####:   81:static LogicalResult reshapeLowerToHigher(PatternRewriter &rewriter,
+        -:   82:                                          Location loc,
+        -:   83:                                          RankedTensorType outputType,
+        -:   84:                                          Value input1, Value input2,
+        -:   85:                                          Value &outInput1, Value &outInput2) {
+    #####:   86:  auto input1Ty = input1.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:   87:  auto input2Ty = input2.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+        -:   88:
+    #####:   89:  if (!input1Ty || !input2Ty)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   90:    return failure();
+        -:   91:
+    #####:   92:  int64_t input1Rank = input1Ty.getRank();
+call    0 never executed
+    #####:   93:  int64_t input2Rank = input2Ty.getRank();
+call    0 never executed
+        -:   94:
+    #####:   95:  Value higherTensorValue, lowerTensorValue;
+        -:   96:  // Cannot rewrite as its already correct.
+    #####:   97:  if (input1Rank == input2Rank)
+branch  0 never executed
+branch  1 never executed
+    #####:   98:    return failure();
+        -:   99:
+    #####:  100:  if (input1Rank > input2Rank) {
+branch  0 never executed
+branch  1 never executed
+    #####:  101:    higherTensorValue = input1;
+    #####:  102:    lowerTensorValue = input2;
+        -:  103:  } else {
+    #####:  104:    higherTensorValue = input2;
+    #####:  105:    lowerTensorValue = input1;
+        -:  106:  }
+        -:  107:
+    #####:  108:  ArrayRef<int64_t> higherRankShape =
+    #####:  109:      higherTensorValue.getType().cast<RankedTensorType>().getShape();
+call    0 never executed
+call    1 never executed
+    #####:  110:  (void)higherRankShape;
+    #####:  111:  ArrayRef<int64_t> lowerRankShape =
+    #####:  112:      lowerTensorValue.getType().cast<RankedTensorType>().getShape();
+call    0 never executed
+call    1 never executed
+        -:  113:
+    #####:  114:  SmallVector<int64_t, 4> reshapeOutputShape;
+call    0 never executed
+        -:  115:
+    #####:  116:  if (computeReshapeOutput(higherRankShape, lowerRankShape, reshapeOutputShape)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  117:          .failed())
+branch  0 never executed
+branch  1 never executed
+    #####:  118:    return failure();
+        -:  119:
+    #####:  120:  auto reshapeInputType = lowerTensorValue.getType().cast<RankedTensorType>();
+call    0 never executed
+    #####:  121:  auto reshapeOutputType = RankedTensorType::get(
+    #####:  122:      ArrayRef<int64_t>(reshapeOutputShape), reshapeInputType.getElementType());
+call    0 never executed
+call    1 never executed
+        -:  123:
+        -:  124:  // Verify the rank agrees with the output type if the output type is ranked.
+    #####:  125:  if (outputType) {
+branch  0 never executed
+branch  1 never executed
+    #####:  126:    if (outputType.getShape().size() != reshapeOutputShape.size() ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  127:        outputType.getShape().size() != higherRankShape.size())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  128:      return failure();
+        -:  129:  }
+        -:  130:
+    #####:  131:  auto reshapeLower = rewriter.create<tosa::ReshapeOp>(
+        -:  132:      loc, reshapeOutputType, lowerTensorValue,
+    #####:  133:      rewriter.getI64ArrayAttr(reshapeOutputShape));
+call    0 never executed
+call    1 never executed
+        -:  134:
+    #####:  135:  if (input1Rank > input2Rank) {
+branch  0 never executed
+branch  1 never executed
+    #####:  136:    outInput1 = higherTensorValue;
+    #####:  137:    outInput2 = reshapeLower.getResult();
+        -:  138:  } else {
+    #####:  139:    outInput1 = reshapeLower.getResult();
+    #####:  140:    outInput2 = higherTensorValue;
+        -:  141:  }
+        -:  142:
+    #####:  143:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  144:}
+        -:  145:
+        -:  146:namespace {
+        -:  147:template <typename OpTy>
+        -:  148:struct ConvertTosaOp : public OpRewritePattern<OpTy> {
+        -:  149:  using OpRewritePattern<OpTy>::OpRewritePattern;
+        -:  150:
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+    #####:  159:    if (!outputType)
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa7EqualOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa7EqualOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5PowOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5PowOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12LogicalXorOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12LogicalXorOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa11LogicalOrOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa11LogicalOrOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12LogicalAndOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12LogicalAndOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa19LogicalRightShiftOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa19LogicalRightShiftOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa18LogicalLeftShiftOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa18LogicalLeftShiftOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa14GreaterEqualOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa14GreaterEqualOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9GreaterOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9GreaterOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12BitwiseAndOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12BitwiseAndOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9MinimumOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9MinimumOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9MaximumOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa9MaximumOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5DivOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5DivOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5SubOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5SubOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5AddOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5AddOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12BitwiseXorOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa12BitwiseXorOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+_ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa11BitwiseOrOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa11BitwiseOrOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  151:  LogicalResult matchAndRewrite(OpTy tosaBinaryOp,
+        -:  152:                                PatternRewriter &rewriter) const override {
+        -:  153:
+    #####:  154:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  155:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+call    1 never executed
+    #####:  156:    Value output = tosaBinaryOp.getResult();
+        -:  157:
+    #####:  158:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  159:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      return failure();
+        -:  161:
+    #####:  162:    Value outInput1, outInput2;
+    #####:  163:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  164:                             input1, input2, outInput1, outInput2)
+        -:  165:            .failed())
+    #####:  166:      return failure();
+        -:  167:
+    #####:  168:    rewriter.replaceOpWithNewOp<OpTy>(tosaBinaryOp, outputType, outInput1,
+call    0 never executed
+        -:  169:                                      outInput2);
+        -:  170:
+    #####:  171:    return success();
+        -:  172:  }
+------------------
+        -:  173:};
+        -:  174:
+        -:  175:// The MulOp has an extra parameter 'shift' not present in other elementwise
+        -:  176:// binary ops, that necessitates special handling of its builder.
+        -:  177:template <>
+        -:  178:struct ConvertTosaOp<tosa::MulOp> : public OpRewritePattern<tosa::MulOp> {
+        -:  179:  using OpRewritePattern<tosa::MulOp>::OpRewritePattern;
+        -:  180:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa5MulOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  181:  LogicalResult matchAndRewrite(tosa::MulOp tosaBinaryOp,
+        -:  182:                                PatternRewriter &rewriter) const override {
+        -:  183:
+    #####:  184:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  185:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+    #####:  186:    int32_t shift = tosaBinaryOp.getShift();
+call    0 never executed
+    #####:  187:    Value output = tosaBinaryOp.getResult();
+call    0 never executed
+    #####:  188:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  189:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  190:      return failure();
+        -:  191:
+    #####:  192:    Value outInput1, outInput2;
+    #####:  193:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+branch  0 never executed
+branch  1 never executed
+    #####:  194:                             input1, input2, outInput1, outInput2)
+call    0 never executed
+    #####:  195:            .failed())
+branch  0 never executed
+branch  1 never executed
+    #####:  196:      return failure();
+        -:  197:
+    #####:  198:    rewriter.replaceOpWithNewOp<tosa::MulOp>(tosaBinaryOp, outputType,
+    #####:  199:                                             outInput1, outInput2, shift);
+call    0 never executed
+        -:  200:
+    #####:  201:    return success();
+        -:  202:  }
+        -:  203:};
+        -:  204:
+        -:  205:// The ArithmeticRightShiftOp has an extra parameter 'round' not present in
+        -:  206:// other elementwise binary ops, that necessitates special handling of its
+        -:  207:// builder.
+        -:  208:template <>
+        -:  209:struct ConvertTosaOp<tosa::ArithmeticRightShiftOp>
+        -:  210:    : public OpRewritePattern<tosa::ArithmeticRightShiftOp> {
+        -:  211:  using OpRewritePattern<tosa::ArithmeticRightShiftOp>::OpRewritePattern;
+        -:  212:
+function _ZNK12_GLOBAL__N_113ConvertTosaOpIN4mlir4tosa22ArithmeticRightShiftOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  213:  LogicalResult matchAndRewrite(tosa::ArithmeticRightShiftOp tosaBinaryOp,
+        -:  214:                                PatternRewriter &rewriter) const override {
+        -:  215:
+    #####:  216:    Value input1 = tosaBinaryOp.getInput1();
+call    0 never executed
+    #####:  217:    Value input2 = tosaBinaryOp.getInput2();
+call    0 never executed
+    #####:  218:    int32_t round = tosaBinaryOp.getRound();
+call    0 never executed
+    #####:  219:    Value output = tosaBinaryOp.getResult();
+call    0 never executed
+    #####:  220:    auto outputType = output.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  221:    if (!outputType)
+branch  0 never executed
+branch  1 never executed
+    #####:  222:      return failure();
+        -:  223:
+    #####:  224:    Value outInput1, outInput2;
+    #####:  225:    if (reshapeLowerToHigher(rewriter, tosaBinaryOp.getLoc(), outputType,
+branch  0 never executed
+branch  1 never executed
+    #####:  226:                             input1, input2, outInput1, outInput2)
+call    0 never executed
+    #####:  227:            .failed())
+branch  0 never executed
+branch  1 never executed
+    #####:  228:      return failure();
+        -:  229:
+    #####:  230:    rewriter.replaceOpWithNewOp<tosa::ArithmeticRightShiftOp>(
+    #####:  231:        tosaBinaryOp, outputType, outInput1, outInput2, round);
+call    0 never executed
+        -:  232:
+    #####:  233:    return success();
+        -:  234:  }
+        -:  235:};
+        -:  236:} // namespace
+        -:  237:
+        -:  238:namespace {
+        -:  239:/// Pass that enables broadcast by making all input arrays have the same
+        -:  240:/// number of dimensions. Insert RESHAPE operations to lower rank operand
+   163463:  241:struct TosaMakeBroadcastable
+call    0 returned 100%
+call    1 returned 100%
+        -:  242:    : public tosa::impl::TosaMakeBroadcastableBase<TosaMakeBroadcastable> {
+        -:  243:public:
+function _ZN12_GLOBAL__N_121TosaMakeBroadcastable14runOnOperationEv called 0 returned 0% blocks executed 0%
+    #####:  244:  void runOnOperation() override {
+    #####:  245:    auto func = getOperation();
+call    0 never executed
+    #####:  246:    RewritePatternSet patterns(func.getContext());
+call    0 never executed
+call    1 never executed
+    #####:  247:    MLIRContext *ctx = func.getContext();
+call    0 never executed
+        -:  248:    // Add the generated patterns to the list.
+    #####:  249:    patterns.add<ConvertTosaOp<tosa::BitwiseAndOp>>(ctx);
+call    0 never executed
+    #####:  250:    patterns.add<ConvertTosaOp<tosa::BitwiseOrOp>>(ctx);
+call    0 never executed
+    #####:  251:    patterns.add<ConvertTosaOp<tosa::BitwiseXorOp>>(ctx);
+call    0 never executed
+    #####:  252:    patterns.add<ConvertTosaOp<tosa::AddOp>>(ctx);
+call    0 never executed
+    #####:  253:    patterns.add<ConvertTosaOp<tosa::SubOp>>(ctx);
+call    0 never executed
+    #####:  254:    patterns.add<ConvertTosaOp<tosa::MulOp>>(ctx);
+call    0 never executed
+    #####:  255:    patterns.add<ConvertTosaOp<tosa::DivOp>>(ctx);
+call    0 never executed
+    #####:  256:    patterns.add<ConvertTosaOp<tosa::MaximumOp>>(ctx);
+call    0 never executed
+    #####:  257:    patterns.add<ConvertTosaOp<tosa::MinimumOp>>(ctx);
+call    0 never executed
+    #####:  258:    patterns.add<ConvertTosaOp<tosa::EqualOp>>(ctx);
+call    0 never executed
+    #####:  259:    patterns.add<ConvertTosaOp<tosa::GreaterOp>>(ctx);
+call    0 never executed
+    #####:  260:    patterns.add<ConvertTosaOp<tosa::GreaterEqualOp>>(ctx);
+call    0 never executed
+    #####:  261:    patterns.add<ConvertTosaOp<tosa::LogicalLeftShiftOp>>(ctx);
+call    0 never executed
+    #####:  262:    patterns.add<ConvertTosaOp<tosa::ArithmeticRightShiftOp>>(ctx);
+call    0 never executed
+    #####:  263:    patterns.add<ConvertTosaOp<tosa::LogicalRightShiftOp>>(ctx);
+call    0 never executed
+    #####:  264:    patterns.add<ConvertTosaOp<tosa::LogicalAndOp>>(ctx);
+call    0 never executed
+    #####:  265:    patterns.add<ConvertTosaOp<tosa::LogicalOrOp>>(ctx);
+call    0 never executed
+    #####:  266:    patterns.add<ConvertTosaOp<tosa::LogicalXorOp>>(ctx);
+call    0 never executed
+    #####:  267:    patterns.add<ConvertTosaOp<tosa::PowOp>>(ctx);
+call    0 never executed
+    #####:  268:    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  269:  }
+        -:  270:};
+        -:  271:} // namespace
+        -:  272:
+function _ZN4mlir4tosa31createTosaMakeBroadcastablePassEv called 129191 returned 100% blocks executed 100%
+   129191:  273:std::unique_ptr<Pass> mlir::tosa::createTosaMakeBroadcastablePass() {
+   129191:  274:  return std::make_unique<TosaMakeBroadcastable>();
+call    0 returned 100%
+        -:  275:}

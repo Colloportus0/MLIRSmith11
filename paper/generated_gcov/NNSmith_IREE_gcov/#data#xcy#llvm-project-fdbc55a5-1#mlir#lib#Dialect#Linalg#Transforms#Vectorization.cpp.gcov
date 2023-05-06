@@ -1,0 +1,3601 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Vectorization.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Vectorization.cpp.gcda
+        -:    0:Runs:325547
+        -:    1://===- Vectorization.cpp - Implementation of linalg Vectorization ---------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the linalg dialect Vectorization transformations.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Analysis/SliceAnalysis.h"
+        -:   14:#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
+        -:   15:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   16:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   17:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   18:#include "mlir/Dialect/Linalg/Analysis/DependenceAnalysis.h"
+        -:   19:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   20:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   21:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   22:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   23:#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+        -:   24:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   25:#include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+        -:   26:#include "mlir/IR/AffineExpr.h"
+        -:   27:#include "mlir/IR/Matchers.h"
+        -:   28:#include "mlir/IR/PatternMatch.h"
+        -:   29:#include "mlir/Pass/Pass.h"
+        -:   30:#include "mlir/Support/LLVM.h"
+        -:   31:#include "mlir/Transforms/RegionUtils.h"
+        -:   32:#include "llvm/ADT/ScopeExit.h"
+        -:   33:#include "llvm/ADT/Sequence.h"
+        -:   34:#include "llvm/ADT/SmallVector.h"
+        -:   35:#include "llvm/ADT/TypeSwitch.h"
+        -:   36:#include "llvm/Support/Debug.h"
+        -:   37:#include "llvm/Support/raw_ostream.h"
+        -:   38:#include <type_traits>
+        -:   39:
+        -:   40:using namespace mlir;
+        -:   41:using namespace mlir::linalg;
+        -:   42:
+        -:   43:#define DEBUG_TYPE "linalg-vectorization"
+        -:   44:
+        -:   45:#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+        -:   46:#define LDBG(X) LLVM_DEBUG(DBGS() << X)
+        -:   47:
+        -:   48:/// Try to vectorize `convOp` as a convolution.
+        -:   49:static FailureOr<Operation *> vectorizeConvolution(OpBuilder &b,
+        -:   50:                                                   LinalgOp convOp);
+        -:   51:
+        -:   52:/// Return the unique instance of OpType in `block` if it is indeed unique.
+        -:   53:/// Return null if none or more than 1 instances exist.
+        -:   54:template <typename OpType>
+        -:   55:static OpType getSingleOpOfType(Block &block) {
+        -:   56:  OpType res;
+        -:   57:  block.walk([&](OpType op) {
+        -:   58:    if (res) {
+        -:   59:      res = nullptr;
+        -:   60:      return WalkResult::interrupt();
+        -:   61:    }
+        -:   62:    res = op;
+        -:   63:    return WalkResult::advance();
+        -:   64:  });
+        -:   65:  return res;
+        -:   66:}
+        -:   67:
+        -:   68:/// Given an indexing `map` coming from a LinalgOp indexing, restricted to a
+        -:   69:/// projectedPermutation, compress the unused dimensions to serve as a
+        -:   70:/// permutation_map for a vector transfer operation.
+        -:   71:/// For example, given a linalg op such as:
+        -:   72:///
+        -:   73:/// ```
+        -:   74:///   %0 = linalg.generic {
+        -:   75:///        indexing_maps = affine_map<(d0, d1, d2, d3, d4) -> (d4, d0, d2)>,
+        -:   76:///        indexing_maps = affine_map<(d0, d1, d2, d3, d4) -> (d1, d3)>
+        -:   77:///      }
+        -:   78:///     ins(%0 : tensor<2x3x4xf32>)
+        -:   79:///    outs(%1 : tensor<5x6xf32>)
+        -:   80:/// ```
+        -:   81:///
+        -:   82:/// the iteration domain size of the linalg op is 3x5x4x6x2. The first affine
+        -:   83:/// map is reindexed to `affine_map<(d0, d1, d2) -> (d2, d0, d1)>`, the second
+        -:   84:/// affine map is reindexed to `affine_map<(d0, d1) -> (d0, d1)>`.
+function _ZL18reindexIndexingMapN4mlir9AffineMapE called 0 returned 0% blocks executed 0%
+    #####:   85:static AffineMap reindexIndexingMap(AffineMap map) {
+    #####:   86:  assert(map.isProjectedPermutation(/*allowZeroInResults=*/true) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:   87:         "expected projected permutation");
+    #####:   88:  auto res = compressUnusedDims(map);
+call    0 never executed
+    #####:   89:  assert(res.getNumDims() == res.getNumResults() &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:   90:         "expected reindexed map with same number of dims and results");
+    #####:   91:  return res;
+        -:   92:}
+        -:   93:
+        -:   94:/// Helper enum to represent conv1d input traversal order.
+        -:   95:enum class Conv1DOpOrder {
+        -:   96:  Ncw, // Corresponds to operation that traverses the input in (n, c, w) order.
+        -:   97:  Nwc  // Corresponds to operation that traverses the input in (n, w, c) order.
+        -:   98:};
+        -:   99:
+        -:  100:/// Helper data structure to represent the result of vectorization.
+        -:  101:/// In certain specific cases, like terminators, we do not want to propagate/
+        -:  102:enum VectorizationStatus {
+        -:  103:  /// Op failed to vectorize.
+        -:  104:  Failure = 0,
+        -:  105:  /// Op vectorized and custom function took care of replacement logic
+        -:  106:  NoReplace,
+        -:  107:  /// Op vectorized into a new Op whose results will replace original Op's
+        -:  108:  /// results.
+        -:  109:  NewOp
+        -:  110:  // TODO: support values if Op vectorized to Many-Ops whose results we need to
+        -:  111:  // aggregate for replacement.
+        -:  112:};
+        -:  113:struct VectorizationResult {
+        -:  114:  /// Return status from vectorizing the current op.
+        -:  115:  enum VectorizationStatus status = VectorizationStatus::Failure;
+        -:  116:  /// New vectorized operation to replace the current op.
+        -:  117:  /// Replacement behavior is specified by `status`.
+        -:  118:  Operation *newOp;
+        -:  119:};
+        -:  120:
+        -:  121:llvm::Optional<vector::CombiningKind>
+function _ZN4mlir6linalg17getCombinerOpKindEPNS_9OperationE called 0 returned 0% blocks executed 0%
+    #####:  122:mlir::linalg::getCombinerOpKind(Operation *combinerOp) {
+    #####:  123:  using ::mlir::vector::CombiningKind;
+        -:  124:
+    #####:  125:  if (!combinerOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  126:    return llvm::None;
+    #####:  127:  return llvm::TypeSwitch<Operation *, llvm::Optional<CombiningKind>>(
+call    0 never executed
+        -:  128:             combinerOp)
+        -:  129:      .Case<arith::AddIOp, arith::AddFOp>(
+    #####:  130:          [&](auto op) { return CombiningKind::ADD; })
+    #####:  131:      .Case<arith::AndIOp>([&](auto op) { return CombiningKind::AND; })
+call    0 never executed
+    #####:  132:      .Case<arith::MaxSIOp>([&](auto op) { return CombiningKind::MAXSI; })
+call    0 never executed
+    #####:  133:      .Case<arith::MaxFOp>([&](auto op) { return CombiningKind::MAXF; })
+call    0 never executed
+    #####:  134:      .Case<arith::MinSIOp>([&](auto op) { return CombiningKind::MINSI; })
+call    0 never executed
+    #####:  135:      .Case<arith::MinFOp>([&](auto op) { return CombiningKind::MINF; })
+call    0 never executed
+        -:  136:      .Case<arith::MulIOp, arith::MulFOp>(
+    #####:  137:          [&](auto op) { return CombiningKind::MUL; })
+call    0 never executed
+    #####:  138:      .Case<arith::OrIOp>([&](auto op) { return CombiningKind::OR; })
+call    0 never executed
+    #####:  139:      .Case<arith::XOrIOp>([&](auto op) { return CombiningKind::XOR; })
+call    0 never executed
+    #####:  140:      .Default([&](auto op) { return llvm::None; });
+branch  0 never executed
+branch  1 never executed
+        -:  141:}
+        -:  142:
+        -:  143:/// Check whether `outputOperand` is a reduction with a single combiner
+        -:  144:/// operation. Return the combiner operation of the reduction. Return
+        -:  145:/// nullptr otherwise. Multiple reduction operations would impose an
+        -:  146:/// ordering between reduction dimensions and is currently unsupported in
+        -:  147:/// Linalg. This limitation is motivated by the fact that e.g. min(max(X)) !=
+        -:  148:/// max(min(X))
+        -:  149:// TODO: use in LinalgOp verification, there is a circular dependency atm.
+function _ZL20matchLinalgReductionPN4mlir9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  150:static Operation *matchLinalgReduction(OpOperand *outputOperand) {
+    #####:  151:  auto linalgOp = cast<LinalgOp>(outputOperand->getOwner());
+call    0 never executed
+    #####:  152:  unsigned outputPos =
+    #####:  153:      outputOperand->getOperandNumber() - linalgOp.getNumDpsInputs();
+call    0 never executed
+call    1 never executed
+        -:  154:  // Only single combiner operations are supported for now.
+    #####:  155:  SmallVector<Operation *, 4> combinerOps;
+call    0 never executed
+    #####:  156:  if (!matchReduction(linalgOp.getRegionOutputArgs(), outputPos, combinerOps) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  157:      combinerOps.size() != 1)
+branch  0 never executed
+branch  1 never executed
+    #####:  158:    return nullptr;
+        -:  159:
+        -:  160:  // Return the combiner operation.
+    #####:  161:  return combinerOps[0];
+        -:  162:}
+        -:  163:
+        -:  164:/// Broadcast `value` to a vector of `shape` if possible. Return value
+        -:  165:/// otherwise.
+function _ZL17broadcastIfNeededRN4mlir9OpBuilderENS_5ValueEN4llvm8ArrayRefIlEE called 0 returned 0% blocks executed 0%
+    #####:  166:static Value broadcastIfNeeded(OpBuilder &b, Value value,
+        -:  167:                               ArrayRef<int64_t> shape) {
+        -:  168:  // If no shape to broadcast to, just return `value`.
+    #####:  169:  if (shape.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  170:    return value;
+    #####:  171:  VectorType targetVectorType =
+    #####:  172:      VectorType::get(shape, getElementTypeOrSelf(value));
+call    0 never executed
+call    1 never executed
+    #####:  173:  if (vector::isBroadcastableTo(value.getType(), targetVectorType) !=
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  174:      vector::BroadcastableToResult::Success)
+    #####:  175:    return value;
+    #####:  176:  Location loc = b.getInsertionPoint()->getLoc();
+call    0 never executed
+call    1 never executed
+    #####:  177:  return b.createOrFold<vector::BroadcastOp>(loc, targetVectorType, value);
+call    0 never executed
+        -:  178:}
+        -:  179:
+        -:  180:/// Create MultiDimReductionOp to compute the reduction for `reductionOp`. This
+        -:  181:/// assumes that `reductionOp` has two operands and one of them is the reduction
+        -:  182:/// initial value.
+function _ZL19buildMultiDimReduceRN4mlir9OpBuilderEPNS_9OperationENS_5ValueES4_RKN4llvm11SmallVectorIbLj40EEE called 0 returned 0% blocks executed 0%
+    #####:  183:static Operation *buildMultiDimReduce(OpBuilder &b, Operation *reduceOp,
+        -:  184:                                      Value valueToReduce, Value acc,
+        -:  185:                                      const SmallVector<bool> &reductionMask) {
+    #####:  186:  auto maybeKind = getCombinerOpKind(reduceOp);
+call    0 never executed
+    #####:  187:  assert(maybeKind && "Failed precondition: could not get reduction kind");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  188:  return b.create<vector::MultiDimReductionOp>(
+call    0 never executed
+    #####:  189:      reduceOp->getLoc(), valueToReduce, acc, reductionMask, *maybeKind);
+call    0 never executed
+        -:  190:}
+        -:  191:
+function _ZL16getReductionMaskN4mlir6linalg8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  192:static SmallVector<bool> getReductionMask(LinalgOp linalgOp) {
+    #####:  193:  return llvm::to_vector(
+    #####:  194:      llvm::map_range(linalgOp.getIteratorTypesArray(), isReductionIterator));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  195:}
+        -:  196:
+        -:  197:/// Build a vector.transfer_write of `value` into `outputOperand` at indices set
+        -:  198:/// to all `0`; where `outputOperand` is an output operand of the LinalgOp
+        -:  199:/// currently being vectorized. If `dest` has null rank, build an memref.store.
+        -:  200:/// Return the produced value or null if no value is produced.
+function _ZL16buildVectorWriteRN4mlir9OpBuilderENS_5ValueEPNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  201:static Value buildVectorWrite(OpBuilder &b, Value value,
+        -:  202:                              OpOperand *outputOperand) {
+    #####:  203:  Operation *write;
+    #####:  204:  Location loc = value.getLoc();
+call    0 never executed
+    #####:  205:  auto linalgOp = cast<LinalgOp>(outputOperand->getOwner());
+call    0 never executed
+    #####:  206:  ArrayRef<int64_t> shape = linalgOp.getShape(outputOperand);
+call    0 never executed
+    #####:  207:  auto vectorType = VectorType::get(
+    #####:  208:      shape, getElementTypeOrSelf(outputOperand->get().getType()));
+call    0 never executed
+call    1 never executed
+    #####:  209:  if (vectorType.getRank() > 0) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  210:    // 0-d case is still special: do not invert the reindexing map.
+    #####:  211:    AffineMap map =
+    #####:  212:        reindexIndexingMap(linalgOp.getMatchingIndexingMap(outputOperand));
+call    0 never executed
+call    1 never executed
+    #####:  213:    SmallVector<int64_t> transposeShape =
+    #####:  214:        applyPermutationMap(inversePermutation(map), vectorType.getShape());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  215:    assert(!transposeShape.empty() && "unexpected empty transpose shape");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  216:    vectorType = VectorType::get(transposeShape, vectorType.getElementType());
+call    0 never executed
+call    1 never executed
+    #####:  217:    SmallVector<Value> indices(linalgOp.getRank(outputOperand),
+call    0 never executed
+    #####:  218:                               b.create<arith::ConstantIndexOp>(loc, 0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  219:    value = broadcastIfNeeded(b, value, vectorType.getShape());
+call    0 never executed
+call    1 never executed
+    #####:  220:    write = b.create<vector::TransferWriteOp>(loc, value, outputOperand->get(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  221:                                              indices, map);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  222:  } else {
+    #####:  223:    if (!value.getType().isa<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  224:      value = b.create<vector::BroadcastOp>(loc, vectorType, value);
+call    0 never executed
+    #####:  225:    assert(value.getType() == vectorType && "incorrect type");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  226:    write = b.create<vector::TransferWriteOp>(loc, value, outputOperand->get(),
+call    0 never executed
+call    1 never executed
+    #####:  227:                                              ValueRange{});
+call    0 never executed
+call    1 never executed
+        -:  228:  }
+    #####:  229:  LDBG("vectorized op: " << *write);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####:  230:  if (!write->getResults().empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  231:    return write->getResult(0);
+    #####:  232:  return Value();
+        -:  233:}
+        -:  234:
+        -:  235:// Custom vectorization precondition function type. This is intented to be used
+        -:  236:// with CustomVectorizationHook. Returns success if the correpsonding custom
+        -:  237:// hook can vectorize the op.
+        -:  238:using CustomVectorizationPrecondition =
+        -:  239:    std::function<LogicalResult(Operation *)>;
+        -:  240:
+        -:  241:// Custom vectorization function type. Produce a vector form of Operation*
+        -:  242:// assuming all its vectorized operands are already in the BlockAndValueMapping.
+        -:  243:// Return nullptr if the Operation cannot be vectorized.
+        -:  244:using CustomVectorizationHook = std::function<VectorizationResult(
+        -:  245:    Operation *, const BlockAndValueMapping &)>;
+        -:  246:
+        -:  247:/// Helper function to vectorize the terminator of a `linalgOp`. New result
+        -:  248:/// vector values are appended to `newResults`. Return
+        -:  249:/// VectorizationStatus::NoReplace to signal the vectorization algorithm that it
+        -:  250:/// should not try to map produced operations and instead return the results
+        -:  251:/// using the `newResults` vector making them available to the
+        -:  252:/// vectorization algorithm for RAUW. This function is meant to be used as a
+        -:  253:/// CustomVectorizationHook.
+        -:  254:static VectorizationResult
+        -:  255:vectorizeLinalgYield(OpBuilder &b, Operation *op,
+        -:  256:                     const BlockAndValueMapping &bvm, LinalgOp linalgOp,
+        -:  257:                     SmallVectorImpl<Value> &newResults) {
+        -:  258:  auto yieldOp = dyn_cast<linalg::YieldOp>(op);
+        -:  259:  if (!yieldOp)
+        -:  260:    return VectorizationResult{VectorizationStatus::Failure, nullptr};
+        -:  261:  for (const auto &outputs : llvm::enumerate(yieldOp.getValues())) {
+        -:  262:    // TODO: Scan for an opportunity for reuse.
+        -:  263:    // TODO: use a map.
+        -:  264:    Value vectorValue = bvm.lookup(outputs.value());
+        -:  265:    Value newResult = buildVectorWrite(
+        -:  266:        b, vectorValue, linalgOp.getDpsInitOperand(outputs.index()));
+        -:  267:    if (newResult)
+        -:  268:      newResults.push_back(newResult);
+        -:  269:  }
+        -:  270:  return VectorizationResult{VectorizationStatus::NoReplace, nullptr};
+        -:  271:}
+        -:  272:
+        -:  273:/// Helper function to vectorize the index operations of a `linalgOp`. Return
+        -:  274:/// VectorizationStatus::NewOp to signal the vectorization algorithm that it
+        -:  275:/// should map the produced operations. This function is meant to be used as a
+        -:  276:/// CustomVectorizationHook.
+function _ZL20vectorizeLinalgIndexRN4mlir9OpBuilderEPNS_9OperationENS_6linalg8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  277:static VectorizationResult vectorizeLinalgIndex(OpBuilder &b, Operation *op,
+        -:  278:                                                LinalgOp linalgOp) {
+    #####:  279:  IndexOp indexOp = dyn_cast<linalg::IndexOp>(op);
+call    0 never executed
+    #####:  280:  if (!indexOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  281:    return VectorizationResult{VectorizationStatus::Failure, nullptr};
+    #####:  282:  auto loc = indexOp.getLoc();
+call    0 never executed
+        -:  283:  // Compute the static loop sizes of the index op.
+    #####:  284:  auto targetShape = linalgOp.computeStaticLoopSizes();
+call    0 never executed
+        -:  285:  // Compute a one-dimensional index vector for the index op dimension.
+    #####:  286:  SmallVector<int64_t> constantSeq =
+    #####:  287:      llvm::to_vector<16>(llvm::seq<int64_t>(0, targetShape[indexOp.getDim()]));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+    #####:  288:  auto constantOp =
+    #####:  289:      b.create<arith::ConstantOp>(loc, b.getIndexVectorAttr(constantSeq));
+call    0 never executed
+call    1 never executed
+        -:  290:  // Return the one-dimensional index vector if it lives in the trailing
+        -:  291:  // dimension of the iteration space since the vectorization algorithm in this
+        -:  292:  // case can handle the broadcast.
+    #####:  293:  if (indexOp.getDim() == targetShape.size() - 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  294:    return VectorizationResult{VectorizationStatus::NewOp, constantOp};
+        -:  295:  // Otherwise permute the targetShape to move the index dimension last,
+        -:  296:  // broadcast the one-dimensional index vector to the permuted shape, and
+        -:  297:  // finally transpose the broadcasted index vector to undo the permutation.
+    #####:  298:  std::swap(targetShape[indexOp.getDim()], targetShape.back());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  299:  auto broadCastOp = b.create<vector::BroadcastOp>(
+    #####:  300:      loc, VectorType::get(targetShape, b.getIndexType()), constantOp);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  301:  SmallVector<int64_t> transposition =
+    #####:  302:      llvm::to_vector<16>(llvm::seq<int64_t>(0, linalgOp.getNumLoops()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:  303:  std::swap(transposition.back(), transposition[indexOp.getDim()]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  304:  auto transposeOp =
+    #####:  305:      b.create<vector::TransposeOp>(loc, broadCastOp, transposition);
+call    0 never executed
+    #####:  306:  return VectorizationResult{VectorizationStatus::NewOp, transposeOp};
+branch  0 never executed
+branch  1 never executed
+        -:  307:}
+        -:  308:
+        -:  309:/// Helper function to check if the tensor.extract can be vectorized by the
+        -:  310:/// custom hook vectorizeTensorExtract.
+function _ZL38tensorExtractVectorizationPreconditionPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  311:static LogicalResult tensorExtractVectorizationPrecondition(Operation *op) {
+    #####:  312:  tensor::ExtractOp extractOp = dyn_cast<tensor::ExtractOp>(op);
+call    0 never executed
+    #####:  313:  if (!extractOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  314:    return failure();
+        -:  315:
+        -:  316:  // Currently only supports extraction with an 1-D index.
+    #####:  317:  if (extractOp.getIndices().size() != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  318:    return failure();
+        -:  319:
+    #####:  320:  if (!VectorType::isValidElementType(extractOp.getIndices()[0].getType()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  321:    return failure();
+        -:  322:
+    #####:  323:  if (llvm::any_of(extractOp->getResultTypes(), [](Type type) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  324:        return !VectorType::isValidElementType(type);
+        -:  325:      })) {
+    #####:  326:    return failure();
+        -:  327:  }
+        -:  328:
+    #####:  329:  return success();
+        -:  330:}
+        -:  331:
+        -:  332:/// Helper function to vectorize the tensor.extract operations. Returns
+        -:  333:/// VectorizationStatus::NewOp to signal the vectorization algorithm that it
+        -:  334:/// should map the produced operations. This function is meant to be used as a
+        -:  335:/// CustomVectorizationHook.
+        -:  336:static VectorizationResult
+function _ZL22vectorizeTensorExtractRN4mlir9OpBuilderEPNS_9OperationENS_6linalg8LinalgOpERKNS_20BlockAndValueMappingE called 0 returned 0% blocks executed 0%
+    #####:  337:vectorizeTensorExtract(OpBuilder &b, Operation *op, LinalgOp linalgOp,
+        -:  338:                       const BlockAndValueMapping &bvm) {
+    #####:  339:  tensor::ExtractOp extractOp = dyn_cast<tensor::ExtractOp>(op);
+call    0 never executed
+    #####:  340:  if (!extractOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  341:    return VectorizationResult{VectorizationStatus::Failure, nullptr};
+    #####:  342:  auto loc = extractOp.getLoc();
+call    0 never executed
+        -:  343:
+        -:  344:  // Currently only supports extraction with an 1-D index. Checked in the
+        -:  345:  // tensorExtractVectorizationPrecondition.
+    #####:  346:  assert(extractOp.getIndices().size() == 1);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  347:
+    #####:  348:  auto indexVec = bvm.lookup(extractOp.getIndices()[0]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  349:  // Compute the static loop sizes of the extract op.
+    #####:  350:  auto targetShape = linalgOp.computeStaticLoopSizes();
+call    0 never executed
+        -:  351:
+    #####:  352:  SmallVector<Value> gatherIndices;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  353:  gatherIndices.push_back(b.create<arith::ConstantIndexOp>(loc, 0));
+call    0 never executed
+call    1 never executed
+        -:  354:
+    #####:  355:  auto maskConstantOp = b.create<arith::ConstantOp>(
+        -:  356:      loc,
+    #####:  357:      DenseIntElementsAttr::get(VectorType::get(targetShape, b.getI1Type()),
+call    0 never executed
+    #####:  358:                                /*value=*/true));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  359:
+    #####:  360:  auto resultType =
+    #####:  361:      VectorType::get(targetShape, extractOp.getResult().getType());
+call    0 never executed
+call    1 never executed
+    #####:  362:  auto passThruConstantOp =
+    #####:  363:      b.create<arith::ConstantOp>(loc, b.getZeroAttr(resultType));
+call    0 never executed
+call    1 never executed
+        -:  364:
+    #####:  365:  auto gatherOp = b.create<vector::GatherOp>(
+    #####:  366:      loc, resultType, extractOp.getTensor(), gatherIndices, indexVec,
+call    0 never executed
+    #####:  367:      maskConstantOp, passThruConstantOp);
+call    0 never executed
+        -:  368:
+    #####:  369:  return VectorizationResult{VectorizationStatus::NewOp, gatherOp};
+branch  0 never executed
+branch  1 never executed
+        -:  370:}
+        -:  371:
+        -:  372:/// Emit reduction operations if the shapes of the value to reduce is different
+        -:  373:/// that the result shape.
+function _ZL14reduceIfNeededRN4mlir9OpBuilderENS_6linalg8LinalgOpEPNS_9OperationENS_5ValueES6_RKNS_20BlockAndValueMappingE called 0 returned 0% blocks executed 0%
+    #####:  374:static Operation *reduceIfNeeded(OpBuilder &b, LinalgOp linalgOp, Operation *op,
+        -:  375:                                 Value reduceValue, Value initialValue,
+        -:  376:                                 const BlockAndValueMapping &bvm) {
+    #####:  377:  Value reduceVec = bvm.lookup(reduceValue);
+call    0 never executed
+    #####:  378:  Value outputVec = bvm.lookup(initialValue);
+call    0 never executed
+    #####:  379:  auto reduceType = reduceVec.getType().dyn_cast<VectorType>();
+call    0 never executed
+    #####:  380:  auto outputType = outputVec.getType().dyn_cast<VectorType>();
+call    0 never executed
+        -:  381:  // Reduce only if needed as the value may already have been reduce for
+        -:  382:  // contraction vectorization.
+    #####:  383:  if (!reduceType ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  384:      (outputType && reduceType.getShape() == outputType.getShape()))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  385:    return nullptr;
+    #####:  386:  SmallVector<bool> reductionMask = getReductionMask(linalgOp);
+call    0 never executed
+    #####:  387:  return buildMultiDimReduce(b, op, reduceVec, outputVec, reductionMask);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  388:}
+        -:  389:
+        -:  390:/// Generic vectorization for a single operation `op`, given already vectorized
+        -:  391:/// operands carried by `bvm`. Vectorization occurs as follows:
+        -:  392:///   1. Try to apply any of the `customVectorizationHooks` and return its
+        -:  393:///   result on success.
+        -:  394:///   2. Clone any constant in the current scope without vectorization: each
+        -:  395:///   consumer of the constant will later determine the shape to which the
+        -:  396:///   constant needs to be broadcast to.
+        -:  397:///   3. Fail on any remaining non `ElementwiseMappable` op. It is the purpose
+        -:  398:///   of the `customVectorizationHooks` to cover such cases.
+        -:  399:///   4. Clone `op` in vector form to a vector of shape prescribed by the first
+        -:  400:///   operand of maximal rank. Other operands have smaller rank and are
+        -:  401:///   broadcast accordingly. It is assumed this broadcast is always legal,
+        -:  402:///   otherwise, it means one of the `customVectorizationHooks` is incorrect.
+        -:  403:///
+        -:  404:/// This function assumes all operands of `op` have been vectorized and are in
+        -:  405:/// the `bvm` mapping. As a consequence, this function is meant to be called on
+        -:  406:/// a topologically-sorted list of ops.
+        -:  407:/// This function does not update `bvm` but returns a VectorizationStatus that
+        -:  408:/// instructs the caller what `bvm` update needs to occur.
+        -:  409:static VectorizationResult
+function _ZL14vectorizeOneOpRN4mlir9OpBuilderENS_6linalg8LinalgOpEPNS_9OperationERKNS_20BlockAndValueMappingEN4llvm8ArrayRefISt8functionIF19VectorizationResultS5_S8_EEEE called 0 returned 0% blocks executed 0%
+    #####:  410:vectorizeOneOp(OpBuilder &b, LinalgOp linalgOp, Operation *op,
+        -:  411:               const BlockAndValueMapping &bvm,
+        -:  412:               ArrayRef<CustomVectorizationHook> customVectorizationHooks) {
+    #####:  413:  LDBG("vectorize op " << *op);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -:  414:
+        -:  415:  // 1. Try to apply any CustomVectorizationHook.
+    #####:  416:  if (!customVectorizationHooks.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  417:    for (auto &customFunc : customVectorizationHooks) {
+branch  0 never executed
+branch  1 never executed
+    #####:  418:      VectorizationResult result = customFunc(op, bvm);
+branch  0 never executed
+branch  1 never executed
+    #####:  419:      if (result.status == VectorizationStatus::Failure)
+branch  0 never executed
+branch  1 never executed
+    #####:  420:        continue;
+    #####:  421:      return result;
+        -:  422:    }
+        -:  423:  }
+        -:  424:
+        -:  425:  // 2. Constant ops don't get vectorized but rather broadcasted at their users.
+        -:  426:  // Clone so that the constant is not confined to the linalgOp block .
+    #####:  427:  if (isa<arith::ConstantOp, func::ConstantOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  428:    return VectorizationResult{VectorizationStatus::NewOp, b.clone(*op)};
+call    0 never executed
+        -:  429:
+        -:  430:  // 3. Only ElementwiseMappable are allowed in the generic vectorization.
+    #####:  431:  if (!OpTrait::hasElementwiseMappableTraits(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  432:    return VectorizationResult{VectorizationStatus::Failure, nullptr};
+        -:  433:
+        -:  434:  // 4 . Check if the operation is a reduction.
+    #####:  435:  SmallVector<std::pair<Value, Value>> reductionOperands;
+call    0 never executed
+    #####:  436:  for (Value operand : op->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  437:    auto arg = operand.dyn_cast<BlockArgument>();
+call    0 never executed
+    #####:  438:    if (!arg || arg.getArgNumber() < linalgOp.getNumDpsInputs())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  439:      continue;
+    #####:  440:    SmallVector<Operation *> reductionOps;
+call    0 never executed
+    #####:  441:    Value reduceValue = matchReduction(
+call    0 never executed
+    #####:  442:        linalgOp.getRegionOutputArgs(),
+    #####:  443:        arg.getArgNumber() - linalgOp.getNumDpsInputs(), reductionOps);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  444:    if (!reduceValue)
+branch  0 never executed
+branch  1 never executed
+    #####:  445:      continue;
+branch  0 never executed
+branch  1 never executed
+    #####:  446:    reductionOperands.push_back(std::make_pair(reduceValue, operand));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  447:  }
+    #####:  448:  if (!reductionOperands.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  449:    assert(reductionOperands.size() == 1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  450:    Operation *reduceOp =
+call    0 never executed
+    #####:  451:        reduceIfNeeded(b, linalgOp, op, reductionOperands[0].first,
+    #####:  452:                       reductionOperands[0].second, bvm);
+call    0 never executed
+    #####:  453:    if (reduceOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  454:      return VectorizationResult{VectorizationStatus::NewOp, reduceOp};
+        -:  455:  }
+        -:  456:
+        -:  457:  // 5. Generic vectorization path for ElementwiseMappable ops.
+        -:  458:  //   a. first get the first max ranked shape.
+    #####:  459:  SmallVector<int64_t, 4> firstMaxRankedShape;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  460:  for (Value operand : op->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  461:    auto vt = bvm.lookup(operand).getType().dyn_cast<VectorType>();
+call    0 never executed
+call    1 never executed
+    #####:  462:    if (vt && firstMaxRankedShape.size() < vt.getShape().size())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  463:      firstMaxRankedShape.assign(vt.getShape().begin(), vt.getShape().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  464:  }
+        -:  465:  //   b. broadcast each op if needed.
+function _ZZL14vectorizeOneOpRN4mlir9OpBuilderENS_6linalg8LinalgOpEPNS_9OperationERKNS_20BlockAndValueMappingEN4llvm8ArrayRefISt8functionIF19VectorizationResultS5_S8_EEEEENKUlNS_5ValueEE_clESG_ called 0 returned 0% blocks executed 0%
+    #####:  466:  auto vectorizedOperands = llvm::map_range(op->getOperands(), [&](Value v) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  467:    return firstMaxRankedShape.empty()
+branch  0 never executed
+branch  1 never executed
+    #####:  468:               ? bvm.lookup(v)
+call    0 never executed
+call    1 never executed
+    #####:  469:               : broadcastIfNeeded(b, bvm.lookup(v), firstMaxRankedShape);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  470:  });
+        -:  471:  //   c. for elementwise, the result is the vector with the firstMaxRankedShape
+function _ZZL14vectorizeOneOpRN4mlir9OpBuilderENS_6linalg8LinalgOpEPNS_9OperationERKNS_20BlockAndValueMappingEN4llvm8ArrayRefISt8functionIF19VectorizationResultS5_S8_EEEEENKUlNS_4TypeEE0_clESG_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  472:  auto returnTypes = llvm::map_range(op->getResultTypes(), [&](Type t) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  473:    return firstMaxRankedShape.empty()
+branch  0 never executed
+branch  1 never executed
+        -:  474:               ? t
+    #####:  475:               : VectorType::get(firstMaxRankedShape, t);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  476:  });
+        -:  477:
+        -:  478:  // Build and return the new op.
+    #####:  479:  return VectorizationResult{
+        -:  480:      VectorizationStatus::NewOp,
+    #####:  481:      b.create(op->getLoc(), op->getName().getIdentifier(),
+call    0 never executed
+call    1 never executed
+    #####:  482:               llvm::to_vector<4>(vectorizedOperands),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  483:               llvm::to_vector<4>(returnTypes), op->getAttrs())};
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  484:}
+        -:  485:
+        -:  486:/// Generic vectorization function that rewrites the body of a `linalgOp` into
+        -:  487:/// vector form. Generic vectorization proceeds as follows:
+        -:  488:///   1. Verify the `linalgOp` has one non-empty region.
+        -:  489:///   2. Values defined above the region are mapped to themselves and will be
+        -:  490:///   broadcasted on a per-need basis by their consumers.
+        -:  491:///   3. Each region argument is vectorized into a vector.transfer_read (or 0-d
+        -:  492:///   load).
+        -:  493:///   TODO: Reuse opportunities for RAR dependencies.
+        -:  494:///   4a. Register CustomVectorizationHook for YieldOp to capture the results.
+        -:  495:///   4b. Register CustomVectorizationHook for IndexOp to access the iteration
+        -:  496:///   indices.
+        -:  497:///   5. Iteratively call vectorizeOneOp on the region operations.
+        -:  498:///
+        -:  499:/// When `broadcastToMaximalCommonShape` is set to true, eager broadcasting is
+        -:  500:/// performed to the maximal common vector size implied by the `linalgOp`
+        -:  501:/// iteration space. This eager broadcasting is introduced in the
+        -:  502:/// permutation_map of the vector.transfer_read operations. The eager
+        -:  503:/// broadcasting makes it trivial to detrmine where broadcast, transposes and
+        -:  504:/// reductions should occur, without any bookkeeping. The tradeoff is that, in
+        -:  505:/// the absence of good canonicalizations, the amount of work increases.
+        -:  506:/// This is not deemed a problem as we expect canonicalizations and foldings to
+        -:  507:/// aggressively clean up the useless work.
+        -:  508:static LogicalResult
+function _ZL24vectorizeAsLinalgGenericRN4mlir9OpBuilderENS_6linalg8LinalgOpERN4llvm15SmallVectorImplINS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  509:vectorizeAsLinalgGeneric(OpBuilder &b, LinalgOp linalgOp,
+        -:  510:                         SmallVectorImpl<Value> &newResults) {
+    #####:  511:  Block *block = linalgOp.getBlock();
+call    0 never executed
+        -:  512:
+        -:  513:  // 2. Values defined above the region can only be broadcast for now. Make them
+        -:  514:  // map to themselves.
+    #####:  515:  BlockAndValueMapping bvm;
+call    0 never executed
+call    1 never executed
+    #####:  516:  SetVector<Value> valuesSet;
+call    0 never executed
+    #####:  517:  mlir::getUsedValuesDefinedAbove(linalgOp->getRegion(0), valuesSet);
+call    0 never executed
+call    1 never executed
+    #####:  518:  bvm.map(valuesSet.getArrayRef(), valuesSet.getArrayRef());
+call    0 never executed
+        -:  519:
+    #####:  520:  if (linalgOp.getNumDpsInits() == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  521:    return failure();
+        -:  522:
+        -:  523:  // TODO: the common vector shape is equal to the static loop sizes only when
+        -:  524:  // all indexing maps are projected permutations. For convs and stencils the
+        -:  525:  // logic will need to evolve.
+    #####:  526:  SmallVector<int64_t> commonVectorShape = linalgOp.computeStaticLoopSizes();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  527:
+        -:  528:  // 3. Turn all BBArgs into vector.transfer_read / load.
+    #####:  529:  Location loc = linalgOp.getLoc();
+call    0 never executed
+    #####:  530:  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+call    1 never executed
+    #####:  531:  for (OpOperand *opOperand : linalgOp.getOpOperandsMatchingBBargs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  532:    BlockArgument bbarg = linalgOp.getMatchingBlockArgument(opOperand);
+call    0 never executed
+    #####:  533:    if (linalgOp.isScalar(opOperand)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  534:      bvm.map(bbarg, opOperand->get());
+call    0 never executed
+    #####:  535:      continue;
+        -:  536:    }
+    #####:  537:    VectorType readType;
+    #####:  538:    AffineMap map;
+        -:  539:    // TODO: can we keep this simplification?
+        -:  540:    // if (linalgOp.getShape(&opOperand).empty()) {
+        -:  541:    //   readType = VectorType::get({}, bbarg.getType());
+        -:  542:    // } else {
+    #####:  543:    if (opOperand->getOperandNumber() < linalgOp.getNumDpsInputs()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  544:      map = inverseAndBroadcastProjectedPermutation(
+    #####:  545:          linalgOp.getMatchingIndexingMap(opOperand));
+call    0 never executed
+call    1 never executed
+    #####:  546:      readType = VectorType::get(commonVectorShape,
+    #####:  547:                                 getElementTypeOrSelf(opOperand->get()));
+call    0 never executed
+call    1 never executed
+        -:  548:    } else {
+    #####:  549:      map = inversePermutation(
+    #####:  550:          reindexIndexingMap(linalgOp.getMatchingIndexingMap(opOperand)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  551:      readType = VectorType::get(map.compose(linalgOp.getShape(opOperand)),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  552:                                 getElementTypeOrSelf(opOperand->get()));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  553:    }
+        -:  554:    // }
+        -:  555:
+    #####:  556:    auto shape = linalgOp.getShape(opOperand);
+call    0 never executed
+    #####:  557:    SmallVector<Value> indices(shape.size(), zero);
+call    0 never executed
+    #####:  558:    Value readValue = b.create<vector::TransferReadOp>(
+    #####:  559:        loc, readType, opOperand->get(), indices, map);
+call    0 never executed
+call    1 never executed
+        -:  560:    // Not all ops support 0-d vectors, extract the scalar for now.
+        -:  561:    // TODO: remove this.
+    #####:  562:    if (readValue.getType().cast<VectorType>().getRank() == 0)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  563:      readValue = b.create<vector::ExtractElementOp>(loc, readValue);
+call    0 never executed
+        -:  564:
+    #####:  565:    LDBG("new vectorized bbarg(" << bbarg.getArgNumber() << "): " << readValue);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+    #####:  566:    bvm.map(bbarg, readValue);
+call    0 never executed
+    #####:  567:    bvm.map(opOperand->get(), readValue);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  568:  }
+        -:  569:
+    #####:  570:  SmallVector<CustomVectorizationHook> hooks;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  571:  // 4a. Register CustomVectorizationHook for yieldOp.
+    #####:  572:  CustomVectorizationHook vectorizeYield =
+    #####:  573:      [&](Operation *op,
+        -:  574:          const BlockAndValueMapping &bvm) -> VectorizationResult {
+    #####:  575:    return vectorizeLinalgYield(b, op, bvm, linalgOp, newResults);
+call    0 never executed
+    #####:  576:  };
+call    0 never executed
+call    1 never executed
+    #####:  577:  hooks.push_back(vectorizeYield);
+call    0 never executed
+        -:  578:
+        -:  579:  // 4b. Register CustomVectorizationHook for indexOp.
+    #####:  580:  CustomVectorizationHook vectorizeIndex =
+    #####:  581:      [&](Operation *op,
+        -:  582:          const BlockAndValueMapping &bvm) -> VectorizationResult {
+    #####:  583:    return vectorizeLinalgIndex(b, op, linalgOp);
+call    0 never executed
+    #####:  584:  };
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  585:  hooks.push_back(vectorizeIndex);
+call    0 never executed
+        -:  586:
+        -:  587:  // 4c. Register CustomVectorizationHook for extractOp.
+    #####:  588:  CustomVectorizationHook vectorizeExtract =
+    #####:  589:      [&](Operation *op,
+        -:  590:          const BlockAndValueMapping &bvm) -> VectorizationResult {
+    #####:  591:    return vectorizeTensorExtract(b, op, linalgOp, bvm);
+call    0 never executed
+    #####:  592:  };
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  593:  hooks.push_back(vectorizeExtract);
+call    0 never executed
+        -:  594:
+        -:  595:  // 5. Iteratively call `vectorizeOneOp` to each op in the slice.
+    #####:  596:  for (Operation &op : block->getOperations()) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  597:    VectorizationResult result = vectorizeOneOp(b, linalgOp, &op, bvm, hooks);
+call    0 never executed
+    #####:  598:    if (result.status == VectorizationStatus::Failure) {
+branch  0 never executed
+branch  1 never executed
+    #####:  599:      LDBG("failed to vectorize: " << op);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####:  600:      return failure();
+        -:  601:    }
+    #####:  602:    if (result.status == VectorizationStatus::NewOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  603:      LDBG("new vector op: " << *result.newOp;);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####:  604:      bvm.map(op.getResults(), result.newOp->getResults());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  605:    }
+        -:  606:  }
+        -:  607:
+    #####:  608:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  609:}
+        -:  610:
+        -:  611:// TODO: probably need some extra checks for reduction followed by consumer
+        -:  612:// ops that may not commute (e.g. linear reduction + non-linear instructions).
+function _ZL22reductionPreconditionsN4mlir6linalg8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  613:static LogicalResult reductionPreconditions(LinalgOp op) {
+    #####:  614:  if (llvm::none_of(op.getIteratorTypesArray(), isReductionIterator)) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  615:    LDBG("reduction precondition failed: no reduction iterator");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  616:    return failure();
+        -:  617:  }
+    #####:  618:  for (OpOperand *opOperand : op.getDpsInitOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  619:    AffineMap indexingMap = op.getMatchingIndexingMap(opOperand);
+call    0 never executed
+    #####:  620:    if (indexingMap.isPermutation())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  621:      continue;
+        -:  622:
+    #####:  623:    Operation *reduceOp = matchLinalgReduction(opOperand);
+call    0 never executed
+    #####:  624:    if (!reduceOp || !getCombinerOpKind(reduceOp)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  625:      LDBG("reduction precondition failed: reduction detection failed");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  626:      return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  627:    }
+        -:  628:  }
+    #####:  629:  return success();
+        -:  630:}
+        -:  631:
+function _ZL35vectorizeStaticLinalgOpPreconditionN4mlir6linalg8LinalgOpEN4llvm8ArrayRefISt8functionIFNS_13LogicalResultEPNS_9OperationEEEEE called 0 returned 0% blocks executed 0%
+    #####:  632:static LogicalResult vectorizeStaticLinalgOpPrecondition(
+        -:  633:    linalg::LinalgOp op,
+        -:  634:    ArrayRef<CustomVectorizationPrecondition> customPreconditions) {
+        -:  635:
+        -:  636:  // All types in the body should be a supported element type for VectorType.
+    #####:  637:  for (Operation &innerOp : op->getRegion(0).front()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  638:    // Check if any custom hook can vectorize the inner op.
+    #####:  639:    if (llvm::any_of(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  640:            customPreconditions,
+function _ZZL35vectorizeStaticLinalgOpPreconditionN4mlir6linalg8LinalgOpEN4llvm8ArrayRefISt8functionIFNS_13LogicalResultEPNS_9OperationEEEEEENKUlRKS9_E_clESC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  641:            [&](const CustomVectorizationPrecondition &customPrecondition) {
+    #####:  642:              return succeeded(customPrecondition(&innerOp));
+branch  0 never executed
+branch  1 never executed
+        -:  643:            })) {
+    #####:  644:      continue;
+        -:  645:    }
+    #####:  646:    if (llvm::any_of(innerOp.getOperandTypes(), [](Type type) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  647:          return !VectorType::isValidElementType(type);
+        -:  648:        })) {
+    #####:  649:      return failure();
+        -:  650:    }
+    #####:  651:    if (llvm::any_of(innerOp.getResultTypes(), [](Type type) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  652:          return !VectorType::isValidElementType(type);
+        -:  653:        })) {
+    #####:  654:      return failure();
+        -:  655:    }
+        -:  656:  }
+    #####:  657:  if (isElementwise(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  658:    return success();
+        -:  659:  // TODO: isaConvolutionOpInterface that can also infer from generic features.
+        -:  660:  // But we will still need stride/dilation attributes that will be annoying to
+        -:  661:  // reverse-engineer...
+    #####:  662:  if (isa<ConvolutionOpInterface>(op.getOperation()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  663:    return success();
+        -:  664:  // TODO: the common vector shape is equal to the static loop sizes only when
+        -:  665:  // all indexing maps are projected permutations. For convs and stencils the
+        -:  666:  // logic will need to evolve.
+    #####:  667:  if (!allIndexingsAreProjectedPermutation(op)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  668:    LDBG("precondition failed: not projected permutations");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  669:    return failure();
+        -:  670:  }
+    #####:  671:  if (failed(reductionPreconditions(op))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  672:    LDBG("precondition failed: reduction preconditions");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  673:    return failure();
+        -:  674:  }
+    #####:  675:  return success();
+        -:  676:}
+        -:  677:
+function _ZN4mlir6linalg29vectorizeLinalgOpPreconditionENS0_8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  678:LogicalResult mlir::linalg::vectorizeLinalgOpPrecondition(LinalgOp linalgOp) {
+        -:  679:  // All types must be static shape to go to vector.
+    #####:  680:  if (linalgOp.hasDynamicShape()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  681:    LDBG("precondition failed: dynamic shape");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+    #####:  682:    return failure();
+        -:  683:  }
+        -:  684:
+    #####:  685:  SmallVector<CustomVectorizationPrecondition> customPreconditions;
+call    0 never executed
+        -:  686:
+        -:  687:  // Register CustomVectorizationPrecondition for extractOp.
+    #####:  688:  customPreconditions.push_back(tensorExtractVectorizationPrecondition);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  689:
+    #####:  690:  return vectorizeStaticLinalgOpPrecondition(linalgOp, customPreconditions);
+call    0 never executed
+call    1 never executed
+        -:  691:}
+        -:  692:
+function _ZN4mlir6linalg9vectorizeERNS_12RewriterBaseENS0_8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  693:LogicalResult mlir::linalg::vectorize(RewriterBase &rewriter,
+        -:  694:                                      LinalgOp linalgOp) {
+    #####:  695:  if (failed(vectorizeLinalgOpPrecondition(linalgOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  696:    return failure();
+        -:  697:
+    #####:  698:  SmallVector<Value> results;
+call    0 never executed
+        -:  699:  // TODO: isaConvolutionOpInterface that can also infer from generic
+        -:  700:  // features. Will require stride/dilation attributes inference.
+    #####:  701:  FailureOr<Operation *> convOr = vectorizeConvolution(rewriter, linalgOp);
+call    0 never executed
+    #####:  702:  if (succeeded(convOr)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  703:    llvm::append_range(results, (*convOr)->getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  704:  } else {
+    #####:  705:    if (failed(vectorizeLinalgOpPrecondition(linalgOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  706:      return failure();
+    #####:  707:    LDBG("Vectorize generic by broadcasting to a common shape: " << linalgOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####:  708:    if (failed(vectorizeAsLinalgGeneric(rewriter, linalgOp, results)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  709:      return failure();
+        -:  710:  }
+        -:  711:
+    #####:  712:  if (!results.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  713:    rewriter.replaceOp(linalgOp, results);
+call    0 never executed
+call    1 never executed
+        -:  714:  else
+    #####:  715:    rewriter.eraseOp(linalgOp);
+call    0 never executed
+        -:  716:
+    #####:  717:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  718:}
+        -:  719:
+function _ZN4mlir6linalg13vectorizeCopyERNS_12RewriterBaseENS_6memref6CopyOpE called 0 returned 0% blocks executed 0%
+    #####:  720:LogicalResult mlir::linalg::vectorizeCopy(RewriterBase &rewriter,
+        -:  721:                                          memref::CopyOp copyOp) {
+        -:  722:
+    #####:  723:  auto srcType = copyOp.getSource().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+    #####:  724:  auto dstType = copyOp.getTarget().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+    #####:  725:  if (!srcType.hasStaticShape() || !dstType.hasStaticShape())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  726:    return failure();
+        -:  727:
+    #####:  728:  auto readType =
+    #####:  729:      VectorType::get(srcType.getShape(), getElementTypeOrSelf(srcType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  730:  auto writeType =
+    #####:  731:      VectorType::get(dstType.getShape(), getElementTypeOrSelf(dstType));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  732:
+    #####:  733:  Location loc = copyOp->getLoc();
+call    0 never executed
+    #####:  734:  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+call    1 never executed
+    #####:  735:  SmallVector<Value> indices(srcType.getRank(), zero);
+call    0 never executed
+call    1 never executed
+        -:  736:
+    #####:  737:  Value readValue = rewriter.create<vector::TransferReadOp>(
+    #####:  738:      loc, readType, copyOp.getSource(), indices,
+call    0 never executed
+    #####:  739:      rewriter.getMultiDimIdentityMap(srcType.getRank()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  740:  if (readValue.getType().cast<VectorType>().getRank() == 0) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  741:    readValue = rewriter.create<vector::ExtractElementOp>(loc, readValue);
+call    0 never executed
+call    1 never executed
+    #####:  742:    readValue = rewriter.create<vector::BroadcastOp>(loc, writeType, readValue);
+call    0 never executed
+        -:  743:  }
+    #####:  744:  Operation *writeValue = rewriter.create<vector::TransferWriteOp>(
+    #####:  745:      loc, readValue, copyOp.getTarget(), indices,
+call    0 never executed
+    #####:  746:      rewriter.getMultiDimIdentityMap(srcType.getRank()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  747:  rewriter.replaceOp(copyOp, writeValue->getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  748:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  749:}
+        -:  750:
+        -:  751://----------------------------------------------------------------------------//
+        -:  752:// Misc. vectorization patterns.
+        -:  753://----------------------------------------------------------------------------//
+        -:  754:
+        -:  755:/// Helper function that retrieves the value of an IntegerAttr.
+function _ZL14getIntFromAttrN4mlir9AttributeE called 0 returned 0% blocks executed 0%
+    #####:  756:static int64_t getIntFromAttr(Attribute attr) {
+    #####:  757:  return attr.cast<IntegerAttr>().getInt();
+call    0 never executed
+call    1 never executed
+        -:  758:}
+        -:  759:
+        -:  760:/// Given an ArrayRef of OpFoldResults, return a vector of Values.
+        -:  761:/// IntegerAttrs are converted to ConstantIndexOps. Other attribute types are
+        -:  762:/// not supported.
+function _ZL16ofrToIndexValuesRN4mlir9OpBuilderENS_8LocationEN4llvm8ArrayRefINS_12OpFoldResultEEE called 0 returned 0% blocks executed 0%
+    #####:  763:static SmallVector<Value> ofrToIndexValues(OpBuilder &builder, Location loc,
+        -:  764:                                           ArrayRef<OpFoldResult> ofrs) {
+    #####:  765:  SmallVector<Value> result;
+    #####:  766:  for (auto o : ofrs) {
+branch  0 never executed
+branch  1 never executed
+    #####:  767:    if (auto val = o.template dyn_cast<Value>()) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  768:      result.push_back(val);
+call    0 never executed
+        -:  769:    } else {
+    #####:  770:      result.push_back(builder.create<arith::ConstantIndexOp>(
+call    0 never executed
+    #####:  771:          loc, getIntFromAttr(o.template get<Attribute>())));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  772:    }
+        -:  773:  }
+    #####:  774:  return result;
+        -:  775:}
+        -:  776:
+        -:  777:/// Rewrite a tensor::PadOp into a sequence of EmptyOp, FillOp and
+        -:  778:/// InsertSliceOp. For now, only constant padding values are supported.
+        -:  779:/// If there is enough static type information, TransferReadOps and
+        -:  780:/// TransferWriteOps may be generated instead of InsertSliceOps.
+        -:  781:struct GenericPadOpVectorizationPattern : public GeneralizePadOpPattern {
+function _ZN32GenericPadOpVectorizationPatternC2EPN4mlir11MLIRContextENS0_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####:  782:  GenericPadOpVectorizationPattern(MLIRContext *context,
+        -:  783:                                   PatternBenefit benefit = 1)
+    #####:  784:      : GeneralizePadOpPattern(context, tryVectorizeCopy, benefit) {}
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  785:  /// Vectorize the copying of a tensor::PadOp's source. This is possible if
+        -:  786:  /// each dimension size is statically know in the source type or the result
+        -:  787:  /// type (or both).
+function _ZN32GenericPadOpVectorizationPattern16tryVectorizeCopyERN4mlir15PatternRewriterENS0_6tensor5PadOpENS0_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  788:  static LogicalResult tryVectorizeCopy(PatternRewriter &rewriter,
+        -:  789:                                        tensor::PadOp padOp, Value dest) {
+    #####:  790:    auto sourceType = padOp.getSourceType();
+call    0 never executed
+    #####:  791:    auto resultType = padOp.getResultType();
+call    0 never executed
+        -:  792:
+        -:  793:    // Copy cannot be vectorized if pad value is non-constant and source shape
+        -:  794:    // is dynamic. In case of a dynamic source shape, padding must be appended
+        -:  795:    // by TransferReadOp, but TransferReadOp supports only constant padding.
+    #####:  796:    auto padValue = padOp.getConstantPaddingValue();
+call    0 never executed
+    #####:  797:    if (!padValue) {
+branch  0 never executed
+branch  1 never executed
+    #####:  798:      if (!sourceType.hasStaticShape())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  799:        return failure();
+        -:  800:      // Create dummy padding value.
+    #####:  801:      auto elemType = sourceType.getElementType();
+call    0 never executed
+    #####:  802:      padValue = rewriter.create<arith::ConstantOp>(
+    #####:  803:          padOp.getLoc(), elemType, rewriter.getZeroAttr(elemType));
+call    0 never executed
+call    1 never executed
+        -:  804:    }
+        -:  805:
+    #####:  806:    SmallVector<int64_t> vecShape;
+    #####:  807:    SmallVector<bool> readInBounds;
+branch  0 never executed
+branch  1 never executed
+    #####:  808:    SmallVector<bool> writeInBounds;
+branch  0 never executed
+branch  1 never executed
+    #####:  809:    for (unsigned i = 0; i < sourceType.getRank(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  810:      if (!sourceType.isDynamicDim(i)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  811:        vecShape.push_back(sourceType.getDimSize(i));
+call    0 never executed
+call    1 never executed
+        -:  812:        // Source shape is statically known: Neither read nor write are
+        -:  813:        // out-of- bounds.
+    #####:  814:        readInBounds.push_back(true);
+call    0 never executed
+    #####:  815:        writeInBounds.push_back(true);
+call    0 never executed
+    #####:  816:      } else if (!resultType.isDynamicDim(i)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  817:        // Source shape is not statically known, but result shape is.
+        -:  818:        // Vectorize with size of result shape. This may be larger than the
+        -:  819:        // source size.
+    #####:  820:        vecShape.push_back(resultType.getDimSize(i));
+call    0 never executed
+call    1 never executed
+        -:  821:        // Read may be out-of-bounds because the result size could be larger
+        -:  822:        // than the source size.
+    #####:  823:        readInBounds.push_back(false);
+call    0 never executed
+        -:  824:        // Write is out-of-bounds if low padding > 0.
+    #####:  825:        writeInBounds.push_back(
+    #####:  826:            getConstantIntValue(padOp.getMixedLowPad()[i]) ==
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+        -:  827:            static_cast<int64_t>(0));
+        -:  828:      } else {
+        -:  829:        // Neither source nor result dim of padOp is static. Cannot vectorize
+        -:  830:        // the copy.
+    #####:  831:        return failure();
+        -:  832:      }
+        -:  833:    }
+    #####:  834:    auto vecType = VectorType::get(vecShape, sourceType.getElementType());
+call    0 never executed
+call    1 never executed
+        -:  835:
+        -:  836:    // Generate TransferReadOp.
+    #####:  837:    SmallVector<Value> readIndices(
+    #####:  838:        vecType.getRank(),
+    #####:  839:        rewriter.create<arith::ConstantIndexOp>(padOp.getLoc(), 0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  840:    auto read = rewriter.create<vector::TransferReadOp>(
+    #####:  841:        padOp.getLoc(), vecType, padOp.getSource(), readIndices, padValue,
+call    0 never executed
+    #####:  842:        ArrayRef<bool>{readInBounds});
+call    0 never executed
+call    1 never executed
+        -:  843:
+        -:  844:    // If `dest` is a FillOp and the TransferWriteOp would overwrite the
+        -:  845:    // entire tensor, write directly to the FillOp's operand.
+    #####:  846:    if (llvm::equal(vecShape, resultType.getShape()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  847:        llvm::all_of(writeInBounds, [](bool b) { return b; }))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+    #####:  848:      if (auto fill = dest.getDefiningOp<FillOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  849:        dest = fill.output();
+call    0 never executed
+        -:  850:
+        -:  851:    // Generate TransferWriteOp.
+    #####:  852:    auto writeIndices =
+    #####:  853:        ofrToIndexValues(rewriter, padOp.getLoc(), padOp.getMixedLowPad());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  854:    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+    #####:  855:        padOp, read, dest, writeIndices, ArrayRef<bool>{writeInBounds});
+call    0 never executed
+        -:  856:
+    #####:  857:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  858:  }
+        -:  859:};
+        -:  860:
+        -:  861:/// Base pattern for rewriting tensor::PadOps whose result is consumed by a
+        -:  862:/// given operation type OpTy.
+        -:  863:template <typename OpTy>
+        -:  864:struct VectorizePadOpUserPattern : public OpRewritePattern<tensor::PadOp> {
+        -:  865:  using OpRewritePattern<tensor::PadOp>::OpRewritePattern;
+        -:  866:
+    #####:  867:  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+        -:  868:                                PatternRewriter &rewriter) const final {
+    #####:  869:    bool changed = false;
+        -:  870:    // Insert users in vector, because some users may be replaced/removed.
+    #####:  871:    for (auto *user : llvm::to_vector<4>(padOp->getUsers()))
+    #####:  872:      if (auto op = dyn_cast<OpTy>(user))
+    #####:  873:        changed |= rewriteUser(rewriter, padOp, op).succeeded();
+    #####:  874:    return success(changed);
+        -:  875:  }
+------------------
+_ZNK25VectorizePadOpUserPatternIN4mlir6vector14TransferReadOpEE15matchAndRewriteENS0_6tensor5PadOpERNS0_15PatternRewriterE:
+function _ZNK25VectorizePadOpUserPatternIN4mlir6vector14TransferReadOpEE15matchAndRewriteENS0_6tensor5PadOpERNS0_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  867:  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+        -:  868:                                PatternRewriter &rewriter) const final {
+    #####:  869:    bool changed = false;
+        -:  870:    // Insert users in vector, because some users may be replaced/removed.
+    #####:  871:    for (auto *user : llvm::to_vector<4>(padOp->getUsers()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  872:      if (auto op = dyn_cast<OpTy>(user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  873:        changed |= rewriteUser(rewriter, padOp, op).succeeded();
+call    0 never executed
+    #####:  874:    return success(changed);
+        -:  875:  }
+------------------
+_ZNK25VectorizePadOpUserPatternIN4mlir6vector15TransferWriteOpEE15matchAndRewriteENS0_6tensor5PadOpERNS0_15PatternRewriterE:
+function _ZNK25VectorizePadOpUserPatternIN4mlir6vector15TransferWriteOpEE15matchAndRewriteENS0_6tensor5PadOpERNS0_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  867:  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+        -:  868:                                PatternRewriter &rewriter) const final {
+    #####:  869:    bool changed = false;
+        -:  870:    // Insert users in vector, because some users may be replaced/removed.
+    #####:  871:    for (auto *user : llvm::to_vector<4>(padOp->getUsers()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  872:      if (auto op = dyn_cast<OpTy>(user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  873:        changed |= rewriteUser(rewriter, padOp, op).succeeded();
+call    0 never executed
+    #####:  874:    return success(changed);
+        -:  875:  }
+------------------
+_ZNK25VectorizePadOpUserPatternIN4mlir6tensor13InsertSliceOpEE15matchAndRewriteENS1_5PadOpERNS0_15PatternRewriterE:
+function _ZNK25VectorizePadOpUserPatternIN4mlir6tensor13InsertSliceOpEE15matchAndRewriteENS1_5PadOpERNS0_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  867:  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+        -:  868:                                PatternRewriter &rewriter) const final {
+    #####:  869:    bool changed = false;
+        -:  870:    // Insert users in vector, because some users may be replaced/removed.
+    #####:  871:    for (auto *user : llvm::to_vector<4>(padOp->getUsers()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  872:      if (auto op = dyn_cast<OpTy>(user))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  873:        changed |= rewriteUser(rewriter, padOp, op).succeeded();
+call    0 never executed
+    #####:  874:    return success(changed);
+        -:  875:  }
+------------------
+        -:  876:
+        -:  877:protected:
+        -:  878:  virtual LogicalResult rewriteUser(PatternRewriter &rewriter,
+        -:  879:                                    tensor::PadOp padOp, OpTy op) const = 0;
+        -:  880:};
+        -:  881:
+        -:  882:/// Rewrite use of tensor::PadOp result in TransferReadOp. E.g.:
+        -:  883:/// ```
+        -:  884:/// %0 = tensor.pad %src ... : tensor<?x?xf32> to tensor<17x5xf32>
+        -:  885:/// %r = vector.transfer_read %0[%c0, %c0], %cst
+        -:  886:///     {in_bounds = [true, true]} : tensor<17x5xf32>, vector<17x5xf32>
+        -:  887:/// ```
+        -:  888:/// is rewritten to:
+        -:  889:/// ```
+        -:  890:/// %r = vector.transfer_read %src[%c0, %c0], %padding
+        -:  891:///     {in_bounds = [true, true]}
+        -:  892:///     : tensor<?x?xf32>, vector<17x5xf32>
+        -:  893:/// ```
+        -:  894:/// Note: By restricting this pattern to in-bounds TransferReadOps, we can be
+        -:  895:/// sure that the original padding value %cst was never used.
+        -:  896:///
+        -:  897:/// This rewrite is possible if:
+        -:  898:/// - `xferOp` has no out-of-bounds dims or mask.
+        -:  899:/// - Low padding is static 0.
+        -:  900:/// - Single, scalar padding value.
+        -:  901:struct PadOpVectorizationWithTransferReadPattern
+        -:  902:    : public VectorizePadOpUserPattern<vector::TransferReadOp> {
+        -:  903:  using VectorizePadOpUserPattern<
+        -:  904:      vector::TransferReadOp>::VectorizePadOpUserPattern;
+        -:  905:
+function _ZNK41PadOpVectorizationWithTransferReadPattern11rewriteUserERN4mlir15PatternRewriterENS0_6tensor5PadOpENS0_6vector14TransferReadOpE called 0 returned 0% blocks executed 0%
+    #####:  906:  LogicalResult rewriteUser(PatternRewriter &rewriter, tensor::PadOp padOp,
+        -:  907:                            vector::TransferReadOp xferOp) const override {
+        -:  908:    // Low padding must be static 0.
+    #####:  909:    if (!padOp.hasZeroLowPad())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  910:      return failure();
+        -:  911:    // Pad value must be a constant.
+    #####:  912:    auto padValue = padOp.getConstantPaddingValue();
+call    0 never executed
+    #####:  913:    if (!padValue)
+branch  0 never executed
+branch  1 never executed
+    #####:  914:      return failure();
+        -:  915:    // Padding value of existing `xferOp` is unused.
+    #####:  916:    if (xferOp.hasOutOfBoundsDim() || xferOp.getMask())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  917:      return failure();
+        -:  918:
+function _ZZNK41PadOpVectorizationWithTransferReadPattern11rewriteUserERN4mlir15PatternRewriterENS0_6tensor5PadOpENS0_6vector14TransferReadOpEENKUlvE_clEv called 0 returned 0% blocks executed 0%
+    #####:  919:    rewriter.updateRootInPlace(xferOp, [&]() {
+call    0 never executed
+    #####:  920:      SmallVector<bool> inBounds(xferOp.getVectorType().getRank(), false);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  921:      xferOp->setAttr(xferOp.getInBoundsAttrName(),
+call    0 never executed
+call    1 never executed
+    #####:  922:                      rewriter.getBoolArrayAttr(inBounds));
+call    0 never executed
+    #####:  923:      xferOp.getSourceMutable().assign(padOp.getSource());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  924:      xferOp.getPaddingMutable().assign(padValue);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  925:    });
+        -:  926:
+    #####:  927:    return success();
+        -:  928:  }
+        -:  929:};
+        -:  930:
+        -:  931:/// Rewrite use of tensor::PadOp result in TransferWriteOp.
+        -:  932:/// This pattern rewrites TransferWriteOps that write to a padded tensor
+        -:  933:/// value, where the same amount of padding is immediately removed again after
+        -:  934:/// the write. In such cases, the TransferWriteOp can write to the non-padded
+        -:  935:/// tensor value and apply out-of-bounds masking. E.g.:
+        -:  936:/// ```
+        -:  937:/// %0 = tensor.extract_slice ...[...] [%s0, %s1] [1, 1]
+        -:  938:///     : tensor<...> to tensor<?x?xf32>
+        -:  939:/// %1 = tensor.pad %0 ... : tensor<?x?xf32> to tensor<17x5xf32>
+        -:  940:/// %2 = vector.transfer_write %vec, %1[...]
+        -:  941:///     : vector<17x5xf32>, tensor<17x5xf32>
+        -:  942:/// %r = tensor.extract_slice %2[0, 0] [%s0, %s1] [1, 1]
+        -:  943:///     : tensor<17x5xf32> to tensor<?x?xf32>
+        -:  944:/// ```
+        -:  945:/// is rewritten to:
+        -:  946:/// ```
+        -:  947:/// %0 = tensor.extract_slice ...[...] [%s0, %s1] [1, 1]
+        -:  948:///     : tensor<...> to tensor<?x?xf32>
+        -:  949:/// %r = vector.transfer_write %vec, %0[...] : vector<17x5xf32>,
+        -:  950:/// tensor<?x?xf32>
+        -:  951:/// ```
+        -:  952:/// Note: It is important that the ExtractSliceOp %r resizes the result of the
+        -:  953:/// TransferWriteOp to the same size as the input of the TensorPadOp (or an
+        -:  954:/// even smaller size). Otherwise, %r's new (dynamic) dimensions would differ
+        -:  955:/// from %r's old dimensions.
+        -:  956:///
+        -:  957:/// This rewrite is possible if:
+        -:  958:/// - Low padding is static 0.
+        -:  959:/// - `xferOp` has exactly one use, which is an ExtractSliceOp. This
+        -:  960:///   ExtractSliceOp trims the same amount of padding that was added
+        -:  961:///   beforehand.
+        -:  962:/// - Single, scalar padding value.
+        -:  963:struct PadOpVectorizationWithTransferWritePattern
+        -:  964:    : public VectorizePadOpUserPattern<vector::TransferWriteOp> {
+        -:  965:  using VectorizePadOpUserPattern<
+        -:  966:      vector::TransferWriteOp>::VectorizePadOpUserPattern;
+        -:  967:
+function _ZNK42PadOpVectorizationWithTransferWritePattern11rewriteUserERN4mlir15PatternRewriterENS0_6tensor5PadOpENS0_6vector15TransferWriteOpE called 0 returned 0% blocks executed 0%
+    #####:  968:  LogicalResult rewriteUser(PatternRewriter &rewriter, tensor::PadOp padOp,
+        -:  969:                            vector::TransferWriteOp xferOp) const override {
+        -:  970:    // TODO: support 0-d corner case.
+    #####:  971:    if (xferOp.getTransferRank() == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  972:      return failure();
+        -:  973:
+        -:  974:    // Low padding must be static 0.
+    #####:  975:    if (!padOp.hasZeroLowPad())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  976:      return failure();
+        -:  977:    // Pad value must be a constant.
+    #####:  978:    auto padValue = padOp.getConstantPaddingValue();
+call    0 never executed
+    #####:  979:    if (!padValue)
+branch  0 never executed
+branch  1 never executed
+    #####:  980:      return failure();
+        -:  981:    // TransferWriteOp result must be directly consumed by an ExtractSliceOp.
+    #####:  982:    if (!xferOp->hasOneUse())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  983:      return failure();
+    #####:  984:    auto trimPadding = dyn_cast<tensor::ExtractSliceOp>(*xferOp->user_begin());
+call    0 never executed
+call    1 never executed
+    #####:  985:    if (!trimPadding)
+branch  0 never executed
+branch  1 never executed
+    #####:  986:      return failure();
+        -:  987:    // Only static zero offsets supported when trimming padding.
+    #####:  988:    if (!trimPadding.hasZeroOffset())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  989:      return failure();
+        -:  990:    // trimPadding must remove the amount of padding that was added earlier.
+    #####:  991:    if (!hasSameTensorSize(padOp.getSource(), trimPadding))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  992:      return failure();
+        -:  993:
+        -:  994:    // Insert the new TransferWriteOp at position of the old TransferWriteOp.
+    #####:  995:    rewriter.setInsertionPoint(xferOp);
+call    0 never executed
+        -:  996:
+    #####:  997:    SmallVector<bool> inBounds(xferOp.getVectorType().getRank(), false);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  998:    auto newXferOp = rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+    #####:  999:        xferOp, padOp.getSource().getType(), xferOp.getVector(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1000:        padOp.getSource(), xferOp.getIndices(), xferOp.getPermutationMapAttr(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1001:        xferOp.getMask(), rewriter.getBoolArrayAttr(inBounds));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1002:    rewriter.replaceOp(trimPadding, newXferOp->getResult(0));
+call    0 never executed
+call    1 never executed
+        -: 1003:
+    #####: 1004:    return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1005:  }
+        -: 1006:
+        -: 1007:  /// Check if `beforePadding` and `afterTrimming` have the same tensor size,
+        -: 1008:  /// i.e., same dimensions.
+        -: 1009:  ///
+        -: 1010:  /// Dimensions may be static, dynamic or mix of both. In case of dynamic
+        -: 1011:  /// dimensions, this function tries to infer the (static) tensor size by
+        -: 1012:  /// looking at the defining op and utilizing op-specific knowledge.
+        -: 1013:  ///
+        -: 1014:  /// This is a conservative analysis. In case equal tensor sizes cannot be
+        -: 1015:  /// proven statically, this analysis returns `false` even though the tensor
+        -: 1016:  /// sizes may turn out to be equal at runtime.
+function _ZNK42PadOpVectorizationWithTransferWritePattern17hasSameTensorSizeEN4mlir5ValueENS0_6tensor14ExtractSliceOpE called 0 returned 0% blocks executed 0%
+    #####: 1017:  bool hasSameTensorSize(Value beforePadding,
+        -: 1018:                         tensor::ExtractSliceOp afterTrimming) const {
+        -: 1019:    // If the input to tensor::PadOp is a CastOp, try with with both CastOp
+        -: 1020:    // result and CastOp operand.
+    #####: 1021:    if (auto castOp = beforePadding.getDefiningOp<tensor::CastOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1022:      if (hasSameTensorSize(castOp.getSource(), afterTrimming))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1023:        return true;
+        -: 1024:
+    #####: 1025:    auto t1 = beforePadding.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####: 1026:    auto t2 = afterTrimming.getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+call    1 never executed
+        -: 1027:    // Only RankedTensorType supported.
+    #####: 1028:    if (!t1 || !t2)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1029:      return false;
+        -: 1030:    // Rank of both values must be the same.
+    #####: 1031:    if (t1.getRank() != t2.getRank())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1032:      return false;
+        -: 1033:
+        -: 1034:    // All static dimensions must be the same. Mixed cases (e.g., dimension
+        -: 1035:    // static in `t1` but dynamic in `t2`) are not supported.
+    #####: 1036:    for (unsigned i = 0; i < t1.getRank(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1037:      if (t1.isDynamicDim(i) != t2.isDynamicDim(i))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1038:        return false;
+    #####: 1039:      if (!t1.isDynamicDim(i) && t1.getDimSize(i) != t2.getDimSize(i))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -: 1040:        return false;
+        -: 1041:    }
+        -: 1042:
+        -: 1043:    // Nothing more to check if all dimensions are static.
+    #####: 1044:    if (t1.getNumDynamicDims() == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1045:      return true;
+        -: 1046:
+        -: 1047:    // All dynamic sizes must be the same. The only supported case at the
+        -: 1048:    // moment is when `beforePadding` is an ExtractSliceOp (or a cast
+        -: 1049:    // thereof).
+        -: 1050:
+        -: 1051:    // Apart from CastOp, only ExtractSliceOp is supported.
+    #####: 1052:    auto beforeSlice = beforePadding.getDefiningOp<tensor::ExtractSliceOp>();
+call    0 never executed
+    #####: 1053:    if (!beforeSlice)
+branch  0 never executed
+branch  1 never executed
+        -: 1054:      return false;
+        -: 1055:
+    #####: 1056:    assert(static_cast<size_t>(t1.getRank()) ==
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1057:           beforeSlice.getMixedSizes().size());
+    #####: 1058:    assert(static_cast<size_t>(t2.getRank()) ==
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1059:           afterTrimming.getMixedSizes().size());
+        -: 1060:
+    #####: 1061:    for (unsigned i = 0; i < t1.getRank(); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1062:      // Skip static dimensions.
+    #####: 1063:      if (!t1.isDynamicDim(i))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1064:        continue;
+    #####: 1065:      auto size1 = beforeSlice.getMixedSizes()[i];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1066:      auto size2 = afterTrimming.getMixedSizes()[i];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+        -: 1067:
+        -: 1068:      // Case 1: Same value or same constant int.
+    #####: 1069:      if (isEqualConstantIntOrValue(size1, size2))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1070:        continue;
+        -: 1071:
+        -: 1072:      // Other cases: Take a deeper look at defining ops of values.
+    #####: 1073:      auto v1 = size1.dyn_cast<Value>();
+branch  0 never executed
+branch  1 never executed
+    #####: 1074:      auto v2 = size2.dyn_cast<Value>();
+branch  0 never executed
+branch  1 never executed
+    #####: 1075:      if (!v1 || !v2)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1076:        return false;
+        -: 1077:
+        -: 1078:      // Case 2: Both values are identical AffineMinOps. (Should not happen if
+        -: 1079:      // CSE is run.)
+    #####: 1080:      auto minOp1 = v1.getDefiningOp<AffineMinOp>();
+call    0 never executed
+    #####: 1081:      auto minOp2 = v2.getDefiningOp<AffineMinOp>();
+call    0 never executed
+    #####: 1082:      if (minOp1 && minOp2 && minOp1.getAffineMap() == minOp2.getAffineMap() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1083:          minOp1.operands() == minOp2.operands())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1084:        continue;
+        -: 1085:
+        -: 1086:      // Add additional cases as needed.
+        -: 1087:    }
+        -: 1088:
+        -: 1089:    // All tests passed.
+        -: 1090:    return true;
+        -: 1091:  }
+        -: 1092:};
+        -: 1093:
+        -: 1094:/// Rewrite use of tensor::PadOp result in InsertSliceOp. E.g.:
+        -: 1095:/// ```
+        -: 1096:/// %0 = tensor.pad %src ... : tensor<?x?xf32> to tensor<17x5xf32>
+        -: 1097:/// %r = tensor.insert_slice %0
+        -: 1098:///     into %dest[%a, %b, 0, 0] [1, 1, 17, 5] [1, 1, 1, 1]
+        -: 1099:///     : tensor<17x5xf32> into tensor<?x?x17x5xf32>
+        -: 1100:/// ```
+        -: 1101:/// is rewritten to:
+        -: 1102:/// ```
+        -: 1103:/// %0 = vector.transfer_read %src[%c0, %c0], %padding
+        -: 1104:///     : tensor<?x?xf32>, vector<17x5xf32>
+        -: 1105:/// %r = vector.transfer_write %0, %dest[%a, %b, %c0, %c0]
+        -: 1106:///     {in_bounds = [true, true]} : vector<17x5xf32>, tensor<?x?x17x5xf32>
+        -: 1107:/// ```
+        -: 1108:///
+        -: 1109:/// This rewrite is possible if:
+        -: 1110:/// - Low padding is static 0.
+        -: 1111:/// - `padOp` result shape is static.
+        -: 1112:/// - The entire padded tensor is inserted.
+        -: 1113:///   (Implies that sizes of `insertOp` are all static.)
+        -: 1114:/// - Only unit strides in `insertOp`.
+        -: 1115:/// - Single, scalar padding value.
+        -: 1116:/// - `padOp` result not used as destination.
+        -: 1117:struct PadOpVectorizationWithInsertSlicePattern
+        -: 1118:    : public VectorizePadOpUserPattern<tensor::InsertSliceOp> {
+        -: 1119:  using VectorizePadOpUserPattern<
+        -: 1120:      tensor::InsertSliceOp>::VectorizePadOpUserPattern;
+        -: 1121:
+function _ZNK40PadOpVectorizationWithInsertSlicePattern11rewriteUserERN4mlir15PatternRewriterENS0_6tensor5PadOpENS3_13InsertSliceOpE called 0 returned 0% blocks executed 0%
+    #####: 1122:  LogicalResult rewriteUser(PatternRewriter &rewriter, tensor::PadOp padOp,
+        -: 1123:                            tensor::InsertSliceOp insertOp) const override {
+        -: 1124:    // Low padding must be static 0.
+    #####: 1125:    if (!padOp.hasZeroLowPad())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1126:      return failure();
+        -: 1127:    // Only unit stride supported.
+    #####: 1128:    if (!insertOp.hasUnitStride())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1129:      return failure();
+        -: 1130:    // Pad value must be a constant.
+    #####: 1131:    auto padValue = padOp.getConstantPaddingValue();
+call    0 never executed
+    #####: 1132:    if (!padValue)
+branch  0 never executed
+branch  1 never executed
+    #####: 1133:      return failure();
+        -: 1134:    // Dynamic shapes not supported.
+    #####: 1135:    if (!padOp.getResult().getType().cast<ShapedType>().hasStaticShape())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1136:      return failure();
+        -: 1137:    // Pad result not used as destination.
+    #####: 1138:    if (insertOp.getDest() == padOp.getResult())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1139:      return failure();
+        -: 1140:
+    #####: 1141:    auto vecType = VectorType::get(padOp.getType().getShape(),
+call    0 never executed
+    #####: 1142:                                   padOp.getType().getElementType());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1143:    unsigned vecRank = vecType.getRank();
+call    0 never executed
+    #####: 1144:    unsigned tensorRank = insertOp.getType().getRank();
+call    0 never executed
+call    1 never executed
+        -: 1145:
+        -: 1146:    // Check if sizes match: Insert the entire tensor into most minor dims.
+        -: 1147:    // (No permutations allowed.)
+    #####: 1148:    SmallVector<int64_t> expectedSizes(tensorRank - vecRank, 1);
+call    0 never executed
+    #####: 1149:    expectedSizes.append(vecType.getShape().begin(), vecType.getShape().end());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1150:    if (!llvm::all_of(
+branch  0 never executed
+branch  1 never executed
+function _ZZNK40PadOpVectorizationWithInsertSlicePattern11rewriteUserERN4mlir15PatternRewriterENS0_6tensor5PadOpENS3_13InsertSliceOpEENKUlT_E_clISt5tupleIJRKNS0_12OpFoldResultERlEEEEDaS6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1151:            llvm::zip(insertOp.getMixedSizes(), expectedSizes), [](auto it) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1152:              return getConstantIntValue(std::get<0>(it)) == std::get<1>(it);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1153:            }))
+    #####: 1154:      return failure();
+        -: 1155:
+        -: 1156:    // Insert the TransferReadOp and TransferWriteOp at the position of the
+        -: 1157:    // InsertSliceOp.
+    #####: 1158:    rewriter.setInsertionPoint(insertOp);
+call    0 never executed
+        -: 1159:
+        -: 1160:    // Generate TransferReadOp: Read entire source tensor and add high
+        -: 1161:    // padding.
+    #####: 1162:    SmallVector<Value> readIndices(
+    #####: 1163:        vecRank, rewriter.create<arith::ConstantIndexOp>(padOp.getLoc(), 0));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1164:    auto read = rewriter.create<vector::TransferReadOp>(
+    #####: 1165:        padOp.getLoc(), vecType, padOp.getSource(), readIndices, padValue);
+call    0 never executed
+call    1 never executed
+        -: 1166:
+        -: 1167:    // Generate TransferWriteOp: Write to InsertSliceOp's dest tensor at
+        -: 1168:    // specified offsets. Write is fully in-bounds because a InsertSliceOp's
+        -: 1169:    // source must fit into the destination at the specified offsets.
+    #####: 1170:    auto writeIndices =
+    #####: 1171:        ofrToIndexValues(rewriter, padOp.getLoc(), insertOp.getMixedOffsets());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1172:    SmallVector<bool> inBounds(vecRank, true);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1173:    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+    #####: 1174:        insertOp, read, insertOp.getDest(), writeIndices,
+call    0 never executed
+    #####: 1175:        ArrayRef<bool>{inBounds});
+call    0 never executed
+call    1 never executed
+        -: 1176:
+    #####: 1177:    return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1178:  }
+        -: 1179:};
+        -: 1180:
+function _ZN4mlir6linalg34populatePadOpVectorizationPatternsERNS_17RewritePatternSetENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1181:void mlir::linalg::populatePadOpVectorizationPatterns(
+        -: 1182:    RewritePatternSet &patterns, PatternBenefit baseBenefit) {
+    #####: 1183:  patterns.add<GenericPadOpVectorizationPattern>(patterns.getContext(),
+call    0 never executed
+    #####: 1184:                                                 baseBenefit);
+call    0 never executed
+        -: 1185:  // Try these specialized patterns first before resorting to the generic one.
+    #####: 1186:  patterns.add<PadOpVectorizationWithTransferReadPattern,
+        -: 1187:               PadOpVectorizationWithTransferWritePattern,
+        -: 1188:               PadOpVectorizationWithInsertSlicePattern>(
+    #####: 1189:      patterns.getContext(), baseBenefit.getBenefit() + 1);
+call    0 never executed
+call    1 never executed
+    #####: 1190:}
+        -: 1191:
+        -: 1192://----------------------------------------------------------------------------//
+        -: 1193:// Forwarding patterns
+        -: 1194://----------------------------------------------------------------------------//
+        -: 1195:
+        -: 1196:/// Check whether there is any interleaved use of any `values` between
+        -: 1197:/// `firstOp` and `secondOp`. Conservatively return `true` if any op or value
+        -: 1198:/// is in a different block.
+function _ZL23mayExistInterleavedUsesPN4mlir9OperationES1_NS_10ValueRangeE called 0 returned 0% blocks executed 0%
+    #####: 1199:static bool mayExistInterleavedUses(Operation *firstOp, Operation *secondOp,
+        -: 1200:                                    ValueRange values) {
+    #####: 1201:  if (firstOp->getBlock() != secondOp->getBlock() ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1202:      !firstOp->isBeforeInBlock(secondOp)) {
+call    0 never executed
+    #####: 1203:    LDBG("interleavedUses precondition failed, firstOp: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+        -: 1204:         << *firstOp << ", second op: " << *secondOp);
+    #####: 1205:    return true;
+        -: 1206:  }
+    #####: 1207:  for (auto v : values) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1208:    for (auto &u : v.getUses()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1209:      Operation *owner = u.getOwner();
+branch  0 never executed
+branch  1 never executed
+    #####: 1210:      if (owner == firstOp || owner == secondOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1211:        continue;
+        -: 1212:      // TODO: this is too conservative, use dominance info in the future.
+    #####: 1213:      if (owner->getBlock() == firstOp->getBlock() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1214:          (owner->isBeforeInBlock(firstOp) || secondOp->isBeforeInBlock(owner)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1215:        continue;
+    #####: 1216:      LDBG(" found interleaved op " << *owner << ", firstOp: " << *firstOp
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+        -: 1217:                                    << ", second op: " << *secondOp);
+    #####: 1218:      return true;
+        -: 1219:    }
+        -: 1220:  }
+    #####: 1221:  return false;
+        -: 1222:}
+        -: 1223:
+        -: 1224:/// Return the unique subview use of `v` if it is indeed unique, null
+        -: 1225:/// otherwise.
+function _ZL21getSubViewUseIfUniqueN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####: 1226:static memref::SubViewOp getSubViewUseIfUnique(Value v) {
+    #####: 1227:  memref::SubViewOp subViewOp;
+    #####: 1228:  for (auto &u : v.getUses()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1229:    if (auto newSubViewOp = dyn_cast<memref::SubViewOp>(u.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1230:      if (subViewOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1231:        return memref::SubViewOp();
+        -: 1232:      subViewOp = newSubViewOp;
+        -: 1233:    }
+        -: 1234:  }
+    #####: 1235:  return subViewOp;
+        -: 1236:}
+        -: 1237:
+        -: 1238:/// TODO: use interfaces, side-effects and aliasing analysis as appropriate,
+        -: 1239:/// when available.
+function _ZNK4mlir6linalg30LinalgCopyVTRForwardingPattern15matchAndRewriteENS_6vector14TransferReadOpERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1240:LogicalResult LinalgCopyVTRForwardingPattern::matchAndRewrite(
+        -: 1241:    vector::TransferReadOp xferOp, PatternRewriter &rewriter) const {
+        -: 1242:
+        -: 1243:  // TODO: support mask.
+    #####: 1244:  if (xferOp.getMask())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1245:    return failure();
+        -: 1246:
+        -: 1247:  // Transfer into `view`.
+    #####: 1248:  Value viewOrAlloc = xferOp.getSource();
+call    0 never executed
+    #####: 1249:  if (!viewOrAlloc.getDefiningOp<memref::ViewOp>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1250:      !viewOrAlloc.getDefiningOp<memref::AllocOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1251:    return failure();
+        -: 1252:
+    #####: 1253:  LDBG(viewOrAlloc);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+        -: 1254:
+        -: 1255:  // Ensure there is exactly one subview of `viewOrAlloc` defining `subView`.
+    #####: 1256:  memref::SubViewOp subViewOp = getSubViewUseIfUnique(viewOrAlloc);
+call    0 never executed
+    #####: 1257:  if (!subViewOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1258:    return failure();
+    #####: 1259:  Value subView = subViewOp.getResult();
+call    0 never executed
+    #####: 1260:  LDBG("with subView " << subView);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -: 1261:
+        -: 1262:  // Find the copy into `subView` without interleaved uses.
+    #####: 1263:  memref::CopyOp copyOp;
+    #####: 1264:  for (auto &u : subView.getUses()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1265:    if (auto newCopyOp = dyn_cast<memref::CopyOp>(u.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1266:      assert(newCopyOp.getTarget().getType().isa<MemRefType>());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1267:      if (newCopyOp.getTarget() != subView)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1268:        continue;
+    #####: 1269:      LDBG("copy candidate " << *newCopyOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####: 1270:      if (mayExistInterleavedUses(newCopyOp, xferOp, {viewOrAlloc, subView}))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1271:        continue;
+    #####: 1272:      copyOp = newCopyOp;
+    #####: 1273:      break;
+        -: 1274:    }
+        -: 1275:  }
+    #####: 1276:  if (!copyOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1277:    return failure();
+    #####: 1278:  LDBG("with copy " << *copyOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -: 1279:
+        -: 1280:  // Find the fill into `viewOrAlloc` without interleaved uses before the
+        -: 1281:  // copy.
+    #####: 1282:  FillOp maybeFillOp;
+    #####: 1283:  for (auto &u : viewOrAlloc.getUses()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1284:    if (auto newFillOp = dyn_cast<FillOp>(u.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1285:      assert(newFillOp.output().getType().isa<MemRefType>());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1286:      if (newFillOp.output() != viewOrAlloc)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1287:        continue;
+    #####: 1288:      LDBG("fill candidate " << *newFillOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+    #####: 1289:      if (mayExistInterleavedUses(newFillOp, copyOp, {viewOrAlloc, subView}))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1290:        continue;
+        -: 1291:      maybeFillOp = newFillOp;
+    #####: 1292:      break;
+        -: 1293:    }
+        -: 1294:  }
+        -: 1295:  // Ensure padding matches.
+    #####: 1296:  if (maybeFillOp && xferOp.getPadding() != maybeFillOp.value())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1297:    return failure();
+    #####: 1298:  if (maybeFillOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1299:    LDBG("with maybeFillOp " << *maybeFillOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -: 1300:
+        -: 1301:  // `in` is the subview that memref.copy reads. Replace it.
+    #####: 1302:  Value in = copyOp.getSource();
+call    0 never executed
+        -: 1303:
+        -: 1304:  // memref.copy + linalg.fill can be used to create a padded local buffer.
+        -: 1305:  // The `masked` attribute is only valid on this padded buffer.
+        -: 1306:  // When forwarding to vector.transfer_read, the attribute must be reset
+        -: 1307:  // conservatively.
+    #####: 1308:  Value res = rewriter.create<vector::TransferReadOp>(
+    #####: 1309:      xferOp.getLoc(), xferOp.getVectorType(), in, xferOp.getIndices(),
+call    0 never executed
+call    1 never executed
+    #####: 1310:      xferOp.getPermutationMapAttr(), xferOp.getPadding(), xferOp.getMask(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1311:      // in_bounds is explicitly reset
+    #####: 1312:      /*inBoundsAttr=*/ArrayAttr());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1313:
+    #####: 1314:  if (maybeFillOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1315:    rewriter.eraseOp(maybeFillOp);
+call    0 never executed
+    #####: 1316:  rewriter.eraseOp(copyOp);
+call    0 never executed
+    #####: 1317:  rewriter.replaceOp(xferOp, res);
+call    0 never executed
+call    1 never executed
+        -: 1318:
+    #####: 1319:  return success();
+        -: 1320:}
+        -: 1321:
+        -: 1322:/// TODO: use interfaces, side-effects and aliasing analysis as appropriate,
+        -: 1323:/// when available.
+function _ZNK4mlir6linalg30LinalgCopyVTWForwardingPattern15matchAndRewriteENS_6vector15TransferWriteOpERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1324:LogicalResult LinalgCopyVTWForwardingPattern::matchAndRewrite(
+        -: 1325:    vector::TransferWriteOp xferOp, PatternRewriter &rewriter) const {
+        -: 1326:  // TODO: support mask.
+    #####: 1327:  if (xferOp.getMask())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1328:    return failure();
+        -: 1329:
+        -: 1330:  // Transfer into `viewOrAlloc`.
+    #####: 1331:  Value viewOrAlloc = xferOp.getSource();
+call    0 never executed
+    #####: 1332:  if (!viewOrAlloc.getDefiningOp<memref::ViewOp>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1333:      !viewOrAlloc.getDefiningOp<memref::AllocOp>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1334:    return failure();
+        -: 1335:
+        -: 1336:  // Ensure there is exactly one subview of `viewOrAlloc` defining `subView`.
+    #####: 1337:  memref::SubViewOp subViewOp = getSubViewUseIfUnique(viewOrAlloc);
+call    0 never executed
+    #####: 1338:  if (!subViewOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1339:    return failure();
+    #####: 1340:  Value subView = subViewOp.getResult();
+call    0 never executed
+        -: 1341:
+        -: 1342:  // Find the copy from `subView` without interleaved uses.
+    #####: 1343:  memref::CopyOp copyOp;
+call    0 never executed
+    #####: 1344:  for (auto &u : subViewOp.getResult().getUses()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1345:    if (auto newCopyOp = dyn_cast<memref::CopyOp>(u.getOwner())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1346:      if (newCopyOp.getSource() != subView)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1347:        continue;
+    #####: 1348:      if (mayExistInterleavedUses(xferOp, newCopyOp, {viewOrAlloc, subView}))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1349:        continue;
+    #####: 1350:      copyOp = newCopyOp;
+    #####: 1351:      break;
+        -: 1352:    }
+        -: 1353:  }
+    #####: 1354:  if (!copyOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1355:    return failure();
+        -: 1356:
+        -: 1357:  // `out` is the subview copied into that we replace.
+    #####: 1358:  assert(copyOp.getTarget().getType().isa<MemRefType>());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1359:  Value out = copyOp.getTarget();
+call    0 never executed
+        -: 1360:
+        -: 1361:  // Forward vector.transfer into copy.
+        -: 1362:  // memref.copy + linalg.fill can be used to create a padded local buffer.
+        -: 1363:  // The `masked` attribute is only valid on this padded buffer.
+        -: 1364:  // When forwarding to vector.transfer_write, the attribute must be reset
+        -: 1365:  // conservatively.
+    #####: 1366:  rewriter.create<vector::TransferWriteOp>(
+    #####: 1367:      xferOp.getLoc(), xferOp.getVector(), out, xferOp.getIndices(),
+call    0 never executed
+call    1 never executed
+    #####: 1368:      xferOp.getPermutationMapAttr(), xferOp.getMask(),
+call    0 never executed
+call    1 never executed
+        -: 1369:      // in_bounds is explicitly reset
+    #####: 1370:      /*inBoundsAttr=*/ArrayAttr());
+call    0 never executed
+call    1 never executed
+        -: 1371:
+    #####: 1372:  rewriter.eraseOp(copyOp);
+call    0 never executed
+    #####: 1373:  rewriter.eraseOp(xferOp);
+call    0 never executed
+        -: 1374:
+    #####: 1375:  return success();
+        -: 1376:}
+        -: 1377:
+        -: 1378://===----------------------------------------------------------------------===//
+        -: 1379:// Convolution vectorization patterns
+        -: 1380://===----------------------------------------------------------------------===//
+        -: 1381:
+        -: 1382:template <int N>
+    #####: 1383:static void bindShapeDims(ShapedType shapedType) {}
+        -: 1384:
+        -: 1385:template <int N, typename IntTy, typename... IntTy2>
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+    #####: 1389:}
+------------------
+_Z13bindShapeDimsILi2ERlJEEvN4mlir10ShapedTypeERT0_DpRT1_:
+function _Z13bindShapeDimsILi2ERlJEEvN4mlir10ShapedTypeERT0_DpRT1_ called 0 returned 0% blocks executed 0%
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+    #####: 1389:}
+------------------
+_Z13bindShapeDimsILi1ERlJEEvN4mlir10ShapedTypeERT0_DpRT1_:
+function _Z13bindShapeDimsILi1ERlJEEvN4mlir10ShapedTypeERT0_DpRT1_ called 0 returned 0% blocks executed 0%
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+    #####: 1389:}
+------------------
+_Z13bindShapeDimsILi1ERlJS0_EEvN4mlir10ShapedTypeERT0_DpRT1_:
+function _Z13bindShapeDimsILi1ERlJS0_EEvN4mlir10ShapedTypeERT0_DpRT1_ called 0 returned 0% blocks executed 0%
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+call    0 never executed
+    #####: 1389:}
+------------------
+_Z13bindShapeDimsILi0ElJlEEvN4mlir10ShapedTypeERT0_DpRT1_:
+function _Z13bindShapeDimsILi0ElJlEEvN4mlir10ShapedTypeERT0_DpRT1_ called 0 returned 0% blocks executed 0%
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+call    0 never executed
+    #####: 1389:}
+------------------
+_Z13bindShapeDimsILi0ElJllEEvN4mlir10ShapedTypeERT0_DpRT1_:
+function _Z13bindShapeDimsILi0ElJllEEvN4mlir10ShapedTypeERT0_DpRT1_ called 0 returned 0% blocks executed 0%
+    #####: 1386:static void bindShapeDims(ShapedType shapedType, IntTy &val, IntTy2 &...vals) {
+    #####: 1387:  val = shapedType.getShape()[N];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1388:  bindShapeDims<N + 1, IntTy2 &...>(shapedType, vals...);
+call    0 never executed
+    #####: 1389:}
+------------------
+        -: 1390:
+        -: 1391:/// Bind a pack of int& to the leading dimensions of shapedType.getShape().
+        -: 1392:template <typename... IntTy>
+    #####: 1393:static void bindShapeDims(ShapedType shapedType, IntTy &...vals) {
+    #####: 1394:  bindShapeDims<0>(shapedType, vals...);
+        -: 1395:}
+        -: 1396:
+        -: 1397:namespace {
+        -: 1398:/// Generate a vector implementation for either:
+        -: 1399:/// ```
+        -: 1400:///   Op def: (     n,     w,     c,    kw,    f  )
+        -: 1401:///    Iters: ({Par(), Par(), Par(), Red(), Red()})
+        -: 1402:///   Layout: {{n, strideW * w + dilationW * kw, c}, {kw, c, f}, {n, w, f}}
+        -: 1403:/// ```
+        -: 1404:/// kw is unrolled, w is unrolled iff dilationW > 1.
+        -: 1405:///
+        -: 1406:/// or
+        -: 1407:///
+        -: 1408:/// ```
+        -: 1409:///   Op def: (     n,     c,     w,    f,    kw )
+        -: 1410:///    Iters: ({Par(), Par(), Par(), Red(), Red()})
+        -: 1411:///   Layout: {{n, c, strideW * w + dilationW * kw}, {f, c, kw}, {n, f, w}}
+        -: 1412:/// ```
+        -: 1413:/// kw is unrolled, w is unrolled iff dilationW > 1.
+        -: 1414:///
+        -: 1415:/// or
+        -: 1416:///
+        -: 1417:/// ```
+        -: 1418:///   Op def: (     n,     w,     c,    kw )
+        -: 1419:///    Iters: ({Par(), Par(), Par(), Red()})
+        -: 1420:///   Layout: {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
+        -: 1421:/// ```
+        -: 1422:/// kw is unrolled, w is unrolled iff dilationW > 1.
+    #####: 1423:struct Conv1DGenerator : public StructuredGenerator<LinalgOp> {
+call    0 never executed
+function _ZN12_GLOBAL__N_115Conv1DGeneratorC2ERN4mlir9OpBuilderENS1_6linalg8LinalgOpEii called 0 returned 0% blocks executed 0%
+    #####: 1424:  Conv1DGenerator(OpBuilder &builder, LinalgOp linalgOp, int strideW,
+        -: 1425:                  int dilationW)
+    #####: 1426:      : StructuredGenerator<LinalgOp>(builder, linalgOp), strideW(strideW),
+    #####: 1427:        dilationW(dilationW) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1428:    // Determine whether `linalgOp` can be generated with this generator
+    #####: 1429:    if (linalgOp.getNumDpsInputs() != 2 || linalgOp.getNumDpsInits() != 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1430:      return;
+    #####: 1431:    lhsShaped = linalgOp.getDpsInputOperand(0)->get();
+call    0 never executed
+call    1 never executed
+    #####: 1432:    rhsShaped = linalgOp.getDpsInputOperand(1)->get();
+call    0 never executed
+call    1 never executed
+    #####: 1433:    resShaped = linalgOp.getDpsInitOperand(0)->get();
+call    0 never executed
+call    1 never executed
+    #####: 1434:    lhsShapedType = lhsShaped.getType().dyn_cast<ShapedType>();
+call    0 never executed
+    #####: 1435:    rhsShapedType = rhsShaped.getType().dyn_cast<ShapedType>();
+call    0 never executed
+    #####: 1436:    resShapedType = resShaped.getType().dyn_cast<ShapedType>();
+call    0 never executed
+    #####: 1437:    if (!lhsShapedType || !rhsShapedType || !resShapedType)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1438:      return;
+    #####: 1439:    if (lhsShapedType.getRank() != 3 ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1440:        (rhsShapedType.getRank() != 2 && rhsShapedType.getRank() != 3) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####: 1441:        resShapedType.getRank() != 3)
+call    0 never executed
+    #####: 1442:      return;
+        -: 1443:
+        -: 1444:    // Check for reduction `add` preceded by `mul`.
+    #####: 1445:    Operation *reduceOp = matchLinalgReduction(linalgOp.getDpsInitOperand(0));
+call    0 never executed
+call    1 never executed
+    #####: 1446:    if (!reduceOp)
+branch  0 never executed
+branch  1 never executed
+        -: 1447:      return;
+    #####: 1448:    llvm::Optional<vector::CombiningKind> maybeKind;
+    #####: 1449:    maybeKind = getCombinerOpKind(reduceOp);
+call    0 never executed
+    #####: 1450:    if (!maybeKind || *maybeKind != vector::CombiningKind::ADD)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1451:      return;
+        -: 1452:    // Check for single `mul` predecessor. The `mul` operands must be block
+        -: 1453:    // arguments or extension of block arguments.
+    #####: 1454:    Operation *mulOp = nullptr;
+    #####: 1455:    for (Value operand : reduceOp->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1456:      if (operand.isa<BlockArgument>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1457:        continue;
+    #####: 1458:      if (mulOp)
+branch  0 never executed
+branch  1 never executed
+    #####: 1459:        return;
+    #####: 1460:      mulOp = operand.getDefiningOp();
+call    0 never executed
+    #####: 1461:      if (!mulOp || !isa<arith::MulIOp, arith::MulFOp>(mulOp))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1462:        return;
+        -: 1463:    }
+    #####: 1464:    if (!mulOp)
+branch  0 never executed
+branch  1 never executed
+        -: 1465:      return;
+    #####: 1466:    for (Value operand : mulOp->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1467:      if (Operation *def = operand.getDefiningOp()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1468:        if (!isa<arith::ExtFOp>(def))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1469:          return;
+    #####: 1470:        operand = def->getOperand(0);
+call    0 never executed
+        -: 1471:      }
+    #####: 1472:      if (!operand.isa<BlockArgument>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1473:        return;
+        -: 1474:    }
+        -: 1475:    // The op is now known to be valid.
+    #####: 1476:    valid = true;
+        -: 1477:  }
+        -: 1478:
+        -: 1479:  /// Generate a vector implementation for:
+        -: 1480:  /// ```
+        -: 1481:  ///   Op def: (     n,     w,     c,    kw,    f  )
+        -: 1482:  ///    Iters: ({Par(), Par(), Par(), Red(), Red()})
+        -: 1483:  ///   Layout: {{n, strideW * w + dilationW * kw, c}, {kw, c, f}, {n, w, f}}
+        -: 1484:  /// ```
+        -: 1485:  /// kw is always unrolled.
+        -: 1486:  /// TODO: w (resp. kw) is unrolled when the strideW ( resp. dilationW) is
+        -: 1487:  /// > 1.
+function _ZN12_GLOBAL__N_115Conv1DGenerator4convE13Conv1DOpOrder called 0 returned 0% blocks executed 0%
+    #####: 1488:  FailureOr<Operation *> conv(Conv1DOpOrder conv1DOpOrder) {
+    #####: 1489:    if (!valid)
+branch  0 never executed
+branch  1 never executed
+    #####: 1490:      return failure();
+        -: 1491:
+    #####: 1492:    int64_t nSize, wSize, cSize, kwSize, fSize;
+    #####: 1493:    SmallVector<int64_t, 3> lhsShape, rhsShape, resShape;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####: 1494:    switch (conv1DOpOrder) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1495:    case Conv1DOpOrder::Nwc:
+        -: 1496:      // kernel{kw, c, f}
+    #####: 1497:      bindShapeDims(rhsShapedType, kwSize, cSize, fSize);
+call    0 never executed
+        -: 1498:      // out{n, w, f}
+    #####: 1499:      bindShapeDims(resShapedType, nSize, wSize);
+call    0 never executed
+    #####: 1500:      lhsShape = {nSize,
+        -: 1501:                  // iw = ow * sw + kw *  dw - 1
+        -: 1502:                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
+        -: 1503:                  // Perform the proper inclusive -> exclusive -> inclusive.
+    #####: 1504:                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
+call    0 never executed
+        -: 1505:                      1,
+    #####: 1506:                  cSize};
+    #####: 1507:      rhsShape = {kwSize, cSize, fSize};
+call    0 never executed
+    #####: 1508:      resShape = {nSize, wSize, fSize};
+call    0 never executed
+    #####: 1509:      break;
+    #####: 1510:    case Conv1DOpOrder::Ncw:
+        -: 1511:      // kernel{f, c, kw}
+    #####: 1512:      bindShapeDims(rhsShapedType, fSize, cSize, kwSize);
+call    0 never executed
+        -: 1513:      // out{n, f, w}
+    #####: 1514:      bindShapeDims(resShapedType, nSize, fSize, wSize);
+call    0 never executed
+    #####: 1515:      lhsShape = {nSize, cSize,
+        -: 1516:                  // iw = ow * sw + kw *  dw - 1
+        -: 1517:                  //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
+        -: 1518:                  // Perform the proper inclusive -> exclusive -> inclusive.
+    #####: 1519:                  ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) -
+call    0 never executed
+    #####: 1520:                      1};
+    #####: 1521:      rhsShape = {fSize, cSize, kwSize};
+call    0 never executed
+    #####: 1522:      resShape = {nSize, fSize, wSize};
+call    0 never executed
+    #####: 1523:      break;
+        -: 1524:    }
+        -: 1525:
+    #####: 1526:    vector::TransferWriteOp write;
+call    0 never executed
+    #####: 1527:    Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1528:
+        -: 1529:    // w is unrolled (i.e. wSizeStep == 1) iff strideW > 1.
+        -: 1530:    // When strideW == 1, we can batch the contiguous loads and avoid
+        -: 1531:    // unrolling
+    #####: 1532:    int64_t wSizeStep = strideW == 1 ? wSize : 1;
+branch  0 never executed
+branch  1 never executed
+        -: 1533:
+    #####: 1534:    Type lhsEltType = lhsShapedType.getElementType();
+call    0 never executed
+    #####: 1535:    Type rhsEltType = rhsShapedType.getElementType();
+call    0 never executed
+    #####: 1536:    Type resEltType = resShapedType.getElementType();
+call    0 never executed
+    #####: 1537:    auto lhsType = VectorType::get(lhsShape, lhsEltType);
+call    0 never executed
+    #####: 1538:    auto rhsType = VectorType::get(rhsShape, rhsEltType);
+call    0 never executed
+    #####: 1539:    auto resType = VectorType::get(resShape, resEltType);
+call    0 never executed
+        -: 1540:    // Read lhs slice of size {w * strideW + kw * dilationW, c, f} @ [0, 0,
+        -: 1541:    // 0].
+    #####: 1542:    Value lhs = builder.create<vector::TransferReadOp>(
+    #####: 1543:        loc, lhsType, lhsShaped, ValueRange{zero, zero, zero});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1544:    // Read rhs slice of size {kw, c, f} @ [0, 0, 0].
+    #####: 1545:    Value rhs = builder.create<vector::TransferReadOp>(
+    #####: 1546:        loc, rhsType, rhsShaped, ValueRange{zero, zero, zero});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1547:    // Read res slice of size {n, w, f} @ [0, 0, 0].
+    #####: 1548:    Value res = builder.create<vector::TransferReadOp>(
+    #####: 1549:        loc, resType, resShaped, ValueRange{zero, zero, zero});
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1550:
+        -: 1551:    // The base vectorization case is input: {n,w,c}, weight: {kw,c,f}, output:
+        -: 1552:    // {n,w,f}. To reuse the base pattern vectorization case, we do pre
+        -: 1553:    // transpose on input, weight, and output.
+    #####: 1554:    switch (conv1DOpOrder) {
+branch  0 never executed
+branch  1 never executed
+        -: 1555:    case Conv1DOpOrder::Nwc:
+        -: 1556:      // Base case, so no transposes necessary.
+        -: 1557:      break;
+    #####: 1558:    case Conv1DOpOrder::Ncw: {
+        -: 1559:      // To match base vectorization case, we pre-transpose current case.
+        -: 1560:      // ncw -> nwc
+    #####: 1561:      static constexpr std::array<int64_t, 3> permLhs = {0, 2, 1};
+    #####: 1562:      lhs = builder.create<vector::TransposeOp>(loc, lhs, permLhs);
+call    0 never executed
+call    1 never executed
+        -: 1563:      // fcw -> wcf
+    #####: 1564:      static constexpr std::array<int64_t, 3> permRhs = {2, 1, 0};
+    #####: 1565:      rhs = builder.create<vector::TransposeOp>(loc, rhs, permRhs);
+call    0 never executed
+call    1 never executed
+        -: 1566:      // nfw -> nwf
+    #####: 1567:      static constexpr std::array<int64_t, 3> permRes = {0, 2, 1};
+    #####: 1568:      res = builder.create<vector::TransposeOp>(loc, res, permRes);
+call    0 never executed
+    #####: 1569:      break;
+        -: 1570:    }
+        -: 1571:    }
+        -: 1572:
+        -: 1573:    //===------------------------------------------------------------------===//
+        -: 1574:    // Begin vector-only rewrite part
+        -: 1575:    //===------------------------------------------------------------------===//
+        -: 1576:    // Unroll along kw and read slices of lhs and rhs.
+    #####: 1577:    SmallVector<Value> lhsVals, rhsVals, resVals;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1578:    // Extract lhs slice of size {n, wSizeStep, c} @ [0, sw * w + dw * kw, 0].
+    #####: 1579:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1580:      for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1581:        lhsVals.push_back(builder.create<vector::ExtractStridedSliceOp>(
+call    0 never executed
+        -: 1582:            loc, lhs,
+    #####: 1583:            /*offsets=*/ArrayRef<int64_t>{0, w * strideW + kw * dilationW, 0},
+    #####: 1584:            /*sizes=*/ArrayRef<int64_t>{nSize, wSizeStep, cSize},
+call    0 never executed
+    #####: 1585:            /*strides=*/ArrayRef<int64_t>{1, 1, 1}));
+call    0 never executed
+call    1 never executed
+        -: 1586:      }
+        -: 1587:    }
+        -: 1588:    // Extract rhs slice of size {c, f} @ [kw].
+    #####: 1589:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1590:      rhsVals.push_back(builder.create<vector::ExtractOp>(
+call    0 never executed
+    #####: 1591:          loc, rhs, /*offsets=*/ArrayRef<int64_t>{kw}));
+call    0 never executed
+call    1 never executed
+        -: 1592:    }
+        -: 1593:    // Extract res slice: {n, wSizeStep, f} @ [0, w, 0].
+    #####: 1594:    for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1595:      resVals.push_back(builder.create<vector::ExtractStridedSliceOp>(
+call    0 never executed
+        -: 1596:          loc, res,
+    #####: 1597:          /*offsets=*/ArrayRef<int64_t>{0, w, 0},
+    #####: 1598:          /*sizes=*/ArrayRef<int64_t>{nSize, wSizeStep, fSize},
+call    0 never executed
+    #####: 1599:          /*strides=*/ArrayRef<int64_t>{1, 1, 1}));
+call    0 never executed
+call    1 never executed
+        -: 1600:    }
+        -: 1601:
+    #####: 1602:    auto linearIndex = [&](int64_t kw, int64_t w) {
+    #####: 1603:      return kw * (wSize / wSizeStep) + w;
+    #####: 1604:    };
+        -: 1605:
+        -: 1606:    // Compute contraction: O{n, w, f} += I{n, sw * w + dw * kw, c} * F{c, f}
+    #####: 1607:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1608:      for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1609:        resVals[w] = conv1dSliceAsContraction(
+branch  0 never executed
+branch  1 never executed
+    #####: 1610:            builder, loc, lhsVals[linearIndex(kw, w)], rhsVals[kw], resVals[w]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -: 1611:      }
+        -: 1612:    }
+        -: 1613:
+        -: 1614:    // Write back res slice: {n, wSizeStep, f} @ [0, w, 0].
+        -: 1615:    // This does not depend on kw.
+    #####: 1616:    for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1617:      res = builder.create<vector::InsertStridedSliceOp>(
+    #####: 1618:          loc, resVals[w], res,
+    #####: 1619:          /*offsets=*/ArrayRef<int64_t>{0, w, 0},
+branch  0 never executed
+branch  1 never executed
+    #####: 1620:          /*strides=*/ArrayRef<int64_t>{1, 1, 1});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1621:    }
+        -: 1622:    //===------------------------------------------------------------------===//
+        -: 1623:    // End vector-only rewrite part
+        -: 1624:    //===------------------------------------------------------------------===//
+        -: 1625:
+        -: 1626:    // The base vectorization case is output: {n,w,f}
+        -: 1627:    // To reuse the result from base pattern vectorization case, we post
+        -: 1628:    // transpose the base case result.
+    #####: 1629:    switch (conv1DOpOrder) {
+branch  0 never executed
+branch  1 never executed
+        -: 1630:    case Conv1DOpOrder::Nwc:
+        -: 1631:      // Base case, so no transposes necessary.
+        -: 1632:      break;
+    #####: 1633:    case Conv1DOpOrder::Ncw: {
+        -: 1634:      // nwf -> nfw
+    #####: 1635:      static constexpr std::array<int64_t, 3> perm = {0, 2, 1};
+    #####: 1636:      res = builder.create<vector::TransposeOp>(loc, res, perm);
+call    0 never executed
+    #####: 1637:      break;
+        -: 1638:    }
+        -: 1639:    }
+        -: 1640:
+        -: 1641:    // Write back res slice of size {n, w, f} @ [0, 0, 0].
+    #####: 1642:    return builder
+    #####: 1643:        .create<vector::TransferWriteOp>(loc, res, resShaped,
+    #####: 1644:                                         ValueRange{zero, zero, zero})
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1645:        .getOperation();
+branch  0 never executed
+branch  1 never executed
+        -: 1646:  }
+        -: 1647:
+        -: 1648:  // Create a contraction: lhs{n, w, c} * rhs{c, f} -> res{n, w, f}
+        -: 1649:  Value conv1dSliceAsContraction(OpBuilder &b, Location loc, Value lhs,
+        -: 1650:                                 Value rhs, Value res) {
+        -: 1651:    vector::IteratorType par = vector::IteratorType::parallel;
+        -: 1652:    vector::IteratorType red = vector::IteratorType::reduction;
+        -: 1653:    AffineExpr n, w, f, c;
+        -: 1654:    bindDims(ctx, n, w, f, c);
+        -: 1655:    return builder.create<vector::ContractionOp>(
+        -: 1656:        loc, lhs, rhs, res,
+        -: 1657:        /*indexingMaps=*/MapList{{n, w, c}, {c, f}, {n, w, f}},
+        -: 1658:        /*iteratorTypes=*/ArrayRef<vector::IteratorType>{par, par, par, red});
+        -: 1659:  }
+        -: 1660:
+        -: 1661:  /// Generate a vector implementation for:
+        -: 1662:  /// ```
+        -: 1663:  ///   Op def: (     n,     w,     c,    kw)
+        -: 1664:  ///    Iters: ({Par(), Par(), Par(), Red()})
+        -: 1665:  ///   Layout: {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
+        -: 1666:  /// ```
+        -: 1667:  /// kw is always unrolled.
+        -: 1668:  /// TODO: w (resp. kw) is unrolled when the strideW ( resp. dilationW) is
+        -: 1669:  /// > 1.
+function _ZN12_GLOBAL__N_115Conv1DGenerator13depthwiseConvEv called 0 returned 0% blocks executed 0%
+    #####: 1670:  FailureOr<Operation *> depthwiseConv() {
+    #####: 1671:    if (!valid)
+branch  0 never executed
+branch  1 never executed
+    #####: 1672:      return failure();
+        -: 1673:
+    #####: 1674:    int64_t nSize, wSize, cSize, kwSize;
+        -: 1675:    // kernel{kw, c}
+    #####: 1676:    bindShapeDims(rhsShapedType, kwSize, cSize);
+call    0 never executed
+        -: 1677:    // out{n, w, c}
+    #####: 1678:    bindShapeDims(resShapedType, nSize, wSize);
+call    0 never executed
+        -: 1679:
+    #####: 1680:    vector::TransferWriteOp write;
+call    0 never executed
+    #####: 1681:    Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1682:
+        -: 1683:    // w is unrolled (i.e. wSizeStep == 1) iff strideW > 1.
+        -: 1684:    // When strideW == 1, we can batch the contiguous loads and avoid
+        -: 1685:    // unrolling
+    #####: 1686:    int64_t wSizeStep = strideW == 1 ? wSize : 1;
+branch  0 never executed
+branch  1 never executed
+        -: 1687:
+    #####: 1688:    Type lhsEltType = lhsShapedType.getElementType();
+call    0 never executed
+    #####: 1689:    Type rhsEltType = rhsShapedType.getElementType();
+call    0 never executed
+    #####: 1690:    Type resEltType = resShapedType.getElementType();
+call    0 never executed
+    #####: 1691:    VectorType lhsType = VectorType::get(
+        -: 1692:        {nSize,
+        -: 1693:         // iw = ow * sw + kw *  dw - 1
+        -: 1694:         //   (i.e. 16 convolved with 3 (@stride 1 dilation 1) -> 14)
+    #####: 1695:         ((wSize - 1) * strideW + 1) + ((kwSize - 1) * dilationW + 1) - 1,
+        -: 1696:         cSize},
+    #####: 1697:        lhsEltType);
+call    0 never executed
+    #####: 1698:    VectorType rhsType = VectorType::get({kwSize, cSize}, rhsEltType);
+call    0 never executed
+    #####: 1699:    VectorType resType = VectorType::get({nSize, wSize, cSize}, resEltType);
+call    0 never executed
+        -: 1700:
+        -: 1701:    // Read lhs slice of size {n, w * strideW + kw * dilationW, c} @ [0, 0,
+        -: 1702:    // 0].
+    #####: 1703:    Value lhs = builder.create<vector::TransferReadOp>(
+    #####: 1704:        loc, lhsType, lhsShaped, ValueRange{zero, zero, zero});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1705:    // Read rhs slice of size {kw, c} @ [0, 0].
+    #####: 1706:    Value rhs = builder.create<vector::TransferReadOp>(loc, rhsType, rhsShaped,
+    #####: 1707:                                                       ValueRange{zero, zero});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1708:    // Read res slice of size {n, w, c} @ [0, 0, 0].
+    #####: 1709:    Value res = builder.create<vector::TransferReadOp>(
+    #####: 1710:        loc, resType, resShaped, ValueRange{zero, zero, zero});
+call    0 never executed
+call    1 never executed
+        -: 1711:
+        -: 1712:    //===------------------------------------------------------------------===//
+        -: 1713:    // Begin vector-only rewrite part
+        -: 1714:    //===------------------------------------------------------------------===//
+        -: 1715:    // Unroll along kw and read slices of lhs and rhs.
+    #####: 1716:    SmallVector<Value> lhsVals, rhsVals, resVals;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1717:    // Extract lhs slice of size {n, wSizeStep, c}
+        -: 1718:    //   @ [0, sw * w + dw * kw, 0].
+    #####: 1719:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1720:      for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1721:        lhsVals.push_back(builder.create<vector::ExtractStridedSliceOp>(
+call    0 never executed
+        -: 1722:            loc, lhs,
+    #####: 1723:            /*offsets=*/ArrayRef<int64_t>{0, w * strideW + kw * dilationW, 0},
+    #####: 1724:            /*sizes=*/ArrayRef<int64_t>{nSize, wSizeStep, cSize},
+call    0 never executed
+    #####: 1725:            /*strides=*/ArrayRef<int64_t>{1, 1, 1}));
+call    0 never executed
+call    1 never executed
+        -: 1726:      }
+        -: 1727:    }
+        -: 1728:    // Extract rhs slice of size {c} @ [kw].
+    #####: 1729:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1730:      rhsVals.push_back(builder.create<vector::ExtractOp>(
+call    0 never executed
+    #####: 1731:          loc, rhs, /*offsets=*/ArrayRef<int64_t>{kw}));
+call    0 never executed
+call    1 never executed
+        -: 1732:    }
+        -: 1733:    // Extract res slice: {n, wSizeStep, c} @ [0, w, 0].
+    #####: 1734:    for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1735:      resVals.push_back(builder.create<vector::ExtractStridedSliceOp>(
+call    0 never executed
+        -: 1736:          loc, res,
+    #####: 1737:          /*offsets=*/ArrayRef<int64_t>{0, w, 0},
+    #####: 1738:          /*sizes=*/ArrayRef<int64_t>{nSize, wSizeStep, cSize},
+call    0 never executed
+    #####: 1739:          /*strides=*/ArrayRef<int64_t>{1, 1, 1}));
+call    0 never executed
+call    1 never executed
+        -: 1740:    }
+        -: 1741:
+    #####: 1742:    auto linearIndex = [&](int64_t kw, int64_t w) {
+    #####: 1743:      return kw * (wSize / wSizeStep) + w;
+    #####: 1744:    };
+        -: 1745:
+        -: 1746:    // Compute contraction: O{n, w, c} += I{n, sw * w + dw * kw, c} * F{c}
+    #####: 1747:    for (int64_t kw = 0; kw < kwSize; ++kw) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1748:      for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1749:        resVals[w] = depthwiseConv1dSliceAsFma(
+branch  0 never executed
+branch  1 never executed
+    #####: 1750:            builder, loc, lhsVals[linearIndex(kw, w)], rhsVals[kw], resVals[w]);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -: 1751:      }
+        -: 1752:    }
+        -: 1753:
+        -: 1754:    // Write back res slice: {n, wSizeStep, c} @ [0, w, 0].
+        -: 1755:    // This does not depend on kw.
+    #####: 1756:    for (int64_t w = 0; w < wSize; w += wSizeStep) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1757:      res = builder.create<vector::InsertStridedSliceOp>(
+    #####: 1758:          loc, resVals[w], res,
+    #####: 1759:          /*offsets=*/ArrayRef<int64_t>{0, w, 0},
+branch  0 never executed
+branch  1 never executed
+    #####: 1760:          /*strides=*/ArrayRef<int64_t>{1, 1, 1});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1761:    }
+        -: 1762:    //===------------------------------------------------------------------===//
+        -: 1763:    // End vector-only rewrite part
+        -: 1764:    //===------------------------------------------------------------------===//
+        -: 1765:
+        -: 1766:    // Write back res slice of size {n, w, c} @ [0, 0, 0].
+    #####: 1767:    return builder
+    #####: 1768:        .create<vector::TransferWriteOp>(loc, res, resShaped,
+    #####: 1769:                                         ValueRange{zero, zero, zero})
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1770:        .getOperation();
+branch  0 never executed
+branch  1 never executed
+        -: 1771:  }
+        -: 1772:
+        -: 1773:  /// Lower lhs{n, w, c} * rhs{c} -> res{n, w, c} to fma.
+        -: 1774:  Value depthwiseConv1dSliceAsFma(OpBuilder &b, Location loc, Value lhs,
+        -: 1775:                                  Value rhs, Value res) {
+        -: 1776:    Value bcast = builder.create<vector::BroadcastOp>(loc, res.getType(), rhs);
+        -: 1777:    return b.create<vector::FMAOp>(loc, lhs, bcast, res);
+        -: 1778:  }
+        -: 1779:
+        -: 1780:  /// Entry point that transposes into the common form:
+        -: 1781:  ///   {{n, strideW * w + dilationW * kw, c}, {kw, c, f}, {n, w, f}}
+function _ZN12_GLOBAL__N_115Conv1DGenerator15generateNwcConvEv called 0 returned 0% blocks executed 0%
+    #####: 1782:  FailureOr<Operation *> generateNwcConv() {
+    #####: 1783:    AffineExpr n, w, f, kw, c;
+    #####: 1784:    bindDims(ctx, n, w, f, kw, c);
+call    0 never executed
+    #####: 1785:    if (!iters({Par(), Par(), Par(), Red(), Red()}))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1786:      return failure();
+        -: 1787:
+        -: 1788:    // No transposition needed.
+    #####: 1789:    if (layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1790:                /*rhsIndex*/ {kw, c, f},
+        -: 1791:                /*resIndex*/ {n, w, f}}))
+    #####: 1792:      return conv(Conv1DOpOrder::Nwc);
+call    0 never executed
+    #####: 1793:    return failure();
+        -: 1794:  }
+        -: 1795:
+        -: 1796:  /// Entry point that transposes into the common form:
+        -: 1797:  ///   {{n, c, strideW * w + dilationW * kw}, {f, c, kw}, {n, f, w}}
+function _ZN12_GLOBAL__N_115Conv1DGenerator15generateNcwConvEv called 0 returned 0% blocks executed 0%
+    #####: 1798:  FailureOr<Operation *> generateNcwConv() {
+    #####: 1799:    AffineExpr n, w, f, kw, c;
+    #####: 1800:    bindDims(ctx, n, f, w, c, kw);
+call    0 never executed
+    #####: 1801:    if (!iters({Par(), Par(), Par(), Red(), Red()}))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1802:      return failure();
+        -: 1803:
+    #####: 1804:    if (layout({/*lhsIndex*/ {n, c, strideW * w + dilationW * kw},
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1805:                /*rhsIndex*/ {f, c, kw},
+        -: 1806:                /*resIndex*/ {n, f, w}}))
+    #####: 1807:      return conv(Conv1DOpOrder::Ncw);
+call    0 never executed
+        -: 1808:
+    #####: 1809:    return failure();
+        -: 1810:  }
+        -: 1811:
+        -: 1812:  /// Entry point that transposes into the common form:
+        -: 1813:  ///   {{n, strideW * w + dilationW * kw, c}, {kw, c}, {n, w, c}}
+function _ZN12_GLOBAL__N_115Conv1DGenerator19generateDilatedConvEv called 0 returned 0% blocks executed 0%
+    #####: 1814:  FailureOr<Operation *> generateDilatedConv() {
+    #####: 1815:    AffineExpr n, w, c, kw;
+    #####: 1816:    bindDims(ctx, n, w, c, kw);
+call    0 never executed
+    #####: 1817:    if (!iters({Par(), Par(), Par(), Red()}))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1818:      return failure();
+        -: 1819:
+        -: 1820:    // No transposition needed.
+    #####: 1821:    if (layout({/*lhsIndex*/ {n, strideW * w + dilationW * kw, c},
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -: 1822:                /*rhsIndex*/ {kw, c},
+        -: 1823:                /*resIndex*/ {n, w, c}}))
+    #####: 1824:      return depthwiseConv();
+call    0 never executed
+    #####: 1825:    return failure();
+        -: 1826:  }
+        -: 1827:
+        -: 1828:private:
+        -: 1829:  bool valid = false;
+        -: 1830:  int strideW, dilationW;
+        -: 1831:  Value lhsShaped, rhsShaped, resShaped;
+        -: 1832:  ShapedType lhsShapedType, rhsShapedType, resShapedType;
+        -: 1833:};
+        -: 1834:} // namespace
+        -: 1835:
+        -: 1836:/// Helper function to vectorize a LinalgOp with convolution semantics.
+        -: 1837:// TODO: extend the generic vectorization to support windows and drop this.
+function _ZL20vectorizeConvolutionRN4mlir9OpBuilderENS_6linalg8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####: 1838:static FailureOr<Operation *> vectorizeConvolution(OpBuilder &b, LinalgOp op) {
+        -: 1839:  // The ConvolutionOpInterface gives us guarantees of existence for
+        -: 1840:  // strides/dilations. However, we do not need to rely on those, we can simply
+        -: 1841:  // use them if present, otherwise use the default and let the generic conv.
+        -: 1842:  // matcher in the ConvGenerator succeed or fail.
+    #####: 1843:  auto strides = op->getAttrOfType<DenseIntElementsAttr>("strides");
+call    0 never executed
+    #####: 1844:  auto dilations = op->getAttrOfType<DenseIntElementsAttr>("dilations");
+call    0 never executed
+    #####: 1845:  auto stride = strides ? *strides.getValues<uint64_t>().begin() : 1;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1846:  auto dilation = dilations ? *dilations.getValues<uint64_t>().begin() : 1;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1847:  Conv1DGenerator e(b, op, stride, dilation);
+call    0 never executed
+    #####: 1848:  auto res = e.generateNwcConv();
+call    0 never executed
+    #####: 1849:  if (succeeded(res))
+branch  0 never executed
+branch  1 never executed
+    #####: 1850:    return res;
+    #####: 1851:  res = e.generateNcwConv();
+call    0 never executed
+    #####: 1852:  if (succeeded(res))
+branch  0 never executed
+branch  1 never executed
+    #####: 1853:    return res;
+    #####: 1854:  return e.generateDilatedConv();
+call    0 never executed
+        -: 1855:}
+        -: 1856:
+        -: 1857:struct VectorizeConvolution : public OpInterfaceRewritePattern<LinalgOp> {
+        -: 1858:  using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
+        -: 1859:
+function _ZNK20VectorizeConvolution15matchAndRewriteEN4mlir6linalg8LinalgOpERNS0_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1860:  LogicalResult matchAndRewrite(LinalgOp op,
+        -: 1861:                                PatternRewriter &rewriter) const override {
+    #####: 1862:    FailureOr<Operation *> resultOrFail = vectorizeConvolution(rewriter, op);
+call    0 never executed
+    #####: 1863:    if (failed(resultOrFail))
+branch  0 never executed
+branch  1 never executed
+    #####: 1864:      return failure();
+    #####: 1865:    Operation *newOp = *resultOrFail;
+branch  0 never executed
+branch  1 never executed
+    #####: 1866:    if (newOp->getNumResults() == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1867:      rewriter.eraseOp(op.getOperation());
+call    0 never executed
+    #####: 1868:      return success();
+        -: 1869:    }
+    #####: 1870:    assert(newOp->getNumResults() == 1 && "expected single result");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1871:    rewriter.replaceOp(op.getOperation(), newOp->getResult(0));
+call    0 never executed
+call    1 never executed
+    #####: 1872:    return success();
+        -: 1873:  }
+        -: 1874:};
+        -: 1875:
+function _ZN4mlir6linalg40populateConvolutionVectorizationPatternsERNS_17RewritePatternSetENS_14PatternBenefitE called 0 returned 0% blocks executed 0%
+    #####: 1876:void mlir::linalg::populateConvolutionVectorizationPatterns(
+        -: 1877:    RewritePatternSet &patterns, PatternBenefit benefit) {
+    #####: 1878:  patterns.add<VectorizeConvolution>(patterns.getContext(), benefit);
+call    0 never executed
+    #####: 1879:}

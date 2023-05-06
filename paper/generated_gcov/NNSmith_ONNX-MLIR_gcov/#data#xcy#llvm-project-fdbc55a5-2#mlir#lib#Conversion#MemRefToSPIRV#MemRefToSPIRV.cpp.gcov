@@ -1,0 +1,962 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/MemRefToSPIRV/CMakeFiles/obj.MLIRMemRefToSPIRV.dir/MemRefToSPIRV.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/MemRefToSPIRV/CMakeFiles/obj.MLIRMemRefToSPIRV.dir/MemRefToSPIRV.cpp.gcda
+        -:    0:Runs:128636
+        -:    1://===- MemRefToSPIRV.cpp - MemRef to SPIR-V Patterns ----------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements patterns to convert MemRef dialect to SPIR-V dialect.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   14:#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+        -:   15:#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
+        -:   16:#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+        -:   17:#include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
+        -:   18:#include "llvm/Support/Debug.h"
+        -:   19:
+        -:   20:#define DEBUG_TYPE "memref-to-spirv-pattern"
+        -:   21:
+        -:   22:using namespace mlir;
+        -:   23:
+        -:   24://===----------------------------------------------------------------------===//
+        -:   25:// Utility functions
+        -:   26://===----------------------------------------------------------------------===//
+        -:   27:
+        -:   28:/// Returns the offset of the value in `targetBits` representation.
+        -:   29:///
+        -:   30:/// `srcIdx` is an index into a 1-D array with each element having `sourceBits`.
+        -:   31:/// It's assumed to be non-negative.
+        -:   32:///
+        -:   33:/// When accessing an element in the array treating as having elements of
+        -:   34:/// `targetBits`, multiple values are loaded in the same time. The method
+        -:   35:/// returns the offset where the `srcIdx` locates in the value. For example, if
+        -:   36:/// `sourceBits` equals to 8 and `targetBits` equals to 32, the x-th element is
+        -:   37:/// located at (x % 4) * 8. Because there are four elements in one i32, and one
+        -:   38:/// element has 8 bits.
+function _ZL20getOffsetForBitwidthN4mlir8LocationENS_5ValueEiiRNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:   39:static Value getOffsetForBitwidth(Location loc, Value srcIdx, int sourceBits,
+        -:   40:                                  int targetBits, OpBuilder &builder) {
+    #####:   41:  assert(targetBits % sourceBits == 0);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   42:  IntegerType targetType = builder.getIntegerType(targetBits);
+call    0 never executed
+    #####:   43:  IntegerAttr idxAttr =
+    #####:   44:      builder.getIntegerAttr(targetType, targetBits / sourceBits);
+call    0 never executed
+    #####:   45:  auto idx = builder.create<spirv::ConstantOp>(loc, targetType, idxAttr);
+call    0 never executed
+    #####:   46:  IntegerAttr srcBitsAttr = builder.getIntegerAttr(targetType, sourceBits);
+call    0 never executed
+    #####:   47:  auto srcBitsValue =
+    #####:   48:      builder.create<spirv::ConstantOp>(loc, targetType, srcBitsAttr);
+call    0 never executed
+    #####:   49:  auto m = builder.create<spirv::UModOp>(loc, srcIdx, idx);
+call    0 never executed
+    #####:   50:  return builder.create<spirv::IMulOp>(loc, targetType, m, srcBitsValue);
+call    0 never executed
+        -:   51:}
+        -:   52:
+        -:   53:/// Returns an adjusted spirv::AccessChainOp. Based on the
+        -:   54:/// extension/capabilities, certain integer bitwidths `sourceBits` might not be
+        -:   55:/// supported. During conversion if a memref of an unsupported type is used,
+        -:   56:/// load/stores to this memref need to be modified to use a supported higher
+        -:   57:/// bitwidth `targetBits` and extracting the required bits. For an accessing a
+        -:   58:/// 1D array (spirv.array or spirv.rt_array), the last index is modified to load
+        -:   59:/// the bits needed. The extraction of the actual bits needed are handled
+        -:   60:/// separately. Note that this only works for a 1-D tensor.
+function _ZL28adjustAccessChainForBitwidthRN4mlir18SPIRVTypeConverterENS_5spirv13AccessChainOpEiiRNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:   61:static Value adjustAccessChainForBitwidth(SPIRVTypeConverter &typeConverter,
+        -:   62:                                          spirv::AccessChainOp op,
+        -:   63:                                          int sourceBits, int targetBits,
+        -:   64:                                          OpBuilder &builder) {
+    #####:   65:  assert(targetBits % sourceBits == 0);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   66:  const auto loc = op.getLoc();
+call    0 never executed
+    #####:   67:  IntegerType targetType = builder.getIntegerType(targetBits);
+call    0 never executed
+    #####:   68:  IntegerAttr attr =
+    #####:   69:      builder.getIntegerAttr(targetType, targetBits / sourceBits);
+call    0 never executed
+    #####:   70:  auto idx = builder.create<spirv::ConstantOp>(loc, targetType, attr);
+call    0 never executed
+    #####:   71:  auto lastDim = op->getOperand(op.getNumOperands() - 1);
+call    0 never executed
+call    1 never executed
+    #####:   72:  auto indices = llvm::to_vector<4>(op.getIndices());
+call    0 never executed
+call    1 never executed
+        -:   73:  // There are two elements if this is a 1-D tensor.
+    #####:   74:  assert(indices.size() == 2);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   75:  indices.back() = builder.create<spirv::SDivOp>(loc, lastDim, idx);
+call    0 never executed
+call    1 never executed
+    #####:   76:  Type t = typeConverter.convertType(op.getComponentPtr().getType());
+call    0 never executed
+call    1 never executed
+    #####:   77:  return builder.create<spirv::AccessChainOp>(loc, t, op.getBasePtr(), indices);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:   78:}
+        -:   79:
+        -:   80:/// Returns the shifted `targetBits`-bit value with the given offset.
+function _ZL10shiftValueN4mlir8LocationENS_5ValueES1_S1_iRNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:   81:static Value shiftValue(Location loc, Value value, Value offset, Value mask,
+        -:   82:                        int targetBits, OpBuilder &builder) {
+    #####:   83:  Type targetType = builder.getIntegerType(targetBits);
+call    0 never executed
+    #####:   84:  Value result = builder.create<spirv::BitwiseAndOp>(loc, value, mask);
+call    0 never executed
+call    1 never executed
+    #####:   85:  return builder.create<spirv::ShiftLeftLogicalOp>(loc, targetType, result,
+    #####:   86:                                                   offset);
+call    0 never executed
+        -:   87:}
+        -:   88:
+        -:   89:/// Returns true if the allocations of memref `type` generated from `allocOp`
+        -:   90:/// can be lowered to SPIR-V.
+function _ZL21isAllocationSupportedPN4mlir9OperationENS_10MemRefTypeE called 0 returned 0% blocks executed 0%
+    #####:   91:static bool isAllocationSupported(Operation *allocOp, MemRefType type) {
+    #####:   92:  if (isa<memref::AllocOp, memref::DeallocOp>(allocOp)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   93:    auto sc = type.getMemorySpace().dyn_cast_or_null<spirv::StorageClassAttr>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   94:    if (!sc || sc.getValue() != spirv::StorageClass::Workgroup)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   95:      return false;
+    #####:   96:  } else if (isa<memref::AllocaOp>(allocOp)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   97:    auto sc = type.getMemorySpace().dyn_cast_or_null<spirv::StorageClassAttr>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   98:    if (!sc || sc.getValue() != spirv::StorageClass::Function)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   99:      return false;
+        -:  100:  } else {
+        -:  101:    return false;
+        -:  102:  }
+        -:  103:
+        -:  104:  // Currently only support static shape and int or float or vector of int or
+        -:  105:  // float element type.
+    #####:  106:  if (!type.hasStaticShape())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  107:    return false;
+        -:  108:
+    #####:  109:  Type elementType = type.getElementType();
+call    0 never executed
+    #####:  110:  if (auto vecType = elementType.dyn_cast<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  111:    elementType = vecType.getElementType();
+call    0 never executed
+    #####:  112:  return elementType.isIntOrFloat();
+call    0 never executed
+        -:  113:}
+        -:  114:
+        -:  115:/// Returns the scope to use for atomic operations use for emulating store
+        -:  116:/// operations of unsupported integer bitwidths, based on the memref
+        -:  117:/// type. Returns None on failure.
+function _ZL16getAtomicOpScopeN4mlir10MemRefTypeE called 0 returned 0% blocks executed 0%
+    #####:  118:static Optional<spirv::Scope> getAtomicOpScope(MemRefType type) {
+    #####:  119:  auto sc = type.getMemorySpace().dyn_cast_or_null<spirv::StorageClassAttr>();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  120:  switch (sc.getValue()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  121:  case spirv::StorageClass::StorageBuffer:
+    #####:  122:    return spirv::Scope::Device;
+    #####:  123:  case spirv::StorageClass::Workgroup:
+    #####:  124:    return spirv::Scope::Workgroup;
+    #####:  125:  default:
+    #####:  126:    break;
+        -:  127:  }
+    #####:  128:  return {};
+        -:  129:}
+        -:  130:
+        -:  131:/// Casts the given `srcInt` into a boolean value.
+function _ZL14castIntNToBoolN4mlir8LocationENS_5ValueERNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:  132:static Value castIntNToBool(Location loc, Value srcInt, OpBuilder &builder) {
+    #####:  133:  if (srcInt.getType().isInteger(1))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  134:    return srcInt;
+        -:  135:
+    #####:  136:  auto one = spirv::ConstantOp::getOne(srcInt.getType(), loc, builder);
+call    0 never executed
+    #####:  137:  return builder.create<spirv::IEqualOp>(loc, srcInt, one);
+call    0 never executed
+        -:  138:}
+        -:  139:
+        -:  140:/// Casts the given `srcBool` into an integer of `dstType`.
+function _ZL14castBoolToIntNN4mlir8LocationENS_5ValueENS_4TypeERNS_9OpBuilderE called 0 returned 0% blocks executed 0%
+    #####:  141:static Value castBoolToIntN(Location loc, Value srcBool, Type dstType,
+        -:  142:                            OpBuilder &builder) {
+    #####:  143:  assert(srcBool.getType().isInteger(1));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  144:  if (dstType.isInteger(1))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:    return srcBool;
+    #####:  146:  Value zero = spirv::ConstantOp::getZero(dstType, loc, builder);
+call    0 never executed
+call    1 never executed
+    #####:  147:  Value one = spirv::ConstantOp::getOne(dstType, loc, builder);
+call    0 never executed
+call    1 never executed
+    #####:  148:  return builder.create<spirv::SelectOp>(loc, dstType, srcBool, one, zero);
+call    0 never executed
+        -:  149:}
+        -:  150:
+        -:  151://===----------------------------------------------------------------------===//
+        -:  152:// Operation conversion
+        -:  153://===----------------------------------------------------------------------===//
+        -:  154:
+        -:  155:// Note that DRR cannot be used for the patterns in this file: we may need to
+        -:  156:// convert type along the way, which requires ConversionPattern. DRR generates
+        -:  157:// normal RewritePattern.
+        -:  158:
+        -:  159:namespace {
+        -:  160:
+        -:  161:/// Converts memref.alloca to SPIR-V Function variables.
+        -:  162:class AllocaOpPattern final : public OpConversionPattern<memref::AllocaOp> {
+        -:  163:public:
+        -:  164:  using OpConversionPattern<memref::AllocaOp>::OpConversionPattern;
+        -:  165:
+        -:  166:  LogicalResult
+        -:  167:  matchAndRewrite(memref::AllocaOp allocaOp, OpAdaptor adaptor,
+        -:  168:                  ConversionPatternRewriter &rewriter) const override;
+        -:  169:};
+        -:  170:
+        -:  171:/// Converts an allocation operation to SPIR-V. Currently only supports lowering
+        -:  172:/// to Workgroup memory when the size is constant.  Note that this pattern needs
+        -:  173:/// to be applied in a pass that runs at least at spirv.module scope since it
+        -:  174:/// wil ladd global variables into the spirv.module.
+        -:  175:class AllocOpPattern final : public OpConversionPattern<memref::AllocOp> {
+        -:  176:public:
+        -:  177:  using OpConversionPattern<memref::AllocOp>::OpConversionPattern;
+        -:  178:
+        -:  179:  LogicalResult
+        -:  180:  matchAndRewrite(memref::AllocOp operation, OpAdaptor adaptor,
+        -:  181:                  ConversionPatternRewriter &rewriter) const override;
+        -:  182:};
+        -:  183:
+        -:  184:/// Removed a deallocation if it is a supported allocation. Currently only
+        -:  185:/// removes deallocation if the memory space is workgroup memory.
+        -:  186:class DeallocOpPattern final : public OpConversionPattern<memref::DeallocOp> {
+        -:  187:public:
+        -:  188:  using OpConversionPattern<memref::DeallocOp>::OpConversionPattern;
+        -:  189:
+        -:  190:  LogicalResult
+        -:  191:  matchAndRewrite(memref::DeallocOp operation, OpAdaptor adaptor,
+        -:  192:                  ConversionPatternRewriter &rewriter) const override;
+        -:  193:};
+        -:  194:
+        -:  195:/// Converts memref.load to spirv.Load + spirv.AccessChain on integers.
+        -:  196:class IntLoadOpPattern final : public OpConversionPattern<memref::LoadOp> {
+        -:  197:public:
+        -:  198:  using OpConversionPattern<memref::LoadOp>::OpConversionPattern;
+        -:  199:
+        -:  200:  LogicalResult
+        -:  201:  matchAndRewrite(memref::LoadOp loadOp, OpAdaptor adaptor,
+        -:  202:                  ConversionPatternRewriter &rewriter) const override;
+        -:  203:};
+        -:  204:
+        -:  205:/// Converts memref.load to spirv.Load + spirv.AccessChain.
+        -:  206:class LoadOpPattern final : public OpConversionPattern<memref::LoadOp> {
+        -:  207:public:
+        -:  208:  using OpConversionPattern<memref::LoadOp>::OpConversionPattern;
+        -:  209:
+        -:  210:  LogicalResult
+        -:  211:  matchAndRewrite(memref::LoadOp loadOp, OpAdaptor adaptor,
+        -:  212:                  ConversionPatternRewriter &rewriter) const override;
+        -:  213:};
+        -:  214:
+        -:  215:/// Converts memref.store to spirv.Store on integers.
+        -:  216:class IntStoreOpPattern final : public OpConversionPattern<memref::StoreOp> {
+        -:  217:public:
+        -:  218:  using OpConversionPattern<memref::StoreOp>::OpConversionPattern;
+        -:  219:
+        -:  220:  LogicalResult
+        -:  221:  matchAndRewrite(memref::StoreOp storeOp, OpAdaptor adaptor,
+        -:  222:                  ConversionPatternRewriter &rewriter) const override;
+        -:  223:};
+        -:  224:
+        -:  225:/// Converts memref.store to spirv.Store.
+        -:  226:class StoreOpPattern final : public OpConversionPattern<memref::StoreOp> {
+        -:  227:public:
+        -:  228:  using OpConversionPattern<memref::StoreOp>::OpConversionPattern;
+        -:  229:
+        -:  230:  LogicalResult
+        -:  231:  matchAndRewrite(memref::StoreOp storeOp, OpAdaptor adaptor,
+        -:  232:                  ConversionPatternRewriter &rewriter) const override;
+        -:  233:};
+        -:  234:
+        -:  235:} // namespace
+        -:  236:
+        -:  237://===----------------------------------------------------------------------===//
+        -:  238:// AllocaOp
+        -:  239://===----------------------------------------------------------------------===//
+        -:  240:
+        -:  241:LogicalResult
+function _ZNK12_GLOBAL__N_115AllocaOpPattern15matchAndRewriteEN4mlir6memref8AllocaOpENS2_15AllocaOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  242:AllocaOpPattern::matchAndRewrite(memref::AllocaOp allocaOp, OpAdaptor adaptor,
+        -:  243:                                 ConversionPatternRewriter &rewriter) const {
+    #####:  244:  MemRefType allocType = allocaOp.getType();
+call    0 never executed
+    #####:  245:  if (!isAllocationSupported(allocaOp, allocType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  246:    return rewriter.notifyMatchFailure(allocaOp, "unhandled allocation type");
+call    0 never executed
+        -:  247:
+        -:  248:  // Get the SPIR-V type for the allocation.
+    #####:  249:  Type spirvType = getTypeConverter()->convertType(allocType);
+call    0 never executed
+    #####:  250:  rewriter.replaceOpWithNewOp<spirv::VariableOp>(allocaOp, spirvType,
+    #####:  251:                                                 spirv::StorageClass::Function,
+    #####:  252:                                                 /*initializer=*/nullptr);
+call    0 never executed
+    #####:  253:  return success();
+        -:  254:}
+        -:  255:
+        -:  256://===----------------------------------------------------------------------===//
+        -:  257:// AllocOp
+        -:  258://===----------------------------------------------------------------------===//
+        -:  259:
+        -:  260:LogicalResult
+function _ZNK12_GLOBAL__N_114AllocOpPattern15matchAndRewriteEN4mlir6memref7AllocOpENS2_14AllocOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  261:AllocOpPattern::matchAndRewrite(memref::AllocOp operation, OpAdaptor adaptor,
+        -:  262:                                ConversionPatternRewriter &rewriter) const {
+    #####:  263:  MemRefType allocType = operation.getType();
+call    0 never executed
+    #####:  264:  if (!isAllocationSupported(operation, allocType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  265:    return rewriter.notifyMatchFailure(operation, "unhandled allocation type");
+call    0 never executed
+        -:  266:
+        -:  267:  // Get the SPIR-V type for the allocation.
+    #####:  268:  Type spirvType = getTypeConverter()->convertType(allocType);
+call    0 never executed
+        -:  269:
+        -:  270:  // Insert spirv.GlobalVariable for this allocation.
+    #####:  271:  Operation *parent =
+    #####:  272:      SymbolTable::getNearestSymbolTable(operation->getParentOp());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  273:  if (!parent)
+branch  0 never executed
+branch  1 never executed
+    #####:  274:    return failure();
+    #####:  275:  Location loc = operation.getLoc();
+call    0 never executed
+    #####:  276:  spirv::GlobalVariableOp varOp;
+call    0 never executed
+    #####:  277:  {
+    #####:  278:    OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+    #####:  279:    Block &entryBlock = *parent->getRegion(0).begin();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  280:    rewriter.setInsertionPointToStart(&entryBlock);
+call    0 never executed
+    #####:  281:    auto varOps = entryBlock.getOps<spirv::GlobalVariableOp>();
+call    0 never executed
+    #####:  282:    std::string varName =
+    #####:  283:        std::string("__workgroup_mem__") +
+branch  0 never executed
+branch  1 never executed
+    #####:  284:        std::to_string(std::distance(varOps.begin(), varOps.end()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  285:    varOp = rewriter.create<spirv::GlobalVariableOp>(loc, spirvType, varName,
+    #####:  286:                                                     /*initializer=*/nullptr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  287:  }
+        -:  288:
+        -:  289:  // Get pointer to global variable at the current scope.
+    #####:  290:  rewriter.replaceOpWithNewOp<spirv::AddressOfOp>(operation, varOp);
+call    0 never executed
+    #####:  291:  return success();
+        -:  292:}
+        -:  293:
+        -:  294://===----------------------------------------------------------------------===//
+        -:  295:// DeallocOp
+        -:  296://===----------------------------------------------------------------------===//
+        -:  297:
+        -:  298:LogicalResult
+function _ZNK12_GLOBAL__N_116DeallocOpPattern15matchAndRewriteEN4mlir6memref9DeallocOpENS2_16DeallocOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  299:DeallocOpPattern::matchAndRewrite(memref::DeallocOp operation,
+        -:  300:                                  OpAdaptor adaptor,
+        -:  301:                                  ConversionPatternRewriter &rewriter) const {
+    #####:  302:  MemRefType deallocType = operation.getMemref().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+    #####:  303:  if (!isAllocationSupported(operation, deallocType))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  304:    return rewriter.notifyMatchFailure(operation, "unhandled allocation type");
+call    0 never executed
+    #####:  305:  rewriter.eraseOp(operation);
+call    0 never executed
+    #####:  306:  return success();
+        -:  307:}
+        -:  308:
+        -:  309://===----------------------------------------------------------------------===//
+        -:  310:// LoadOp
+        -:  311://===----------------------------------------------------------------------===//
+        -:  312:
+        -:  313:LogicalResult
+function _ZNK12_GLOBAL__N_116IntLoadOpPattern15matchAndRewriteEN4mlir6memref6LoadOpENS2_13LoadOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  314:IntLoadOpPattern::matchAndRewrite(memref::LoadOp loadOp, OpAdaptor adaptor,
+        -:  315:                                  ConversionPatternRewriter &rewriter) const {
+    #####:  316:  auto loc = loadOp.getLoc();
+call    0 never executed
+    #####:  317:  auto memrefType = loadOp.getMemref().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  318:  if (!memrefType.getElementType().isSignlessInteger())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  319:    return failure();
+        -:  320:
+    #####:  321:  auto &typeConverter = *getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  322:  Value accessChain =
+        -:  323:      spirv::getElementPtr(typeConverter, memrefType, adaptor.getMemref(),
+    #####:  324:                           adaptor.getIndices(), loc, rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  325:
+    #####:  326:  if (!accessChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  327:    return failure();
+        -:  328:
+    #####:  329:  int srcBits = memrefType.getElementType().getIntOrFloatBitWidth();
+call    0 never executed
+call    1 never executed
+    #####:  330:  bool isBool = srcBits == 1;
+    #####:  331:  if (isBool)
+branch  0 never executed
+branch  1 never executed
+    #####:  332:    srcBits = typeConverter.getOptions().boolNumBits;
+    #####:  333:  Type pointeeType = typeConverter.convertType(memrefType)
+call    0 never executed
+call    1 never executed
+    #####:  334:                         .cast<spirv::PointerType>()
+    #####:  335:                         .getPointeeType();
+call    0 never executed
+    #####:  336:  Type dstType;
+    #####:  337:  if (typeConverter.allows(spirv::Capability::Kernel)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  338:    if (auto arrayType = pointeeType.dyn_cast<spirv::ArrayType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  339:      dstType = arrayType.getElementType();
+call    0 never executed
+        -:  340:    else
+    #####:  341:      dstType = pointeeType;
+        -:  342:  } else {
+        -:  343:    // For Vulkan we need to extract element from wrapping struct and array.
+    #####:  344:    Type structElemType =
+call    0 never executed
+    #####:  345:        pointeeType.cast<spirv::StructType>().getElementType(0);
+call    0 never executed
+    #####:  346:    if (auto arrayType = structElemType.dyn_cast<spirv::ArrayType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  347:      dstType = arrayType.getElementType();
+call    0 never executed
+        -:  348:    else
+    #####:  349:      dstType = structElemType.cast<spirv::RuntimeArrayType>().getElementType();
+call    0 never executed
+call    1 never executed
+        -:  350:  }
+    #####:  351:  int dstBits = dstType.getIntOrFloatBitWidth();
+call    0 never executed
+    #####:  352:  assert(dstBits % srcBits == 0);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  353:
+        -:  354:  // If the rewrited load op has the same bit width, use the loading value
+        -:  355:  // directly.
+    #####:  356:  if (srcBits == dstBits) {
+branch  0 never executed
+branch  1 never executed
+    #####:  357:    Value loadVal = rewriter.create<spirv::LoadOp>(loc, accessChain);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  358:    if (isBool)
+branch  0 never executed
+branch  1 never executed
+    #####:  359:      loadVal = castIntNToBool(loc, loadVal, rewriter);
+call    0 never executed
+    #####:  360:    rewriter.replaceOp(loadOp, loadVal);
+call    0 never executed
+call    1 never executed
+    #####:  361:    return success();
+        -:  362:  }
+        -:  363:
+        -:  364:  // Bitcasting is currently unsupported for Kernel capability /
+        -:  365:  // spirv.PtrAccessChain.
+    #####:  366:  if (typeConverter.allows(spirv::Capability::Kernel))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  367:    return failure();
+        -:  368:
+    #####:  369:  auto accessChainOp = accessChain.getDefiningOp<spirv::AccessChainOp>();
+call    0 never executed
+    #####:  370:  if (!accessChainOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  371:    return failure();
+        -:  372:
+        -:  373:  // Assume that getElementPtr() works linearizely. If it's a scalar, the method
+        -:  374:  // still returns a linearized accessing. If the accessing is not linearized,
+        -:  375:  // there will be offset issues.
+    #####:  376:  assert(accessChainOp.getIndices().size() == 2);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  377:  Value adjustedPtr = adjustAccessChainForBitwidth(typeConverter, accessChainOp,
+    #####:  378:                                                   srcBits, dstBits, rewriter);
+call    0 never executed
+    #####:  379:  Value spvLoadOp = rewriter.create<spirv::LoadOp>(
+        -:  380:      loc, dstType, adjustedPtr,
+    #####:  381:      loadOp->getAttrOfType<spirv::MemoryAccessAttr>(
+    #####:  382:          spirv::attributeName<spirv::MemoryAccess>()),
+call    0 never executed
+    #####:  383:      loadOp->getAttrOfType<IntegerAttr>("alignment"));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  384:
+        -:  385:  // Shift the bits to the rightmost.
+        -:  386:  // ____XXXX________ -> ____________XXXX
+    #####:  387:  Value lastDim = accessChainOp->getOperand(accessChainOp.getNumOperands() - 1);
+call    0 never executed
+call    1 never executed
+    #####:  388:  Value offset = getOffsetForBitwidth(loc, lastDim, srcBits, dstBits, rewriter);
+call    0 never executed
+    #####:  389:  Value result = rewriter.create<spirv::ShiftRightArithmeticOp>(
+    #####:  390:      loc, spvLoadOp.getType(), spvLoadOp, offset);
+call    0 never executed
+call    1 never executed
+        -:  391:
+        -:  392:  // Apply the mask to extract corresponding bits.
+    #####:  393:  Value mask = rewriter.create<spirv::ConstantOp>(
+    #####:  394:      loc, dstType, rewriter.getIntegerAttr(dstType, (1 << srcBits) - 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  395:  result = rewriter.create<spirv::BitwiseAndOp>(loc, dstType, result, mask);
+call    0 never executed
+call    1 never executed
+        -:  396:
+        -:  397:  // Apply sign extension on the loading value unconditionally. The signedness
+        -:  398:  // semantic is carried in the operator itself, we relies other pattern to
+        -:  399:  // handle the casting.
+    #####:  400:  IntegerAttr shiftValueAttr =
+    #####:  401:      rewriter.getIntegerAttr(dstType, dstBits - srcBits);
+call    0 never executed
+    #####:  402:  Value shiftValue =
+    #####:  403:      rewriter.create<spirv::ConstantOp>(loc, dstType, shiftValueAttr);
+call    0 never executed
+call    1 never executed
+    #####:  404:  result = rewriter.create<spirv::ShiftLeftLogicalOp>(loc, dstType, result,
+    #####:  405:                                                      shiftValue);
+call    0 never executed
+call    1 never executed
+    #####:  406:  result = rewriter.create<spirv::ShiftRightArithmeticOp>(loc, dstType, result,
+    #####:  407:                                                          shiftValue);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  408:
+    #####:  409:  if (isBool) {
+branch  0 never executed
+branch  1 never executed
+    #####:  410:    dstType = typeConverter.convertType(loadOp.getType());
+call    0 never executed
+    #####:  411:    mask = spirv::ConstantOp::getOne(result.getType(), loc, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  412:    result = rewriter.create<spirv::IEqualOp>(loc, result, mask);
+call    0 never executed
+    #####:  413:  } else if (result.getType().getIntOrFloatBitWidth() !=
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  414:             static_cast<unsigned>(dstBits)) {
+    #####:  415:    result = rewriter.create<spirv::SConvertOp>(loc, dstType, result);
+call    0 never executed
+        -:  416:  }
+    #####:  417:  rewriter.replaceOp(loadOp, result);
+call    0 never executed
+call    1 never executed
+        -:  418:
+    #####:  419:  assert(accessChainOp.use_empty());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  420:  rewriter.eraseOp(accessChainOp);
+call    0 never executed
+        -:  421:
+    #####:  422:  return success();
+        -:  423:}
+        -:  424:
+        -:  425:LogicalResult
+function _ZNK12_GLOBAL__N_113LoadOpPattern15matchAndRewriteEN4mlir6memref6LoadOpENS2_13LoadOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  426:LoadOpPattern::matchAndRewrite(memref::LoadOp loadOp, OpAdaptor adaptor,
+        -:  427:                               ConversionPatternRewriter &rewriter) const {
+    #####:  428:  auto memrefType = loadOp.getMemref().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  429:  if (memrefType.getElementType().isSignlessInteger())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  430:    return failure();
+    #####:  431:  auto loadPtr = spirv::getElementPtr(
+    #####:  432:      *getTypeConverter<SPIRVTypeConverter>(), memrefType, adaptor.getMemref(),
+call    0 never executed
+    #####:  433:      adaptor.getIndices(), loadOp.getLoc(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  434:
+    #####:  435:  if (!loadPtr)
+branch  0 never executed
+branch  1 never executed
+    #####:  436:    return failure();
+        -:  437:
+    #####:  438:  rewriter.replaceOpWithNewOp<spirv::LoadOp>(loadOp, loadPtr);
+call    0 never executed
+    #####:  439:  return success();
+        -:  440:}
+        -:  441:
+        -:  442:LogicalResult
+function _ZNK12_GLOBAL__N_117IntStoreOpPattern15matchAndRewriteEN4mlir6memref7StoreOpENS2_14StoreOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  443:IntStoreOpPattern::matchAndRewrite(memref::StoreOp storeOp, OpAdaptor adaptor,
+        -:  444:                                   ConversionPatternRewriter &rewriter) const {
+    #####:  445:  auto memrefType = storeOp.getMemref().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  446:  if (!memrefType.getElementType().isSignlessInteger())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  447:    return failure();
+        -:  448:
+    #####:  449:  auto loc = storeOp.getLoc();
+call    0 never executed
+    #####:  450:  auto &typeConverter = *getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  451:  Value accessChain =
+        -:  452:      spirv::getElementPtr(typeConverter, memrefType, adaptor.getMemref(),
+    #####:  453:                           adaptor.getIndices(), loc, rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  454:
+    #####:  455:  if (!accessChain)
+branch  0 never executed
+branch  1 never executed
+    #####:  456:    return failure();
+        -:  457:
+    #####:  458:  int srcBits = memrefType.getElementType().getIntOrFloatBitWidth();
+call    0 never executed
+call    1 never executed
+        -:  459:
+    #####:  460:  bool isBool = srcBits == 1;
+    #####:  461:  if (isBool)
+branch  0 never executed
+branch  1 never executed
+    #####:  462:    srcBits = typeConverter.getOptions().boolNumBits;
+        -:  463:
+    #####:  464:  Type pointeeType = typeConverter.convertType(memrefType)
+call    0 never executed
+call    1 never executed
+    #####:  465:                         .cast<spirv::PointerType>()
+    #####:  466:                         .getPointeeType();
+call    0 never executed
+    #####:  467:  Type dstType;
+    #####:  468:  if (typeConverter.allows(spirv::Capability::Kernel)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  469:    if (auto arrayType = pointeeType.dyn_cast<spirv::ArrayType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  470:      dstType = arrayType.getElementType();
+call    0 never executed
+        -:  471:    else
+    #####:  472:      dstType = pointeeType;
+        -:  473:  } else {
+        -:  474:    // For Vulkan we need to extract element from wrapping struct and array.
+    #####:  475:    Type structElemType =
+call    0 never executed
+    #####:  476:        pointeeType.cast<spirv::StructType>().getElementType(0);
+call    0 never executed
+    #####:  477:    if (auto arrayType = structElemType.dyn_cast<spirv::ArrayType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  478:      dstType = arrayType.getElementType();
+call    0 never executed
+        -:  479:    else
+    #####:  480:      dstType = structElemType.cast<spirv::RuntimeArrayType>().getElementType();
+call    0 never executed
+call    1 never executed
+        -:  481:  }
+        -:  482:
+    #####:  483:  int dstBits = dstType.getIntOrFloatBitWidth();
+call    0 never executed
+    #####:  484:  assert(dstBits % srcBits == 0);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  485:
+    #####:  486:  if (srcBits == dstBits) {
+branch  0 never executed
+branch  1 never executed
+    #####:  487:    Value storeVal = adaptor.getValue();
+call    0 never executed
+    #####:  488:    if (isBool)
+branch  0 never executed
+branch  1 never executed
+    #####:  489:      storeVal = castBoolToIntN(loc, storeVal, dstType, rewriter);
+call    0 never executed
+    #####:  490:    rewriter.replaceOpWithNewOp<spirv::StoreOp>(storeOp, accessChain, storeVal);
+call    0 never executed
+    #####:  491:    return success();
+        -:  492:  }
+        -:  493:
+        -:  494:  // Bitcasting is currently unsupported for Kernel capability /
+        -:  495:  // spirv.PtrAccessChain.
+    #####:  496:  if (typeConverter.allows(spirv::Capability::Kernel))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  497:    return failure();
+        -:  498:
+    #####:  499:  auto accessChainOp = accessChain.getDefiningOp<spirv::AccessChainOp>();
+call    0 never executed
+    #####:  500:  if (!accessChainOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  501:    return failure();
+        -:  502:
+        -:  503:  // Since there are multi threads in the processing, the emulation will be done
+        -:  504:  // with atomic operations. E.g., if the storing value is i8, rewrite the
+        -:  505:  // StoreOp to
+        -:  506:  // 1) load a 32-bit integer
+        -:  507:  // 2) clear 8 bits in the loading value
+        -:  508:  // 3) store 32-bit value back
+        -:  509:  // 4) load a 32-bit integer
+        -:  510:  // 5) modify 8 bits in the loading value
+        -:  511:  // 6) store 32-bit value back
+        -:  512:  // The step 1 to step 3 are done by AtomicAnd as one atomic step, and the step
+        -:  513:  // 4 to step 6 are done by AtomicOr as another atomic step.
+    #####:  514:  assert(accessChainOp.getIndices().size() == 2);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  515:  Value lastDim = accessChainOp->getOperand(accessChainOp.getNumOperands() - 1);
+call    0 never executed
+call    1 never executed
+    #####:  516:  Value offset = getOffsetForBitwidth(loc, lastDim, srcBits, dstBits, rewriter);
+call    0 never executed
+        -:  517:
+        -:  518:  // Create a mask to clear the destination. E.g., if it is the second i8 in
+        -:  519:  // i32, 0xFFFF00FF is created.
+    #####:  520:  Value mask = rewriter.create<spirv::ConstantOp>(
+    #####:  521:      loc, dstType, rewriter.getIntegerAttr(dstType, (1 << srcBits) - 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  522:  Value clearBitsMask =
+    #####:  523:      rewriter.create<spirv::ShiftLeftLogicalOp>(loc, dstType, mask, offset);
+call    0 never executed
+call    1 never executed
+    #####:  524:  clearBitsMask = rewriter.create<spirv::NotOp>(loc, dstType, clearBitsMask);
+call    0 never executed
+call    1 never executed
+        -:  525:
+    #####:  526:  Value storeVal = adaptor.getValue();
+call    0 never executed
+    #####:  527:  if (isBool)
+branch  0 never executed
+branch  1 never executed
+    #####:  528:    storeVal = castBoolToIntN(loc, storeVal, dstType, rewriter);
+call    0 never executed
+    #####:  529:  storeVal = shiftValue(loc, storeVal, offset, mask, dstBits, rewriter);
+call    0 never executed
+    #####:  530:  Value adjustedPtr = adjustAccessChainForBitwidth(typeConverter, accessChainOp,
+    #####:  531:                                                   srcBits, dstBits, rewriter);
+call    0 never executed
+    #####:  532:  Optional<spirv::Scope> scope = getAtomicOpScope(memrefType);
+call    0 never executed
+    #####:  533:  if (!scope)
+branch  0 never executed
+branch  1 never executed
+    #####:  534:    return failure();
+    #####:  535:  Value result = rewriter.create<spirv::AtomicAndOp>(
+    #####:  536:      loc, dstType, adjustedPtr, *scope, spirv::MemorySemantics::AcquireRelease,
+call    0 never executed
+    #####:  537:      clearBitsMask);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  538:  result = rewriter.create<spirv::AtomicOrOp>(
+    #####:  539:      loc, dstType, adjustedPtr, *scope, spirv::MemorySemantics::AcquireRelease,
+branch  0 never executed
+branch  1 never executed
+    #####:  540:      storeVal);
+call    0 never executed
+call    1 never executed
+        -:  541:
+        -:  542:  // The AtomicOrOp has no side effect. Since it is already inserted, we can
+        -:  543:  // just remove the original StoreOp. Note that rewriter.replaceOp()
+        -:  544:  // doesn't work because it only accepts that the numbers of result are the
+        -:  545:  // same.
+    #####:  546:  rewriter.eraseOp(storeOp);
+call    0 never executed
+        -:  547:
+    #####:  548:  assert(accessChainOp.use_empty());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  549:  rewriter.eraseOp(accessChainOp);
+call    0 never executed
+        -:  550:
+    #####:  551:  return success();
+        -:  552:}
+        -:  553:
+        -:  554:LogicalResult
+function _ZNK12_GLOBAL__N_114StoreOpPattern15matchAndRewriteEN4mlir6memref7StoreOpENS2_14StoreOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  555:StoreOpPattern::matchAndRewrite(memref::StoreOp storeOp, OpAdaptor adaptor,
+        -:  556:                                ConversionPatternRewriter &rewriter) const {
+    #####:  557:  auto memrefType = storeOp.getMemref().getType().cast<MemRefType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  558:  if (memrefType.getElementType().isSignlessInteger())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  559:    return failure();
+    #####:  560:  auto storePtr = spirv::getElementPtr(
+    #####:  561:      *getTypeConverter<SPIRVTypeConverter>(), memrefType, adaptor.getMemref(),
+call    0 never executed
+    #####:  562:      adaptor.getIndices(), storeOp.getLoc(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  563:
+    #####:  564:  if (!storePtr)
+branch  0 never executed
+branch  1 never executed
+    #####:  565:    return failure();
+        -:  566:
+    #####:  567:  rewriter.replaceOpWithNewOp<spirv::StoreOp>(storeOp, storePtr,
+    #####:  568:                                              adaptor.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  569:  return success();
+        -:  570:}
+        -:  571:
+        -:  572://===----------------------------------------------------------------------===//
+        -:  573:// Pattern population
+        -:  574://===----------------------------------------------------------------------===//
+        -:  575:
+        -:  576:namespace mlir {
+function _ZN4mlir29populateMemRefToSPIRVPatternsERNS_18SPIRVTypeConverterERNS_17RewritePatternSetE called 1052 returned 100% blocks executed 100%
+     1052:  577:void populateMemRefToSPIRVPatterns(SPIRVTypeConverter &typeConverter,
+        -:  578:                                   RewritePatternSet &patterns) {
+     1052:  579:  patterns
+        -:  580:      .add<AllocaOpPattern, AllocOpPattern, DeallocOpPattern, IntLoadOpPattern,
+        -:  581:           IntStoreOpPattern, LoadOpPattern, StoreOpPattern>(
+     1052:  582:          typeConverter, patterns.getContext());
+call    0 returned 100%
+     1052:  583:}
+        -:  584:} // namespace mlir

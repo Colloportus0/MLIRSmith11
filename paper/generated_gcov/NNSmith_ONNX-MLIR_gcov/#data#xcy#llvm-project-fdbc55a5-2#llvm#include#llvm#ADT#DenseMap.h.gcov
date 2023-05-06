@@ -1,0 +1,2680 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/ADT/DenseMap.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:128646
+        -:    1://===- llvm/ADT/DenseMap.h - Dense probed hash table ------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:///
+        -:    9:/// \file
+        -:   10:/// This file defines the DenseMap class.
+        -:   11:///
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef LLVM_ADT_DENSEMAP_H
+        -:   15:#define LLVM_ADT_DENSEMAP_H
+        -:   16:
+        -:   17:#include "llvm/ADT/DenseMapInfo.h"
+        -:   18:#include "llvm/ADT/EpochTracker.h"
+        -:   19:#include "llvm/Support/AlignOf.h"
+        -:   20:#include "llvm/Support/Compiler.h"
+        -:   21:#include "llvm/Support/MathExtras.h"
+        -:   22:#include "llvm/Support/MemAlloc.h"
+        -:   23:#include "llvm/Support/ReverseIteration.h"
+        -:   24:#include "llvm/Support/type_traits.h"
+        -:   25:#include <algorithm>
+        -:   26:#include <cassert>
+        -:   27:#include <cstddef>
+        -:   28:#include <cstring>
+        -:   29:#include <initializer_list>
+        -:   30:#include <iterator>
+        -:   31:#include <new>
+        -:   32:#include <type_traits>
+        -:   33:#include <utility>
+        -:   34:
+        -:   35:namespace llvm {
+        -:   36:
+        -:   37:namespace detail {
+        -:   38:
+        -:   39:// We extend a pair to allow users to override the bucket type with their own
+        -:   40:// implementation without requiring two members.
+        -:   41:template <typename KeyT, typename ValueT>
+        -:   42:struct DenseMapPair : public std::pair<KeyT, ValueT> {
+        -:   43:  using std::pair<KeyT, ValueT>::pair;
+        -:   44:
+    #####:   45:  KeyT &getFirst() { return std::pair<KeyT, ValueT>::first; }
+    #####:   46:  const KeyT &getFirst() const { return std::pair<KeyT, ValueT>::first; }
+    #####:   47:  ValueT &getSecond() { return std::pair<KeyT, ValueT>::second; }
+    #####:   48:  const ValueT &getSecond() const { return std::pair<KeyT, ValueT>::second; }
+        -:   49:};
+        -:   50:
+        -:   51:} // end namespace detail
+        -:   52:
+        -:   53:template <typename KeyT, typename ValueT,
+        -:   54:          typename KeyInfoT = DenseMapInfo<KeyT>,
+        -:   55:          typename Bucket = llvm::detail::DenseMapPair<KeyT, ValueT>,
+        -:   56:          bool IsConst = false>
+        -:   57:class DenseMapIterator;
+        -:   58:
+        -:   59:template <typename DerivedT, typename KeyT, typename ValueT, typename KeyInfoT,
+        -:   60:          typename BucketT>
+        -:   61:class DenseMapBase : public DebugEpochBase {
+        -:   62:  template <typename T>
+        -:   63:  using const_arg_type_t = typename const_pointer_or_const_ref<T>::type;
+        -:   64:
+        -:   65:public:
+        -:   66:  using size_type = unsigned;
+        -:   67:  using key_type = KeyT;
+        -:   68:  using mapped_type = ValueT;
+        -:   69:  using value_type = BucketT;
+        -:   70:
+        -:   71:  using iterator = DenseMapIterator<KeyT, ValueT, KeyInfoT, BucketT>;
+        -:   72:  using const_iterator =
+        -:   73:      DenseMapIterator<KeyT, ValueT, KeyInfoT, BucketT, true>;
+        -:   74:
+        -:   75:  inline iterator begin() {
+        -:   76:    // When the map is empty, avoid the overhead of advancing/retreating past
+        -:   77:    // empty buckets.
+        -:   78:    if (empty())
+        -:   79:      return end();
+        -:   80:    if (shouldReverseIterate<KeyT>())
+        -:   81:      return makeIterator(getBucketsEnd() - 1, getBuckets(), *this);
+        -:   82:    return makeIterator(getBuckets(), getBucketsEnd(), *this);
+        -:   83:  }
+        -:   84:  inline iterator end() {
+        -:   85:    return makeIterator(getBucketsEnd(), getBucketsEnd(), *this, true);
+        -:   86:  }
+        -:   87:  inline const_iterator begin() const {
+        -:   88:    if (empty())
+        -:   89:      return end();
+        -:   90:    if (shouldReverseIterate<KeyT>())
+        -:   91:      return makeConstIterator(getBucketsEnd() - 1, getBuckets(), *this);
+        -:   92:    return makeConstIterator(getBuckets(), getBucketsEnd(), *this);
+        -:   93:  }
+        -:   94:  inline const_iterator end() const {
+        -:   95:    return makeConstIterator(getBucketsEnd(), getBucketsEnd(), *this, true);
+        -:   96:  }
+        -:   97:
+        -:   98:  [[nodiscard]] bool empty() const { return getNumEntries() == 0; }
+        -:   99:  unsigned size() const { return getNumEntries(); }
+        -:  100:
+        -:  101:  /// Grow the densemap so that it can contain at least \p NumEntries items
+        -:  102:  /// before resizing again.
+        -:  103:  void reserve(size_type NumEntries) {
+        -:  104:    auto NumBuckets = getMinBucketToReserveForEntries(NumEntries);
+        -:  105:    incrementEpoch();
+        -:  106:    if (NumBuckets > getNumBuckets())
+        -:  107:      grow(NumBuckets);
+        -:  108:  }
+        -:  109:
+        -:  110:  void clear() {
+        -:  111:    incrementEpoch();
+        -:  112:    if (getNumEntries() == 0 && getNumTombstones() == 0) return;
+        -:  113:
+        -:  114:    // If the capacity of the array is huge, and the # elements used is small,
+        -:  115:    // shrink the array.
+        -:  116:    if (getNumEntries() * 4 < getNumBuckets() && getNumBuckets() > 64) {
+        -:  117:      shrink_and_clear();
+        -:  118:      return;
+        -:  119:    }
+        -:  120:
+        -:  121:    const KeyT EmptyKey = getEmptyKey(), TombstoneKey = getTombstoneKey();
+        -:  122:    if (std::is_trivially_destructible<ValueT>::value) {
+        -:  123:      // Use a simpler loop when values don't need destruction.
+        -:  124:      for (BucketT *P = getBuckets(), *E = getBucketsEnd(); P != E; ++P)
+        -:  125:        P->getFirst() = EmptyKey;
+        -:  126:    } else {
+        -:  127:      unsigned NumEntries = getNumEntries();
+        -:  128:      for (BucketT *P = getBuckets(), *E = getBucketsEnd(); P != E; ++P) {
+        -:  129:        if (!KeyInfoT::isEqual(P->getFirst(), EmptyKey)) {
+        -:  130:          if (!KeyInfoT::isEqual(P->getFirst(), TombstoneKey)) {
+        -:  131:            P->getSecond().~ValueT();
+        -:  132:            --NumEntries;
+        -:  133:          }
+        -:  134:          P->getFirst() = EmptyKey;
+        -:  135:        }
+        -:  136:      }
+        -:  137:      assert(NumEntries == 0 && "Node count imbalance!");
+        -:  138:      (void)NumEntries;
+        -:  139:    }
+        -:  140:    setNumEntries(0);
+        -:  141:    setNumTombstones(0);
+        -:  142:  }
+        -:  143:
+        -:  144:  /// Return 1 if the specified key is in the map, 0 otherwise.
+        -:  145:  size_type count(const_arg_type_t<KeyT> Val) const {
+        -:  146:    const BucketT *TheBucket;
+        -:  147:    return LookupBucketFor(Val, TheBucket) ? 1 : 0;
+        -:  148:  }
+        -:  149:
+        -:  150:  iterator find(const_arg_type_t<KeyT> Val) {
+        -:  151:    BucketT *TheBucket;
+        -:  152:    if (LookupBucketFor(Val, TheBucket))
+        -:  153:      return makeIterator(TheBucket,
+        -:  154:                          shouldReverseIterate<KeyT>() ? getBuckets()
+        -:  155:                                                       : getBucketsEnd(),
+        -:  156:                          *this, true);
+        -:  157:    return end();
+        -:  158:  }
+        -:  159:  const_iterator find(const_arg_type_t<KeyT> Val) const {
+        -:  160:    const BucketT *TheBucket;
+        -:  161:    if (LookupBucketFor(Val, TheBucket))
+        -:  162:      return makeConstIterator(TheBucket,
+        -:  163:                               shouldReverseIterate<KeyT>() ? getBuckets()
+        -:  164:                                                            : getBucketsEnd(),
+        -:  165:                               *this, true);
+        -:  166:    return end();
+        -:  167:  }
+        -:  168:
+        -:  169:  /// Alternate version of find() which allows a different, and possibly
+        -:  170:  /// less expensive, key type.
+        -:  171:  /// The DenseMapInfo is responsible for supplying methods
+        -:  172:  /// getHashValue(LookupKeyT) and isEqual(LookupKeyT, KeyT) for each key
+        -:  173:  /// type used.
+        -:  174:  template<class LookupKeyT>
+        -:  175:  iterator find_as(const LookupKeyT &Val) {
+        -:  176:    BucketT *TheBucket;
+        -:  177:    if (LookupBucketFor(Val, TheBucket))
+        -:  178:      return makeIterator(TheBucket,
+        -:  179:                          shouldReverseIterate<KeyT>() ? getBuckets()
+        -:  180:                                                       : getBucketsEnd(),
+        -:  181:                          *this, true);
+        -:  182:    return end();
+        -:  183:  }
+        -:  184:  template<class LookupKeyT>
+        -:  185:  const_iterator find_as(const LookupKeyT &Val) const {
+        -:  186:    const BucketT *TheBucket;
+        -:  187:    if (LookupBucketFor(Val, TheBucket))
+        -:  188:      return makeConstIterator(TheBucket,
+        -:  189:                               shouldReverseIterate<KeyT>() ? getBuckets()
+        -:  190:                                                            : getBucketsEnd(),
+        -:  191:                               *this, true);
+        -:  192:    return end();
+        -:  193:  }
+        -:  194:
+        -:  195:  /// lookup - Return the entry for the specified key, or a default
+        -:  196:  /// constructed value if no such entry exists.
+    #####:  197:  ValueT lookup(const_arg_type_t<KeyT> Val) const {
+        -:  198:    const BucketT *TheBucket;
+    #####:  199:    if (LookupBucketFor(Val, TheBucket))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+call   12 never executed
+branch 13 never executed
+branch 14 never executed
+call   15 never executed
+branch 16 never executed
+branch 17 never executed
+call   18 never executed
+branch 19 never executed
+branch 20 never executed
+call   21 never executed
+branch 22 never executed
+branch 23 never executed
+call   24 never executed
+branch 25 never executed
+branch 26 never executed
+call   27 never executed
+branch 28 never executed
+branch 29 never executed
+call   30 never executed
+branch 31 never executed
+branch 32 never executed
+call   33 never executed
+branch 34 never executed
+branch 35 never executed
+call   36 never executed
+branch 37 never executed
+branch 38 never executed
+call   39 never executed
+branch 40 never executed
+branch 41 never executed
+call   42 never executed
+branch 43 never executed
+branch 44 never executed
+call   45 never executed
+branch 46 never executed
+branch 47 never executed
+call   48 never executed
+branch 49 never executed
+branch 50 never executed
+call   51 never executed
+branch 52 never executed
+branch 53 never executed
+call   54 never executed
+branch 55 never executed
+branch 56 never executed
+call   57 never executed
+branch 58 never executed
+branch 59 never executed
+call   60 never executed
+branch 61 never executed
+branch 62 never executed
+call   63 never executed
+branch 64 never executed
+branch 65 never executed
+call   66 never executed
+branch 67 never executed
+branch 68 never executed
+call   69 never executed
+branch 70 never executed
+branch 71 never executed
+call   72 never executed
+branch 73 never executed
+branch 74 never executed
+call   75 never executed
+branch 76 never executed
+branch 77 never executed
+call   78 never executed
+branch 79 never executed
+branch 80 never executed
+call   81 never executed
+branch 82 never executed
+branch 83 never executed
+call   84 never executed
+branch 85 never executed
+branch 86 never executed
+call   87 never executed
+branch 88 never executed
+branch 89 never executed
+call   90 never executed
+branch 91 never executed
+branch 92 never executed
+call   93 never executed
+branch 94 never executed
+branch 95 never executed
+call   96 never executed
+branch 97 never executed
+branch 98 never executed
+call   99 never executed
+branch 100 never executed
+branch 101 never executed
+call   102 never executed
+branch 103 never executed
+branch 104 never executed
+call   105 never executed
+branch 106 never executed
+branch 107 never executed
+call   108 never executed
+branch 109 never executed
+branch 110 never executed
+call   111 never executed
+branch 112 never executed
+branch 113 never executed
+call   114 never executed
+branch 115 never executed
+branch 116 never executed
+call   117 never executed
+branch 118 never executed
+branch 119 never executed
+call   120 never executed
+branch 121 never executed
+branch 122 never executed
+call   123 never executed
+branch 124 never executed
+branch 125 never executed
+call   126 never executed
+branch 127 never executed
+branch 128 never executed
+call   129 never executed
+branch 130 never executed
+branch 131 never executed
+call   132 never executed
+branch 133 never executed
+branch 134 never executed
+call   135 never executed
+branch 136 never executed
+branch 137 never executed
+call   138 never executed
+branch 139 never executed
+branch 140 never executed
+call   141 never executed
+branch 142 never executed
+branch 143 never executed
+call   144 never executed
+branch 145 never executed
+branch 146 never executed
+call   147 never executed
+branch 148 never executed
+branch 149 never executed
+call   150 never executed
+branch 151 never executed
+branch 152 never executed
+call   153 never executed
+branch 154 never executed
+branch 155 never executed
+call   156 never executed
+branch 157 never executed
+branch 158 never executed
+call   159 never executed
+branch 160 never executed
+branch 161 never executed
+call   162 never executed
+branch 163 never executed
+branch 164 never executed
+call   165 never executed
+branch 166 never executed
+branch 167 never executed
+call   168 never executed
+branch 169 never executed
+branch 170 never executed
+call   171 never executed
+branch 172 never executed
+branch 173 never executed
+call   174 never executed
+branch 175 never executed
+branch 176 never executed
+call   177 never executed
+branch 178 never executed
+branch 179 never executed
+call   180 never executed
+branch 181 never executed
+branch 182 never executed
+call   183 never executed
+branch 184 never executed
+branch 185 never executed
+call   186 never executed
+branch 187 never executed
+branch 188 never executed
+call   189 never executed
+branch 190 never executed
+branch 191 never executed
+call   192 never executed
+branch 193 never executed
+branch 194 never executed
+call   195 never executed
+branch 196 never executed
+branch 197 never executed
+call   198 never executed
+branch 199 never executed
+branch 200 never executed
+call   201 never executed
+branch 202 never executed
+branch 203 never executed
+call   204 never executed
+branch 205 never executed
+branch 206 never executed
+call   207 never executed
+branch 208 never executed
+branch 209 never executed
+call   210 never executed
+branch 211 never executed
+branch 212 never executed
+call   213 never executed
+branch 214 never executed
+branch 215 never executed
+call   216 never executed
+branch 217 never executed
+branch 218 never executed
+call   219 never executed
+branch 220 never executed
+branch 221 never executed
+call   222 never executed
+branch 223 never executed
+branch 224 never executed
+call   225 never executed
+branch 226 never executed
+branch 227 never executed
+call   228 never executed
+branch 229 never executed
+branch 230 never executed
+call   231 never executed
+branch 232 never executed
+branch 233 never executed
+call   234 never executed
+branch 235 never executed
+branch 236 never executed
+call   237 never executed
+branch 238 never executed
+branch 239 never executed
+call   240 never executed
+branch 241 never executed
+branch 242 never executed
+call   243 never executed
+branch 244 never executed
+branch 245 never executed
+call   246 never executed
+branch 247 never executed
+branch 248 never executed
+call   249 never executed
+branch 250 never executed
+branch 251 never executed
+call   252 never executed
+branch 253 never executed
+branch 254 never executed
+call   255 never executed
+branch 256 never executed
+branch 257 never executed
+call   258 never executed
+branch 259 never executed
+branch 260 never executed
+call   261 never executed
+branch 262 never executed
+branch 263 never executed
+call   264 never executed
+branch 265 never executed
+branch 266 never executed
+call   267 never executed
+branch 268 never executed
+branch 269 never executed
+call   270 never executed
+branch 271 never executed
+branch 272 never executed
+call   273 never executed
+branch 274 never executed
+branch 275 never executed
+call   276 never executed
+branch 277 never executed
+branch 278 never executed
+call   279 never executed
+branch 280 never executed
+branch 281 never executed
+call   282 never executed
+branch 283 never executed
+branch 284 never executed
+call   285 never executed
+branch 286 never executed
+branch 287 never executed
+call   288 never executed
+branch 289 never executed
+branch 290 never executed
+call   291 never executed
+branch 292 never executed
+branch 293 never executed
+call   294 never executed
+branch 295 never executed
+branch 296 never executed
+call   297 never executed
+branch 298 never executed
+branch 299 never executed
+call   300 never executed
+branch 301 never executed
+branch 302 never executed
+call   303 never executed
+branch 304 never executed
+branch 305 never executed
+call   306 never executed
+branch 307 never executed
+branch 308 never executed
+call   309 never executed
+branch 310 never executed
+branch 311 never executed
+call   312 never executed
+branch 313 never executed
+branch 314 never executed
+call   315 never executed
+branch 316 never executed
+branch 317 never executed
+call   318 never executed
+branch 319 never executed
+branch 320 never executed
+call   321 never executed
+branch 322 never executed
+branch 323 never executed
+call   324 never executed
+branch 325 never executed
+branch 326 never executed
+call   327 never executed
+branch 328 never executed
+branch 329 never executed
+call   330 never executed
+branch 331 never executed
+branch 332 never executed
+call   333 never executed
+branch 334 never executed
+branch 335 never executed
+call   336 never executed
+branch 337 never executed
+branch 338 never executed
+call   339 never executed
+branch 340 never executed
+branch 341 never executed
+call   342 never executed
+branch 343 never executed
+branch 344 never executed
+call   345 never executed
+branch 346 never executed
+branch 347 never executed
+call   348 never executed
+branch 349 never executed
+branch 350 never executed
+call   351 never executed
+branch 352 never executed
+branch 353 never executed
+call   354 never executed
+branch 355 never executed
+branch 356 never executed
+call   357 never executed
+branch 358 never executed
+branch 359 never executed
+call   360 never executed
+branch 361 never executed
+branch 362 never executed
+call   363 never executed
+branch 364 never executed
+branch 365 never executed
+call   366 never executed
+branch 367 never executed
+branch 368 never executed
+    #####:  200:      return TheBucket->getSecond();
+branch  0 never executed
+branch  1 never executed
+        -:  201:    return ValueT();
+        -:  202:  }
+        -:  203:
+        -:  204:  // Inserts key,value pair into the map if the key isn't already in the map.
+        -:  205:  // If the key is already in the map, it returns false and doesn't update the
+        -:  206:  // value.
+        -:  207:  std::pair<iterator, bool> insert(const std::pair<KeyT, ValueT> &KV) {
+        -:  208:    return try_emplace(KV.first, KV.second);
+        -:  209:  }
+        -:  210:
+        -:  211:  // Inserts key,value pair into the map if the key isn't already in the map.
+        -:  212:  // If the key is already in the map, it returns false and doesn't update the
+        -:  213:  // value.
+        -:  214:  std::pair<iterator, bool> insert(std::pair<KeyT, ValueT> &&KV) {
+        -:  215:    return try_emplace(std::move(KV.first), std::move(KV.second));
+        -:  216:  }
+        -:  217:
+        -:  218:  // Inserts key,value pair into the map if the key isn't already in the map.
+        -:  219:  // The value is constructed in-place if the key is not in the map, otherwise
+        -:  220:  // it is not moved.
+        -:  221:  template <typename... Ts>
+        -:  222:  std::pair<iterator, bool> try_emplace(KeyT &&Key, Ts &&... Args) {
+        -:  223:    BucketT *TheBucket;
+        -:  224:    if (LookupBucketFor(Key, TheBucket))
+        -:  225:      return std::make_pair(makeIterator(TheBucket,
+        -:  226:                                         shouldReverseIterate<KeyT>()
+        -:  227:                                             ? getBuckets()
+        -:  228:                                             : getBucketsEnd(),
+        -:  229:                                         *this, true),
+        -:  230:                            false); // Already in map.
+        -:  231:
+        -:  232:    // Otherwise, insert the new element.
+        -:  233:    TheBucket =
+        -:  234:        InsertIntoBucket(TheBucket, std::move(Key), std::forward<Ts>(Args)...);
+        -:  235:    return std::make_pair(makeIterator(TheBucket,
+        -:  236:                                       shouldReverseIterate<KeyT>()
+        -:  237:                                           ? getBuckets()
+        -:  238:                                           : getBucketsEnd(),
+        -:  239:                                       *this, true),
+        -:  240:                          true);
+        -:  241:  }
+        -:  242:
+        -:  243:  // Inserts key,value pair into the map if the key isn't already in the map.
+        -:  244:  // The value is constructed in-place if the key is not in the map, otherwise
+        -:  245:  // it is not moved.
+        -:  246:  template <typename... Ts>
+    #####:  247:  std::pair<iterator, bool> try_emplace(const KeyT &Key, Ts &&... Args) {
+        -:  248:    BucketT *TheBucket;
+    #####:  249:    if (LookupBucketFor(Key, TheBucket))
+    #####:  250:      return std::make_pair(makeIterator(TheBucket,
+        -:  251:                                         shouldReverseIterate<KeyT>()
+    #####:  252:                                             ? getBuckets()
+        -:  253:                                             : getBucketsEnd(),
+        -:  254:                                         *this, true),
+        -:  255:                            false); // Already in map.
+        -:  256:
+        -:  257:    // Otherwise, insert the new element.
+    #####:  258:    TheBucket = InsertIntoBucket(TheBucket, Key, std::forward<Ts>(Args)...);
+    #####:  259:    return std::make_pair(makeIterator(TheBucket,
+        -:  260:                                       shouldReverseIterate<KeyT>()
+    #####:  261:                                           ? getBuckets()
+        -:  262:                                           : getBucketsEnd(),
+        -:  263:                                       *this, true),
+        -:  264:                          true);
+        -:  265:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E11try_emplaceIJRS5_EEESt4pairINS_16DenseMapIteratorIS3_S5_S7_SA_Lb0EEEbERKS3_DpOT_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E11try_emplaceIJRS5_EEESt4pairINS_16DenseMapIteratorIS3_S5_S7_SA_Lb0EEEbERKS3_DpOT_ called 0 returned 0% blocks executed 0%
+    #####:  247:  std::pair<iterator, bool> try_emplace(const KeyT &Key, Ts &&... Args) {
+        -:  248:    BucketT *TheBucket;
+    #####:  249:    if (LookupBucketFor(Key, TheBucket))
+    #####:  250:      return std::make_pair(makeIterator(TheBucket,
+call    0 never executed
+        -:  251:                                         shouldReverseIterate<KeyT>()
+    #####:  252:                                             ? getBuckets()
+        -:  253:                                             : getBucketsEnd(),
+        -:  254:                                         *this, true),
+        -:  255:                            false); // Already in map.
+        -:  256:
+        -:  257:    // Otherwise, insert the new element.
+    #####:  258:    TheBucket = InsertIntoBucket(TheBucket, Key, std::forward<Ts>(Args)...);
+    #####:  259:    return std::make_pair(makeIterator(TheBucket,
+call    0 never executed
+        -:  260:                                       shouldReverseIterate<KeyT>()
+    #####:  261:                                           ? getBuckets()
+        -:  262:                                           : getBucketsEnd(),
+        -:  263:                                       *this, true),
+        -:  264:                          true);
+        -:  265:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E11try_emplaceIJRS6_EEESt4pairINS_16DenseMapIteratorIS4_S6_S8_SB_Lb0EEEbERKS4_DpOT_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E11try_emplaceIJRS6_EEESt4pairINS_16DenseMapIteratorIS4_S6_S8_SB_Lb0EEEbERKS4_DpOT_ called 0 returned 0% blocks executed 0%
+    #####:  247:  std::pair<iterator, bool> try_emplace(const KeyT &Key, Ts &&... Args) {
+        -:  248:    BucketT *TheBucket;
+    #####:  249:    if (LookupBucketFor(Key, TheBucket))
+    #####:  250:      return std::make_pair(makeIterator(TheBucket,
+call    0 never executed
+        -:  251:                                         shouldReverseIterate<KeyT>()
+    #####:  252:                                             ? getBuckets()
+        -:  253:                                             : getBucketsEnd(),
+        -:  254:                                         *this, true),
+        -:  255:                            false); // Already in map.
+        -:  256:
+        -:  257:    // Otherwise, insert the new element.
+    #####:  258:    TheBucket = InsertIntoBucket(TheBucket, Key, std::forward<Ts>(Args)...);
+    #####:  259:    return std::make_pair(makeIterator(TheBucket,
+call    0 never executed
+        -:  260:                                       shouldReverseIterate<KeyT>()
+    #####:  261:                                           ? getBuckets()
+        -:  262:                                           : getBucketsEnd(),
+        -:  263:                                       *this, true),
+        -:  264:                          true);
+        -:  265:  }
+------------------
+        -:  266:
+        -:  267:  /// Alternate version of insert() which allows a different, and possibly
+        -:  268:  /// less expensive, key type.
+        -:  269:  /// The DenseMapInfo is responsible for supplying methods
+        -:  270:  /// getHashValue(LookupKeyT) and isEqual(LookupKeyT, KeyT) for each key
+        -:  271:  /// type used.
+        -:  272:  template <typename LookupKeyT>
+        -:  273:  std::pair<iterator, bool> insert_as(std::pair<KeyT, ValueT> &&KV,
+        -:  274:                                      const LookupKeyT &Val) {
+        -:  275:    BucketT *TheBucket;
+        -:  276:    if (LookupBucketFor(Val, TheBucket))
+        -:  277:      return std::make_pair(makeIterator(TheBucket,
+        -:  278:                                         shouldReverseIterate<KeyT>()
+        -:  279:                                             ? getBuckets()
+        -:  280:                                             : getBucketsEnd(),
+        -:  281:                                         *this, true),
+        -:  282:                            false); // Already in map.
+        -:  283:
+        -:  284:    // Otherwise, insert the new element.
+        -:  285:    TheBucket = InsertIntoBucketWithLookup(TheBucket, std::move(KV.first),
+        -:  286:                                           std::move(KV.second), Val);
+        -:  287:    return std::make_pair(makeIterator(TheBucket,
+        -:  288:                                       shouldReverseIterate<KeyT>()
+        -:  289:                                           ? getBuckets()
+        -:  290:                                           : getBucketsEnd(),
+        -:  291:                                       *this, true),
+        -:  292:                          true);
+        -:  293:  }
+        -:  294:
+        -:  295:  /// insert - Range insertion of pairs.
+        -:  296:  template<typename InputIt>
+        -:  297:  void insert(InputIt I, InputIt E) {
+        -:  298:    for (; I != E; ++I)
+        -:  299:      insert(*I);
+        -:  300:  }
+        -:  301:
+        -:  302:  bool erase(const KeyT &Val) {
+        -:  303:    BucketT *TheBucket;
+        -:  304:    if (!LookupBucketFor(Val, TheBucket))
+        -:  305:      return false; // not in map.
+        -:  306:
+        -:  307:    TheBucket->getSecond().~ValueT();
+        -:  308:    TheBucket->getFirst() = getTombstoneKey();
+        -:  309:    decrementNumEntries();
+        -:  310:    incrementNumTombstones();
+        -:  311:    return true;
+        -:  312:  }
+        -:  313:  void erase(iterator I) {
+        -:  314:    BucketT *TheBucket = &*I;
+        -:  315:    TheBucket->getSecond().~ValueT();
+        -:  316:    TheBucket->getFirst() = getTombstoneKey();
+        -:  317:    decrementNumEntries();
+        -:  318:    incrementNumTombstones();
+        -:  319:  }
+        -:  320:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E16FindAndConstructERKS3_ called 0 returned 0% blocks executed 0%
+    #####:  321:  value_type& FindAndConstruct(const KeyT &Key) {
+        -:  322:    BucketT *TheBucket;
+    #####:  323:    if (LookupBucketFor(Key, TheBucket))
+        -:  324:      return *TheBucket;
+        -:  325:
+    #####:  326:    return *InsertIntoBucket(TheBucket, Key);
+        -:  327:  }
+        -:  328:
+    #####:  329:  ValueT &operator[](const KeyT &Key) {
+    #####:  330:    return FindAndConstruct(Key).second;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  331:  }
+        -:  332:
+        -:  333:  value_type& FindAndConstruct(KeyT &&Key) {
+        -:  334:    BucketT *TheBucket;
+        -:  335:    if (LookupBucketFor(Key, TheBucket))
+        -:  336:      return *TheBucket;
+        -:  337:
+        -:  338:    return *InsertIntoBucket(TheBucket, std::move(Key));
+        -:  339:  }
+        -:  340:
+        -:  341:  ValueT &operator[](KeyT &&Key) {
+        -:  342:    return FindAndConstruct(std::move(Key)).second;
+        -:  343:  }
+        -:  344:
+        -:  345:  /// isPointerIntoBucketsArray - Return true if the specified pointer points
+        -:  346:  /// somewhere into the DenseMap's array of buckets (i.e. either to a key or
+        -:  347:  /// value in the DenseMap).
+        -:  348:  bool isPointerIntoBucketsArray(const void *Ptr) const {
+        -:  349:    return Ptr >= getBuckets() && Ptr < getBucketsEnd();
+        -:  350:  }
+        -:  351:
+        -:  352:  /// getPointerIntoBucketsArray() - Return an opaque pointer into the buckets
+        -:  353:  /// array.  In conjunction with the previous method, this can be used to
+        -:  354:  /// determine whether an insertion caused the DenseMap to reallocate.
+        -:  355:  const void *getPointerIntoBucketsArray() const { return getBuckets(); }
+        -:  356:
+        -:  357:protected:
+        -:  358:  DenseMapBase() = default;
+        -:  359:
+        -:  360:  void destroyAll() {
+        -:  361:    if (getNumBuckets() == 0) // Nothing to do.
+        -:  362:      return;
+        -:  363:
+        -:  364:    const KeyT EmptyKey = getEmptyKey(), TombstoneKey = getTombstoneKey();
+        -:  365:    for (BucketT *P = getBuckets(), *E = getBucketsEnd(); P != E; ++P) {
+        -:  366:      if (!KeyInfoT::isEqual(P->getFirst(), EmptyKey) &&
+        -:  367:          !KeyInfoT::isEqual(P->getFirst(), TombstoneKey))
+        -:  368:        P->getSecond().~ValueT();
+        -:  369:      P->getFirst().~KeyT();
+        -:  370:    }
+        -:  371:  }
+        -:  372:
+    #####:  373:  void initEmpty() {
+    #####:  374:    setNumEntries(0);
+    #####:  375:    setNumTombstones(0);
+        -:  376:
+    #####:  377:    assert((getNumBuckets() & (getNumBuckets()-1)) == 0 &&
+        -:  378:           "# initial buckets must be a power of two!");
+    #####:  379:    const KeyT EmptyKey = getEmptyKey();
+    #####:  380:    for (BucketT *B = getBuckets(), *E = getBucketsEnd(); B != E; ++B)
+    #####:  381:      ::new (&B->getFirst()) KeyT(EmptyKey);
+    #####:  382:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E9initEmptyEv:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E9initEmptyEv called 0 returned 0% blocks executed 0%
+    #####:  373:  void initEmpty() {
+    #####:  374:    setNumEntries(0);
+    #####:  375:    setNumTombstones(0);
+        -:  376:
+    #####:  377:    assert((getNumBuckets() & (getNumBuckets()-1)) == 0 &&
+call    0 never executed
+        -:  378:           "# initial buckets must be a power of two!");
+    #####:  379:    const KeyT EmptyKey = getEmptyKey();
+    #####:  380:    for (BucketT *B = getBuckets(), *E = getBucketsEnd(); B != E; ++B)
+branch  0 never executed
+branch  1 never executed
+    #####:  381:      ::new (&B->getFirst()) KeyT(EmptyKey);
+    #####:  382:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E9initEmptyEv:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E9initEmptyEv called 0 returned 0% blocks executed 0%
+    #####:  373:  void initEmpty() {
+    #####:  374:    setNumEntries(0);
+    #####:  375:    setNumTombstones(0);
+        -:  376:
+    #####:  377:    assert((getNumBuckets() & (getNumBuckets()-1)) == 0 &&
+call    0 never executed
+        -:  378:           "# initial buckets must be a power of two!");
+    #####:  379:    const KeyT EmptyKey = getEmptyKey();
+    #####:  380:    for (BucketT *B = getBuckets(), *E = getBucketsEnd(); B != E; ++B)
+branch  0 never executed
+branch  1 never executed
+    #####:  381:      ::new (&B->getFirst()) KeyT(EmptyKey);
+    #####:  382:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E9initEmptyEv:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E9initEmptyEv called 0 returned 0% blocks executed 0%
+    #####:  373:  void initEmpty() {
+    #####:  374:    setNumEntries(0);
+    #####:  375:    setNumTombstones(0);
+        -:  376:
+    #####:  377:    assert((getNumBuckets() & (getNumBuckets()-1)) == 0 &&
+call    0 never executed
+        -:  378:           "# initial buckets must be a power of two!");
+    #####:  379:    const KeyT EmptyKey = getEmptyKey();
+    #####:  380:    for (BucketT *B = getBuckets(), *E = getBucketsEnd(); B != E; ++B)
+branch  0 never executed
+branch  1 never executed
+    #####:  381:      ::new (&B->getFirst()) KeyT(EmptyKey);
+    #####:  382:  }
+------------------
+        -:  383:
+        -:  384:  /// Returns the number of buckets to allocate to ensure that the DenseMap can
+        -:  385:  /// accommodate \p NumEntries without need to grow().
+        -:  386:  unsigned getMinBucketToReserveForEntries(unsigned NumEntries) {
+        -:  387:    // Ensure that "NumEntries * 4 < NumBuckets * 3"
+        -:  388:    if (NumEntries == 0)
+        -:  389:      return 0;
+        -:  390:    // +1 is required because of the strict equality.
+        -:  391:    // For example if NumEntries is 48, we need to return 401.
+        -:  392:    return NextPowerOf2(NumEntries * 4 / 3 + 1);
+        -:  393:  }
+        -:  394:
+    #####:  395:  void moveFromOldBuckets(BucketT *OldBucketsBegin, BucketT *OldBucketsEnd) {
+    #####:  396:    initEmpty();
+        -:  397:
+        -:  398:    // Insert all the old elements.
+    #####:  399:    const KeyT EmptyKey = getEmptyKey();
+    #####:  400:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  401:    for (BucketT *B = OldBucketsBegin, *E = OldBucketsEnd; B != E; ++B) {
+    #####:  402:      if (!KeyInfoT::isEqual(B->getFirst(), EmptyKey) &&
+    #####:  403:          !KeyInfoT::isEqual(B->getFirst(), TombstoneKey)) {
+        -:  404:        // Insert the key/value into the new table.
+        -:  405:        BucketT *DestBucket;
+    #####:  406:        bool FoundVal = LookupBucketFor(B->getFirst(), DestBucket);
+        -:  407:        (void)FoundVal; // silence warning.
+    #####:  408:        assert(!FoundVal && "Key already in new map?");
+    #####:  409:        DestBucket->getFirst() = std::move(B->getFirst());
+    #####:  410:        ::new (&DestBucket->getSecond()) ValueT(std::move(B->getSecond()));
+    #####:  411:        incrementNumEntries();
+        -:  412:
+        -:  413:        // Free the value.
+    #####:  414:        B->getSecond().~ValueT();
+        -:  415:      }
+    #####:  416:      B->getFirst().~KeyT();
+        -:  417:    }
+    #####:  418:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E18moveFromOldBucketsEPSA_SD_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E18moveFromOldBucketsEPSA_SD_ called 0 returned 0% blocks executed 0%
+    #####:  395:  void moveFromOldBuckets(BucketT *OldBucketsBegin, BucketT *OldBucketsEnd) {
+    #####:  396:    initEmpty();
+        -:  397:
+        -:  398:    // Insert all the old elements.
+    #####:  399:    const KeyT EmptyKey = getEmptyKey();
+    #####:  400:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  401:    for (BucketT *B = OldBucketsBegin, *E = OldBucketsEnd; B != E; ++B) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  402:      if (!KeyInfoT::isEqual(B->getFirst(), EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  403:          !KeyInfoT::isEqual(B->getFirst(), TombstoneKey)) {
+branch  0 never executed
+branch  1 never executed
+        -:  404:        // Insert the key/value into the new table.
+        -:  405:        BucketT *DestBucket;
+    #####:  406:        bool FoundVal = LookupBucketFor(B->getFirst(), DestBucket);
+        -:  407:        (void)FoundVal; // silence warning.
+    #####:  408:        assert(!FoundVal && "Key already in new map?");
+call    0 never executed
+    #####:  409:        DestBucket->getFirst() = std::move(B->getFirst());
+    #####:  410:        ::new (&DestBucket->getSecond()) ValueT(std::move(B->getSecond()));
+    #####:  411:        incrementNumEntries();
+        -:  412:
+        -:  413:        // Free the value.
+    #####:  414:        B->getSecond().~ValueT();
+        -:  415:      }
+    #####:  416:      B->getFirst().~KeyT();
+        -:  417:    }
+    #####:  418:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E18moveFromOldBucketsEPSA_SD_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E18moveFromOldBucketsEPSA_SD_ called 0 returned 0% blocks executed 0%
+    #####:  395:  void moveFromOldBuckets(BucketT *OldBucketsBegin, BucketT *OldBucketsEnd) {
+    #####:  396:    initEmpty();
+        -:  397:
+        -:  398:    // Insert all the old elements.
+    #####:  399:    const KeyT EmptyKey = getEmptyKey();
+    #####:  400:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  401:    for (BucketT *B = OldBucketsBegin, *E = OldBucketsEnd; B != E; ++B) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  402:      if (!KeyInfoT::isEqual(B->getFirst(), EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  403:          !KeyInfoT::isEqual(B->getFirst(), TombstoneKey)) {
+branch  0 never executed
+branch  1 never executed
+        -:  404:        // Insert the key/value into the new table.
+        -:  405:        BucketT *DestBucket;
+    #####:  406:        bool FoundVal = LookupBucketFor(B->getFirst(), DestBucket);
+        -:  407:        (void)FoundVal; // silence warning.
+    #####:  408:        assert(!FoundVal && "Key already in new map?");
+call    0 never executed
+    #####:  409:        DestBucket->getFirst() = std::move(B->getFirst());
+    #####:  410:        ::new (&DestBucket->getSecond()) ValueT(std::move(B->getSecond()));
+    #####:  411:        incrementNumEntries();
+        -:  412:
+        -:  413:        // Free the value.
+    #####:  414:        B->getSecond().~ValueT();
+        -:  415:      }
+    #####:  416:      B->getFirst().~KeyT();
+        -:  417:    }
+    #####:  418:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E18moveFromOldBucketsEPSB_SE_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E18moveFromOldBucketsEPSB_SE_ called 0 returned 0% blocks executed 0%
+    #####:  395:  void moveFromOldBuckets(BucketT *OldBucketsBegin, BucketT *OldBucketsEnd) {
+    #####:  396:    initEmpty();
+        -:  397:
+        -:  398:    // Insert all the old elements.
+    #####:  399:    const KeyT EmptyKey = getEmptyKey();
+    #####:  400:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  401:    for (BucketT *B = OldBucketsBegin, *E = OldBucketsEnd; B != E; ++B) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  402:      if (!KeyInfoT::isEqual(B->getFirst(), EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  403:          !KeyInfoT::isEqual(B->getFirst(), TombstoneKey)) {
+branch  0 never executed
+branch  1 never executed
+        -:  404:        // Insert the key/value into the new table.
+        -:  405:        BucketT *DestBucket;
+    #####:  406:        bool FoundVal = LookupBucketFor(B->getFirst(), DestBucket);
+        -:  407:        (void)FoundVal; // silence warning.
+    #####:  408:        assert(!FoundVal && "Key already in new map?");
+call    0 never executed
+    #####:  409:        DestBucket->getFirst() = std::move(B->getFirst());
+    #####:  410:        ::new (&DestBucket->getSecond()) ValueT(std::move(B->getSecond()));
+    #####:  411:        incrementNumEntries();
+        -:  412:
+        -:  413:        // Free the value.
+    #####:  414:        B->getSecond().~ValueT();
+        -:  415:      }
+    #####:  416:      B->getFirst().~KeyT();
+        -:  417:    }
+    #####:  418:  }
+------------------
+        -:  419:
+        -:  420:  template <typename OtherBaseT>
+        -:  421:  void copyFrom(
+        -:  422:      const DenseMapBase<OtherBaseT, KeyT, ValueT, KeyInfoT, BucketT> &other) {
+        -:  423:    assert(&other != this);
+        -:  424:    assert(getNumBuckets() == other.getNumBuckets());
+        -:  425:
+        -:  426:    setNumEntries(other.getNumEntries());
+        -:  427:    setNumTombstones(other.getNumTombstones());
+        -:  428:
+        -:  429:    if (std::is_trivially_copyable<KeyT>::value &&
+        -:  430:        std::is_trivially_copyable<ValueT>::value)
+        -:  431:      memcpy(reinterpret_cast<void *>(getBuckets()), other.getBuckets(),
+        -:  432:             getNumBuckets() * sizeof(BucketT));
+        -:  433:    else
+        -:  434:      for (size_t i = 0; i < getNumBuckets(); ++i) {
+        -:  435:        ::new (&getBuckets()[i].getFirst())
+        -:  436:            KeyT(other.getBuckets()[i].getFirst());
+        -:  437:        if (!KeyInfoT::isEqual(getBuckets()[i].getFirst(), getEmptyKey()) &&
+        -:  438:            !KeyInfoT::isEqual(getBuckets()[i].getFirst(), getTombstoneKey()))
+        -:  439:          ::new (&getBuckets()[i].getSecond())
+        -:  440:              ValueT(other.getBuckets()[i].getSecond());
+        -:  441:      }
+        -:  442:  }
+        -:  443:
+    #####:  444:  static unsigned getHashValue(const KeyT &Val) {
+call    0 never executed
+    #####:  445:    return KeyInfoT::getHashValue(Val);
+        -:  446:  }
+        -:  447:
+        -:  448:  template<typename LookupKeyT>
+    #####:  449:  static unsigned getHashValue(const LookupKeyT &Val) {
+    #####:  450:    return KeyInfoT::getHashValue(Val);
+        -:  451:  }
+        -:  452:
+    #####:  453:  static const KeyT getEmptyKey() {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  454:    static_assert(std::is_base_of<DenseMapBase, DerivedT>::value,
+        -:  455:                  "Must pass the derived type to this template!");
+        -:  456:    return KeyInfoT::getEmptyKey();
+        -:  457:  }
+        -:  458:
+    #####:  459:  static const KeyT getTombstoneKey() {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  460:    return KeyInfoT::getTombstoneKey();
+        -:  461:  }
+        -:  462:
+        -:  463:private:
+    #####:  464:  iterator makeIterator(BucketT *P, BucketT *E,
+        -:  465:                        DebugEpochBase &Epoch,
+        -:  466:                        bool NoAdvance=false) {
+        -:  467:    if (shouldReverseIterate<KeyT>()) {
+        -:  468:      BucketT *B = P == getBucketsEnd() ? getBuckets() : P + 1;
+        -:  469:      return iterator(B, E, Epoch, NoAdvance);
+        -:  470:    }
+    #####:  471:    return iterator(P, E, Epoch, NoAdvance);
+        -:  472:  }
+        -:  473:
+        -:  474:  const_iterator makeConstIterator(const BucketT *P, const BucketT *E,
+        -:  475:                                   const DebugEpochBase &Epoch,
+        -:  476:                                   const bool NoAdvance=false) const {
+        -:  477:    if (shouldReverseIterate<KeyT>()) {
+        -:  478:      const BucketT *B = P == getBucketsEnd() ? getBuckets() : P + 1;
+        -:  479:      return const_iterator(B, E, Epoch, NoAdvance);
+        -:  480:    }
+        -:  481:    return const_iterator(P, E, Epoch, NoAdvance);
+        -:  482:  }
+        -:  483:
+    #####:  484:  unsigned getNumEntries() const {
+    #####:  485:    return static_cast<const DerivedT *>(this)->getNumEntries();
+        -:  486:  }
+        -:  487:
+    #####:  488:  void setNumEntries(unsigned Num) {
+    #####:  489:    static_cast<DerivedT *>(this)->setNumEntries(Num);
+        -:  490:  }
+        -:  491:
+    #####:  492:  void incrementNumEntries() {
+    #####:  493:    setNumEntries(getNumEntries() + 1);
+        -:  494:  }
+        -:  495:
+        -:  496:  void decrementNumEntries() {
+        -:  497:    setNumEntries(getNumEntries() - 1);
+        -:  498:  }
+        -:  499:
+    #####:  500:  unsigned getNumTombstones() const {
+    #####:  501:    return static_cast<const DerivedT *>(this)->getNumTombstones();
+        -:  502:  }
+        -:  503:
+    #####:  504:  void setNumTombstones(unsigned Num) {
+    #####:  505:    static_cast<DerivedT *>(this)->setNumTombstones(Num);
+        -:  506:  }
+        -:  507:
+        -:  508:  void incrementNumTombstones() {
+        -:  509:    setNumTombstones(getNumTombstones() + 1);
+        -:  510:  }
+        -:  511:
+    #####:  512:  void decrementNumTombstones() {
+    #####:  513:    setNumTombstones(getNumTombstones() - 1);
+    #####:  514:  }
+        -:  515:
+    #####:  516:  const BucketT *getBuckets() const {
+    #####:  517:    return static_cast<const DerivedT *>(this)->getBuckets();
+        -:  518:  }
+        -:  519:
+    #####:  520:  BucketT *getBuckets() {
+    #####:  521:    return static_cast<DerivedT *>(this)->getBuckets();
+        -:  522:  }
+        -:  523:
+    #####:  524:  unsigned getNumBuckets() const {
+    #####:  525:    return static_cast<const DerivedT *>(this)->getNumBuckets();
+        -:  526:  }
+        -:  527:
+    #####:  528:  BucketT *getBucketsEnd() {
+    #####:  529:    return getBuckets() + getNumBuckets();
+        -:  530:  }
+        -:  531:
+        -:  532:  const BucketT *getBucketsEnd() const {
+        -:  533:    return getBuckets() + getNumBuckets();
+        -:  534:  }
+        -:  535:
+    #####:  536:  void grow(unsigned AtLeast) {
+    #####:  537:    static_cast<DerivedT *>(this)->grow(AtLeast);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  538:  }
+        -:  539:
+        -:  540:  void shrink_and_clear() {
+        -:  541:    static_cast<DerivedT *>(this)->shrink_and_clear();
+        -:  542:  }
+        -:  543:
+        -:  544:  template <typename KeyArg, typename... ValueArgs>
+    #####:  545:  BucketT *InsertIntoBucket(BucketT *TheBucket, KeyArg &&Key,
+        -:  546:                            ValueArgs &&... Values) {
+    #####:  547:    TheBucket = InsertIntoBucketImpl(Key, Key, TheBucket);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  548:
+    #####:  549:    TheBucket->getFirst() = std::forward<KeyArg>(Key);
+    #####:  550:    ::new (&TheBucket->getSecond()) ValueT(std::forward<ValueArgs>(Values)...);
+call    0 never executed
+call    1 never executed
+        -:  551:    return TheBucket;
+        -:  552:  }
+        -:  553:
+        -:  554:  template <typename LookupKeyT>
+        -:  555:  BucketT *InsertIntoBucketWithLookup(BucketT *TheBucket, KeyT &&Key,
+        -:  556:                                      ValueT &&Value, LookupKeyT &Lookup) {
+        -:  557:    TheBucket = InsertIntoBucketImpl(Key, Lookup, TheBucket);
+        -:  558:
+        -:  559:    TheBucket->getFirst() = std::move(Key);
+        -:  560:    ::new (&TheBucket->getSecond()) ValueT(std::move(Value));
+        -:  561:    return TheBucket;
+        -:  562:  }
+        -:  563:
+        -:  564:  template <typename LookupKeyT>
+    #####:  565:  BucketT *InsertIntoBucketImpl(const KeyT &Key, const LookupKeyT &Lookup,
+        -:  566:                                BucketT *TheBucket) {
+    #####:  567:    incrementEpoch();
+        -:  568:
+        -:  569:    // If the load of the hash table is more than 3/4, or if fewer than 1/8 of
+        -:  570:    // the buckets are empty (meaning that many are filled with tombstones),
+        -:  571:    // grow the table.
+        -:  572:    //
+        -:  573:    // The later case is tricky.  For example, if we had one empty bucket with
+        -:  574:    // tons of tombstones, failing lookups (e.g. for insertion) would have to
+        -:  575:    // probe almost the entire table until it found the empty bucket.  If the
+        -:  576:    // table completely filled with tombstones, no lookup would ever succeed,
+        -:  577:    // causing infinite loops in lookup.
+    #####:  578:    unsigned NewNumEntries = getNumEntries() + 1;
+    #####:  579:    unsigned NumBuckets = getNumBuckets();
+    #####:  580:    if (LLVM_UNLIKELY(NewNumEntries * 4 >= NumBuckets * 3)) {
+    #####:  581:      this->grow(NumBuckets * 2);
+    #####:  582:      LookupBucketFor(Lookup, TheBucket);
+    #####:  583:      NumBuckets = getNumBuckets();
+    #####:  584:    } else if (LLVM_UNLIKELY(NumBuckets-(NewNumEntries+getNumTombstones()) <=
+        -:  585:                             NumBuckets/8)) {
+    #####:  586:      this->grow(NumBuckets);
+    #####:  587:      LookupBucketFor(Lookup, TheBucket);
+        -:  588:    }
+    #####:  589:    assert(TheBucket);
+        -:  590:
+        -:  591:    // Only update the state after we've grown our bucket space appropriately
+        -:  592:    // so that when growing buckets we have self-consistent entry count.
+    #####:  593:    incrementNumEntries();
+        -:  594:
+        -:  595:    // If we are writing over a tombstone, remember this.
+    #####:  596:    const KeyT EmptyKey = getEmptyKey();
+    #####:  597:    if (!KeyInfoT::isEqual(TheBucket->getFirst(), EmptyKey))
+    #####:  598:      decrementNumTombstones();
+        -:  599:
+    #####:  600:    return TheBucket;
+        -:  601:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E20InsertIntoBucketImplIS3_EEPSA_RKS3_RKT_SE_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E20InsertIntoBucketImplIS3_EEPSA_RKS3_RKT_SE_ called 0 returned 0% blocks executed 0%
+    #####:  565:  BucketT *InsertIntoBucketImpl(const KeyT &Key, const LookupKeyT &Lookup,
+        -:  566:                                BucketT *TheBucket) {
+    #####:  567:    incrementEpoch();
+branch  0 never executed
+branch  1 never executed
+        -:  568:
+        -:  569:    // If the load of the hash table is more than 3/4, or if fewer than 1/8 of
+        -:  570:    // the buckets are empty (meaning that many are filled with tombstones),
+        -:  571:    // grow the table.
+        -:  572:    //
+        -:  573:    // The later case is tricky.  For example, if we had one empty bucket with
+        -:  574:    // tons of tombstones, failing lookups (e.g. for insertion) would have to
+        -:  575:    // probe almost the entire table until it found the empty bucket.  If the
+        -:  576:    // table completely filled with tombstones, no lookup would ever succeed,
+        -:  577:    // causing infinite loops in lookup.
+    #####:  578:    unsigned NewNumEntries = getNumEntries() + 1;
+    #####:  579:    unsigned NumBuckets = getNumBuckets();
+    #####:  580:    if (LLVM_UNLIKELY(NewNumEntries * 4 >= NumBuckets * 3)) {
+    #####:  581:      this->grow(NumBuckets * 2);
+call    0 never executed
+    #####:  582:      LookupBucketFor(Lookup, TheBucket);
+    #####:  583:      NumBuckets = getNumBuckets();
+    #####:  584:    } else if (LLVM_UNLIKELY(NumBuckets-(NewNumEntries+getNumTombstones()) <=
+        -:  585:                             NumBuckets/8)) {
+    #####:  586:      this->grow(NumBuckets);
+    #####:  587:      LookupBucketFor(Lookup, TheBucket);
+        -:  588:    }
+    #####:  589:    assert(TheBucket);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  590:
+        -:  591:    // Only update the state after we've grown our bucket space appropriately
+        -:  592:    // so that when growing buckets we have self-consistent entry count.
+    #####:  593:    incrementNumEntries();
+        -:  594:
+        -:  595:    // If we are writing over a tombstone, remember this.
+    #####:  596:    const KeyT EmptyKey = getEmptyKey();
+    #####:  597:    if (!KeyInfoT::isEqual(TheBucket->getFirst(), EmptyKey))
+branch  0 never executed
+branch  1 never executed
+    #####:  598:      decrementNumTombstones();
+        -:  599:
+    #####:  600:    return TheBucket;
+        -:  601:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E20InsertIntoBucketImplIS3_EEPSA_RKS3_RKT_SE_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E20InsertIntoBucketImplIS3_EEPSA_RKS3_RKT_SE_ called 0 returned 0% blocks executed 0%
+    #####:  565:  BucketT *InsertIntoBucketImpl(const KeyT &Key, const LookupKeyT &Lookup,
+        -:  566:                                BucketT *TheBucket) {
+    #####:  567:    incrementEpoch();
+branch  0 never executed
+branch  1 never executed
+        -:  568:
+        -:  569:    // If the load of the hash table is more than 3/4, or if fewer than 1/8 of
+        -:  570:    // the buckets are empty (meaning that many are filled with tombstones),
+        -:  571:    // grow the table.
+        -:  572:    //
+        -:  573:    // The later case is tricky.  For example, if we had one empty bucket with
+        -:  574:    // tons of tombstones, failing lookups (e.g. for insertion) would have to
+        -:  575:    // probe almost the entire table until it found the empty bucket.  If the
+        -:  576:    // table completely filled with tombstones, no lookup would ever succeed,
+        -:  577:    // causing infinite loops in lookup.
+    #####:  578:    unsigned NewNumEntries = getNumEntries() + 1;
+    #####:  579:    unsigned NumBuckets = getNumBuckets();
+    #####:  580:    if (LLVM_UNLIKELY(NewNumEntries * 4 >= NumBuckets * 3)) {
+    #####:  581:      this->grow(NumBuckets * 2);
+call    0 never executed
+    #####:  582:      LookupBucketFor(Lookup, TheBucket);
+    #####:  583:      NumBuckets = getNumBuckets();
+    #####:  584:    } else if (LLVM_UNLIKELY(NumBuckets-(NewNumEntries+getNumTombstones()) <=
+        -:  585:                             NumBuckets/8)) {
+    #####:  586:      this->grow(NumBuckets);
+    #####:  587:      LookupBucketFor(Lookup, TheBucket);
+        -:  588:    }
+    #####:  589:    assert(TheBucket);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  590:
+        -:  591:    // Only update the state after we've grown our bucket space appropriately
+        -:  592:    // so that when growing buckets we have self-consistent entry count.
+    #####:  593:    incrementNumEntries();
+        -:  594:
+        -:  595:    // If we are writing over a tombstone, remember this.
+    #####:  596:    const KeyT EmptyKey = getEmptyKey();
+    #####:  597:    if (!KeyInfoT::isEqual(TheBucket->getFirst(), EmptyKey))
+branch  0 never executed
+branch  1 never executed
+    #####:  598:      decrementNumTombstones();
+        -:  599:
+    #####:  600:    return TheBucket;
+        -:  601:  }
+------------------
+_ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E20InsertIntoBucketImplIS4_EEPSB_RKS4_RKT_SF_:
+function _ZN4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E20InsertIntoBucketImplIS4_EEPSB_RKS4_RKT_SF_ called 0 returned 0% blocks executed 0%
+    #####:  565:  BucketT *InsertIntoBucketImpl(const KeyT &Key, const LookupKeyT &Lookup,
+        -:  566:                                BucketT *TheBucket) {
+    #####:  567:    incrementEpoch();
+branch  0 never executed
+branch  1 never executed
+        -:  568:
+        -:  569:    // If the load of the hash table is more than 3/4, or if fewer than 1/8 of
+        -:  570:    // the buckets are empty (meaning that many are filled with tombstones),
+        -:  571:    // grow the table.
+        -:  572:    //
+        -:  573:    // The later case is tricky.  For example, if we had one empty bucket with
+        -:  574:    // tons of tombstones, failing lookups (e.g. for insertion) would have to
+        -:  575:    // probe almost the entire table until it found the empty bucket.  If the
+        -:  576:    // table completely filled with tombstones, no lookup would ever succeed,
+        -:  577:    // causing infinite loops in lookup.
+    #####:  578:    unsigned NewNumEntries = getNumEntries() + 1;
+    #####:  579:    unsigned NumBuckets = getNumBuckets();
+    #####:  580:    if (LLVM_UNLIKELY(NewNumEntries * 4 >= NumBuckets * 3)) {
+    #####:  581:      this->grow(NumBuckets * 2);
+call    0 never executed
+    #####:  582:      LookupBucketFor(Lookup, TheBucket);
+    #####:  583:      NumBuckets = getNumBuckets();
+    #####:  584:    } else if (LLVM_UNLIKELY(NumBuckets-(NewNumEntries+getNumTombstones()) <=
+        -:  585:                             NumBuckets/8)) {
+    #####:  586:      this->grow(NumBuckets);
+    #####:  587:      LookupBucketFor(Lookup, TheBucket);
+        -:  588:    }
+    #####:  589:    assert(TheBucket);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  590:
+        -:  591:    // Only update the state after we've grown our bucket space appropriately
+        -:  592:    // so that when growing buckets we have self-consistent entry count.
+    #####:  593:    incrementNumEntries();
+        -:  594:
+        -:  595:    // If we are writing over a tombstone, remember this.
+    #####:  596:    const KeyT EmptyKey = getEmptyKey();
+    #####:  597:    if (!KeyInfoT::isEqual(TheBucket->getFirst(), EmptyKey))
+branch  0 never executed
+branch  1 never executed
+    #####:  598:      decrementNumTombstones();
+        -:  599:
+    #####:  600:    return TheBucket;
+        -:  601:  }
+------------------
+        -:  602:
+        -:  603:  /// LookupBucketFor - Lookup the appropriate bucket for Val, returning it in
+        -:  604:  /// FoundBucket.  If the bucket contains the key and a value, this returns
+        -:  605:  /// true, otherwise it returns a bucket with an empty marker or tombstone and
+        -:  606:  /// returns false.
+        -:  607:  template<typename LookupKeyT>
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+_ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIS4_EEbRKT_RPKSB_:
+function _ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIS4_EEbRKT_RPKSB_ called 0 returned 0% blocks executed 0%
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+branch  0 never executed
+branch  1 never executed
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+branch  0 never executed
+branch  1 never executed
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+_ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11GlobalValueENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIPKS3_EEbRKT_RPKSB_:
+function _ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir9OperationEPNS_11GlobalValueENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIPKS3_EEbRKT_RPKSB_ called 0 returned 0% blocks executed 0%
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+branch  0 never executed
+branch  1 never executed
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+branch  0 never executed
+branch  1 never executed
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+_ZNK4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E15LookupBucketForIS3_EEbRKT_RPKSA_:
+function _ZNK4llvm12DenseMapBaseINS_8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E15LookupBucketForIS3_EEbRKT_RPKSA_ called 0 returned 0% blocks executed 0%
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+branch  0 never executed
+branch  1 never executed
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+branch  0 never executed
+branch  1 never executed
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+_ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir5BlockEPNS_10BasicBlockENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIPKS3_EEbRKT_RPKSB_:
+function _ZNK4llvm12DenseMapBaseINS_8DenseMapIPN4mlir5BlockEPNS_10BasicBlockENS_12DenseMapInfoIS4_vEENS_6detail12DenseMapPairIS4_S6_EEEES4_S6_S8_SB_E15LookupBucketForIPKS3_EEbRKT_RPKSB_ called 0 returned 0% blocks executed 0%
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+branch  0 never executed
+branch  1 never executed
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+branch  0 never executed
+branch  1 never executed
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+_ZNK4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E15LookupBucketForIS3_EEbRKT_RPKSA_:
+function _ZNK4llvm12DenseMapBaseINS_8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEEES3_S5_S7_SA_E15LookupBucketForIS3_EEbRKT_RPKSA_ called 0 returned 0% blocks executed 0%
+    #####:  608:  bool LookupBucketFor(const LookupKeyT &Val,
+        -:  609:                       const BucketT *&FoundBucket) const {
+    #####:  610:    const BucketT *BucketsPtr = getBuckets();
+    #####:  611:    const unsigned NumBuckets = getNumBuckets();
+        -:  612:
+    #####:  613:    if (NumBuckets == 0) {
+    #####:  614:      FoundBucket = nullptr;
+    #####:  615:      return false;
+        -:  616:    }
+        -:  617:
+        -:  618:    // FoundTombstone - Keep track of whether we find a tombstone while probing.
+    #####:  619:    const BucketT *FoundTombstone = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  620:    const KeyT EmptyKey = getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  621:    const KeyT TombstoneKey = getTombstoneKey();
+branch  0 never executed
+branch  1 never executed
+    #####:  622:    assert(!KeyInfoT::isEqual(Val, EmptyKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  623:           !KeyInfoT::isEqual(Val, TombstoneKey) &&
+        -:  624:           "Empty/Tombstone value shouldn't be inserted into map!");
+        -:  625:
+    #####:  626:    unsigned BucketNo = getHashValue(Val) & (NumBuckets-1);
+    #####:  627:    unsigned ProbeAmt = 1;
+    #####:  628:    while (true) {
+    #####:  629:      const BucketT *ThisBucket = BucketsPtr + BucketNo;
+        -:  630:      // Found Val's bucket?  If so, return it.
+    #####:  631:      if (LLVM_LIKELY(KeyInfoT::isEqual(Val, ThisBucket->getFirst()))) {
+branch  0 never executed
+branch  1 never executed
+    #####:  632:        FoundBucket = ThisBucket;
+    #####:  633:        return true;
+        -:  634:      }
+        -:  635:
+        -:  636:      // If we found an empty bucket, the key doesn't exist in the set.
+        -:  637:      // Insert it and return the default value.
+    #####:  638:      if (LLVM_LIKELY(KeyInfoT::isEqual(ThisBucket->getFirst(), EmptyKey))) {
+branch  0 never executed
+branch  1 never executed
+        -:  639:        // If we've already seen a tombstone while probing, fill it in instead
+        -:  640:        // of the empty bucket we eventually probed to.
+    #####:  641:        FoundBucket = FoundTombstone ? FoundTombstone : ThisBucket;
+branch  0 never executed
+branch  1 never executed
+    #####:  642:        return false;
+        -:  643:      }
+        -:  644:
+        -:  645:      // If this is a tombstone, remember it.  If Val ends up not in the map, we
+        -:  646:      // prefer to return it than something that would require more probing.
+    #####:  647:      if (KeyInfoT::isEqual(ThisBucket->getFirst(), TombstoneKey) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  648:          !FoundTombstone)
+        -:  649:        FoundTombstone = ThisBucket;  // Remember the first tombstone found.
+        -:  650:
+        -:  651:      // Otherwise, it's a hash collision or a tombstone, continue quadratic
+        -:  652:      // probing.
+    #####:  653:      BucketNo += ProbeAmt++;
+    #####:  654:      BucketNo &= (NumBuckets-1);
+        -:  655:    }
+        -:  656:  }
+------------------
+        -:  657:
+        -:  658:  template <typename LookupKeyT>
+    #####:  659:  bool LookupBucketFor(const LookupKeyT &Val, BucketT *&FoundBucket) {
+        -:  660:    const BucketT *ConstFoundBucket;
+    #####:  661:    bool Result = const_cast<const DenseMapBase *>(this)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -:  662:      ->LookupBucketFor(Val, ConstFoundBucket);
+    #####:  663:    FoundBucket = const_cast<BucketT *>(ConstFoundBucket);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+    #####:  664:    return Result;
+        -:  665:  }
+        -:  666:
+        -:  667:public:
+        -:  668:  /// Return the approximate size (in bytes) of the actual map.
+        -:  669:  /// This is just the raw memory used by DenseMap.
+        -:  670:  /// If entries are pointers to objects, the size of the referenced objects
+        -:  671:  /// are not included.
+        -:  672:  size_t getMemorySize() const {
+        -:  673:    return getNumBuckets() * sizeof(BucketT);
+        -:  674:  }
+        -:  675:};
+        -:  676:
+        -:  677:/// Equality comparison for DenseMap.
+        -:  678:///
+        -:  679:/// Iterates over elements of LHS confirming that each (key, value) pair in LHS
+        -:  680:/// is also in RHS, and that no additional pairs are in RHS.
+        -:  681:/// Equivalent to N calls to RHS.find and N value comparisons. Amortized
+        -:  682:/// complexity is linear, worst case is O(N^2) (if every hash collides).
+        -:  683:template <typename DerivedT, typename KeyT, typename ValueT, typename KeyInfoT,
+        -:  684:          typename BucketT>
+        -:  685:bool operator==(
+        -:  686:    const DenseMapBase<DerivedT, KeyT, ValueT, KeyInfoT, BucketT> &LHS,
+        -:  687:    const DenseMapBase<DerivedT, KeyT, ValueT, KeyInfoT, BucketT> &RHS) {
+        -:  688:  if (LHS.size() != RHS.size())
+        -:  689:    return false;
+        -:  690:
+        -:  691:  for (auto &KV : LHS) {
+        -:  692:    auto I = RHS.find(KV.first);
+        -:  693:    if (I == RHS.end() || I->second != KV.second)
+        -:  694:      return false;
+        -:  695:  }
+        -:  696:
+        -:  697:  return true;
+        -:  698:}
+        -:  699:
+        -:  700:/// Inequality comparison for DenseMap.
+        -:  701:///
+        -:  702:/// Equivalent to !(LHS == RHS). See operator== for performance notes.
+        -:  703:template <typename DerivedT, typename KeyT, typename ValueT, typename KeyInfoT,
+        -:  704:          typename BucketT>
+        -:  705:bool operator!=(
+        -:  706:    const DenseMapBase<DerivedT, KeyT, ValueT, KeyInfoT, BucketT> &LHS,
+        -:  707:    const DenseMapBase<DerivedT, KeyT, ValueT, KeyInfoT, BucketT> &RHS) {
+        -:  708:  return !(LHS == RHS);
+        -:  709:}
+        -:  710:
+        -:  711:template <typename KeyT, typename ValueT,
+        -:  712:          typename KeyInfoT = DenseMapInfo<KeyT>,
+        -:  713:          typename BucketT = llvm::detail::DenseMapPair<KeyT, ValueT>>
+        -:  714:class DenseMap : public DenseMapBase<DenseMap<KeyT, ValueT, KeyInfoT, BucketT>,
+        -:  715:                                     KeyT, ValueT, KeyInfoT, BucketT> {
+        -:  716:  friend class DenseMapBase<DenseMap, KeyT, ValueT, KeyInfoT, BucketT>;
+        -:  717:
+        -:  718:  // Lift some types from the dependent base class into this class for
+        -:  719:  // simplicity of referring to them.
+        -:  720:  using BaseT = DenseMapBase<DenseMap, KeyT, ValueT, KeyInfoT, BucketT>;
+        -:  721:
+        -:  722:  BucketT *Buckets;
+        -:  723:  unsigned NumEntries;
+        -:  724:  unsigned NumTombstones;
+        -:  725:  unsigned NumBuckets;
+        -:  726:
+        -:  727:public:
+        -:  728:  /// Create a DenseMap with an optional \p InitialReserve that guarantee that
+        -:  729:  /// this number of elements can be inserted in the map without grow()
+        -:  730:  explicit DenseMap(unsigned InitialReserve = 0) { init(InitialReserve); }
+        -:  731:
+        -:  732:  DenseMap(const DenseMap &other) : BaseT() {
+        -:  733:    init(0);
+        -:  734:    copyFrom(other);
+        -:  735:  }
+        -:  736:
+        -:  737:  DenseMap(DenseMap &&other) : BaseT() {
+        -:  738:    init(0);
+        -:  739:    swap(other);
+        -:  740:  }
+        -:  741:
+        -:  742:  template<typename InputIt>
+        -:  743:  DenseMap(const InputIt &I, const InputIt &E) {
+        -:  744:    init(std::distance(I, E));
+        -:  745:    this->insert(I, E);
+        -:  746:  }
+        -:  747:
+        -:  748:  DenseMap(std::initializer_list<typename BaseT::value_type> Vals) {
+        -:  749:    init(Vals.size());
+        -:  750:    this->insert(Vals.begin(), Vals.end());
+        -:  751:  }
+        -:  752:
+        -:  753:  ~DenseMap() {
+        -:  754:    this->destroyAll();
+        -:  755:    deallocate_buffer(Buckets, sizeof(BucketT) * NumBuckets, alignof(BucketT));
+        -:  756:  }
+        -:  757:
+        -:  758:  void swap(DenseMap& RHS) {
+        -:  759:    this->incrementEpoch();
+        -:  760:    RHS.incrementEpoch();
+        -:  761:    std::swap(Buckets, RHS.Buckets);
+        -:  762:    std::swap(NumEntries, RHS.NumEntries);
+        -:  763:    std::swap(NumTombstones, RHS.NumTombstones);
+        -:  764:    std::swap(NumBuckets, RHS.NumBuckets);
+        -:  765:  }
+        -:  766:
+        -:  767:  DenseMap& operator=(const DenseMap& other) {
+        -:  768:    if (&other != this)
+        -:  769:      copyFrom(other);
+        -:  770:    return *this;
+        -:  771:  }
+        -:  772:
+        -:  773:  DenseMap& operator=(DenseMap &&other) {
+        -:  774:    this->destroyAll();
+        -:  775:    deallocate_buffer(Buckets, sizeof(BucketT) * NumBuckets, alignof(BucketT));
+        -:  776:    init(0);
+        -:  777:    swap(other);
+        -:  778:    return *this;
+        -:  779:  }
+        -:  780:
+        -:  781:  void copyFrom(const DenseMap& other) {
+        -:  782:    this->destroyAll();
+        -:  783:    deallocate_buffer(Buckets, sizeof(BucketT) * NumBuckets, alignof(BucketT));
+        -:  784:    if (allocateBuckets(other.NumBuckets)) {
+        -:  785:      this->BaseT::copyFrom(other);
+        -:  786:    } else {
+        -:  787:      NumEntries = 0;
+        -:  788:      NumTombstones = 0;
+        -:  789:    }
+        -:  790:  }
+        -:  791:
+        -:  792:  void init(unsigned InitNumEntries) {
+        -:  793:    auto InitBuckets = BaseT::getMinBucketToReserveForEntries(InitNumEntries);
+        -:  794:    if (allocateBuckets(InitBuckets)) {
+        -:  795:      this->BaseT::initEmpty();
+        -:  796:    } else {
+        -:  797:      NumEntries = 0;
+        -:  798:      NumTombstones = 0;
+        -:  799:    }
+        -:  800:  }
+        -:  801:
+    #####:  802:  void grow(unsigned AtLeast) {
+    #####:  803:    unsigned OldNumBuckets = NumBuckets;
+    #####:  804:    BucketT *OldBuckets = Buckets;
+        -:  805:
+    #####:  806:    allocateBuckets(std::max<unsigned>(64, static_cast<unsigned>(NextPowerOf2(AtLeast-1))));
+    #####:  807:    assert(Buckets);
+    #####:  808:    if (!OldBuckets) {
+    #####:  809:      this->BaseT::initEmpty();
+    #####:  810:      return;
+        -:  811:    }
+        -:  812:
+    #####:  813:    this->moveFromOldBuckets(OldBuckets, OldBuckets+OldNumBuckets);
+        -:  814:
+        -:  815:    // Free the old table.
+    #####:  816:    deallocate_buffer(OldBuckets, sizeof(BucketT) * OldNumBuckets,
+        -:  817:                      alignof(BucketT));
+        -:  818:  }
+------------------
+_ZN4llvm8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EEE4growEj:
+function _ZN4llvm8DenseMapIN4mlir5ValueEPNS_5ValueENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EEE4growEj called 0 returned 0% blocks executed 0%
+    #####:  802:  void grow(unsigned AtLeast) {
+    #####:  803:    unsigned OldNumBuckets = NumBuckets;
+    #####:  804:    BucketT *OldBuckets = Buckets;
+        -:  805:
+    #####:  806:    allocateBuckets(std::max<unsigned>(64, static_cast<unsigned>(NextPowerOf2(AtLeast-1))));
+branch  0 never executed
+branch  1 never executed
+    #####:  807:    assert(Buckets);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  808:    if (!OldBuckets) {
+branch  0 never executed
+branch  1 never executed
+    #####:  809:      this->BaseT::initEmpty();
+call    0 never executed
+    #####:  810:      return;
+        -:  811:    }
+        -:  812:
+    #####:  813:    this->moveFromOldBuckets(OldBuckets, OldBuckets+OldNumBuckets);
+call    0 never executed
+        -:  814:
+        -:  815:    // Free the old table.
+    #####:  816:    deallocate_buffer(OldBuckets, sizeof(BucketT) * OldNumBuckets,
+call    0 never executed
+        -:  817:                      alignof(BucketT));
+        -:  818:  }
+------------------
+_ZN4llvm8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EEE4growEj:
+function _ZN4llvm8DenseMapIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EEE4growEj called 0 returned 0% blocks executed 0%
+    #####:  802:  void grow(unsigned AtLeast) {
+    #####:  803:    unsigned OldNumBuckets = NumBuckets;
+    #####:  804:    BucketT *OldBuckets = Buckets;
+        -:  805:
+    #####:  806:    allocateBuckets(std::max<unsigned>(64, static_cast<unsigned>(NextPowerOf2(AtLeast-1))));
+branch  0 never executed
+branch  1 never executed
+    #####:  807:    assert(Buckets);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  808:    if (!OldBuckets) {
+branch  0 never executed
+branch  1 never executed
+    #####:  809:      this->BaseT::initEmpty();
+call    0 never executed
+    #####:  810:      return;
+        -:  811:    }
+        -:  812:
+    #####:  813:    this->moveFromOldBuckets(OldBuckets, OldBuckets+OldNumBuckets);
+call    0 never executed
+        -:  814:
+        -:  815:    // Free the old table.
+    #####:  816:    deallocate_buffer(OldBuckets, sizeof(BucketT) * OldNumBuckets,
+call    0 never executed
+        -:  817:                      alignof(BucketT));
+        -:  818:  }
+------------------
+_ZN4llvm8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEE4growEj:
+function _ZN4llvm8DenseMapIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EEE4growEj called 0 returned 0% blocks executed 0%
+    #####:  802:  void grow(unsigned AtLeast) {
+    #####:  803:    unsigned OldNumBuckets = NumBuckets;
+    #####:  804:    BucketT *OldBuckets = Buckets;
+        -:  805:
+    #####:  806:    allocateBuckets(std::max<unsigned>(64, static_cast<unsigned>(NextPowerOf2(AtLeast-1))));
+branch  0 never executed
+branch  1 never executed
+    #####:  807:    assert(Buckets);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  808:    if (!OldBuckets) {
+branch  0 never executed
+branch  1 never executed
+    #####:  809:      this->BaseT::initEmpty();
+call    0 never executed
+    #####:  810:      return;
+        -:  811:    }
+        -:  812:
+    #####:  813:    this->moveFromOldBuckets(OldBuckets, OldBuckets+OldNumBuckets);
+call    0 never executed
+        -:  814:
+        -:  815:    // Free the old table.
+    #####:  816:    deallocate_buffer(OldBuckets, sizeof(BucketT) * OldNumBuckets,
+call    0 never executed
+        -:  817:                      alignof(BucketT));
+        -:  818:  }
+------------------
+        -:  819:
+        -:  820:  void shrink_and_clear() {
+        -:  821:    unsigned OldNumBuckets = NumBuckets;
+        -:  822:    unsigned OldNumEntries = NumEntries;
+        -:  823:    this->destroyAll();
+        -:  824:
+        -:  825:    // Reduce the number of buckets.
+        -:  826:    unsigned NewNumBuckets = 0;
+        -:  827:    if (OldNumEntries)
+        -:  828:      NewNumBuckets = std::max(64, 1 << (Log2_32_Ceil(OldNumEntries) + 1));
+        -:  829:    if (NewNumBuckets == NumBuckets) {
+        -:  830:      this->BaseT::initEmpty();
+        -:  831:      return;
+        -:  832:    }
+        -:  833:
+        -:  834:    deallocate_buffer(Buckets, sizeof(BucketT) * OldNumBuckets,
+        -:  835:                      alignof(BucketT));
+        -:  836:    init(NewNumBuckets);
+        -:  837:  }
+        -:  838:
+        -:  839:private:
+    #####:  840:  unsigned getNumEntries() const {
+        -:  841:    return NumEntries;
+        -:  842:  }
+        -:  843:
+    #####:  844:  void setNumEntries(unsigned Num) {
+    #####:  845:    NumEntries = Num;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  846:  }
+        -:  847:
+    #####:  848:  unsigned getNumTombstones() const {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  849:    return NumTombstones;
+        -:  850:  }
+        -:  851:
+    #####:  852:  void setNumTombstones(unsigned Num) {
+    #####:  853:    NumTombstones = Num;
+        -:  854:  }
+        -:  855:
+    #####:  856:  BucketT *getBuckets() const {
+        -:  857:    return Buckets;
+        -:  858:  }
+        -:  859:
+    #####:  860:  unsigned getNumBuckets() const {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+branch 20 never executed
+branch 21 never executed
+call   22 never executed
+call   23 never executed
+call   24 never executed
+call   25 never executed
+        -:  861:    return NumBuckets;
+        -:  862:  }
+        -:  863:
+    #####:  864:  bool allocateBuckets(unsigned Num) {
+    #####:  865:    NumBuckets = Num;
+    #####:  866:    if (NumBuckets == 0) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  867:      Buckets = nullptr;
+    #####:  868:      return false;
+        -:  869:    }
+        -:  870:
+    #####:  871:    Buckets = static_cast<BucketT *>(
+    #####:  872:        allocate_buffer(sizeof(BucketT) * NumBuckets, alignof(BucketT)));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  873:    return true;
+        -:  874:  }
+        -:  875:};
+        -:  876:
+        -:  877:template <typename KeyT, typename ValueT, unsigned InlineBuckets = 4,
+        -:  878:          typename KeyInfoT = DenseMapInfo<KeyT>,
+        -:  879:          typename BucketT = llvm::detail::DenseMapPair<KeyT, ValueT>>
+        -:  880:class SmallDenseMap
+        -:  881:    : public DenseMapBase<
+        -:  882:          SmallDenseMap<KeyT, ValueT, InlineBuckets, KeyInfoT, BucketT>, KeyT,
+        -:  883:          ValueT, KeyInfoT, BucketT> {
+        -:  884:  friend class DenseMapBase<SmallDenseMap, KeyT, ValueT, KeyInfoT, BucketT>;
+        -:  885:
+        -:  886:  // Lift some types from the dependent base class into this class for
+        -:  887:  // simplicity of referring to them.
+        -:  888:  using BaseT = DenseMapBase<SmallDenseMap, KeyT, ValueT, KeyInfoT, BucketT>;
+        -:  889:
+        -:  890:  static_assert(isPowerOf2_64(InlineBuckets),
+        -:  891:                "InlineBuckets must be a power of 2.");
+        -:  892:
+        -:  893:  unsigned Small : 1;
+        -:  894:  unsigned NumEntries : 31;
+        -:  895:  unsigned NumTombstones;
+        -:  896:
+        -:  897:  struct LargeRep {
+        -:  898:    BucketT *Buckets;
+        -:  899:    unsigned NumBuckets;
+        -:  900:  };
+        -:  901:
+        -:  902:  /// A "union" of an inline bucket array and the struct representing
+        -:  903:  /// a large bucket. This union will be discriminated by the 'Small' bit.
+        -:  904:  AlignedCharArrayUnion<BucketT[InlineBuckets], LargeRep> storage;
+        -:  905:
+        -:  906:public:
+        -:  907:  explicit SmallDenseMap(unsigned NumInitBuckets = 0) {
+        -:  908:    if (NumInitBuckets > InlineBuckets)
+        -:  909:      NumInitBuckets = NextPowerOf2(NumInitBuckets - 1);
+        -:  910:    init(NumInitBuckets);
+        -:  911:  }
+        -:  912:
+        -:  913:  SmallDenseMap(const SmallDenseMap &other) : BaseT() {
+        -:  914:    init(0);
+        -:  915:    copyFrom(other);
+        -:  916:  }
+        -:  917:
+        -:  918:  SmallDenseMap(SmallDenseMap &&other) : BaseT() {
+        -:  919:    init(0);
+        -:  920:    swap(other);
+        -:  921:  }
+        -:  922:
+        -:  923:  template<typename InputIt>
+        -:  924:  SmallDenseMap(const InputIt &I, const InputIt &E) {
+        -:  925:    init(NextPowerOf2(std::distance(I, E)));
+        -:  926:    this->insert(I, E);
+        -:  927:  }
+        -:  928:
+        -:  929:  SmallDenseMap(std::initializer_list<typename BaseT::value_type> Vals)
+        -:  930:      : SmallDenseMap(Vals.begin(), Vals.end()) {}
+        -:  931:
+        -:  932:  ~SmallDenseMap() {
+        -:  933:    this->destroyAll();
+        -:  934:    deallocateBuckets();
+        -:  935:  }
+        -:  936:
+        -:  937:  void swap(SmallDenseMap& RHS) {
+        -:  938:    unsigned TmpNumEntries = RHS.NumEntries;
+        -:  939:    RHS.NumEntries = NumEntries;
+        -:  940:    NumEntries = TmpNumEntries;
+        -:  941:    std::swap(NumTombstones, RHS.NumTombstones);
+        -:  942:
+        -:  943:    const KeyT EmptyKey = this->getEmptyKey();
+        -:  944:    const KeyT TombstoneKey = this->getTombstoneKey();
+        -:  945:    if (Small && RHS.Small) {
+        -:  946:      // If we're swapping inline bucket arrays, we have to cope with some of
+        -:  947:      // the tricky bits of DenseMap's storage system: the buckets are not
+        -:  948:      // fully initialized. Thus we swap every key, but we may have
+        -:  949:      // a one-directional move of the value.
+        -:  950:      for (unsigned i = 0, e = InlineBuckets; i != e; ++i) {
+        -:  951:        BucketT *LHSB = &getInlineBuckets()[i],
+        -:  952:                *RHSB = &RHS.getInlineBuckets()[i];
+        -:  953:        bool hasLHSValue = (!KeyInfoT::isEqual(LHSB->getFirst(), EmptyKey) &&
+        -:  954:                            !KeyInfoT::isEqual(LHSB->getFirst(), TombstoneKey));
+        -:  955:        bool hasRHSValue = (!KeyInfoT::isEqual(RHSB->getFirst(), EmptyKey) &&
+        -:  956:                            !KeyInfoT::isEqual(RHSB->getFirst(), TombstoneKey));
+        -:  957:        if (hasLHSValue && hasRHSValue) {
+        -:  958:          // Swap together if we can...
+        -:  959:          std::swap(*LHSB, *RHSB);
+        -:  960:          continue;
+        -:  961:        }
+        -:  962:        // Swap separately and handle any asymmetry.
+        -:  963:        std::swap(LHSB->getFirst(), RHSB->getFirst());
+        -:  964:        if (hasLHSValue) {
+        -:  965:          ::new (&RHSB->getSecond()) ValueT(std::move(LHSB->getSecond()));
+        -:  966:          LHSB->getSecond().~ValueT();
+        -:  967:        } else if (hasRHSValue) {
+        -:  968:          ::new (&LHSB->getSecond()) ValueT(std::move(RHSB->getSecond()));
+        -:  969:          RHSB->getSecond().~ValueT();
+        -:  970:        }
+        -:  971:      }
+        -:  972:      return;
+        -:  973:    }
+        -:  974:    if (!Small && !RHS.Small) {
+        -:  975:      std::swap(getLargeRep()->Buckets, RHS.getLargeRep()->Buckets);
+        -:  976:      std::swap(getLargeRep()->NumBuckets, RHS.getLargeRep()->NumBuckets);
+        -:  977:      return;
+        -:  978:    }
+        -:  979:
+        -:  980:    SmallDenseMap &SmallSide = Small ? *this : RHS;
+        -:  981:    SmallDenseMap &LargeSide = Small ? RHS : *this;
+        -:  982:
+        -:  983:    // First stash the large side's rep and move the small side across.
+        -:  984:    LargeRep TmpRep = std::move(*LargeSide.getLargeRep());
+        -:  985:    LargeSide.getLargeRep()->~LargeRep();
+        -:  986:    LargeSide.Small = true;
+        -:  987:    // This is similar to the standard move-from-old-buckets, but the bucket
+        -:  988:    // count hasn't actually rotated in this case. So we have to carefully
+        -:  989:    // move construct the keys and values into their new locations, but there
+        -:  990:    // is no need to re-hash things.
+        -:  991:    for (unsigned i = 0, e = InlineBuckets; i != e; ++i) {
+        -:  992:      BucketT *NewB = &LargeSide.getInlineBuckets()[i],
+        -:  993:              *OldB = &SmallSide.getInlineBuckets()[i];
+        -:  994:      ::new (&NewB->getFirst()) KeyT(std::move(OldB->getFirst()));
+        -:  995:      OldB->getFirst().~KeyT();
+        -:  996:      if (!KeyInfoT::isEqual(NewB->getFirst(), EmptyKey) &&
+        -:  997:          !KeyInfoT::isEqual(NewB->getFirst(), TombstoneKey)) {
+        -:  998:        ::new (&NewB->getSecond()) ValueT(std::move(OldB->getSecond()));
+        -:  999:        OldB->getSecond().~ValueT();
+        -: 1000:      }
+        -: 1001:    }
+        -: 1002:
+        -: 1003:    // The hard part of moving the small buckets across is done, just move
+        -: 1004:    // the TmpRep into its new home.
+        -: 1005:    SmallSide.Small = false;
+        -: 1006:    new (SmallSide.getLargeRep()) LargeRep(std::move(TmpRep));
+        -: 1007:  }
+        -: 1008:
+        -: 1009:  SmallDenseMap& operator=(const SmallDenseMap& other) {
+        -: 1010:    if (&other != this)
+        -: 1011:      copyFrom(other);
+        -: 1012:    return *this;
+        -: 1013:  }
+        -: 1014:
+        -: 1015:  SmallDenseMap& operator=(SmallDenseMap &&other) {
+        -: 1016:    this->destroyAll();
+        -: 1017:    deallocateBuckets();
+        -: 1018:    init(0);
+        -: 1019:    swap(other);
+        -: 1020:    return *this;
+        -: 1021:  }
+        -: 1022:
+        -: 1023:  void copyFrom(const SmallDenseMap& other) {
+        -: 1024:    this->destroyAll();
+        -: 1025:    deallocateBuckets();
+        -: 1026:    Small = true;
+        -: 1027:    if (other.getNumBuckets() > InlineBuckets) {
+        -: 1028:      Small = false;
+        -: 1029:      new (getLargeRep()) LargeRep(allocateBuckets(other.getNumBuckets()));
+        -: 1030:    }
+        -: 1031:    this->BaseT::copyFrom(other);
+        -: 1032:  }
+        -: 1033:
+        -: 1034:  void init(unsigned InitBuckets) {
+        -: 1035:    Small = true;
+        -: 1036:    if (InitBuckets > InlineBuckets) {
+        -: 1037:      Small = false;
+        -: 1038:      new (getLargeRep()) LargeRep(allocateBuckets(InitBuckets));
+        -: 1039:    }
+        -: 1040:    this->BaseT::initEmpty();
+        -: 1041:  }
+        -: 1042:
+        -: 1043:  void grow(unsigned AtLeast) {
+        -: 1044:    if (AtLeast > InlineBuckets)
+        -: 1045:      AtLeast = std::max<unsigned>(64, NextPowerOf2(AtLeast-1));
+        -: 1046:
+        -: 1047:    if (Small) {
+        -: 1048:      // First move the inline buckets into a temporary storage.
+        -: 1049:      AlignedCharArrayUnion<BucketT[InlineBuckets]> TmpStorage;
+        -: 1050:      BucketT *TmpBegin = reinterpret_cast<BucketT *>(&TmpStorage);
+        -: 1051:      BucketT *TmpEnd = TmpBegin;
+        -: 1052:
+        -: 1053:      // Loop over the buckets, moving non-empty, non-tombstones into the
+        -: 1054:      // temporary storage. Have the loop move the TmpEnd forward as it goes.
+        -: 1055:      const KeyT EmptyKey = this->getEmptyKey();
+        -: 1056:      const KeyT TombstoneKey = this->getTombstoneKey();
+        -: 1057:      for (BucketT *P = getBuckets(), *E = P + InlineBuckets; P != E; ++P) {
+        -: 1058:        if (!KeyInfoT::isEqual(P->getFirst(), EmptyKey) &&
+        -: 1059:            !KeyInfoT::isEqual(P->getFirst(), TombstoneKey)) {
+        -: 1060:          assert(size_t(TmpEnd - TmpBegin) < InlineBuckets &&
+        -: 1061:                 "Too many inline buckets!");
+        -: 1062:          ::new (&TmpEnd->getFirst()) KeyT(std::move(P->getFirst()));
+        -: 1063:          ::new (&TmpEnd->getSecond()) ValueT(std::move(P->getSecond()));
+        -: 1064:          ++TmpEnd;
+        -: 1065:          P->getSecond().~ValueT();
+        -: 1066:        }
+        -: 1067:        P->getFirst().~KeyT();
+        -: 1068:      }
+        -: 1069:
+        -: 1070:      // AtLeast == InlineBuckets can happen if there are many tombstones,
+        -: 1071:      // and grow() is used to remove them. Usually we always switch to the
+        -: 1072:      // large rep here.
+        -: 1073:      if (AtLeast > InlineBuckets) {
+        -: 1074:        Small = false;
+        -: 1075:        new (getLargeRep()) LargeRep(allocateBuckets(AtLeast));
+        -: 1076:      }
+        -: 1077:      this->moveFromOldBuckets(TmpBegin, TmpEnd);
+        -: 1078:      return;
+        -: 1079:    }
+        -: 1080:
+        -: 1081:    LargeRep OldRep = std::move(*getLargeRep());
+        -: 1082:    getLargeRep()->~LargeRep();
+        -: 1083:    if (AtLeast <= InlineBuckets) {
+        -: 1084:      Small = true;
+        -: 1085:    } else {
+        -: 1086:      new (getLargeRep()) LargeRep(allocateBuckets(AtLeast));
+        -: 1087:    }
+        -: 1088:
+        -: 1089:    this->moveFromOldBuckets(OldRep.Buckets, OldRep.Buckets+OldRep.NumBuckets);
+        -: 1090:
+        -: 1091:    // Free the old table.
+        -: 1092:    deallocate_buffer(OldRep.Buckets, sizeof(BucketT) * OldRep.NumBuckets,
+        -: 1093:                      alignof(BucketT));
+        -: 1094:  }
+        -: 1095:
+        -: 1096:  void shrink_and_clear() {
+        -: 1097:    unsigned OldSize = this->size();
+        -: 1098:    this->destroyAll();
+        -: 1099:
+        -: 1100:    // Reduce the number of buckets.
+        -: 1101:    unsigned NewNumBuckets = 0;
+        -: 1102:    if (OldSize) {
+        -: 1103:      NewNumBuckets = 1 << (Log2_32_Ceil(OldSize) + 1);
+        -: 1104:      if (NewNumBuckets > InlineBuckets && NewNumBuckets < 64u)
+        -: 1105:        NewNumBuckets = 64;
+        -: 1106:    }
+        -: 1107:    if ((Small && NewNumBuckets <= InlineBuckets) ||
+        -: 1108:        (!Small && NewNumBuckets == getLargeRep()->NumBuckets)) {
+        -: 1109:      this->BaseT::initEmpty();
+        -: 1110:      return;
+        -: 1111:    }
+        -: 1112:
+        -: 1113:    deallocateBuckets();
+        -: 1114:    init(NewNumBuckets);
+        -: 1115:  }
+        -: 1116:
+        -: 1117:private:
+        -: 1118:  unsigned getNumEntries() const {
+        -: 1119:    return NumEntries;
+        -: 1120:  }
+        -: 1121:
+        -: 1122:  void setNumEntries(unsigned Num) {
+        -: 1123:    // NumEntries is hardcoded to be 31 bits wide.
+        -: 1124:    assert(Num < (1U << 31) && "Cannot support more than 1<<31 entries");
+        -: 1125:    NumEntries = Num;
+        -: 1126:  }
+        -: 1127:
+        -: 1128:  unsigned getNumTombstones() const {
+        -: 1129:    return NumTombstones;
+        -: 1130:  }
+        -: 1131:
+        -: 1132:  void setNumTombstones(unsigned Num) {
+        -: 1133:    NumTombstones = Num;
+        -: 1134:  }
+        -: 1135:
+        -: 1136:  const BucketT *getInlineBuckets() const {
+        -: 1137:    assert(Small);
+        -: 1138:    // Note that this cast does not violate aliasing rules as we assert that
+        -: 1139:    // the memory's dynamic type is the small, inline bucket buffer, and the
+        -: 1140:    // 'storage' is a POD containing a char buffer.
+        -: 1141:    return reinterpret_cast<const BucketT *>(&storage);
+        -: 1142:  }
+        -: 1143:
+        -: 1144:  BucketT *getInlineBuckets() {
+        -: 1145:    return const_cast<BucketT *>(
+        -: 1146:      const_cast<const SmallDenseMap *>(this)->getInlineBuckets());
+        -: 1147:  }
+        -: 1148:
+        -: 1149:  const LargeRep *getLargeRep() const {
+        -: 1150:    assert(!Small);
+        -: 1151:    // Note, same rule about aliasing as with getInlineBuckets.
+        -: 1152:    return reinterpret_cast<const LargeRep *>(&storage);
+        -: 1153:  }
+        -: 1154:
+        -: 1155:  LargeRep *getLargeRep() {
+        -: 1156:    return const_cast<LargeRep *>(
+        -: 1157:      const_cast<const SmallDenseMap *>(this)->getLargeRep());
+        -: 1158:  }
+        -: 1159:
+        -: 1160:  const BucketT *getBuckets() const {
+        -: 1161:    return Small ? getInlineBuckets() : getLargeRep()->Buckets;
+        -: 1162:  }
+        -: 1163:
+        -: 1164:  BucketT *getBuckets() {
+        -: 1165:    return const_cast<BucketT *>(
+        -: 1166:      const_cast<const SmallDenseMap *>(this)->getBuckets());
+        -: 1167:  }
+        -: 1168:
+        -: 1169:  unsigned getNumBuckets() const {
+        -: 1170:    return Small ? InlineBuckets : getLargeRep()->NumBuckets;
+        -: 1171:  }
+        -: 1172:
+        -: 1173:  void deallocateBuckets() {
+        -: 1174:    if (Small)
+        -: 1175:      return;
+        -: 1176:
+        -: 1177:    deallocate_buffer(getLargeRep()->Buckets,
+        -: 1178:                      sizeof(BucketT) * getLargeRep()->NumBuckets,
+        -: 1179:                      alignof(BucketT));
+        -: 1180:    getLargeRep()->~LargeRep();
+        -: 1181:  }
+        -: 1182:
+        -: 1183:  LargeRep allocateBuckets(unsigned Num) {
+        -: 1184:    assert(Num > InlineBuckets && "Must allocate more buckets than are inline");
+        -: 1185:    LargeRep Rep = {static_cast<BucketT *>(allocate_buffer(
+        -: 1186:                        sizeof(BucketT) * Num, alignof(BucketT))),
+        -: 1187:                    Num};
+        -: 1188:    return Rep;
+        -: 1189:  }
+        -: 1190:};
+        -: 1191:
+        -: 1192:template <typename KeyT, typename ValueT, typename KeyInfoT, typename Bucket,
+        -: 1193:          bool IsConst>
+        -: 1194:class DenseMapIterator : DebugEpochBase::HandleBase {
+        -: 1195:  friend class DenseMapIterator<KeyT, ValueT, KeyInfoT, Bucket, true>;
+        -: 1196:  friend class DenseMapIterator<KeyT, ValueT, KeyInfoT, Bucket, false>;
+        -: 1197:
+        -: 1198:public:
+        -: 1199:  using difference_type = ptrdiff_t;
+        -: 1200:  using value_type = std::conditional_t<IsConst, const Bucket, Bucket>;
+        -: 1201:  using pointer = value_type *;
+        -: 1202:  using reference = value_type &;
+        -: 1203:  using iterator_category = std::forward_iterator_tag;
+        -: 1204:
+        -: 1205:private:
+        -: 1206:  pointer Ptr = nullptr;
+        -: 1207:  pointer End = nullptr;
+        -: 1208:
+        -: 1209:public:
+        -: 1210:  DenseMapIterator() = default;
+        -: 1211:
+    #####: 1212:  DenseMapIterator(pointer Pos, pointer E, const DebugEpochBase &Epoch,
+        -: 1213:                   bool NoAdvance = false)
+    #####: 1214:      : DebugEpochBase::HandleBase(&Epoch), Ptr(Pos), End(E) {
+    #####: 1215:    assert(isHandleInSync() && "invalid construction!");
+        -: 1216:
+    #####: 1217:    if (NoAdvance) return;
+        -: 1218:    if (shouldReverseIterate<KeyT>()) {
+        -: 1219:      RetreatPastEmptyBuckets();
+        -: 1220:      return;
+        -: 1221:    }
+    #####: 1222:    AdvancePastEmptyBuckets();
+        -: 1223:  }
+------------------
+_ZN4llvm16DenseMapIteratorIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EELb0EEC2EPS9_SB_RKNS_14DebugEpochBaseEb:
+function _ZN4llvm16DenseMapIteratorIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EELb0EEC2EPS9_SB_RKNS_14DebugEpochBaseEb called 0 returned 0% blocks executed 0%
+    #####: 1212:  DenseMapIterator(pointer Pos, pointer E, const DebugEpochBase &Epoch,
+        -: 1213:                   bool NoAdvance = false)
+    #####: 1214:      : DebugEpochBase::HandleBase(&Epoch), Ptr(Pos), End(E) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1215:    assert(isHandleInSync() && "invalid construction!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1216:
+    #####: 1217:    if (NoAdvance) return;
+branch  0 never executed
+branch  1 never executed
+        -: 1218:    if (shouldReverseIterate<KeyT>()) {
+        -: 1219:      RetreatPastEmptyBuckets();
+        -: 1220:      return;
+        -: 1221:    }
+    #####: 1222:    AdvancePastEmptyBuckets();
+call    0 never executed
+        -: 1223:  }
+------------------
+_ZN4llvm16DenseMapIteratorIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EELb0EEC2EPSA_SC_RKNS_14DebugEpochBaseEb:
+function _ZN4llvm16DenseMapIteratorIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EELb0EEC2EPSA_SC_RKNS_14DebugEpochBaseEb called 0 returned 0% blocks executed 0%
+    #####: 1212:  DenseMapIterator(pointer Pos, pointer E, const DebugEpochBase &Epoch,
+        -: 1213:                   bool NoAdvance = false)
+    #####: 1214:      : DebugEpochBase::HandleBase(&Epoch), Ptr(Pos), End(E) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1215:    assert(isHandleInSync() && "invalid construction!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1216:
+    #####: 1217:    if (NoAdvance) return;
+branch  0 never executed
+branch  1 never executed
+        -: 1218:    if (shouldReverseIterate<KeyT>()) {
+        -: 1219:      RetreatPastEmptyBuckets();
+        -: 1220:      return;
+        -: 1221:    }
+    #####: 1222:    AdvancePastEmptyBuckets();
+call    0 never executed
+        -: 1223:  }
+------------------
+        -: 1224:
+        -: 1225:  // Converting ctor from non-const iterators to const iterators. SFINAE'd out
+        -: 1226:  // for const iterator destinations so it doesn't end up as a user defined copy
+        -: 1227:  // constructor.
+        -: 1228:  template <bool IsConstSrc,
+        -: 1229:            typename = std::enable_if_t<!IsConstSrc && IsConst>>
+        -: 1230:  DenseMapIterator(
+        -: 1231:      const DenseMapIterator<KeyT, ValueT, KeyInfoT, Bucket, IsConstSrc> &I)
+        -: 1232:      : DebugEpochBase::HandleBase(I), Ptr(I.Ptr), End(I.End) {}
+        -: 1233:
+        -: 1234:  reference operator*() const {
+        -: 1235:    assert(isHandleInSync() && "invalid iterator access!");
+        -: 1236:    assert(Ptr != End && "dereferencing end() iterator");
+        -: 1237:    if (shouldReverseIterate<KeyT>())
+        -: 1238:      return Ptr[-1];
+        -: 1239:    return *Ptr;
+        -: 1240:  }
+        -: 1241:  pointer operator->() const {
+        -: 1242:    assert(isHandleInSync() && "invalid iterator access!");
+        -: 1243:    assert(Ptr != End && "dereferencing end() iterator");
+        -: 1244:    if (shouldReverseIterate<KeyT>())
+        -: 1245:      return &(Ptr[-1]);
+        -: 1246:    return Ptr;
+        -: 1247:  }
+        -: 1248:
+        -: 1249:  friend bool operator==(const DenseMapIterator &LHS,
+        -: 1250:                         const DenseMapIterator &RHS) {
+        -: 1251:    assert((!LHS.Ptr || LHS.isHandleInSync()) && "handle not in sync!");
+        -: 1252:    assert((!RHS.Ptr || RHS.isHandleInSync()) && "handle not in sync!");
+        -: 1253:    assert(LHS.getEpochAddress() == RHS.getEpochAddress() &&
+        -: 1254:           "comparing incomparable iterators!");
+        -: 1255:    return LHS.Ptr == RHS.Ptr;
+        -: 1256:  }
+        -: 1257:
+        -: 1258:  friend bool operator!=(const DenseMapIterator &LHS,
+        -: 1259:                         const DenseMapIterator &RHS) {
+        -: 1260:    return !(LHS == RHS);
+        -: 1261:  }
+        -: 1262:
+        -: 1263:  inline DenseMapIterator& operator++() {  // Preincrement
+        -: 1264:    assert(isHandleInSync() && "invalid iterator access!");
+        -: 1265:    assert(Ptr != End && "incrementing end() iterator");
+        -: 1266:    if (shouldReverseIterate<KeyT>()) {
+        -: 1267:      --Ptr;
+        -: 1268:      RetreatPastEmptyBuckets();
+        -: 1269:      return *this;
+        -: 1270:    }
+        -: 1271:    ++Ptr;
+        -: 1272:    AdvancePastEmptyBuckets();
+        -: 1273:    return *this;
+        -: 1274:  }
+        -: 1275:  DenseMapIterator operator++(int) {  // Postincrement
+        -: 1276:    assert(isHandleInSync() && "invalid iterator access!");
+        -: 1277:    DenseMapIterator tmp = *this; ++*this; return tmp;
+        -: 1278:  }
+        -: 1279:
+        -: 1280:private:
+    #####: 1281:  void AdvancePastEmptyBuckets() {
+    #####: 1282:    assert(Ptr <= End);
+    #####: 1283:    const KeyT Empty = KeyInfoT::getEmptyKey();
+    #####: 1284:    const KeyT Tombstone = KeyInfoT::getTombstoneKey();
+        -: 1285:
+    #####: 1286:    while (Ptr != End && (KeyInfoT::isEqual(Ptr->getFirst(), Empty) ||
+    #####: 1287:                          KeyInfoT::isEqual(Ptr->getFirst(), Tombstone)))
+    #####: 1288:      ++Ptr;
+    #####: 1289:  }
+------------------
+_ZN4llvm16DenseMapIteratorIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EELb0EE23AdvancePastEmptyBucketsEv:
+function _ZN4llvm16DenseMapIteratorIN4mlir9AttributeEPNS_6MDNodeENS_12DenseMapInfoIS2_vEENS_6detail12DenseMapPairIS2_S4_EELb0EE23AdvancePastEmptyBucketsEv called 0 returned 0% blocks executed 0%
+    #####: 1281:  void AdvancePastEmptyBuckets() {
+    #####: 1282:    assert(Ptr <= End);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1283:    const KeyT Empty = KeyInfoT::getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####: 1284:    const KeyT Tombstone = KeyInfoT::getTombstoneKey();
+        -: 1285:
+    #####: 1286:    while (Ptr != End && (KeyInfoT::isEqual(Ptr->getFirst(), Empty) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1287:                          KeyInfoT::isEqual(Ptr->getFirst(), Tombstone)))
+branch  0 never executed
+branch  1 never executed
+    #####: 1288:      ++Ptr;
+    #####: 1289:  }
+------------------
+_ZN4llvm16DenseMapIteratorIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EELb0EE23AdvancePastEmptyBucketsEv:
+function _ZN4llvm16DenseMapIteratorIPN4mlir9OperationEPNS_11InstructionENS_12DenseMapInfoIS3_vEENS_6detail12DenseMapPairIS3_S5_EELb0EE23AdvancePastEmptyBucketsEv called 0 returned 0% blocks executed 0%
+    #####: 1281:  void AdvancePastEmptyBuckets() {
+    #####: 1282:    assert(Ptr <= End);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1283:    const KeyT Empty = KeyInfoT::getEmptyKey();
+branch  0 never executed
+branch  1 never executed
+    #####: 1284:    const KeyT Tombstone = KeyInfoT::getTombstoneKey();
+        -: 1285:
+    #####: 1286:    while (Ptr != End && (KeyInfoT::isEqual(Ptr->getFirst(), Empty) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####: 1287:                          KeyInfoT::isEqual(Ptr->getFirst(), Tombstone)))
+branch  0 never executed
+branch  1 never executed
+    #####: 1288:      ++Ptr;
+    #####: 1289:  }
+------------------
+        -: 1290:
+        -: 1291:  void RetreatPastEmptyBuckets() {
+        -: 1292:    assert(Ptr >= End);
+        -: 1293:    const KeyT Empty = KeyInfoT::getEmptyKey();
+        -: 1294:    const KeyT Tombstone = KeyInfoT::getTombstoneKey();
+        -: 1295:
+        -: 1296:    while (Ptr != End && (KeyInfoT::isEqual(Ptr[-1].getFirst(), Empty) ||
+        -: 1297:                          KeyInfoT::isEqual(Ptr[-1].getFirst(), Tombstone)))
+        -: 1298:      --Ptr;
+        -: 1299:  }
+        -: 1300:};
+        -: 1301:
+        -: 1302:template <typename KeyT, typename ValueT, typename KeyInfoT>
+        -: 1303:inline size_t capacity_in_bytes(const DenseMap<KeyT, ValueT, KeyInfoT> &X) {
+        -: 1304:  return X.getMemorySize();
+        -: 1305:}
+        -: 1306:
+        -: 1307:} // end namespace llvm
+        -: 1308:
+        -: 1309:#endif // LLVM_ADT_DENSEMAP_H

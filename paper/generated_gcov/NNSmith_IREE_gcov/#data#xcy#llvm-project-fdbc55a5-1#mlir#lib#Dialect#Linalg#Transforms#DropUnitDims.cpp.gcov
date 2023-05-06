@@ -1,0 +1,1176 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Linalg/Transforms/DropUnitDims.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/DropUnitDims.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/DropUnitDims.cpp.gcda
+        -:    0:Runs:325547
+        -:    1://===- DropUnitDims.cpp - Pass to drop use of unit-extent for broadcasting ===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements patterns/pass to remove usage of unit-extent dimensions
+        -:   10:// to specify broadcasting in favor of more canonical representation of the
+        -:   11:// computation
+        -:   12://
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#include "mlir/Dialect/Linalg/Passes.h"
+        -:   16:
+        -:   17:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   18:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   19:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   20:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   21:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   22:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   23:#include "mlir/IR/AffineExpr.h"
+        -:   24:#include "mlir/IR/AffineMap.h"
+        -:   25:#include "mlir/IR/BuiltinTypes.h"
+        -:   26:#include "mlir/Transforms/FoldUtils.h"
+        -:   27:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   28:#include "llvm/Support/CommandLine.h"
+        -:   29:#include "llvm/Support/Debug.h"
+        -:   30:
+        -:   31:namespace mlir {
+        -:   32:#define GEN_PASS_DEF_LINALGFOLDUNITEXTENTDIMS
+        -:   33:#include "mlir/Dialect/Linalg/Passes.h.inc"
+        -:   34:} // namespace mlir
+        -:   35:
+        -:   36:#define DEBUG_TYPE "linalg-drop-unit-dims"
+        -:   37:
+        -:   38:using namespace mlir;
+        -:   39:using namespace mlir::linalg;
+        -:   40:
+        -:   41:/// Implements a pass that canonicalizes the uses of unit-extent dimensions for
+        -:   42:/// broadcasting. For example,
+        -:   43:///
+        -:   44:/// ```mlir
+        -:   45:/// #accesses = [
+        -:   46:///   affine_map<(d0, d1) -> (0, d1)>,
+        -:   47:///   affine_map<(d0, d1) -> (d0, 0)>,
+        -:   48:///   affine_map<(d0, d1) -> (d0, d1)>
+        -:   49:/// ]
+        -:   50:///
+        -:   51:/// #trait = {
+        -:   52:///   args_in = 2,
+        -:   53:///   args_out = 1,
+        -:   54:///   indexing_maps = #accesses,
+        -:   55:///   iterator_types = ["parallel", "parallel"],
+        -:   56:///   library_call = "some_external_fn"
+        -:   57:/// }
+        -:   58:///
+        -:   59:/// func @broadcast_test(%arg0 : tensor<5xf32>, %arg1 : tensor<5xf32>) ->
+        -:   60:/// tensor<5x5xf32>
+        -:   61:/// {
+        -:   62:///   %0 = linalg.tensor_reshape %arg0 [affine_map<(d0, d1) -> (d0, d1)>] :
+        -:   63:///        tensor<5xf32> into tensor<1x5xf32>
+        -:   64:///   %1 = linalg.tensor_reshape %arg1 [affine_map<(d0, d1) -> (d0, d1)>] :
+        -:   65:///        tensor<5xf32> into tensor<5x1xf32>
+        -:   66:///   %2 = linalg.generic #trait %0, %1 {
+        -:   67:///        ^bb0(%arg2: f32, %arg3: f32):
+        -:   68:///          %3 = arith.addf %arg2, %arg3 : f32
+        -:   69:///          linalg.yield %3 : f32
+        -:   70:///        } : tensor<1x5xf32>, tensor<5x1xf32> -> tensor<5x5xf32>
+        -:   71:///   return %2 : tensor<5x5xf32>
+        -:   72:/// }
+        -:   73:///
+        -:   74:/// would canonicalize to
+        -:   75:///
+        -:   76:/// ```mlir
+        -:   77:/// #accesses = [
+        -:   78:///   affine_map<(d0, d1) -> (d1)>,
+        -:   79:///   affine_map<(d0, d1) -> (d0)>,
+        -:   80:///   affine_map<(d0, d1) -> (d0, d1)>
+        -:   81:/// ]
+        -:   82:///
+        -:   83:/// #trait = {
+        -:   84:///   args_in = 2,
+        -:   85:///   args_out = 1,
+        -:   86:///   indexing_maps = #accesses,
+        -:   87:///   iterator_types = ["parallel", "parallel"],
+        -:   88:///   library_call = "some_external_fn"
+        -:   89:/// }
+        -:   90:///
+        -:   91:/// func @broadcast_test(%arg0 : tensor<5xf32>, %arg1 : tensor<5xf32>) ->
+        -:   92:/// tensor<5x5xf32>
+        -:   93:/// {
+        -:   94:///   %0 = linalg.generic #trait %arg0, %arg1 {
+        -:   95:///        ^bb0(%arg2: f32, %arg3: f32):
+        -:   96:///          %3 = arith.addf %arg2, %arg3 : f32
+        -:   97:///          linalg.yield %3 : f32
+        -:   98:///        } : tensor<5xf32>, tensor<5xf32> -> tensor<5x5xf32>
+        -:   99:///   return %0 : tensor<5x5xf32>
+        -:  100:/// }
+        -:  101:
+        -:  102:/// Given dims of the iteration space of a structured op that are known to be
+        -:  103:/// single trip count (`unitDims`), return the indexing maps to use in the
+        -:  104:/// canonicalized op with these dims removed, given the original `indexingMaps`.
+function _ZL15replaceUnitDimsRN4llvm8DenseSetIjNS_12DenseMapInfoIjvEEEENS_8ArrayRefIN4mlir9AffineMapEEEPNS6_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  105:static ArrayAttr replaceUnitDims(DenseSet<unsigned> &unitDims,
+        -:  106:                                 ArrayRef<AffineMap> indexingMaps,
+        -:  107:                                 MLIRContext *context) {
+    #####:  108:  if (indexingMaps.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  109:    return nullptr;
+    #####:  110:  unsigned numIterationDims = indexingMaps.front().getNumDims();
+call    0 never executed
+    #####:  111:  unsigned numSymbols = indexingMaps.front().getNumSymbols();
+call    0 never executed
+        -:  112:
+        -:  113:  // Compute the replacement for each dim expr.
+    #####:  114:  SmallVector<AffineExpr, 4> dimReplacements;
+branch  0 never executed
+branch  1 never executed
+    #####:  115:  dimReplacements.reserve(numIterationDims);
+branch  0 never executed
+branch  1 never executed
+    #####:  116:  unsigned numKeptDims = 0;
+    #####:  117:  for (unsigned dim : llvm::seq<unsigned>(0, numIterationDims)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  118:    if (unitDims.count(dim))
+call    0 never executed
+    #####:  119:      dimReplacements.push_back(getAffineConstantExpr(0, context));
+call    0 never executed
+call    1 never executed
+        -:  120:    else
+    #####:  121:      dimReplacements.push_back(getAffineDimExpr(numKeptDims++, context));
+call    0 never executed
+call    1 never executed
+        -:  122:  }
+        -:  123:
+        -:  124:  // Symbols remain the same.
+    #####:  125:  SmallVector<AffineExpr, 4> symReplacements;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  126:  symReplacements.reserve(numSymbols);
+branch  0 never executed
+branch  1 never executed
+    #####:  127:  for (unsigned symbol : llvm::seq<unsigned>(0, numSymbols))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  128:    symReplacements.push_back(getAffineSymbolExpr(symbol, context));
+call    0 never executed
+call    1 never executed
+        -:  129:
+    #####:  130:  SmallVector<AffineMap, 4> newIndexingMaps;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  131:  newIndexingMaps.reserve(indexingMaps.size());
+branch  0 never executed
+branch  1 never executed
+    #####:  132:  for (AffineMap operandMap : indexingMaps) {
+branch  0 never executed
+branch  1 never executed
+        -:  133:    // Expected indexing maps to have no symbols.
+    #####:  134:    if (operandMap.getNumSymbols())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  135:      return nullptr;
+    #####:  136:    newIndexingMaps.push_back(simplifyAffineMap(
+call    0 never executed
+call    1 never executed
+        -:  137:        operandMap.replaceDimsAndSymbols(dimReplacements, symReplacements,
+    #####:  138:                                         numIterationDims - unitDims.size(),
+call    0 never executed
+        -:  139:                                         numSymbols)));
+        -:  140:  }
+        -:  141:
+        -:  142:  // Check that the new index maps are invertible. If not, something went
+        -:  143:  // wrong, so abort.
+    #####:  144:  if (!inversePermutation(concatAffineMaps(newIndexingMaps)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  145:    return nullptr;
+    #####:  146:  return ArrayAttr::get(context,
+    #####:  147:                        llvm::to_vector<4>(llvm::map_range(
+call    0 never executed
+call    1 never executed
+        -:  148:                            newIndexingMaps, [](AffineMap map) -> Attribute {
+        -:  149:                              return AffineMapAttr::get(map);
+    #####:  150:                            })));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  151:}
+        -:  152:
+        -:  153:/// Update the index accesses of linalg operations having index semantics.
+function _ZL22replaceUnitDimIndexOpsN4mlir6linalg9GenericOpERKN4llvm8DenseSetIjNS2_12DenseMapInfoIjvEEEERNS_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  154:static void replaceUnitDimIndexOps(GenericOp genericOp,
+        -:  155:                                   const DenseSet<unsigned> &unitDims,
+        -:  156:                                   PatternRewriter &rewriter) {
+    #####:  157:  for (IndexOp indexOp :
+    #####:  158:       llvm::make_early_inc_range(genericOp.getBody()->getOps<IndexOp>())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+    #####:  159:    OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  160:    rewriter.setInsertionPoint(indexOp);
+call    0 never executed
+    #####:  161:    if (unitDims.count(indexOp.getDim()) != 0) {
+call    0 never executed
+call    1 never executed
+    #####:  162:      rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(indexOp, 0);
+call    0 never executed
+        -:  163:    } else {
+        -:  164:      // Update the dimension of the index operation if needed.
+    #####:  165:      unsigned droppedDims = llvm::count_if(
+call    0 never executed
+    #####:  166:          unitDims, [&](unsigned dim) { return dim < indexOp.getDim(); });
+call    0 never executed
+    #####:  167:      if (droppedDims != 0)
+branch  0 never executed
+branch  1 never executed
+    #####:  168:        rewriter.replaceOpWithNewOp<IndexOp>(indexOp,
+    #####:  169:                                             indexOp.getDim() - droppedDims);
+call    0 never executed
+call    1 never executed
+        -:  170:    }
+        -:  171:  }
+    #####:  172:}
+        -:  173:
+        -:  174:namespace {
+        -:  175:/// Pattern to fold unit-trip count loops in GenericOps.
+        -:  176:struct FoldUnitDimLoops : public OpRewritePattern<GenericOp> {
+        -:  177:  using OpRewritePattern<GenericOp>::OpRewritePattern;
+function _ZNK12_GLOBAL__N_116FoldUnitDimLoops15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  178:  LogicalResult matchAndRewrite(GenericOp genericOp,
+        -:  179:                                PatternRewriter &rewriter) const override {
+    #####:  180:    SmallVector<AffineMap, 4> indexingMaps = genericOp.getIndexingMapsArray();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  181:    if (indexingMaps.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  182:      return failure();
+        -:  183:
+        -:  184:    // Check if any of the iteration dimensions are unit-trip count. They will
+        -:  185:    // end up being unit-trip count if they are used to index into a unit-dim
+        -:  186:    // tensor/memref.
+    #####:  187:    AffineMap invertedMap = inversePermutation(concatAffineMaps(indexingMaps));
+call    0 never executed
+call    1 never executed
+    #####:  188:    if (!invertedMap)
+branch  0 never executed
+branch  1 never executed
+    #####:  189:      return failure();
+    #####:  190:    SmallVector<int64_t> dims = genericOp.getStaticShape();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  191:
+    #####:  192:    DenseSet<unsigned> unitDims;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  193:    SmallVector<unsigned, 4> unitDimsReductionLoops;
+call    0 never executed
+call    1 never executed
+    #####:  194:    ArrayAttr iteratorTypes = genericOp.getIteratorTypes();
+call    0 never executed
+    #####:  195:    for (const auto &expr : enumerate(invertedMap.getResults())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  196:      if (AffineDimExpr dimExpr = expr.value().dyn_cast<AffineDimExpr>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  197:        if (dims[dimExpr.getPosition()] == 1)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  198:          unitDims.insert(expr.index());
+call    0 never executed
+        -:  199:    }
+        -:  200:
+    #####:  201:    if (unitDims.empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  202:      return failure();
+        -:  203:
+        -:  204:    // Compute the modified indexing maps.
+    #####:  205:    MLIRContext *context = rewriter.getContext();
+call    0 never executed
+    #####:  206:    ArrayAttr newIndexingMapAttr =
+call    0 never executed
+    #####:  207:        replaceUnitDims(unitDims, indexingMaps, context);
+call    0 never executed
+    #####:  208:    if (!newIndexingMapAttr)
+branch  0 never executed
+branch  1 never executed
+    #####:  209:      return genericOp.emitError("unable to compute modified indexing_maps");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  210:
+        -:  211:    // Compute the iterator types of the modified op by dropping the one-trip
+        -:  212:    // count loops.
+    #####:  213:    SmallVector<Attribute, 4> newIteratorTypes;
+call    0 never executed
+call    1 never executed
+    #####:  214:    for (const auto &attr : llvm::enumerate(iteratorTypes)) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  215:      if (!unitDims.count(attr.index()))
+call    0 never executed
+    #####:  216:        newIteratorTypes.push_back(attr.value());
+call    0 never executed
+        -:  217:    }
+        -:  218:
+    #####:  219:    rewriter.startRootUpdate(genericOp);
+call    0 never executed
+    #####:  220:    genericOp.setIndexingMapsAttr(newIndexingMapAttr);
+call    0 never executed
+    #####:  221:    genericOp.setIteratorTypesAttr(ArrayAttr::get(context, newIteratorTypes));
+call    0 never executed
+call    1 never executed
+    #####:  222:    replaceUnitDimIndexOps(genericOp, unitDims, rewriter);
+call    0 never executed
+    #####:  223:    rewriter.finalizeRootUpdate(genericOp);
+call    0 never executed
+    #####:  224:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  225:  }
+        -:  226:};
+        -:  227:
+        -:  228:struct UnitExtentReplacementInfo {
+        -:  229:  Type type;
+        -:  230:  AffineMap indexMap;
+        -:  231:  ArrayAttr reassociation;
+        -:  232:};
+        -:  233:} // namespace
+        -:  234:
+        -:  235:/// Utility function for replacing operands/results to a linalg generic
+        -:  236:/// operation with unit-extent dimensions. These can be replaced with
+        -:  237:/// an operand/result with the unit-extent dimension removed. This is only done
+        -:  238:/// if the indexing map used to access that dimension has a
+        -:  239:/// AffineConstantExpr of value 0. Given the `type` of an result/operand of a
+        -:  240:/// Linalg op, and its `indexMap` the utility function returns:
+        -:  241:/// - the new type with dimensions of size 1 removed.
+        -:  242:/// - modified index map that can be used to access the replaced result/operand
+        -:  243:/// - the reassociation that converts from the original tensor type to the
+        -:  244:///   modified tensor type.
+        -:  245:static llvm::Optional<UnitExtentReplacementInfo>
+function _ZL18replaceUnitExtentsN4mlir6linalg9GenericOpEPNS_9OpOperandEPNS_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:  246:replaceUnitExtents(GenericOp genericOp, OpOperand *opOperand,
+        -:  247:                   MLIRContext *context) {
+    #####:  248:  AffineMap indexingMap = genericOp.getMatchingIndexingMap(opOperand);
+call    0 never executed
+    #####:  249:  ArrayRef<int64_t> shape = genericOp.getShape(opOperand);
+call    0 never executed
+    #####:  250:  ArrayRef<AffineExpr> exprs = indexingMap.getResults();
+call    0 never executed
+    #####:  251:  SmallVector<AffineExpr> reassociations;
+call    0 never executed
+    #####:  252:  SmallVector<Attribute> reassociationMaps;
+branch  0 never executed
+branch  1 never executed
+    #####:  253:  SmallVector<AffineExpr> newIndexExprs;
+branch  0 never executed
+branch  1 never executed
+    #####:  254:  SmallVector<int64_t> newShape;
+branch  0 never executed
+branch  1 never executed
+        -:  255:
+    #####:  256:  int64_t origRank = genericOp.getRank(opOperand);
+call    0 never executed
+    #####:  257:  AffineExpr zeroExpr = getAffineConstantExpr(0, context);
+call    0 never executed
+function _ZZL18replaceUnitExtentsN4mlir6linalg9GenericOpEPNS_9OpOperandEPNS_11MLIRContextEENKUllE_clEl called 0 returned 0% blocks executed 0%
+    #####:  258:  auto isUnitExtent = [&](int64_t dim) -> bool {
+    #####:  259:    return shape[dim] == 1 && exprs[dim] == zeroExpr;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  260:  };
+        -:  261:
+        -:  262:  // Early return for memrefs with affine maps to represent that we will always
+        -:  263:  // leave them unchanged.
+    #####:  264:  Type actualType = opOperand->get().getType();
+call    0 never executed
+    #####:  265:  if (auto memref = actualType.dyn_cast<MemRefType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  266:    if (!memref.getLayout().isIdentity())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  267:      return llvm::None;
+        -:  268:  }
+        -:  269:
+    #####:  270:  int64_t dim = 0;
+        -:  271:  // Fold dimensions that are unit-extent at the beginning of the tensor.
+    #####:  272:  while (dim < origRank && isUnitExtent(dim))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  273:    reassociations.push_back(getAffineDimExpr(dim++, context));
+call    0 never executed
+call    1 never executed
+    #####:  274:  while (dim < origRank) {
+branch  0 never executed
+branch  1 never executed
+    #####:  275:    reassociations.push_back(getAffineDimExpr(dim, context));
+call    0 never executed
+call    1 never executed
+    #####:  276:    newIndexExprs.push_back(exprs[dim]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  277:    newShape.push_back(shape[dim]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  278:    // Fold all following dimensions that are unit-extent.
+    #####:  279:    while (dim + 1 < origRank && isUnitExtent(dim + 1)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  280:      ++dim;
+    #####:  281:      reassociations.push_back(getAffineDimExpr(dim, context));
+call    0 never executed
+call    1 never executed
+        -:  282:    }
+    #####:  283:    reassociationMaps.push_back(AffineMapAttr::get(AffineMap::get(
+call    0 never executed
+call    1 never executed
+    #####:  284:        origRank, /*symbolCount = */ 0, reassociations, context)));
+call    0 never executed
+call    1 never executed
+    #####:  285:    reassociations.clear();
+    #####:  286:    ++dim;
+        -:  287:  }
+        -:  288:
+        -:  289:  // Compute the tensor or scalar replacement type.
+    #####:  290:  Type elementType = getElementTypeOrSelf(opOperand->get());
+call    0 never executed
+    #####:  291:  Type replacementType;
+    #####:  292:  if (elementType == opOperand->get().getType()) {
+branch  0 never executed
+branch  1 never executed
+        -:  293:    replacementType = elementType;
+    #####:  294:  } else if (actualType.isa<RankedTensorType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  295:    replacementType = RankedTensorType::get(newShape, elementType);
+call    0 never executed
+        -:  296:  } else {
+    #####:  297:    auto memrefType = actualType.cast<MemRefType>();
+call    0 never executed
+    #####:  298:    replacementType = MemRefType::get(newShape, elementType, {},
+    #####:  299:                                      memrefType.getMemorySpaceAsInt());
+call    0 never executed
+call    1 never executed
+        -:  300:  }
+    #####:  301:  UnitExtentReplacementInfo info = {replacementType,
+        -:  302:                                    AffineMap::get(indexingMap.getNumDims(),
+        -:  303:                                                   indexingMap.getNumSymbols(),
+    #####:  304:                                                   newIndexExprs, context),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  305:                                    ArrayAttr::get(context, reassociationMaps)};
+call    0 never executed
+call    1 never executed
+    #####:  306:  return info;
+branch  0 never executed
+branch  1 never executed
+        -:  307:}
+        -:  308:
+        -:  309:namespace {
+        -:  310:
+        -:  311:SmallVector<ReassociationExprs, 2>
+function _ZN12_GLOBAL__N_128convertAffineMapArrayToExprsEN4mlir9ArrayAttrE called 0 returned 0% blocks executed 0%
+    #####:  312:convertAffineMapArrayToExprs(ArrayAttr affineMapArrayAttr) {
+    #####:  313:  SmallVector<ReassociationExprs, 2> reassociationExprs;
+call    0 never executed
+    #####:  314:  for (auto attr : affineMapArrayAttr)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  315:    reassociationExprs.push_back(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  316:        llvm::to_vector<4>(attr.cast<AffineMapAttr>().getValue().getResults()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  317:  return reassociationExprs;
+        -:  318:}
+        -:  319:
+        -:  320:/// Pattern to replace tensor/buffer operands/results that are unit extents.
+        -:  321:struct ReplaceUnitExtents : public OpRewritePattern<GenericOp> {
+        -:  322:  using OpRewritePattern<GenericOp>::OpRewritePattern;
+        -:  323:
+        -:  324:  // Return the original value if the type is unchanged, or reshape it. Return a
+        -:  325:  // nullptr if this is an unsupported type.
+        -:  326:  Value maybeExpand(Value result, Type origResultType,
+        -:  327:                    ArrayAttr reassociationMap, Location loc,
+        -:  328:                    PatternRewriter &rewriter) const {
+        -:  329:    if (origResultType == result.getType())
+        -:  330:      return result;
+        -:  331:    if (origResultType.isa<RankedTensorType>()) {
+        -:  332:      return rewriter.create<tensor::ExpandShapeOp>(
+        -:  333:          loc, origResultType, result,
+        -:  334:          convertAffineMapArrayToExprs(reassociationMap));
+        -:  335:    }
+        -:  336:    if (origResultType.isa<MemRefType>()) {
+        -:  337:      return rewriter.create<memref::ExpandShapeOp>(
+        -:  338:          loc, origResultType, result,
+        -:  339:          convertAffineMapArrayToExprs(reassociationMap));
+        -:  340:    }
+        -:  341:    return nullptr;
+        -:  342:  };
+        -:  343:
+        -:  344:  // Return the original value if the type is unchanged, or reshape it. Return a
+        -:  345:  // nullptr if this is an unsupported type.
+        -:  346:  Value maybeCollapse(Value operand, Type newInputOutputType,
+        -:  347:                      ArrayAttr reassociationMap, Location loc,
+        -:  348:                      PatternRewriter &rewriter) const {
+        -:  349:    auto operandType = operand.getType();
+        -:  350:    if (operandType == newInputOutputType)
+        -:  351:      return operand;
+        -:  352:    if (operandType.isa<MemRefType>()) {
+        -:  353:      return rewriter.create<memref::CollapseShapeOp>(
+        -:  354:          loc, newInputOutputType, operand,
+        -:  355:          convertAffineMapArrayToExprs(reassociationMap));
+        -:  356:    }
+        -:  357:    if (operandType.isa<RankedTensorType>()) {
+        -:  358:      return rewriter.create<tensor::CollapseShapeOp>(
+        -:  359:          loc, newInputOutputType, operand,
+        -:  360:          convertAffineMapArrayToExprs(reassociationMap));
+        -:  361:    }
+        -:  362:    return nullptr;
+        -:  363:  };
+        -:  364:
+function _ZNK12_GLOBAL__N_118ReplaceUnitExtents15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  365:  LogicalResult matchAndRewrite(GenericOp genericOp,
+        -:  366:                                PatternRewriter &rewriter) const override {
+        -:  367:    // Skip the pattern if the op has any tensor with special encoding.
+function _ZZNK12_GLOBAL__N_118ReplaceUnitExtents15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterEENKUlNS1_4TypeEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  368:    if (llvm::any_of(genericOp->getOperandTypes(), [](Type type) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  369:          auto tensorType = type.dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  370:          return tensorType && tensorType.getEncoding() != nullptr;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  371:        }))
+    #####:  372:      return failure();
+    #####:  373:    MLIRContext *context = rewriter.getContext();
+call    0 never executed
+    #####:  374:    Location loc = genericOp.getLoc();
+call    0 never executed
+        -:  375:
+    #####:  376:    SmallVector<AffineMap> newIndexingMaps;
+call    0 never executed
+    #####:  377:    SmallVector<ArrayAttr> reassociationMaps;
+branch  0 never executed
+branch  1 never executed
+    #####:  378:    SmallVector<Type> newInputOutputTypes;
+branch  0 never executed
+branch  1 never executed
+    #####:  379:    bool doCanonicalization = false;
+    #####:  380:    for (OpOperand &opOperand : genericOp->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  381:      auto replacementInfo = replaceUnitExtents(genericOp, &opOperand, context);
+call    0 never executed
+    #####:  382:      if (replacementInfo) {
+branch  0 never executed
+branch  1 never executed
+    #####:  383:        reassociationMaps.push_back(replacementInfo->reassociation);
+call    0 never executed
+    #####:  384:        newIndexingMaps.push_back(replacementInfo->indexMap);
+call    0 never executed
+    #####:  385:        newInputOutputTypes.push_back(replacementInfo->type);
+call    0 never executed
+    #####:  386:        doCanonicalization |=
+    #####:  387:            replacementInfo->type != opOperand.get().getType();
+        -:  388:      } else {
+        -:  389:        // If replaceUnitExtents cannot handle this case, maintain the same
+        -:  390:        // type, indexing map, and create a set of mappings representing an
+        -:  391:        // identity matrix.
+    #####:  392:        newInputOutputTypes.push_back(opOperand.get().getType());
+call    0 never executed
+    #####:  393:        newIndexingMaps.push_back(genericOp.getMatchingIndexingMap(&opOperand));
+call    0 never executed
+call    1 never executed
+    #####:  394:        int64_t origRank = genericOp.getRank(&opOperand);
+call    0 never executed
+    #####:  395:        auto maps = llvm::to_vector<8>(llvm::map_range(
+function _ZZNK12_GLOBAL__N_118ReplaceUnitExtents15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterEENKUllE0_clEl.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  396:            llvm::seq<int64_t>(0, origRank), [&](int64_t dim) -> Attribute {
+call    0 never executed
+call    1 never executed
+    #####:  397:              return AffineMapAttr::get(
+    #####:  398:                  AffineMap::get(origRank, /*symbolCount = */ 0,
+call    0 never executed
+    #####:  399:                                 getAffineDimExpr(dim, context), context));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  400:            }));
+call    0 never executed
+    #####:  401:        reassociationMaps.push_back(ArrayAttr::get(context, maps));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  402:      }
+        -:  403:    }
+        -:  404:
+        -:  405:    // If the indexing maps of the result operation are not invertible (i.e. not
+        -:  406:    // legal), abort.
+    #####:  407:    if (!doCanonicalization ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  408:        !inversePermutation(concatAffineMaps(newIndexingMaps)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  409:      return failure();
+        -:  410:
+        -:  411:    // If any operand type change, insert a reshape to convert from the original
+        -:  412:    // type to the new type.
+        -:  413:    // TODO: get rid of flattenedIdx which assumes operand order and contiguity.
+    #####:  414:    unsigned flattenedIdx = 0;
+function _ZZNK12_GLOBAL__N_118ReplaceUnitExtents15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterEENKUlNS1_10ValueRangeEE1_clES6_ called 0 returned 0% blocks executed 0%
+    #####:  415:    auto insertReshapes = [&](ValueRange values) {
+    #####:  416:      SmallVector<Value, 4> res;
+branch  0 never executed
+branch  1 never executed
+    #####:  417:      res.reserve(values.size());
+branch  0 never executed
+branch  1 never executed
+    #####:  418:      for (auto operand : values) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  419:        auto reshapedValue =
+    #####:  420:            maybeCollapse(operand, newInputOutputTypes[flattenedIdx],
+    #####:  421:                          reassociationMaps[flattenedIdx], loc, rewriter);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  422:        assert(reshapedValue &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  423:               "expected ranked MemRef or Tensor operand type");
+    #####:  424:        res.push_back(reshapedValue);
+call    0 never executed
+    #####:  425:        ++flattenedIdx;
+        -:  426:      }
+    #####:  427:      return res;
+    #####:  428:    };
+        -:  429:
+    #####:  430:    SmallVector<Value, 4> newInputs = insertReshapes(genericOp.getInputs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  431:    SmallVector<Value, 4> newOutputs = insertReshapes(genericOp.getOutputs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  432:
+        -:  433:    // If any result type changes, insert a reshape to convert from the original
+        -:  434:    // type to the new type.
+    #####:  435:    SmallVector<Type, 4> resultTypes;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  436:    resultTypes.reserve(genericOp.getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  437:    for (unsigned i : llvm::seq<unsigned>(0, genericOp.getNumResults()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  438:      resultTypes.push_back(
+    #####:  439:          newInputOutputTypes[i + genericOp.getNumDpsInputs()]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  440:    GenericOp replacementOp = rewriter.create<GenericOp>(
+        -:  441:        loc, resultTypes, newInputs, newOutputs, newIndexingMaps,
+    #####:  442:        genericOp.getIteratorTypesArray());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  443:    rewriter.inlineRegionBefore(genericOp.getRegion(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  444:                                replacementOp.getRegion(),
+    #####:  445:                                replacementOp.getRegion().begin());
+call    0 never executed
+call    1 never executed
+        -:  446:
+        -:  447:    // If any result tensor has a modified shape, then add reshape to recover
+        -:  448:    // the original shape.
+    #####:  449:    SmallVector<Value, 4> resultReplacements;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  450:    for (const auto &result : llvm::enumerate(replacementOp.getResults())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  451:      unsigned index = result.index() + replacementOp.getNumDpsInputs();
+call    0 never executed
+    #####:  452:      auto origResultType = genericOp.getResult(result.index()).getType();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  453:
+    #####:  454:      auto newResult = maybeExpand(result.value(), origResultType,
+    #####:  455:                                   reassociationMaps[index], loc, rewriter);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  456:      assert(newResult &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  457:             "unexpected output type other than ranked MemRef or Tensor");
+    #####:  458:      resultReplacements.push_back(newResult);
+call    0 never executed
+        -:  459:    }
+    #####:  460:    rewriter.replaceOp(genericOp, resultReplacements);
+call    0 never executed
+call    1 never executed
+    #####:  461:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  462:  }
+        -:  463:};
+        -:  464:} // namespace
+        -:  465:
+        -:  466:namespace {
+        -:  467:/// Convert `extract_slice` operations to rank-reduced versions.
+        -:  468:struct RankReducedExtractSliceOp
+        -:  469:    : public OpRewritePattern<tensor::ExtractSliceOp> {
+        -:  470:  using OpRewritePattern<tensor::ExtractSliceOp>::OpRewritePattern;
+        -:  471:
+function _ZNK12_GLOBAL__N_125RankReducedExtractSliceOp15matchAndRewriteEN4mlir6tensor14ExtractSliceOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  472:  LogicalResult matchAndRewrite(tensor::ExtractSliceOp sliceOp,
+        -:  473:                                PatternRewriter &rewriter) const override {
+    #####:  474:    RankedTensorType resultType = sliceOp.getType();
+call    0 never executed
+    #####:  475:    SmallVector<OpFoldResult> offsets = sliceOp.getMixedOffsets();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  476:    SmallVector<OpFoldResult> sizes = sliceOp.getMixedSizes();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  477:    SmallVector<OpFoldResult> strides = sliceOp.getMixedStrides();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  478:    auto reassociation = getReassociationMapForFoldingUnitDims(sizes);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  479:    if (!reassociation ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  480:        reassociation->size() == static_cast<size_t>(resultType.getRank()))
+call    0 never executed
+    #####:  481:      return failure();
+    #####:  482:    auto rankReducedType =
+call    0 never executed
+    #####:  483:        tensor::ExtractSliceOp::inferCanonicalRankReducedResultType(
+    #####:  484:            reassociation->size(), sliceOp.getSourceType(), offsets, sizes,
+call    0 never executed
+    #####:  485:            strides)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  486:            .cast<RankedTensorType>();
+        -:  487:
+    #####:  488:    Location loc = sliceOp.getLoc();
+call    0 never executed
+    #####:  489:    Value newSlice = rewriter.create<tensor::ExtractSliceOp>(
+    #####:  490:        loc, rankReducedType, sliceOp.getSource(), offsets, sizes, strides);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  491:    rewriter.replaceOpWithNewOp<tensor::ExpandShapeOp>(
+    #####:  492:        sliceOp, resultType, newSlice, *reassociation);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  493:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  494:  }
+        -:  495:};
+        -:  496:
+        -:  497:/// Convert `insert_slice` operations to rank-reduced versions.
+        -:  498:/// This patterns works with both InsertSliceOp and ParallelInsertSliceOp.
+        -:  499:template <typename InsertOpTy>
+        -:  500:struct RankReducedInsertSliceOp : public OpRewritePattern<InsertOpTy> {
+        -:  501:  using OpRewritePattern<InsertOpTy>::OpRewritePattern;
+        -:  502:
+    #####:  503:  LogicalResult matchAndRewrite(InsertOpTy insertSliceOp,
+        -:  504:                                PatternRewriter &rewriter) const override {
+    #####:  505:    RankedTensorType sourceType = insertSliceOp.getSourceType();
+    #####:  506:    SmallVector<OpFoldResult> offsets = insertSliceOp.getMixedOffsets();
+    #####:  507:    SmallVector<OpFoldResult> sizes = insertSliceOp.getMixedSizes();
+    #####:  508:    SmallVector<OpFoldResult> strides = insertSliceOp.getMixedStrides();
+    #####:  509:    auto reassociation = getReassociationMapForFoldingUnitDims(sizes);
+    #####:  510:    if (!reassociation ||
+    #####:  511:        reassociation->size() == static_cast<size_t>(sourceType.getRank()))
+    #####:  512:      return failure();
+    #####:  513:    Location loc = insertSliceOp.getLoc();
+    #####:  514:    tensor::CollapseShapeOp reshapedSource;
+        -:  515:    {
+    #####:  516:      OpBuilder::InsertionGuard g(rewriter);
+        -:  517:      // The only difference between InsertSliceOp and ParallelInsertSliceOp is
+        -:  518:      // the insertion point is just before the ParallelCombiningOp in the
+        -:  519:      // parallel case.
+        -:  520:      if (std::is_same<InsertOpTy, tensor::ParallelInsertSliceOp>::value)
+    #####:  521:        rewriter.setInsertionPoint(insertSliceOp->getParentOp());
+    #####:  522:      reshapedSource = rewriter.create<tensor::CollapseShapeOp>(
+        -:  523:          loc, insertSliceOp.getSource(), *reassociation);
+        -:  524:    }
+    #####:  525:    rewriter.replaceOpWithNewOp<InsertOpTy>(
+        -:  526:        insertSliceOp, reshapedSource, insertSliceOp.getDest(),
+        -:  527:        insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
+        -:  528:        insertSliceOp.getMixedStrides());
+    #####:  529:    return success();
+        -:  530:  }
+------------------
+_ZNK12_GLOBAL__N_124RankReducedInsertSliceOpIN4mlir6tensor13InsertSliceOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_124RankReducedInsertSliceOpIN4mlir6tensor13InsertSliceOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  503:  LogicalResult matchAndRewrite(InsertOpTy insertSliceOp,
+        -:  504:                                PatternRewriter &rewriter) const override {
+    #####:  505:    RankedTensorType sourceType = insertSliceOp.getSourceType();
+call    0 never executed
+    #####:  506:    SmallVector<OpFoldResult> offsets = insertSliceOp.getMixedOffsets();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  507:    SmallVector<OpFoldResult> sizes = insertSliceOp.getMixedSizes();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  508:    SmallVector<OpFoldResult> strides = insertSliceOp.getMixedStrides();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  509:    auto reassociation = getReassociationMapForFoldingUnitDims(sizes);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  510:    if (!reassociation ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  511:        reassociation->size() == static_cast<size_t>(sourceType.getRank()))
+call    0 never executed
+    #####:  512:      return failure();
+    #####:  513:    Location loc = insertSliceOp.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  514:    tensor::CollapseShapeOp reshapedSource;
+        -:  515:    {
+    #####:  516:      OpBuilder::InsertionGuard g(rewriter);
+branch  0 never executed
+branch  1 never executed
+        -:  517:      // The only difference between InsertSliceOp and ParallelInsertSliceOp is
+        -:  518:      // the insertion point is just before the ParallelCombiningOp in the
+        -:  519:      // parallel case.
+        -:  520:      if (std::is_same<InsertOpTy, tensor::ParallelInsertSliceOp>::value)
+        -:  521:        rewriter.setInsertionPoint(insertSliceOp->getParentOp());
+    #####:  522:      reshapedSource = rewriter.create<tensor::CollapseShapeOp>(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  523:          loc, insertSliceOp.getSource(), *reassociation);
+        -:  524:    }
+    #####:  525:    rewriter.replaceOpWithNewOp<InsertOpTy>(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+        -:  526:        insertSliceOp, reshapedSource, insertSliceOp.getDest(),
+        -:  527:        insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
+        -:  528:        insertSliceOp.getMixedStrides());
+    #####:  529:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  530:  }
+------------------
+_ZNK12_GLOBAL__N_124RankReducedInsertSliceOpIN4mlir6tensor21ParallelInsertSliceOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_124RankReducedInsertSliceOpIN4mlir6tensor21ParallelInsertSliceOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  503:  LogicalResult matchAndRewrite(InsertOpTy insertSliceOp,
+        -:  504:                                PatternRewriter &rewriter) const override {
+    #####:  505:    RankedTensorType sourceType = insertSliceOp.getSourceType();
+call    0 never executed
+    #####:  506:    SmallVector<OpFoldResult> offsets = insertSliceOp.getMixedOffsets();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  507:    SmallVector<OpFoldResult> sizes = insertSliceOp.getMixedSizes();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  508:    SmallVector<OpFoldResult> strides = insertSliceOp.getMixedStrides();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  509:    auto reassociation = getReassociationMapForFoldingUnitDims(sizes);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  510:    if (!reassociation ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  511:        reassociation->size() == static_cast<size_t>(sourceType.getRank()))
+call    0 never executed
+    #####:  512:      return failure();
+    #####:  513:    Location loc = insertSliceOp.getLoc();
+branch  0 never executed
+branch  1 never executed
+    #####:  514:    tensor::CollapseShapeOp reshapedSource;
+        -:  515:    {
+    #####:  516:      OpBuilder::InsertionGuard g(rewriter);
+branch  0 never executed
+branch  1 never executed
+        -:  517:      // The only difference between InsertSliceOp and ParallelInsertSliceOp is
+        -:  518:      // the insertion point is just before the ParallelCombiningOp in the
+        -:  519:      // parallel case.
+        -:  520:      if (std::is_same<InsertOpTy, tensor::ParallelInsertSliceOp>::value)
+    #####:  521:        rewriter.setInsertionPoint(insertSliceOp->getParentOp());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  522:      reshapedSource = rewriter.create<tensor::CollapseShapeOp>(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  523:          loc, insertSliceOp.getSource(), *reassociation);
+        -:  524:    }
+    #####:  525:    rewriter.replaceOpWithNewOp<InsertOpTy>(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+        -:  526:        insertSliceOp, reshapedSource, insertSliceOp.getDest(),
+        -:  527:        insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes(),
+        -:  528:        insertSliceOp.getMixedStrides());
+    #####:  529:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  530:  }
+------------------
+        -:  531:};
+        -:  532:} // namespace
+        -:  533:
+        -:  534:/// Patterns that are used to canonicalize the use of unit-extent dims for
+        -:  535:/// broadcasting.
+function _ZN4mlir6linalg34populateFoldUnitExtentDimsPatternsERNS_17RewritePatternSetE called 873 returned 100% blocks executed 100%
+      873:  536:void mlir::linalg::populateFoldUnitExtentDimsPatterns(
+        -:  537:    RewritePatternSet &patterns) {
+      873:  538:  auto *context = patterns.getContext();
+call    0 returned 100%
+      873:  539:  patterns.add<FoldUnitDimLoops, ReplaceUnitExtents, RankReducedExtractSliceOp,
+        -:  540:               RankReducedInsertSliceOp<tensor::InsertSliceOp>,
+        -:  541:               RankReducedInsertSliceOp<tensor::ParallelInsertSliceOp>>(
+      873:  542:      context);
+call    0 returned 100%
+      873:  543:  linalg::FillOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+      873:  544:  tensor::CollapseShapeOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+      873:  545:  tensor::EmptyOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+      873:  546:  tensor::ExpandShapeOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+      873:  547:}
+        -:  548:
+        -:  549:namespace {
+        -:  550:/// Pass that removes unit-extent dims within generic ops.
+  326640*:  551:struct LinalgFoldUnitExtentDimsPass
+call    0 never executed
+call    1 returned 100%
+        -:  552:    : public impl::LinalgFoldUnitExtentDimsBase<LinalgFoldUnitExtentDimsPass> {
+function _ZN12_GLOBAL__N_128LinalgFoldUnitExtentDimsPass14runOnOperationEv called 873 returned 100% blocks executed 77%
+      873:  553:  void runOnOperation() override {
+      873:  554:    Operation *op = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      873:  555:    MLIRContext *context = op->getContext();
+call    0 returned 100%
+      873:  556:    RewritePatternSet patterns(context);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      873:  557:    if (foldOneTripLoopsOnly)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  558:      patterns.add<FoldUnitDimLoops>(context);
+call    0 never executed
+        -:  559:    else
+      873:  560:      populateFoldUnitExtentDimsPatterns(patterns);
+call    0 returned 100%
+      873:  561:    (void)applyPatternsAndFoldGreedily(op, std::move(patterns));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+      873:  562:  }
+        -:  563:};
+        -:  564:} // namespace
+        -:  565:
+function _ZN4mlir34createLinalgFoldUnitExtentDimsPassEv called 326640 returned 100% blocks executed 100%
+   326640:  566:std::unique_ptr<Pass> mlir::createLinalgFoldUnitExtentDimsPass() {
+   326640:  567:  return std::make_unique<LinalgFoldUnitExtentDimsPass>();
+call    0 returned 100%
+        -:  568:}

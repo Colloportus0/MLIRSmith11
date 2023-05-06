@@ -1,0 +1,573 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Transforms/CSE.cpp
+        -:    0:Graph:../tools/mlir/lib/Transforms/CMakeFiles/obj.MLIRTransforms.dir/CSE.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Transforms/CMakeFiles/obj.MLIRTransforms.dir/CSE.cpp.gcda
+        -:    0:Runs:325564
+        -:    1://===- CSE.cpp - Common Sub-expression Elimination ------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This transformation pass performs a simple common sub-expression elimination
+        -:   10:// algorithm on operations within a region.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Transforms/Passes.h"
+        -:   15:
+        -:   16:#include "mlir/IR/Dominance.h"
+        -:   17:#include "mlir/Interfaces/SideEffectInterfaces.h"
+        -:   18:#include "mlir/Pass/Pass.h"
+        -:   19:#include "llvm/ADT/DenseMapInfo.h"
+        -:   20:#include "llvm/ADT/Hashing.h"
+        -:   21:#include "llvm/ADT/ScopedHashTable.h"
+        -:   22:#include "llvm/Support/Allocator.h"
+        -:   23:#include "llvm/Support/RecyclingAllocator.h"
+        -:   24:#include <deque>
+        -:   25:
+        -:   26:namespace mlir {
+        -:   27:#define GEN_PASS_DEF_CSE
+        -:   28:#include "mlir/Transforms/Passes.h.inc"
+        -:   29:} // namespace mlir
+        -:   30:
+        -:   31:using namespace mlir;
+        -:   32:
+        -:   33:namespace {
+        -:   34:struct SimpleOperationInfo : public llvm::DenseMapInfo<Operation *> {
+function _ZN12_GLOBAL__N_119SimpleOperationInfo12getHashValueEPKN4mlir9OperationE called 69862 returned 100% blocks executed 100%
+    69862:   35:  static unsigned getHashValue(const Operation *opC) {
+    69862:   36:    return OperationEquivalence::computeHash(
+call    0 returned 100%
+        -:   37:        const_cast<Operation *>(opC),
+        -:   38:        /*hashOperands=*/OperationEquivalence::directHashValue,
+        -:   39:        /*hashResults=*/OperationEquivalence::ignoreHashValue,
+    69862:   40:        OperationEquivalence::IgnoreLocations);
+call    0 returned 100%
+        -:   41:  }
+function _ZN12_GLOBAL__N_119SimpleOperationInfo7isEqualEPKN4mlir9OperationES4_ called 434384 returned 100% blocks executed 100%
+   434384:   42:  static bool isEqual(const Operation *lhsC, const Operation *rhsC) {
+   434384:   43:    auto *lhs = const_cast<Operation *>(lhsC);
+   434384:   44:    auto *rhs = const_cast<Operation *>(rhsC);
+   434384:   45:    if (lhs == rhs)
+branch  0 taken 54% (fallthrough)
+branch  1 taken 46%
+        -:   46:      return true;
+   233848:   47:    if (lhs == getTombstoneKey() || lhs == getEmptyKey() ||
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 taken 61% (fallthrough)
+branch  5 taken 39%
+   365872:   48:        rhs == getTombstoneKey() || rhs == getEmptyKey())
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+branch  2 taken 11% (fallthrough)
+branch  3 taken 89%
+        -:   49:      return false;
+    14056:   50:    return OperationEquivalence::isEquivalentTo(
+call    0 returned 100%
+        -:   51:        const_cast<Operation *>(lhsC), const_cast<Operation *>(rhsC),
+        -:   52:        /*mapOperands=*/OperationEquivalence::exactValueMatch,
+        -:   53:        /*mapResults=*/OperationEquivalence::ignoreValueEquivalence,
+        -:   54:        OperationEquivalence::IgnoreLocations);
+        -:   55:  }
+        -:   56:};
+        -:   57:} // namespace
+        -:   58:
+        -:   59:namespace {
+        -:   60:/// Simple common sub-expression elimination.
+        -:   61:struct CSE : public impl::CSEBase<CSE> {
+        -:   62:  /// Shared implementation of operation elimination and scoped map definitions.
+        -:   63:  using AllocatorTy = llvm::RecyclingAllocator<
+        -:   64:      llvm::BumpPtrAllocator,
+        -:   65:      llvm::ScopedHashTableVal<Operation *, Operation *>>;
+        -:   66:  using ScopedMapTy = llvm::ScopedHashTable<Operation *, Operation *,
+        -:   67:                                            SimpleOperationInfo, AllocatorTy>;
+        -:   68:
+        -:   69:  /// Cache holding MemoryEffects information between two operations. The first
+        -:   70:  /// operation is stored has the key. The second operation is stored inside a
+        -:   71:  /// pair in the value. The pair also hold the MemoryEffects between those
+        -:   72:  /// two operations. If the MemoryEffects is nullptr then we assume there is
+        -:   73:  /// no operation with MemoryEffects::Write between the two operations.
+        -:   74:  using MemEffectsCache =
+        -:   75:      DenseMap<Operation *, std::pair<Operation *, MemoryEffects::Effect *>>;
+        -:   76:
+        -:   77:  /// Represents a single entry in the depth first traversal of a CFG.
+        -:   78:  struct CFGStackNode {
+    #####:   79:    CFGStackNode(ScopedMapTy &knownValues, DominanceInfoNode *node)
+    #####:   80:        : scope(knownValues), node(node), childIterator(node->begin()) {}
+call    0 never executed
+call    1 never executed
+        -:   81:
+        -:   82:    /// Scope for the known values.
+        -:   83:    ScopedMapTy::ScopeTy scope;
+        -:   84:
+        -:   85:    DominanceInfoNode *node;
+        -:   86:    DominanceInfoNode::const_iterator childIterator;
+        -:   87:
+        -:   88:    /// If this node has been fully processed yet or not.
+        -:   89:    bool processed = false;
+        -:   90:  };
+        -:   91:
+        -:   92:  /// Attempt to eliminate a redundant operation. Returns success if the
+        -:   93:  /// operation was marked for removal, failure otherwise.
+        -:   94:  LogicalResult simplifyOperation(ScopedMapTy &knownValues, Operation *op,
+        -:   95:                                  bool hasSSADominance);
+        -:   96:  void simplifyBlock(ScopedMapTy &knownValues, Block *bb, bool hasSSADominance);
+        -:   97:  void simplifyRegion(ScopedMapTy &knownValues, Region &region);
+        -:   98:
+        -:   99:  void runOnOperation() override;
+        -:  100:
+        -:  101:private:
+        -:  102:  void replaceUsesAndDelete(ScopedMapTy &knownValues, Operation *op,
+        -:  103:                            Operation *existing, bool hasSSADominance);
+        -:  104:
+        -:  105:  /// Check if there is side-effecting operations other than the given effect
+        -:  106:  /// between the two operations.
+        -:  107:  bool hasOtherSideEffectingOpInBetween(Operation *fromOp, Operation *toOp);
+        -:  108:
+        -:  109:  /// Operations marked as dead and to be erased.
+        -:  110:  std::vector<Operation *> opsToErase;
+        -:  111:  DominanceInfo *domInfo = nullptr;
+        -:  112:  MemEffectsCache memEffectsCache;
+        -:  113:};
+        -:  114:} // namespace
+        -:  115:
+function _ZN12_GLOBAL__N_13CSE20replaceUsesAndDeleteERN4llvm15ScopedHashTableIPN4mlir9OperationES5_NS_19SimpleOperationInfoENS1_18RecyclingAllocatorINS1_20BumpPtrAllocatorImplINS1_15MallocAllocatorELm4096ELm4096ELm128EEENS1_18ScopedHashTableValIS5_S5_EELm32ELm8EEEEES5_S5_b called 0 returned 0% blocks executed 0%
+    #####:  116:void CSE::replaceUsesAndDelete(ScopedMapTy &knownValues, Operation *op,
+        -:  117:                               Operation *existing, bool hasSSADominance) {
+        -:  118:  // If we find one then replace all uses of the current operation with the
+        -:  119:  // existing one and mark it for deletion. We can only replace an operand in
+        -:  120:  // an operation if it has not been visited yet.
+    #####:  121:  if (hasSSADominance) {
+branch  0 never executed
+branch  1 never executed
+        -:  122:    // If the region has SSA dominance, then we are guaranteed to have not
+        -:  123:    // visited any use of the current operation.
+    #####:  124:    op->replaceAllUsesWith(existing);
+branch  0 never executed
+branch  1 never executed
+    #####:  125:    opsToErase.push_back(op);
+call    0 never executed
+        -:  126:  } else {
+        -:  127:    // When the region does not have SSA dominance, we need to check if we
+        -:  128:    // have visited a use before replacing any use.
+    #####:  129:    for (auto it : llvm::zip(op->getResults(), existing->getResults())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  130:      std::get<0>(it).replaceUsesWithIf(
+call    0 never executed
+    #####:  131:          std::get<1>(it), [&](OpOperand &operand) {
+call    0 never executed
+    #####:  132:            return !knownValues.count(operand.getOwner());
+call    0 never executed
+        -:  133:          });
+        -:  134:    }
+        -:  135:
+        -:  136:    // There may be some remaining uses of the operation.
+    #####:  137:    if (op->use_empty())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  138:      opsToErase.push_back(op);
+call    0 never executed
+        -:  139:  }
+        -:  140:
+        -:  141:  // If the existing operation has an unknown location and the current
+        -:  142:  // operation doesn't, then set the existing op's location to that of the
+        -:  143:  // current op.
+    #####:  144:  if (existing->getLoc().isa<UnknownLoc>() && !op->getLoc().isa<UnknownLoc>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  145:    existing->setLoc(op->getLoc());
+        -:  146:
+    #####:  147:  ++numCSE;
+call    0 never executed
+    #####:  148:}
+        -:  149:
+function _ZN12_GLOBAL__N_13CSE32hasOtherSideEffectingOpInBetweenEPN4mlir9OperationES3_ called 0 returned 0% blocks executed 0%
+    #####:  150:bool CSE::hasOtherSideEffectingOpInBetween(Operation *fromOp, Operation *toOp) {
+    #####:  151:  assert(fromOp->getBlock() == toOp->getBlock());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  152:  assert(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+call   10 never executed
+call   11 never executed
+branch 12 never executed
+branch 13 never executed
+call   14 never executed
+        -:  153:      isa<MemoryEffectOpInterface>(fromOp) &&
+        -:  154:      cast<MemoryEffectOpInterface>(fromOp).hasEffect<MemoryEffects::Read>() &&
+        -:  155:      isa<MemoryEffectOpInterface>(toOp) &&
+        -:  156:      cast<MemoryEffectOpInterface>(toOp).hasEffect<MemoryEffects::Read>());
+    #####:  157:  Operation *nextOp = fromOp->getNextNode();
+branch  0 never executed
+branch  1 never executed
+    #####:  158:  auto result =
+    #####:  159:      memEffectsCache.try_emplace(fromOp, std::make_pair(fromOp, nullptr));
+call    0 never executed
+    #####:  160:  if (result.second) {
+branch  0 never executed
+branch  1 never executed
+    #####:  161:    auto memEffectsCachePair = result.first->second;
+call    0 never executed
+    #####:  162:    if (memEffectsCachePair.second == nullptr) {
+branch  0 never executed
+branch  1 never executed
+        -:  163:      // No MemoryEffects::Write has been detected until the cached operation.
+        -:  164:      // Continue looking from the cached operation to toOp.
+        -:  165:      nextOp = memEffectsCachePair.first;
+        -:  166:    } else {
+        -:  167:      // MemoryEffects::Write has been detected before so there is no need to
+        -:  168:      // check further.
+    #####:  169:      return true;
+        -:  170:    }
+        -:  171:  }
+    #####:  172:  while (nextOp && nextOp != toOp) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  173:    auto nextOpMemEffects = dyn_cast<MemoryEffectOpInterface>(nextOp);
+call    0 never executed
+        -:  174:    // TODO: Do we need to handle other effects generically?
+        -:  175:    // If the operation does not implement the MemoryEffectOpInterface we
+        -:  176:    // conservatively assumes it writes.
+    #####:  177:    if ((nextOpMemEffects &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  178:         nextOpMemEffects.hasEffect<MemoryEffects::Write>()) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  179:        !nextOpMemEffects) {
+branch  0 never executed
+branch  1 never executed
+    #####:  180:      result.first->second =
+call    0 never executed
+call    1 never executed
+    #####:  181:          std::make_pair(nextOp, MemoryEffects::Write::get());
+call    0 never executed
+    #####:  182:      return true;
+        -:  183:    }
+    #####:  184:    nextOp = nextOp->getNextNode();
+branch  0 never executed
+branch  1 never executed
+        -:  185:  }
+    #####:  186:  result.first->second = std::make_pair(toOp, nullptr);
+call    0 never executed
+    #####:  187:  return false;
+        -:  188:}
+        -:  189:
+        -:  190:/// Attempt to eliminate a redundant operation.
+function _ZN12_GLOBAL__N_13CSE17simplifyOperationERN4llvm15ScopedHashTableIPN4mlir9OperationES5_NS_19SimpleOperationInfoENS1_18RecyclingAllocatorINS1_20BumpPtrAllocatorImplINS1_15MallocAllocatorELm4096ELm4096ELm128EEENS1_18ScopedHashTableValIS5_S5_EELm32ELm8EEEEES5_b called 20725 returned 100% blocks executed 74%
+    20725:  191:LogicalResult CSE::simplifyOperation(ScopedMapTy &knownValues, Operation *op,
+        -:  192:                                     bool hasSSADominance) {
+        -:  193:  // Don't simplify terminator operations.
+    20725:  194:  if (op->hasTrait<OpTrait::IsTerminator>())
+call    0 returned 100%
+branch  1 taken 9% (fallthrough)
+branch  2 taken 91%
+     1768:  195:    return failure();
+        -:  196:
+        -:  197:  // If the operation is already trivially dead just add it to the erase list.
+    18957:  198:  if (isOpTriviallyDead(op)) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+       61:  199:    opsToErase.push_back(op);
+call    0 returned 100%
+       61:  200:    ++numDCE;
+call    0 returned 100%
+       61:  201:    return success();
+        -:  202:  }
+        -:  203:
+        -:  204:  // Don't simplify operations with nested blocks. We don't currently model
+        -:  205:  // equality comparisons correctly among other things. It is also unclear
+        -:  206:  // whether we would want to CSE such operations.
+    18896:  207:  if (op->getNumRegions() != 0)
+branch  0 taken 5% (fallthrough)
+branch  1 taken 95%
+      990:  208:    return failure();
+        -:  209:
+        -:  210:  // Some simple use case of operation with memory side-effect are dealt with
+        -:  211:  // here. Operations with no side-effect are done after.
+    17906:  212:  if (!MemoryEffectOpInterface::hasNoEffect(op)) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+       26:  213:    auto memEffects = dyn_cast<MemoryEffectOpInterface>(op);
+call    0 returned 100%
+        -:  214:    // TODO: Only basic use case for operations with MemoryEffects::Read can be
+        -:  215:    // eleminated now. More work needs to be done for more complicated patterns
+        -:  216:    // and other side-effects.
+       26:  217:    if (!memEffects || !memEffects.onlyHasEffect<MemoryEffects::Read>())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  218:      return failure();
+        -:  219:
+        -:  220:    // Look for an existing definition for the operation.
+       26:  221:    if (auto *existing = knownValues.lookup(op)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  222:      if (existing->getBlock() == op->getBlock() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  223:          !hasOtherSideEffectingOpInBetween(existing, op)) {
+call    0 never executed
+        -:  224:        // The operation that can be deleted has been reach with no
+        -:  225:        // side-effecting operations in between the existing operation and
+        -:  226:        // this one so we can remove the duplicate.
+    #####:  227:        replaceUsesAndDelete(knownValues, op, existing, hasSSADominance);
+call    0 never executed
+    #####:  228:        return success();
+        -:  229:      }
+        -:  230:    }
+       26:  231:    knownValues.insert(op, op);
+call    0 returned 100%
+       26:  232:    return failure();
+        -:  233:  }
+        -:  234:
+        -:  235:  // Look for an existing definition for the operation.
+    17880:  236:  if (auto *existing = knownValues.lookup(op)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  237:    replaceUsesAndDelete(knownValues, op, existing, hasSSADominance);
+call    0 never executed
+    #####:  238:    ++numCSE;
+call    0 never executed
+    #####:  239:    return success();
+        -:  240:  }
+        -:  241:
+        -:  242:  // Otherwise, we add this operation to the known values map.
+    17880:  243:  knownValues.insert(op, op);
+call    0 returned 100%
+    17880:  244:  return failure();
+        -:  245:}
+        -:  246:
+function _ZN12_GLOBAL__N_13CSE13simplifyBlockERN4llvm15ScopedHashTableIPN4mlir9OperationES5_NS_19SimpleOperationInfoENS1_18RecyclingAllocatorINS1_20BumpPtrAllocatorImplINS1_15MallocAllocatorELm4096ELm4096ELm128EEENS1_18ScopedHashTableValIS5_S5_EELm32ELm8EEEEEPNS3_5BlockEb called 2664 returned 100% blocks executed 79%
+     2664:  247:void CSE::simplifyBlock(ScopedMapTy &knownValues, Block *bb,
+        -:  248:                        bool hasSSADominance) {
+    23389:  249:  for (auto &op : *bb) {
+branch  0 taken 89% (fallthrough)
+branch  1 taken 11%
+call    2 returned 100%
+        -:  250:    // If the operation is simplified, we don't process any held regions.
+    20725:  251:    if (succeeded(simplifyOperation(knownValues, &op, hasSSADominance)))
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+       61:  252:      continue;
+        -:  253:
+        -:  254:    // Most operations don't have regions, so fast path that case.
+    20664:  255:    if (op.getNumRegions() == 0)
+branch  0 taken 95% (fallthrough)
+branch  1 taken 5%
+    19674:  256:      continue;
+        -:  257:
+        -:  258:    // If this operation is isolated above, we can't process nested regions with
+        -:  259:    // the given 'knownValues' map. This would cause the insertion of implicit
+        -:  260:    // captures in explicit capture only regions.
+      990:  261:    if (op.mightHaveTrait<OpTrait::IsIsolatedFromAbove>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+      990:  262:      ScopedMapTy nestedKnownValues;
+call    0 returned 100%
+     2970:  263:      for (auto &region : op.getRegions())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+      990:  264:        simplifyRegion(nestedKnownValues, region);
+call    0 returned 100%
+      990:  265:      continue;
+call    0 returned 100%
+        -:  266:    }
+        -:  267:
+        -:  268:    // Otherwise, process nested regions normally.
+    #####:  269:    for (auto &region : op.getRegions())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  270:      simplifyRegion(knownValues, region);
+call    0 never executed
+        -:  271:  }
+        -:  272:  // Clear the MemoryEffects cache since its usage is by block only.
+     2664:  273:  memEffectsCache.clear();
+call    0 returned 100%
+     2664:  274:}
+        -:  275:
+function _ZN12_GLOBAL__N_13CSE14simplifyRegionERN4llvm15ScopedHashTableIPN4mlir9OperationES5_NS_19SimpleOperationInfoENS1_18RecyclingAllocatorINS1_20BumpPtrAllocatorImplINS1_15MallocAllocatorELm4096ELm4096ELm128EEENS1_18ScopedHashTableValIS5_S5_EELm32ELm8EEEEERNS3_6RegionE called 2880 returned 100% blocks executed 30%
+     2880:  276:void CSE::simplifyRegion(ScopedMapTy &knownValues, Region &region) {
+        -:  277:  // If the region is empty there is nothing to do.
+     2880:  278:  if (region.empty())
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+     2880:  279:    return;
+        -:  280:
+     2664:  281:  bool hasSSADominance = domInfo->hasSSADominance(&region);
+call    0 returned 100%
+        -:  282:
+        -:  283:  // If the region only contains one block, then simplify it directly.
+    2664*:  284:  if (region.hasOneBlock()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+     2664:  285:    ScopedMapTy::ScopeTy scope(knownValues);
+call    0 returned 100%
+     2664:  286:    simplifyBlock(knownValues, &region.front(), hasSSADominance);
+call    0 returned 100%
+call    1 returned 100%
+     2664:  287:    return;
+call    0 returned 100%
+        -:  288:  }
+        -:  289:
+        -:  290:  // If the region does not have dominanceInfo, then skip it.
+        -:  291:  // TODO: Regions without SSA dominance should define a different
+        -:  292:  // traversal order which is appropriate and can be used here.
+    #####:  293:  if (!hasSSADominance)
+branch  0 never executed
+branch  1 never executed
+        -:  294:    return;
+        -:  295:
+        -:  296:  // Note, deque is being used here because there was significant performance
+        -:  297:  // gains over vector when the container becomes very large due to the
+        -:  298:  // specific access patterns. If/when these performance issues are no
+        -:  299:  // longer a problem we can change this to vector. For more information see
+        -:  300:  // the llvm mailing list discussion on this:
+        -:  301:  // http://lists.llvm.org/pipermail/llvm-commits/Week-of-Mon-20120116/135228.html
+    #####:  302:  std::deque<std::unique_ptr<CFGStackNode>> stack;
+call    0 never executed
+call    1 never executed
+        -:  303:
+        -:  304:  // Process the nodes of the dom tree for this region.
+    #####:  305:  stack.emplace_back(std::make_unique<CFGStackNode>(
+call    0 never executed
+    #####:  306:      knownValues, domInfo->getRootNode(&region)));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  307:
+    #####:  308:  while (!stack.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    auto &currentNode = stack.back();
+branch  0 never executed
+branch  1 never executed
+        -:  310:
+        -:  311:    // Check to see if we need to process this node.
+    #####:  312:    if (!currentNode->processed) {
+branch  0 never executed
+branch  1 never executed
+    #####:  313:      currentNode->processed = true;
+call    0 never executed
+    #####:  314:      simplifyBlock(knownValues, currentNode->node->getBlock(),
+call    0 never executed
+        -:  315:                    hasSSADominance);
+        -:  316:    }
+        -:  317:
+        -:  318:    // Otherwise, check to see if we need to process a child node.
+    #####:  319:    if (currentNode->childIterator != currentNode->node->end()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  320:      auto *childNode = *(currentNode->childIterator++);
+call    0 never executed
+    #####:  321:      stack.emplace_back(
+    #####:  322:          std::make_unique<CFGStackNode>(knownValues, childNode));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  323:    } else {
+        -:  324:      // Finally, if the node and all of its children have been processed
+        -:  325:      // then we delete the node.
+    #####:  326:      stack.pop_back();
+call    0 never executed
+        -:  327:    }
+        -:  328:  }
+        -:  329:}
+        -:  330:
+function _ZN12_GLOBAL__N_13CSE14runOnOperationEv called 1888 returned 100% blocks executed 96%
+     1888:  331:void CSE::runOnOperation() {
+        -:  332:  /// A scoped hash table of defining operations within a region.
+     1888:  333:  ScopedMapTy knownValues;
+call    0 returned 100%
+        -:  334:
+     1888:  335:  domInfo = &getAnalysis<DominanceInfo>();
+call    0 returned 100%
+     1891:  336:  Operation *rootOp = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  337:
+     5675:  338:  for (auto &region : rootOp->getRegions())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 50% (fallthrough)
+branch  3 taken 50%
+     1893:  339:    simplifyRegion(knownValues, region);
+call    0 returned 100%
+        -:  340:
+        -:  341:  // If no operations were erased, then we mark all analyses as preserved.
+     1891:  342:  if (opsToErase.empty())
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+     1879:  343:    return markAllAnalysesPreserved();
+call    0 returned 100%
+call    1 returned 100%
+        -:  344:
+        -:  345:  /// Erase any operations that were marked as dead during simplification.
+       72:  346:  for (auto *op : opsToErase)
+branch  0 taken 85% (fallthrough)
+branch  1 taken 15%
+call    2 returned 98%
+       61:  347:    op->erase();
+call    0 returned 98%
+       11:  348:  opsToErase.clear();
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  349:
+        -:  350:  // We currently don't remove region operations, so mark dominance as
+        -:  351:  // preserved.
+       11:  352:  markAnalysesPreserved<DominanceInfo, PostDominanceInfo>();
+call    0 returned 100%
+       11:  353:  domInfo = nullptr;
+call    0 returned 100%
+        -:  354:}
+        -:  355:
+function _ZN4mlir13createCSEPassEv called 327645 returned 100% blocks executed 100%
+   327645:  356:std::unique_ptr<Pass> mlir::createCSEPass() { return std::make_unique<CSE>(); }
+call    0 returned 100%

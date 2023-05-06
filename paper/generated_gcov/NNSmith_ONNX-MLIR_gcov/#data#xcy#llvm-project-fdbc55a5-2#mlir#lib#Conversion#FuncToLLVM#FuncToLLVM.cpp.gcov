@@ -1,0 +1,1582 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Conversion/FuncToLLVM/FuncToLLVM.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/FuncToLLVM/CMakeFiles/obj.MLIRFuncToLLVM.dir/FuncToLLVM.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/FuncToLLVM/CMakeFiles/obj.MLIRFuncToLLVM.dir/FuncToLLVM.cpp.gcda
+        -:    0:Runs:128636
+        -:    1://===- FuncToLLVM.cpp - Func to LLVM dialect conversion -------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass to convert MLIR Func and builtin dialects
+        -:   10:// into the LLVM IR dialect.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+        -:   15:
+        -:   16:#include "mlir/Analysis/DataLayoutAnalysis.h"
+        -:   17:#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+        -:   18:#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+        -:   19:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+        -:   20:#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+        -:   21:#include "mlir/Conversion/LLVMCommon/Pattern.h"
+        -:   22:#include "mlir/Conversion/LLVMCommon/VectorPattern.h"
+        -:   23:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   24:#include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
+        -:   25:#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+        -:   26:#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+        -:   27:#include "mlir/Dialect/Utils/StaticValueUtils.h"
+        -:   28:#include "mlir/IR/Attributes.h"
+        -:   29:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   30:#include "mlir/IR/Builders.h"
+        -:   31:#include "mlir/IR/BuiltinAttributeInterfaces.h"
+        -:   32:#include "mlir/IR/BuiltinAttributes.h"
+        -:   33:#include "mlir/IR/BuiltinOps.h"
+        -:   34:#include "mlir/IR/PatternMatch.h"
+        -:   35:#include "mlir/IR/TypeUtilities.h"
+        -:   36:#include "mlir/Support/LogicalResult.h"
+        -:   37:#include "mlir/Support/MathExtras.h"
+        -:   38:#include "mlir/Transforms/DialectConversion.h"
+        -:   39:#include "mlir/Transforms/Passes.h"
+        -:   40:#include "llvm/ADT/SmallVector.h"
+        -:   41:#include "llvm/ADT/TypeSwitch.h"
+        -:   42:#include "llvm/IR/DerivedTypes.h"
+        -:   43:#include "llvm/IR/IRBuilder.h"
+        -:   44:#include "llvm/IR/Type.h"
+        -:   45:#include "llvm/Support/CommandLine.h"
+        -:   46:#include "llvm/Support/FormatVariadic.h"
+        -:   47:#include <algorithm>
+        -:   48:#include <functional>
+        -:   49:
+        -:   50:namespace mlir {
+        -:   51:#define GEN_PASS_DEF_CONVERTFUNCTOLLVM
+        -:   52:#include "mlir/Conversion/Passes.h.inc"
+        -:   53:} // namespace mlir
+        -:   54:
+        -:   55:using namespace mlir;
+        -:   56:
+        -:   57:#define PASS_NAME "convert-func-to-llvm"
+        -:   58:
+        -:   59:/// Only retain those attributes that are not constructed by
+        -:   60:/// `LLVMFuncOp::build`. If `filterArgAttrs` is set, also filter out argument
+        -:   61:/// attributes.
+function _ZL20filterFuncAttributesN4llvm8ArrayRefIN4mlir14NamedAttributeEEEbRNS_15SmallVectorImplIS2_EE called 0 returned 0% blocks executed 0%
+    #####:   62:static void filterFuncAttributes(ArrayRef<NamedAttribute> attrs,
+        -:   63:                                 bool filterArgAndResAttrs,
+        -:   64:                                 SmallVectorImpl<NamedAttribute> &result) {
+    #####:   65:  for (const auto &attr : attrs) {
+branch  0 never executed
+branch  1 never executed
+    #####:   66:    if (attr.getName() == SymbolTable::getSymbolAttrName() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   67:        attr.getName() == FunctionOpInterface::getTypeAttrName() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   68:        attr.getName() == "func.varargs" ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:   69:        (filterArgAndResAttrs &&
+branch  0 never executed
+branch  1 never executed
+    #####:   70:         (attr.getName() == FunctionOpInterface::getArgDictAttrName() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   71:          attr.getName() == FunctionOpInterface::getResultDictAttrName())))
+call    0 never executed
+call    1 never executed
+    #####:   72:      continue;
+    #####:   73:    result.push_back(attr);
+call    0 never executed
+        -:   74:  }
+    #####:   75:}
+        -:   76:
+        -:   77:/// Helper function for wrapping all attributes into a single DictionaryAttr
+function _ZL17wrapAsStructAttrsRN4mlir9OpBuilderENS_9ArrayAttrE called 0 returned 0% blocks executed 0%
+    #####:   78:static auto wrapAsStructAttrs(OpBuilder &b, ArrayAttr attrs) {
+    #####:   79:  return DictionaryAttr::get(
+        -:   80:      b.getContext(),
+    #####:   81:      b.getNamedAttr(LLVM::LLVMDialect::getStructAttrsAttrName(), attrs));
+call    0 never executed
+call    1 never executed
+        -:   82:}
+        -:   83:
+        -:   84:/// Combines all result attributes into a single DictionaryAttr
+        -:   85:/// and prepends to argument attrs.
+        -:   86:/// This is intended to be used to format the attributes for a C wrapper
+        -:   87:/// function when the result(s) is converted to the first function argument
+        -:   88:/// (in the multiple return case, all returns get wrapped into a single
+        -:   89:/// argument). The total number of argument attributes should be equal to
+        -:   90:/// (number of function arguments) + 1.
+        -:   91:static void
+function _ZL25prependResAttrsToArgAttrsRN4mlir9OpBuilderERN4llvm15SmallVectorImplINS_14NamedAttributeEEEm called 0 returned 0% blocks executed 0%
+    #####:   92:prependResAttrsToArgAttrs(OpBuilder &builder,
+        -:   93:                          SmallVectorImpl<NamedAttribute> &attributes,
+        -:   94:                          size_t numArguments) {
+    #####:   95:  auto allAttrs = SmallVector<Attribute>(
+call    0 never executed
+    #####:   96:      numArguments + 1, DictionaryAttr::get(builder.getContext()));
+call    0 never executed
+call    1 never executed
+    #####:   97:  NamedAttribute *argAttrs = nullptr;
+    #####:   98:  for (auto *it = attributes.begin(); it != attributes.end();) {
+branch  0 never executed
+branch  1 never executed
+    #####:   99:    if (it->getName() == FunctionOpInterface::getArgDictAttrName()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  100:      auto arrayAttrs = it->getValue().cast<ArrayAttr>();
+call    0 never executed
+    #####:  101:      assert(arrayAttrs.size() == numArguments &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  102:             "Number of arg attrs and args should match");
+    #####:  103:      std::copy(arrayAttrs.begin(), arrayAttrs.end(), allAttrs.begin() + 1);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  104:      argAttrs = it;
+    #####:  105:    } else if (it->getName() == FunctionOpInterface::getResultDictAttrName()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  106:      auto arrayAttrs = it->getValue().cast<ArrayAttr>();
+call    0 never executed
+    #####:  107:      assert(!arrayAttrs.empty() && "expected array to be non-empty");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  108:      allAttrs[0] = (arrayAttrs.size() == 1)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  109:                        ? arrayAttrs[0]
+call    0 never executed
+    #####:  110:                        : wrapAsStructAttrs(builder, arrayAttrs);
+call    0 never executed
+    #####:  111:      it = attributes.erase(it);
+call    0 never executed
+    #####:  112:      continue;
+        -:  113:    }
+    #####:  114:    it++;
+        -:  115:  }
+        -:  116:
+    #####:  117:  auto newArgAttrs =
+        -:  118:      builder.getNamedAttr(FunctionOpInterface::getArgDictAttrName(),
+    #####:  119:                           builder.getArrayAttr(allAttrs));
+call    0 never executed
+call    1 never executed
+    #####:  120:  if (!argAttrs) {
+branch  0 never executed
+branch  1 never executed
+    #####:  121:    attributes.emplace_back(newArgAttrs);
+call    0 never executed
+    #####:  122:    return;
+branch  0 never executed
+branch  1 never executed
+        -:  123:  }
+    #####:  124:  *argAttrs = newArgAttrs;
+branch  0 never executed
+branch  1 never executed
+        -:  125:}
+        -:  126:
+        -:  127:/// Creates an auxiliary function with pointer-to-memref-descriptor-struct
+        -:  128:/// arguments instead of unpacked arguments. This function can be called from C
+        -:  129:/// by passing a pointer to a C struct corresponding to a memref descriptor.
+        -:  130:/// Similarly, returned memrefs are passed via pointers to a C struct that is
+        -:  131:/// passed as additional argument.
+        -:  132:/// Internally, the auxiliary function unpacks the descriptor into individual
+        -:  133:/// components and forwards them to `newFuncOp` and forwards the results to
+        -:  134:/// the extra arguments.
+function _ZL22wrapForExternalCallersRN4mlir9OpBuilderENS_8LocationERNS_17LLVMTypeConverterENS_4func6FuncOpENS_4LLVM10LLVMFuncOpE called 0 returned 0% blocks executed 0%
+    #####:  135:static void wrapForExternalCallers(OpBuilder &rewriter, Location loc,
+        -:  136:                                   LLVMTypeConverter &typeConverter,
+        -:  137:                                   func::FuncOp funcOp,
+        -:  138:                                   LLVM::LLVMFuncOp newFuncOp) {
+    #####:  139:  auto type = funcOp.getFunctionType();
+call    0 never executed
+    #####:  140:  SmallVector<NamedAttribute, 4> attributes;
+call    0 never executed
+    #####:  141:  filterFuncAttributes(funcOp->getAttrs(), /*filterArgAndResAttrs=*/false,
+call    0 never executed
+call    1 never executed
+        -:  142:                       attributes);
+    #####:  143:  auto [wrapperFuncType, resultIsNowArg] =
+branch  0 never executed
+branch  1 never executed
+    #####:  144:      typeConverter.convertFunctionTypeCWrapper(type);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:  if (resultIsNowArg)
+branch  0 never executed
+branch  1 never executed
+    #####:  146:    prependResAttrsToArgAttrs(rewriter, attributes, funcOp.getNumArguments());
+call    0 never executed
+call    1 never executed
+    #####:  147:  auto wrapperFuncOp = rewriter.create<LLVM::LLVMFuncOp>(
+    #####:  148:      loc, llvm::formatv("_mlir_ciface_{0}", funcOp.getName()).str(),
+call    0 never executed
+call    1 never executed
+    #####:  149:      wrapperFuncType, LLVM::Linkage::External, /*dsoLocal*/ false,
+    #####:  150:      /*cconv*/ LLVM::CConv::C, attributes);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  151:
+    #####:  152:  OpBuilder::InsertionGuard guard(rewriter);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  153:  rewriter.setInsertionPointToStart(wrapperFuncOp.addEntryBlock());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  154:
+    #####:  155:  SmallVector<Value, 8> args;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  156:  size_t argOffset = resultIsNowArg ? 1 : 0;
+branch  0 never executed
+branch  1 never executed
+    #####:  157:  for (auto &en : llvm::enumerate(type.getInputs())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  158:    Value arg = wrapperFuncOp.getArgument(en.index() + argOffset);
+call    0 never executed
+    #####:  159:    if (auto memrefType = en.value().dyn_cast<MemRefType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  160:      Value loaded = rewriter.create<LLVM::LoadOp>(loc, arg);
+call    0 never executed
+call    1 never executed
+    #####:  161:      MemRefDescriptor::unpack(rewriter, loc, loaded, memrefType, args);
+call    0 never executed
+    #####:  162:      continue;
+        -:  163:    }
+    #####:  164:    if (en.value().isa<UnrankedMemRefType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  165:      Value loaded = rewriter.create<LLVM::LoadOp>(loc, arg);
+call    0 never executed
+call    1 never executed
+    #####:  166:      UnrankedMemRefDescriptor::unpack(rewriter, loc, loaded, args);
+call    0 never executed
+    #####:  167:      continue;
+        -:  168:    }
+        -:  169:
+    #####:  170:    args.push_back(arg);
+call    0 never executed
+        -:  171:  }
+        -:  172:
+    #####:  173:  auto call = rewriter.create<LLVM::CallOp>(loc, newFuncOp, args);
+call    0 never executed
+        -:  174:
+    #####:  175:  if (resultIsNowArg) {
+branch  0 never executed
+branch  1 never executed
+    #####:  176:    rewriter.create<LLVM::StoreOp>(loc, call.getResult(),
+call    0 never executed
+    #####:  177:                                   wrapperFuncOp.getArgument(0));
+call    0 never executed
+call    1 never executed
+    #####:  178:    rewriter.create<LLVM::ReturnOp>(loc, ValueRange{});
+call    0 never executed
+call    1 never executed
+        -:  179:  } else {
+    #####:  180:    rewriter.create<LLVM::ReturnOp>(loc, call.getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  181:  }
+    #####:  182:}
+        -:  183:
+        -:  184:/// Creates an auxiliary function with pointer-to-memref-descriptor-struct
+        -:  185:/// arguments instead of unpacked arguments. Creates a body for the (external)
+        -:  186:/// `newFuncOp` that allocates a memref descriptor on stack, packs the
+        -:  187:/// individual arguments into this descriptor and passes a pointer to it into
+        -:  188:/// the auxiliary function. If the result of the function cannot be directly
+        -:  189:/// returned, we write it to a special first argument that provides a pointer
+        -:  190:/// to a corresponding struct. This auxiliary external function is now
+        -:  191:/// compatible with functions defined in C using pointers to C structs
+        -:  192:/// corresponding to a memref descriptor.
+function _ZL20wrapExternalFunctionRN4mlir9OpBuilderENS_8LocationERNS_17LLVMTypeConverterENS_4func6FuncOpENS_4LLVM10LLVMFuncOpE called 0 returned 0% blocks executed 0%
+    #####:  193:static void wrapExternalFunction(OpBuilder &builder, Location loc,
+        -:  194:                                 LLVMTypeConverter &typeConverter,
+        -:  195:                                 func::FuncOp funcOp,
+        -:  196:                                 LLVM::LLVMFuncOp newFuncOp) {
+    #####:  197:  OpBuilder::InsertionGuard guard(builder);
+call    0 never executed
+        -:  198:
+    #####:  199:  auto [wrapperType, resultIsNowArg] =
+branch  0 never executed
+branch  1 never executed
+    #####:  200:      typeConverter.convertFunctionTypeCWrapper(funcOp.getFunctionType());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  201:  // This conversion can only fail if it could not convert one of the argument
+        -:  202:  // types. But since it has been applied to a non-wrapper function before, it
+        -:  203:  // should have failed earlier and not reach this point at all.
+    #####:  204:  assert(wrapperType && "unexpected type conversion failure");
+call    0 never executed
+        -:  205:
+    #####:  206:  SmallVector<NamedAttribute, 4> attributes;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  207:  filterFuncAttributes(funcOp->getAttrs(), /*filterArgAndResAttrs=*/false,
+call    0 never executed
+call    1 never executed
+        -:  208:                       attributes);
+        -:  209:
+    #####:  210:  if (resultIsNowArg)
+branch  0 never executed
+branch  1 never executed
+    #####:  211:    prependResAttrsToArgAttrs(builder, attributes, funcOp.getNumArguments());
+call    0 never executed
+call    1 never executed
+        -:  212:  // Create the auxiliary function.
+    #####:  213:  auto wrapperFunc = builder.create<LLVM::LLVMFuncOp>(
+    #####:  214:      loc, llvm::formatv("_mlir_ciface_{0}", funcOp.getName()).str(),
+call    0 never executed
+call    1 never executed
+    #####:  215:      wrapperType, LLVM::Linkage::External, /*dsoLocal*/ false,
+    #####:  216:      /*cconv*/ LLVM::CConv::C, attributes);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  217:
+    #####:  218:  builder.setInsertionPointToStart(newFuncOp.addEntryBlock());
+call    0 never executed
+call    1 never executed
+        -:  219:
+        -:  220:  // Get a ValueRange containing arguments.
+    #####:  221:  FunctionType type = funcOp.getFunctionType();
+call    0 never executed
+    #####:  222:  SmallVector<Value, 8> args;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  223:  args.reserve(type.getNumInputs());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  224:  ValueRange wrapperArgsRange(newFuncOp.getArguments());
+call    0 never executed
+call    1 never executed
+        -:  225:
+    #####:  226:  if (resultIsNowArg) {
+branch  0 never executed
+branch  1 never executed
+        -:  227:    // Allocate the struct on the stack and pass the pointer.
+    #####:  228:    Type resultType =
+call    0 never executed
+    #####:  229:        wrapperType.cast<LLVM::LLVMFunctionType>().getParamType(0);
+call    0 never executed
+    #####:  230:    Value one = builder.create<LLVM::ConstantOp>(
+    #####:  231:        loc, typeConverter.convertType(builder.getIndexType()),
+call    0 never executed
+call    1 never executed
+    #####:  232:        builder.getIntegerAttr(builder.getIndexType(), 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  233:    Value result = builder.create<LLVM::AllocaOp>(loc, resultType, one);
+call    0 never executed
+call    1 never executed
+    #####:  234:    args.push_back(result);
+call    0 never executed
+        -:  235:  }
+        -:  236:
+        -:  237:  // Iterate over the inputs of the original function and pack values into
+        -:  238:  // memref descriptors if the original type is a memref.
+    #####:  239:  for (auto &en : llvm::enumerate(type.getInputs())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  240:    Value arg;
+    #####:  241:    int numToDrop = 1;
+    #####:  242:    auto memRefType = en.value().dyn_cast<MemRefType>();
+call    0 never executed
+    #####:  243:    auto unrankedMemRefType = en.value().dyn_cast<UnrankedMemRefType>();
+call    0 never executed
+    #####:  244:    if (memRefType || unrankedMemRefType) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  245:      numToDrop = memRefType
+    #####:  246:                      ? MemRefDescriptor::getNumUnpackedValues(memRefType)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  247:                      : UnrankedMemRefDescriptor::getNumUnpackedValues();
+branch  0 never executed
+branch  1 never executed
+    #####:  248:      Value packed =
+        -:  249:          memRefType
+        -:  250:              ? MemRefDescriptor::pack(builder, loc, typeConverter, memRefType,
+    #####:  251:                                       wrapperArgsRange.take_front(numToDrop))
+call    0 never executed
+call    1 never executed
+        -:  252:              : UnrankedMemRefDescriptor::pack(
+        -:  253:                    builder, loc, typeConverter, unrankedMemRefType,
+    #####:  254:                    wrapperArgsRange.take_front(numToDrop));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  255:
+    #####:  256:      auto ptrTy = LLVM::LLVMPointerType::get(packed.getType());
+call    0 never executed
+    #####:  257:      Value one = builder.create<LLVM::ConstantOp>(
+    #####:  258:          loc, typeConverter.convertType(builder.getIndexType()),
+call    0 never executed
+call    1 never executed
+    #####:  259:          builder.getIntegerAttr(builder.getIndexType(), 1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  260:      Value allocated =
+    #####:  261:          builder.create<LLVM::AllocaOp>(loc, ptrTy, one, /*alignment=*/0);
+call    0 never executed
+call    1 never executed
+    #####:  262:      builder.create<LLVM::StoreOp>(loc, packed, allocated);
+call    0 never executed
+    #####:  263:      arg = allocated;
+        -:  264:    } else {
+    #####:  265:      arg = wrapperArgsRange[0];
+call    0 never executed
+        -:  266:    }
+        -:  267:
+    #####:  268:    args.push_back(arg);
+call    0 never executed
+    #####:  269:    wrapperArgsRange = wrapperArgsRange.drop_front(numToDrop);
+call    0 never executed
+        -:  270:  }
+    #####:  271:  assert(wrapperArgsRange.empty() && "did not map some of the arguments");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  272:
+    #####:  273:  auto call = builder.create<LLVM::CallOp>(loc, wrapperFunc, args);
+call    0 never executed
+        -:  274:
+    #####:  275:  if (resultIsNowArg) {
+branch  0 never executed
+branch  1 never executed
+    #####:  276:    Value result = builder.create<LLVM::LoadOp>(loc, args.front());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  277:    builder.create<LLVM::ReturnOp>(loc, result);
+call    0 never executed
+        -:  278:  } else {
+    #####:  279:    builder.create<LLVM::ReturnOp>(loc, call.getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  280:  }
+    #####:  281:}
+        -:  282:
+        -:  283:namespace {
+        -:  284:
+        -:  285:struct FuncOpConversionBase : public ConvertOpToLLVMPattern<func::FuncOp> {
+        -:  286:protected:
+    3157*:  287:  using ConvertOpToLLVMPattern<func::FuncOp>::ConvertOpToLLVMPattern;
+        -:  288:
+        -:  289:  // Convert input FuncOp to LLVMFuncOp by using the LLVMTypeConverter provided
+        -:  290:  // to this legalization pattern.
+        -:  291:  LLVM::LLVMFuncOp
+function _ZNK12_GLOBAL__N_120FuncOpConversionBase25convertFuncOpToLLVMFuncOpEN4mlir4func6FuncOpERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  292:  convertFuncOpToLLVMFuncOp(func::FuncOp funcOp,
+        -:  293:                            ConversionPatternRewriter &rewriter) const {
+        -:  294:    // Convert the original function arguments. They are converted using the
+        -:  295:    // LLVMTypeConverter provided to this legalization pattern.
+    #####:  296:    auto varargsAttr = funcOp->getAttrOfType<BoolAttr>("func.varargs");
+call    0 never executed
+    #####:  297:    TypeConverter::SignatureConversion result(funcOp.getNumArguments());
+call    0 never executed
+call    1 never executed
+    #####:  298:    auto llvmType = getTypeConverter()->convertFunctionSignature(
+    #####:  299:        funcOp.getFunctionType(), varargsAttr && varargsAttr.getValue(),
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  300:        result);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  301:    if (!llvmType)
+branch  0 never executed
+branch  1 never executed
+    #####:  302:      return nullptr;
+        -:  303:
+        -:  304:    // Propagate argument/result attributes to all converted arguments/result
+        -:  305:    // obtained after converting a given original argument/result.
+    #####:  306:    SmallVector<NamedAttribute, 4> attributes;
+call    0 never executed
+call    1 never executed
+    #####:  307:    filterFuncAttributes(funcOp->getAttrs(), /*filterArgAndResAttrs=*/true,
+call    0 never executed
+call    1 never executed
+        -:  308:                         attributes);
+    #####:  309:    if (ArrayAttr resAttrDicts = funcOp.getAllResultAttrs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  310:      assert(!resAttrDicts.empty() && "expected array to be non-empty");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  311:      auto newResAttrDicts =
+call    0 never executed
+    #####:  312:          (funcOp.getNumResults() == 1)
+        -:  313:              ? resAttrDicts
+        -:  314:              : rewriter.getArrayAttr(
+    #####:  315:                    {wrapAsStructAttrs(rewriter, resAttrDicts)});
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  316:      attributes.push_back(rewriter.getNamedAttr(
+call    0 never executed
+call    1 never executed
+        -:  317:          FunctionOpInterface::getResultDictAttrName(), newResAttrDicts));
+        -:  318:    }
+    #####:  319:    if (ArrayAttr argAttrDicts = funcOp.getAllArgAttrs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  320:      SmallVector<Attribute, 4> newArgAttrs(
+    #####:  321:          llvmType.cast<LLVM::LLVMFunctionType>().getNumParams());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  322:      for (unsigned i = 0, e = funcOp.getNumArguments(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  323:        // Some LLVM IR attribute have a type attached to them. During FuncOp ->
+        -:  324:        // LLVMFuncOp conversion these types may have changed. Account for that
+        -:  325:        // change by converting attributes' types as well.
+    #####:  326:        SmallVector<NamedAttribute, 4> convertedAttrs;
+call    0 never executed
+    #####:  327:        auto attrsDict = argAttrDicts[i].cast<DictionaryAttr>();
+call    0 never executed
+call    1 never executed
+    #####:  328:        convertedAttrs.reserve(attrsDict.size());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  329:        for (const NamedAttribute &attr : attrsDict) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+function _ZZNK12_GLOBAL__N_120FuncOpConversionBase25convertFuncOpToLLVMFuncOpEN4mlir4func6FuncOpERNS1_25ConversionPatternRewriterEENKUlRKNS1_14NamedAttributeEE_clES8_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  330:          const auto convert = [&](const NamedAttribute &attr) {
+    #####:  331:            return TypeAttr::get(getTypeConverter()->convertType(
+call    0 never executed
+    #####:  332:                attr.getValue().cast<TypeAttr>().getValue()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  333:          };
+    #####:  334:          if (attr.getName().getValue() ==
+call    0 never executed
+call    1 never executed
+        -:  335:              LLVM::LLVMDialect::getByValAttrName()) {
+    #####:  336:            convertedAttrs.push_back(rewriter.getNamedAttr(
+call    0 never executed
+call    1 never executed
+    #####:  337:                LLVM::LLVMDialect::getByValAttrName(), convert(attr)));
+call    0 never executed
+    #####:  338:          } else if (attr.getName().getValue() ==
+call    0 never executed
+call    1 never executed
+        -:  339:                     LLVM::LLVMDialect::getByRefAttrName()) {
+    #####:  340:            convertedAttrs.push_back(rewriter.getNamedAttr(
+call    0 never executed
+call    1 never executed
+    #####:  341:                LLVM::LLVMDialect::getByRefAttrName(), convert(attr)));
+call    0 never executed
+    #####:  342:          } else if (attr.getName().getValue() ==
+call    0 never executed
+call    1 never executed
+        -:  343:                     LLVM::LLVMDialect::getStructRetAttrName()) {
+    #####:  344:            convertedAttrs.push_back(rewriter.getNamedAttr(
+call    0 never executed
+call    1 never executed
+    #####:  345:                LLVM::LLVMDialect::getStructRetAttrName(), convert(attr)));
+call    0 never executed
+    #####:  346:          } else if (attr.getName().getValue() ==
+call    0 never executed
+call    1 never executed
+        -:  347:                     LLVM::LLVMDialect::getInAllocaAttrName()) {
+    #####:  348:            convertedAttrs.push_back(rewriter.getNamedAttr(
+call    0 never executed
+call    1 never executed
+    #####:  349:                LLVM::LLVMDialect::getInAllocaAttrName(), convert(attr)));
+call    0 never executed
+        -:  350:          } else {
+    #####:  351:            convertedAttrs.push_back(attr);
+call    0 never executed
+        -:  352:          }
+        -:  353:        }
+    #####:  354:        auto mapping = result.getInputMapping(i);
+call    0 never executed
+    #####:  355:        assert(mapping && "unexpected deletion of function argument");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  356:        for (size_t j = 0; j < mapping->size; ++j)
+branch  0 never executed
+branch  1 never executed
+    #####:  357:          newArgAttrs[mapping->inputNo + j] =
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  358:              DictionaryAttr::get(rewriter.getContext(), convertedAttrs);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  359:      }
+    #####:  360:      attributes.push_back(
+call    0 never executed
+call    1 never executed
+        -:  361:          rewriter.getNamedAttr(FunctionOpInterface::getArgDictAttrName(),
+    #####:  362:                                rewriter.getArrayAttr(newArgAttrs)));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  363:    }
+    #####:  364:    for (const auto &pair : llvm::enumerate(attributes)) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  365:      if (pair.value().getName() == "llvm.linkage") {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  366:        attributes.erase(attributes.begin() + pair.index());
+call    0 never executed
+    #####:  367:        break;
+call    0 never executed
+        -:  368:      }
+        -:  369:    }
+        -:  370:
+        -:  371:    // Create an LLVM function, use external linkage by default until MLIR
+        -:  372:    // functions have linkage.
+    #####:  373:    LLVM::Linkage linkage = LLVM::Linkage::External;
+    #####:  374:    if (funcOp->hasAttr("llvm.linkage")) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  375:      auto attr =
+    #####:  376:          funcOp->getAttr("llvm.linkage").dyn_cast<mlir::LLVM::LinkageAttr>();
+call    0 never executed
+call    1 never executed
+    #####:  377:      if (!attr) {
+branch  0 never executed
+branch  1 never executed
+    #####:  378:        funcOp->emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  379:            << "Contains llvm.linkage attribute not of type LLVM::LinkageAttr";
+call    0 never executed
+    #####:  380:        return nullptr;
+        -:  381:      }
+    #####:  382:      linkage = attr.getLinkage();
+call    0 never executed
+        -:  383:    }
+    #####:  384:    auto newFuncOp = rewriter.create<LLVM::LLVMFuncOp>(
+    #####:  385:        funcOp.getLoc(), funcOp.getName(), llvmType, linkage,
+    #####:  386:        /*dsoLocal*/ false, /*cconv*/ LLVM::CConv::C, attributes);
+call    0 never executed
+call    1 never executed
+    #####:  387:    rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  388:                                newFuncOp.end());
+    #####:  389:    if (failed(rewriter.convertRegionTypes(&newFuncOp.getBody(), *typeConverter,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  390:                                           &result)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  391:      return nullptr;
+        -:  392:
+    #####:  393:    return newFuncOp;
+        -:  394:  }
+        -:  395:};
+        -:  396:
+        -:  397:/// FuncOp legalization pattern that converts MemRef arguments to pointers to
+        -:  398:/// MemRef descriptors (LLVM struct data types) containing all the MemRef type
+        -:  399:/// information.
+        -:  400:struct FuncOpConversion : public FuncOpConversionBase {
+function _ZN12_GLOBAL__N_116FuncOpConversionC2ERN4mlir17LLVMTypeConverterE called 3157 returned 100% blocks executed 100%
+     3157:  401:  FuncOpConversion(LLVMTypeConverter &converter)
+     3157:  402:      : FuncOpConversionBase(converter) {}
+call    0 returned 100%
+call    1 returned 100%
+        -:  403:
+        -:  404:  LogicalResult
+function _ZNK12_GLOBAL__N_116FuncOpConversion15matchAndRewriteEN4mlir4func6FuncOpENS2_13FuncOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  405:  matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
+        -:  406:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  407:    auto newFuncOp = convertFuncOpToLLVMFuncOp(funcOp, rewriter);
+call    0 never executed
+    #####:  408:    if (!newFuncOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  409:      return failure();
+        -:  410:
+    #####:  411:    if (funcOp->getAttrOfType<UnitAttr>(
+branch  0 never executed
+branch  1 never executed
+    #####:  412:            LLVM::LLVMDialect::getEmitCWrapperAttrName())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  413:      if (newFuncOp.isVarArg())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  414:        return funcOp->emitError("C interface for variadic functions is not "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  415:                                 "supported yet.");
+call    0 never executed
+        -:  416:
+    #####:  417:      if (newFuncOp.isExternal())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  418:        wrapExternalFunction(rewriter, funcOp.getLoc(), *getTypeConverter(),
+call    0 never executed
+call    1 never executed
+        -:  419:                             funcOp, newFuncOp);
+        -:  420:      else
+    #####:  421:        wrapForExternalCallers(rewriter, funcOp.getLoc(), *getTypeConverter(),
+call    0 never executed
+call    1 never executed
+        -:  422:                               funcOp, newFuncOp);
+        -:  423:    }
+        -:  424:
+    #####:  425:    rewriter.eraseOp(funcOp);
+call    0 never executed
+    #####:  426:    return success();
+        -:  427:  }
+        -:  428:};
+        -:  429:
+        -:  430:/// FuncOp legalization pattern that converts MemRef arguments to bare pointers
+        -:  431:/// to the MemRef element type. This will impact the calling convention and ABI.
+        -:  432:struct BarePtrFuncOpConversion : public FuncOpConversionBase {
+    #####:  433:  using FuncOpConversionBase::FuncOpConversionBase;
+call    0 never executed
+        -:  434:
+        -:  435:  LogicalResult
+function _ZNK12_GLOBAL__N_123BarePtrFuncOpConversion15matchAndRewriteEN4mlir4func6FuncOpENS2_13FuncOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  436:  matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
+        -:  437:                  ConversionPatternRewriter &rewriter) const override {
+        -:  438:
+        -:  439:    // TODO: bare ptr conversion could be handled by argument materialization
+        -:  440:    // and most of the code below would go away. But to do this, we would need a
+        -:  441:    // way to distinguish between FuncOp and other regions in the
+        -:  442:    // addArgumentMaterialization hook.
+        -:  443:
+        -:  444:    // Store the type of memref-typed arguments before the conversion so that we
+        -:  445:    // can promote them to MemRef descriptor at the beginning of the function.
+    #####:  446:    SmallVector<Type, 8> oldArgTypes =
+    #####:  447:        llvm::to_vector<8>(funcOp.getFunctionType().getInputs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  448:
+    #####:  449:    auto newFuncOp = convertFuncOpToLLVMFuncOp(funcOp, rewriter);
+call    0 never executed
+    #####:  450:    if (!newFuncOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  451:      return failure();
+    #####:  452:    if (newFuncOp.getBody().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  453:      rewriter.eraseOp(funcOp);
+call    0 never executed
+    #####:  454:      return success();
+        -:  455:    }
+        -:  456:
+        -:  457:    // Promote bare pointers from memref arguments to memref descriptors at the
+        -:  458:    // beginning of the function so that all the memrefs in the function have a
+        -:  459:    // uniform representation.
+    #####:  460:    Block *entryBlock = &newFuncOp.getBody().front();
+call    0 never executed
+call    1 never executed
+    #####:  461:    auto blockArgs = entryBlock->getArguments();
+branch  0 never executed
+branch  1 never executed
+    #####:  462:    assert(blockArgs.size() == oldArgTypes.size() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  463:           "The number of arguments and types doesn't match");
+        -:  464:
+    #####:  465:    OpBuilder::InsertionGuard guard(rewriter);
+branch  0 never executed
+branch  1 never executed
+    #####:  466:    rewriter.setInsertionPointToStart(entryBlock);
+    #####:  467:    for (auto it : llvm::zip(blockArgs, oldArgTypes)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  468:      BlockArgument arg = std::get<0>(it);
+call    0 never executed
+    #####:  469:      Type argTy = std::get<1>(it);
+call    0 never executed
+        -:  470:
+        -:  471:      // Unranked memrefs are not supported in the bare pointer calling
+        -:  472:      // convention. We should have bailed out before in the presence of
+        -:  473:      // unranked memrefs.
+    #####:  474:      assert(!argTy.isa<UnrankedMemRefType>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  475:             "Unranked memref is not supported");
+    #####:  476:      auto memrefTy = argTy.dyn_cast<MemRefType>();
+call    0 never executed
+    #####:  477:      if (!memrefTy)
+branch  0 never executed
+branch  1 never executed
+    #####:  478:        continue;
+        -:  479:
+        -:  480:      // Replace barePtr with a placeholder (undef), promote barePtr to a ranked
+        -:  481:      // or unranked memref descriptor and replace placeholder with the last
+        -:  482:      // instruction of the memref descriptor.
+        -:  483:      // TODO: The placeholder is needed to avoid replacing barePtr uses in the
+        -:  484:      // MemRef descriptor instructions. We may want to have a utility in the
+        -:  485:      // rewriter to properly handle this use case.
+    #####:  486:      Location loc = funcOp.getLoc();
+call    0 never executed
+    #####:  487:      auto placeholder = rewriter.create<LLVM::UndefOp>(
+    #####:  488:          loc, getTypeConverter()->convertType(memrefTy));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  489:      rewriter.replaceUsesOfBlockArgument(arg, placeholder);
+call    0 never executed
+        -:  490:
+    #####:  491:      Value desc = MemRefDescriptor::fromStaticShape(
+    #####:  492:          rewriter, loc, *getTypeConverter(), memrefTy, arg);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  493:      rewriter.replaceOp(placeholder, {desc});
+call    0 never executed
+call    1 never executed
+        -:  494:    }
+        -:  495:
+    #####:  496:    rewriter.eraseOp(funcOp);
+call    0 never executed
+    #####:  497:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  498:  }
+        -:  499:};
+        -:  500:
+        -:  501:struct ConstantOpLowering : public ConvertOpToLLVMPattern<func::ConstantOp> {
+     3157:  502:  using ConvertOpToLLVMPattern<func::ConstantOp>::ConvertOpToLLVMPattern;
+call    0 returned 100%
+        -:  503:
+        -:  504:  LogicalResult
+function _ZNK12_GLOBAL__N_118ConstantOpLowering15matchAndRewriteEN4mlir4func10ConstantOpENS2_17ConstantOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  505:  matchAndRewrite(func::ConstantOp op, OpAdaptor adaptor,
+        -:  506:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  507:    auto type = typeConverter->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  508:    if (!type || !LLVM::isCompatibleType(type))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  509:      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+call    0 never executed
+        -:  510:
+    #####:  511:    auto newOp =
+    #####:  512:        rewriter.create<LLVM::AddressOfOp>(op.getLoc(), type, op.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  513:    for (const NamedAttribute &attr : op->getAttrs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  514:      if (attr.getName().strref() == "value")
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  515:        continue;
+    #####:  516:      newOp->setAttr(attr.getName(), attr.getValue());
+call    0 never executed
+call    1 never executed
+        -:  517:    }
+    #####:  518:    rewriter.replaceOp(op, newOp->getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  519:    return success();
+        -:  520:  }
+        -:  521:};
+        -:  522:
+        -:  523:// A CallOp automatically promotes MemRefType to a sequence of alloca/store and
+        -:  524:// passes the pointer to the MemRef across function boundaries.
+        -:  525:template <typename CallOpType>
+        -:  526:struct CallOpInterfaceLowering : public ConvertOpToLLVMPattern<CallOpType> {
+     6314:  527:  using ConvertOpToLLVMPattern<CallOpType>::ConvertOpToLLVMPattern;
+        -:  528:  using Super = CallOpInterfaceLowering<CallOpType>;
+        -:  529:  using Base = ConvertOpToLLVMPattern<CallOpType>;
+        -:  530:
+        -:  531:  LogicalResult
+    #####:  532:  matchAndRewrite(CallOpType callOp, typename CallOpType::Adaptor adaptor,
+        -:  533:                  ConversionPatternRewriter &rewriter) const override {
+        -:  534:    // Pack the result types into a struct.
+    #####:  535:    Type packedResult = nullptr;
+    #####:  536:    unsigned numResults = callOp.getNumResults();
+    #####:  537:    auto resultTypes = llvm::to_vector<4>(callOp.getResultTypes());
+        -:  538:
+    #####:  539:    if (numResults != 0) {
+    #####:  540:      if (!(packedResult =
+        -:  541:                this->getTypeConverter()->packFunctionResults(resultTypes)))
+    #####:  542:        return failure();
+        -:  543:    }
+        -:  544:
+    #####:  545:    auto promoted = this->getTypeConverter()->promoteOperands(
+        -:  546:        callOp.getLoc(), /*opOperands=*/callOp->getOperands(),
+        -:  547:        adaptor.getOperands(), rewriter);
+    #####:  548:    auto newOp = rewriter.create<LLVM::CallOp>(
+        -:  549:        callOp.getLoc(), packedResult ? TypeRange(packedResult) : TypeRange(),
+        -:  550:        promoted, callOp->getAttrs());
+        -:  551:
+    #####:  552:    SmallVector<Value, 4> results;
+    #####:  553:    if (numResults < 2) {
+        -:  554:      // If < 2 results, packing did not do anything and we can just return.
+    #####:  555:      results.append(newOp.result_begin(), newOp.result_end());
+        -:  556:    } else {
+        -:  557:      // Otherwise, it had been converted to an operation producing a structure.
+        -:  558:      // Extract individual results from the structure and return them as list.
+    #####:  559:      results.reserve(numResults);
+    #####:  560:      for (unsigned i = 0; i < numResults; ++i) {
+    #####:  561:        results.push_back(rewriter.create<LLVM::ExtractValueOp>(
+        -:  562:            callOp.getLoc(), newOp->getResult(0), i));
+        -:  563:      }
+        -:  564:    }
+        -:  565:
+    #####:  566:    if (this->getTypeConverter()->getOptions().useBarePtrCallConv) {
+        -:  567:      // For the bare-ptr calling convention, promote memref results to
+        -:  568:      // descriptors.
+    #####:  569:      assert(results.size() == resultTypes.size() &&
+        -:  570:             "The number of arguments and types doesn't match");
+    #####:  571:      this->getTypeConverter()->promoteBarePtrsToDescriptors(
+        -:  572:          rewriter, callOp.getLoc(), resultTypes, results);
+    #####:  573:    } else if (failed(this->copyUnrankedDescriptors(rewriter, callOp.getLoc(),
+        -:  574:                                                    resultTypes, results,
+        -:  575:                                                    /*toDynamic=*/false))) {
+    #####:  576:      return failure();
+        -:  577:    }
+        -:  578:
+    #####:  579:    rewriter.replaceOp(callOp, results);
+    #####:  580:    return success();
+        -:  581:  }
+------------------
+_ZNK12_GLOBAL__N_123CallOpInterfaceLoweringIN4mlir4func6CallOpEE15matchAndRewriteES3_NS2_13CallOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_123CallOpInterfaceLoweringIN4mlir4func6CallOpEE15matchAndRewriteES3_NS2_13CallOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  532:  matchAndRewrite(CallOpType callOp, typename CallOpType::Adaptor adaptor,
+branch  0 never executed
+branch  1 never executed
+        -:  533:                  ConversionPatternRewriter &rewriter) const override {
+        -:  534:    // Pack the result types into a struct.
+    #####:  535:    Type packedResult = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  536:    unsigned numResults = callOp.getNumResults();
+branch  0 never executed
+branch  1 never executed
+    #####:  537:    auto resultTypes = llvm::to_vector<4>(callOp.getResultTypes());
+call    0 never executed
+        -:  538:
+    #####:  539:    if (numResults != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  540:      if (!(packedResult =
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  541:                this->getTypeConverter()->packFunctionResults(resultTypes)))
+    #####:  542:        return failure();
+        -:  543:    }
+        -:  544:
+    #####:  545:    auto promoted = this->getTypeConverter()->promoteOperands(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  546:        callOp.getLoc(), /*opOperands=*/callOp->getOperands(),
+        -:  547:        adaptor.getOperands(), rewriter);
+    #####:  548:    auto newOp = rewriter.create<LLVM::CallOp>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  549:        callOp.getLoc(), packedResult ? TypeRange(packedResult) : TypeRange(),
+        -:  550:        promoted, callOp->getAttrs());
+        -:  551:
+    #####:  552:    SmallVector<Value, 4> results;
+branch  0 never executed
+branch  1 never executed
+    #####:  553:    if (numResults < 2) {
+branch  0 never executed
+branch  1 never executed
+        -:  554:      // If < 2 results, packing did not do anything and we can just return.
+    #####:  555:      results.append(newOp.result_begin(), newOp.result_end());
+call    0 never executed
+        -:  556:    } else {
+        -:  557:      // Otherwise, it had been converted to an operation producing a structure.
+        -:  558:      // Extract individual results from the structure and return them as list.
+    #####:  559:      results.reserve(numResults);
+branch  0 never executed
+branch  1 never executed
+    #####:  560:      for (unsigned i = 0; i < numResults; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  561:        results.push_back(rewriter.create<LLVM::ExtractValueOp>(
+call    0 never executed
+call    1 never executed
+        -:  562:            callOp.getLoc(), newOp->getResult(0), i));
+        -:  563:      }
+        -:  564:    }
+        -:  565:
+    #####:  566:    if (this->getTypeConverter()->getOptions().useBarePtrCallConv) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  567:      // For the bare-ptr calling convention, promote memref results to
+        -:  568:      // descriptors.
+    #####:  569:      assert(results.size() == resultTypes.size() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  570:             "The number of arguments and types doesn't match");
+    #####:  571:      this->getTypeConverter()->promoteBarePtrsToDescriptors(
+call    0 never executed
+call    1 never executed
+        -:  572:          rewriter, callOp.getLoc(), resultTypes, results);
+    #####:  573:    } else if (failed(this->copyUnrankedDescriptors(rewriter, callOp.getLoc(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  574:                                                    resultTypes, results,
+        -:  575:                                                    /*toDynamic=*/false))) {
+    #####:  576:      return failure();
+        -:  577:    }
+        -:  578:
+    #####:  579:    rewriter.replaceOp(callOp, results);
+call    0 never executed
+    #####:  580:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  581:  }
+------------------
+_ZNK12_GLOBAL__N_123CallOpInterfaceLoweringIN4mlir4func14CallIndirectOpEE15matchAndRewriteES3_NS2_21CallIndirectOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_123CallOpInterfaceLoweringIN4mlir4func14CallIndirectOpEE15matchAndRewriteES3_NS2_21CallIndirectOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  532:  matchAndRewrite(CallOpType callOp, typename CallOpType::Adaptor adaptor,
+branch  0 never executed
+branch  1 never executed
+        -:  533:                  ConversionPatternRewriter &rewriter) const override {
+        -:  534:    // Pack the result types into a struct.
+    #####:  535:    Type packedResult = nullptr;
+branch  0 never executed
+branch  1 never executed
+    #####:  536:    unsigned numResults = callOp.getNumResults();
+branch  0 never executed
+branch  1 never executed
+    #####:  537:    auto resultTypes = llvm::to_vector<4>(callOp.getResultTypes());
+call    0 never executed
+        -:  538:
+    #####:  539:    if (numResults != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  540:      if (!(packedResult =
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  541:                this->getTypeConverter()->packFunctionResults(resultTypes)))
+    #####:  542:        return failure();
+        -:  543:    }
+        -:  544:
+    #####:  545:    auto promoted = this->getTypeConverter()->promoteOperands(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  546:        callOp.getLoc(), /*opOperands=*/callOp->getOperands(),
+        -:  547:        adaptor.getOperands(), rewriter);
+    #####:  548:    auto newOp = rewriter.create<LLVM::CallOp>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  549:        callOp.getLoc(), packedResult ? TypeRange(packedResult) : TypeRange(),
+        -:  550:        promoted, callOp->getAttrs());
+        -:  551:
+    #####:  552:    SmallVector<Value, 4> results;
+branch  0 never executed
+branch  1 never executed
+    #####:  553:    if (numResults < 2) {
+branch  0 never executed
+branch  1 never executed
+        -:  554:      // If < 2 results, packing did not do anything and we can just return.
+    #####:  555:      results.append(newOp.result_begin(), newOp.result_end());
+call    0 never executed
+        -:  556:    } else {
+        -:  557:      // Otherwise, it had been converted to an operation producing a structure.
+        -:  558:      // Extract individual results from the structure and return them as list.
+    #####:  559:      results.reserve(numResults);
+branch  0 never executed
+branch  1 never executed
+    #####:  560:      for (unsigned i = 0; i < numResults; ++i) {
+branch  0 never executed
+branch  1 never executed
+    #####:  561:        results.push_back(rewriter.create<LLVM::ExtractValueOp>(
+call    0 never executed
+call    1 never executed
+        -:  562:            callOp.getLoc(), newOp->getResult(0), i));
+        -:  563:      }
+        -:  564:    }
+        -:  565:
+    #####:  566:    if (this->getTypeConverter()->getOptions().useBarePtrCallConv) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  567:      // For the bare-ptr calling convention, promote memref results to
+        -:  568:      // descriptors.
+    #####:  569:      assert(results.size() == resultTypes.size() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  570:             "The number of arguments and types doesn't match");
+    #####:  571:      this->getTypeConverter()->promoteBarePtrsToDescriptors(
+call    0 never executed
+call    1 never executed
+        -:  572:          rewriter, callOp.getLoc(), resultTypes, results);
+    #####:  573:    } else if (failed(this->copyUnrankedDescriptors(rewriter, callOp.getLoc(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  574:                                                    resultTypes, results,
+        -:  575:                                                    /*toDynamic=*/false))) {
+    #####:  576:      return failure();
+        -:  577:    }
+        -:  578:
+    #####:  579:    rewriter.replaceOp(callOp, results);
+call    0 never executed
+    #####:  580:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  581:  }
+------------------
+        -:  582:};
+        -:  583:
+        -:  584:struct CallOpLowering : public CallOpInterfaceLowering<func::CallOp> {
+     3157:  585:  using Super::Super;
+call    0 returned 100%
+        -:  586:};
+        -:  587:
+        -:  588:struct CallIndirectOpLowering
+        -:  589:    : public CallOpInterfaceLowering<func::CallIndirectOp> {
+     3157:  590:  using Super::Super;
+call    0 returned 100%
+        -:  591:};
+        -:  592:
+        -:  593:struct UnrealizedConversionCastOpLowering
+        -:  594:    : public ConvertOpToLLVMPattern<UnrealizedConversionCastOp> {
+        -:  595:  using ConvertOpToLLVMPattern<
+        -:  596:      UnrealizedConversionCastOp>::ConvertOpToLLVMPattern;
+        -:  597:
+        -:  598:  LogicalResult
+        -:  599:  matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+        -:  600:                  ConversionPatternRewriter &rewriter) const override {
+        -:  601:    SmallVector<Type> convertedTypes;
+        -:  602:    if (succeeded(typeConverter->convertTypes(op.getOutputs().getTypes(),
+        -:  603:                                              convertedTypes)) &&
+        -:  604:        convertedTypes == adaptor.getInputs().getTypes()) {
+        -:  605:      rewriter.replaceOp(op, adaptor.getInputs());
+        -:  606:      return success();
+        -:  607:    }
+        -:  608:
+        -:  609:    convertedTypes.clear();
+        -:  610:    if (succeeded(typeConverter->convertTypes(adaptor.getInputs().getTypes(),
+        -:  611:                                              convertedTypes)) &&
+        -:  612:        convertedTypes == op.getOutputs().getType()) {
+        -:  613:      rewriter.replaceOp(op, adaptor.getInputs());
+        -:  614:      return success();
+        -:  615:    }
+        -:  616:    return failure();
+        -:  617:  }
+        -:  618:};
+        -:  619:
+        -:  620:// Special lowering pattern for `ReturnOps`.  Unlike all other operations,
+        -:  621:// `ReturnOp` interacts with the function signature and must have as many
+        -:  622:// operands as the function has return values.  Because in LLVM IR, functions
+        -:  623:// can only return 0 or 1 value, we pack multiple values into a structure type.
+        -:  624:// Emit `UndefOp` followed by `InsertValueOp`s to create such structure if
+        -:  625:// necessary before returning it
+        -:  626:struct ReturnOpLowering : public ConvertOpToLLVMPattern<func::ReturnOp> {
+     3157:  627:  using ConvertOpToLLVMPattern<func::ReturnOp>::ConvertOpToLLVMPattern;
+call    0 returned 100%
+        -:  628:
+        -:  629:  LogicalResult
+function _ZNK12_GLOBAL__N_116ReturnOpLowering15matchAndRewriteEN4mlir4func8ReturnOpENS2_15ReturnOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  630:  matchAndRewrite(func::ReturnOp op, OpAdaptor adaptor,
+        -:  631:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  632:    Location loc = op.getLoc();
+call    0 never executed
+    #####:  633:    unsigned numArguments = op.getNumOperands();
+call    0 never executed
+    #####:  634:    SmallVector<Value, 4> updatedOperands;
+call    0 never executed
+        -:  635:
+    #####:  636:    if (getTypeConverter()->getOptions().useBarePtrCallConv) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  637:      // For the bare-ptr calling convention, extract the aligned pointer to
+        -:  638:      // be returned from the memref descriptor.
+    #####:  639:      for (auto it : llvm::zip(op->getOperands(), adaptor.getOperands())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  640:        Type oldTy = std::get<0>(it).getType();
+call    0 never executed
+    #####:  641:        Value newOperand = std::get<1>(it);
+call    0 never executed
+    #####:  642:        if (oldTy.isa<MemRefType>() && getTypeConverter()->canConvertToBarePtr(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  643:                                           oldTy.cast<BaseMemRefType>())) {
+call    0 never executed
+    #####:  644:          MemRefDescriptor memrefDesc(newOperand);
+call    0 never executed
+    #####:  645:          newOperand = memrefDesc.alignedPtr(rewriter, loc);
+call    0 never executed
+    #####:  646:        } else if (oldTy.isa<UnrankedMemRefType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  647:          // Unranked memref is not supported in the bare pointer calling
+        -:  648:          // convention.
+    #####:  649:          return failure();
+        -:  650:        }
+    #####:  651:        updatedOperands.push_back(newOperand);
+call    0 never executed
+        -:  652:      }
+        -:  653:    } else {
+    #####:  654:      updatedOperands = llvm::to_vector<4>(adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  655:      (void)copyUnrankedDescriptors(rewriter, loc, op.getOperands().getTypes(),
+        -:  656:                                    updatedOperands,
+    #####:  657:                                    /*toDynamic=*/true);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  658:    }
+        -:  659:
+        -:  660:    // If ReturnOp has 0 or 1 operand, create it and return immediately.
+    #####:  661:    if (numArguments <= 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:  662:      rewriter.replaceOpWithNewOp<LLVM::ReturnOp>(
+    #####:  663:          op, TypeRange(), updatedOperands, op->getAttrs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  664:      return success();
+        -:  665:    }
+        -:  666:
+        -:  667:    // Otherwise, we need to pack the arguments into an LLVM struct type before
+        -:  668:    // returning.
+    #####:  669:    auto packedType =
+    #####:  670:        getTypeConverter()->packFunctionResults(op.getOperandTypes());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  671:
+    #####:  672:    Value packed = rewriter.create<LLVM::UndefOp>(loc, packedType);
+call    0 never executed
+    #####:  673:    for (auto &it : llvm::enumerate(updatedOperands)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  674:      packed = rewriter.create<LLVM::InsertValueOp>(loc, packed, it.value(),
+call    0 never executed
+    #####:  675:                                                    it.index());
+call    0 never executed
+call    1 never executed
+        -:  676:    }
+    #####:  677:    rewriter.replaceOpWithNewOp<LLVM::ReturnOp>(op, TypeRange(), packed,
+call    0 never executed
+    #####:  678:                                                op->getAttrs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  679:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  680:  }
+        -:  681:};
+        -:  682:} // namespace
+        -:  683:
+function _ZN4mlir41populateFuncToLLVMFuncOpConversionPatternERNS_17LLVMTypeConverterERNS_17RewritePatternSetE called 3157 returned 100% blocks executed 67%
+     3157:  684:void mlir::populateFuncToLLVMFuncOpConversionPattern(
+        -:  685:    LLVMTypeConverter &converter, RewritePatternSet &patterns) {
+     3157:  686:  if (converter.getOptions().useBarePtrCallConv)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  687:    patterns.add<BarePtrFuncOpConversion>(converter);
+call    0 never executed
+        -:  688:  else
+     3157:  689:    patterns.add<FuncOpConversion>(converter);
+call    0 returned 100%
+     3157:  690:}
+        -:  691:
+function _ZN4mlir36populateFuncToLLVMConversionPatternsERNS_17LLVMTypeConverterERNS_17RewritePatternSetE called 2133 returned 100% blocks executed 100%
+     3157:  692:void mlir::populateFuncToLLVMConversionPatterns(LLVMTypeConverter &converter,
+        -:  693:                                                RewritePatternSet &patterns) {
+     2133:  694:  populateFuncToLLVMFuncOpConversionPattern(converter, patterns);
+call    0 returned 100%
+        -:  695:  // clang-format off
+     3157:  696:  patterns.add<
+        -:  697:      CallIndirectOpLowering,
+        -:  698:      CallOpLowering,
+        -:  699:      ConstantOpLowering,
+     3157:  700:      ReturnOpLowering>(converter);
+call    0 returned 100%
+call    1 returned 100%
+        -:  701:  // clang-format on
+     2133:  702:}
+        -:  703:
+        -:  704:namespace {
+        -:  705:/// A pass converting Func operations into the LLVM IR dialect.
+    #####:  706:struct ConvertFuncToLLVMPass
+call    0 never executed
+        -:  707:    : public impl::ConvertFuncToLLVMBase<ConvertFuncToLLVMPass> {
+   129872:  708:  ConvertFuncToLLVMPass() = default;
+call    0 returned 100%
+function _ZN12_GLOBAL__N_121ConvertFuncToLLVMPassC2EbjbRKN4llvm10DataLayoutE called 0 returned 0% blocks executed 0%
+    #####:  709:  ConvertFuncToLLVMPass(bool useBarePtrCallConv, unsigned indexBitwidth,
+        -:  710:                        bool useAlignedAlloc,
+    #####:  711:                        const llvm::DataLayout &dataLayout) {
+call    0 never executed
+    #####:  712:    this->useBarePtrCallConv = useBarePtrCallConv;
+branch  0 never executed
+branch  1 never executed
+    #####:  713:    this->indexBitwidth = indexBitwidth;
+branch  0 never executed
+branch  1 never executed
+    #####:  714:    this->dataLayout = dataLayout.getStringRepresentation();
+call    0 never executed
+    #####:  715:  }
+        -:  716:
+        -:  717:  /// Run the dialect converter on the module.
+function _ZN12_GLOBAL__N_121ConvertFuncToLLVMPass14runOnOperationEv called 1024 returned 100% blocks executed 90%
+     1024:  718:  void runOnOperation() override {
+     1024:  719:    if (failed(LLVM::LLVMDialect::verifyDataLayoutString(
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+function _ZZN12_GLOBAL__N_121ConvertFuncToLLVMPass14runOnOperationEvENKUlRKN4llvm5TwineEE_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  720:            this->dataLayout, [this](const Twine &message) {
+    #####:  721:              getOperation().emitError() << message.str();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+    #####:  722:            }))) {
+    #####:  723:      signalPassFailure();
+call    0 never executed
+    #####:  724:      return;
+        -:  725:    }
+        -:  726:
+     1024:  727:    ModuleOp m = getOperation();
+call    0 returned 100%
+     1024:  728:    const auto &dataLayoutAnalysis = getAnalysis<DataLayoutAnalysis>();
+call    0 returned 100%
+        -:  729:
+     1024:  730:    LowerToLLVMOptions options(&getContext(),
+call    0 returned 100%
+     3072:  731:                               dataLayoutAnalysis.getAtOrAbove(m));
+call    0 returned 100%
+call    1 returned 100%
+     1024:  732:    options.useBarePtrCallConv = useBarePtrCallConv;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+     1024:  733:    if (indexBitwidth != kDeriveIndexBitwidthFromDataLayout)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  734:      options.overrideIndexBitwidth(indexBitwidth);
+     1024:  735:    options.dataLayout = llvm::DataLayout(this->dataLayout);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  736:
+     1024:  737:    LLVMTypeConverter typeConverter(&getContext(), options,
+call    0 returned 100%
+     2048:  738:                                    &dataLayoutAnalysis);
+call    0 returned 100%
+call    1 returned 100%
+        -:  739:
+     2048:  740:    RewritePatternSet patterns(&getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     1024:  741:    populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+call    0 returned 100%
+        -:  742:
+        -:  743:    // TODO: Remove these in favor of their dedicated conversion passes.
+     1024:  744:    arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+call    0 returned 100%
+     1024:  745:    cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
+call    0 returned 100%
+        -:  746:
+     2048:  747:    LLVMConversionTarget target(getContext());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+     1024:  748:    if (failed(applyPartialConversion(m, target, std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  749:      signalPassFailure();
+call    0 never executed
+        -:  750:
+     2048:  751:    m->setAttr(LLVM::LLVMDialect::getDataLayoutAttrName(),
+call    0 returned 100%
+call    1 returned 100%
+     2048:  752:               StringAttr::get(m.getContext(), this->dataLayout));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  753:  }
+        -:  754:};
+        -:  755:} // namespace
+        -:  756:
+function _ZN4mlir27createConvertFuncToLLVMPassEv called 129872 returned 100% blocks executed 100%
+   129872:  757:std::unique_ptr<OperationPass<ModuleOp>> mlir::createConvertFuncToLLVMPass() {
+   129872:  758:  return std::make_unique<ConvertFuncToLLVMPass>();
+call    0 returned 100%
+        -:  759:}
+        -:  760:
+        -:  761:std::unique_ptr<OperationPass<ModuleOp>>
+function _ZN4mlir27createConvertFuncToLLVMPassERKNS_18LowerToLLVMOptionsE called 0 returned 0% blocks executed 0%
+    #####:  762:mlir::createConvertFuncToLLVMPass(const LowerToLLVMOptions &options) {
+    #####:  763:  auto allocLowering = options.allocLowering;
+        -:  764:  // There is no way to provide additional patterns for pass, so
+        -:  765:  // AllocLowering::None will always fail.
+    #####:  766:  assert(allocLowering != LowerToLLVMOptions::AllocLowering::None &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  767:         "ConvertFuncToLLVMPass doesn't support AllocLowering::None");
+    #####:  768:  bool useAlignedAlloc =
+    #####:  769:      (allocLowering == LowerToLLVMOptions::AllocLowering::AlignedAlloc);
+    #####:  770:  return std::make_unique<ConvertFuncToLLVMPass>(
+    #####:  771:      options.useBarePtrCallConv, options.getIndexBitwidth(), useAlignedAlloc,
+    #####:  772:      options.dataLayout);
+call    0 never executed
+        -:  773:}

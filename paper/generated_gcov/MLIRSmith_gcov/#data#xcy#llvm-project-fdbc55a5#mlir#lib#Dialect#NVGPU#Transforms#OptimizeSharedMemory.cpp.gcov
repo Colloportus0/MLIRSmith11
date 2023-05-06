@@ -1,0 +1,523 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/NVGPU/Transforms/OptimizeSharedMemory.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/NVGPU/Transforms/CMakeFiles/obj.MLIRNVGPUTransforms.dir/OptimizeSharedMemory.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/NVGPU/Transforms/CMakeFiles/obj.MLIRNVGPUTransforms.dir/OptimizeSharedMemory.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- OptimizeSharedMemory.cpp - MLIR NVGPU pass implementation ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements transforms to optimize accesses to shared memory.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/NVGPU/Passes.h"
+        -:   14:
+        -:   15:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   16:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   17:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   18:#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
+        -:   19:#include "mlir/Dialect/NVGPU/Transforms/Transforms.h"
+        -:   20:#include "mlir/Dialect/Vector/IR/VectorOps.h"
+        -:   21:#include "mlir/Interfaces/SideEffectInterfaces.h"
+        -:   22:#include "mlir/Support/LogicalResult.h"
+        -:   23:#include "llvm/ADT/STLExtras.h"
+        -:   24:#include "llvm/Support/MathExtras.h"
+        -:   25:
+        -:   26:namespace mlir {
+        -:   27:namespace nvgpu {
+        -:   28:#define GEN_PASS_DEF_OPTIMIZESHAREDMEMORY
+        -:   29:#include "mlir/Dialect/NVGPU/Passes.h.inc"
+        -:   30:} // namespace nvgpu
+        -:   31:} // namespace mlir
+        -:   32:
+        -:   33:using namespace mlir;
+        -:   34:using namespace mlir::nvgpu;
+        -:   35:
+        -:   36:/// The size of a shared memory line according to NV documentation.
+        -:   37:constexpr int64_t kSharedMemoryLineSizeBytes = 128;
+        -:   38:/// We optimize for 128bit accesses, but this can be made an argument in the
+        -:   39:/// future.
+        -:   40:constexpr int64_t kDefaultVectorSizeBits = 128;
+        -:   41:
+        -:   42:/// Uses `srcIndexValue` to permute `tgtIndexValue` via
+        -:   43:/// `result = xor(floordiv(srcIdxVal,permuteEveryN),
+        -:   44:///               floordiv(tgtIdxVal,vectorSize)))
+        -:   45:///            + tgtIdxVal % vectorSize`
+        -:   46:/// This is done using an optimized sequence of `arith` operations.
+function _ZL19permuteVectorOffsetRN4mlir9OpBuilderENS_8LocationEN4llvm8ArrayRefINS_5ValueEEENS_10MemRefTypeEll called 0 returned 0% blocks executed 0%
+    #####:   47:static Value permuteVectorOffset(OpBuilder &b, Location loc,
+        -:   48:                                 ArrayRef<Value> indices, MemRefType memrefTy,
+        -:   49:                                 int64_t srcDim, int64_t tgtDim) {
+        -:   50:  // Adjust the src index to change how often the permutation changes
+        -:   51:  // if necessary.
+    #####:   52:  Value src = indices[srcDim];
+branch  0 never executed
+branch  1 never executed
+        -:   53:
+        -:   54:  // We only want to permute every N iterations of the target dim where N is
+        -:   55:  // ceil(sharedMemoryLineSizeBytes / dimSizeBytes(tgtDim)).
+    #####:   56:  const int64_t permuteEveryN = std::max<int64_t>(
+    #####:   57:      1, kSharedMemoryLineSizeBytes / ((memrefTy.getDimSize(tgtDim) *
+call    0 never executed
+call    1 never executed
+    #####:   58:                                        memrefTy.getElementTypeBitWidth()) /
+branch  0 never executed
+branch  1 never executed
+    #####:   59:                                       8));
+        -:   60:
+        -:   61:  // clang-format off
+        -:   62:  // Index bit representation (b0 = least significant bit) for dim(1)
+        -:   63:  // of a `memref<?x?xDT>` is as follows:
+        -:   64:  // N := log2(128/elementSizeBits)
+        -:   65:  // M := log2(dimSize(1))
+        -:   66:  // then
+        -:   67:  // bits[0:N] = sub-vector element offset
+        -:   68:  // bits[N:M] = vector index
+        -:   69:  // clang-format on
+    #####:   70:  int64_t n =
+call    0 never executed
+    #####:   71:      llvm::Log2_64(kDefaultVectorSizeBits / memrefTy.getElementTypeBitWidth());
+branch  0 never executed
+branch  1 never executed
+    #####:   72:  int64_t m = llvm::Log2_64(memrefTy.getDimSize(tgtDim));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   73:
+        -:   74:  // Capture bits[0:(M-N)] of src by first creating a (M-N) mask.
+    #####:   75:  int64_t mask = (1LL << (m - n)) - 1;
+    #####:   76:  if (permuteEveryN > 1)
+branch  0 never executed
+branch  1 never executed
+    #####:   77:    mask = mask << llvm::Log2_64(permuteEveryN);
+    #####:   78:  Value srcBits = b.create<arith::ConstantIndexOp>(loc, mask);
+call    0 never executed
+call    1 never executed
+    #####:   79:  srcBits = b.create<arith::AndIOp>(loc, src, srcBits);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   80:
+        -:   81:  // Use the src bits to permute the target bits b[N:M] containing the
+        -:   82:  // vector offset.
+    #####:   83:  if (permuteEveryN > 1) {
+branch  0 never executed
+branch  1 never executed
+    #####:   84:    int64_t shlBits = n - llvm::Log2_64(permuteEveryN);
+branch  0 never executed
+branch  1 never executed
+    #####:   85:    if (shlBits > 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:   86:      Value finalShiftVal = b.create<arith::ConstantIndexOp>(loc, shlBits);
+call    0 never executed
+call    1 never executed
+        -:   87:      srcBits = b.createOrFold<arith::ShLIOp>(loc, srcBits, finalShiftVal);
+    #####:   88:    } else if (shlBits < 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:   89:      Value finalShiftVal = b.create<arith::ConstantIndexOp>(loc, -1 * shlBits);
+call    0 never executed
+call    1 never executed
+    #####:   90:      srcBits = b.createOrFold<arith::ShRUIOp>(loc, srcBits, finalShiftVal);
+call    0 never executed
+        -:   91:    }
+        -:   92:  } else {
+    #####:   93:    Value finalShiftVal = b.create<arith::ConstantIndexOp>(loc, n);
+call    0 never executed
+call    1 never executed
+    #####:   94:    srcBits = b.createOrFold<arith::ShLIOp>(loc, srcBits, finalShiftVal);
+call    0 never executed
+        -:   95:  }
+        -:   96:
+    #####:   97:  Value permutedVectorIdx =
+    #####:   98:      b.create<arith::XOrIOp>(loc, indices[tgtDim], srcBits);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   99:  return permutedVectorIdx;
+        -:  100:}
+        -:  101:
+function _ZL16transformIndicesRN4mlir9OpBuilderENS_8LocationERN4llvm11SmallVectorINS_5ValueELj4EEENS_10MemRefTypeEll called 0 returned 0% blocks executed 0%
+    #####:  102:static void transformIndices(OpBuilder &builder, Location loc,
+        -:  103:                             SmallVector<Value, 4> &indices,
+        -:  104:                             MemRefType memrefTy, int64_t srcDim,
+        -:  105:                             int64_t tgtDim) {
+    #####:  106:  indices[tgtDim] =
+branch  0 never executed
+branch  1 never executed
+    #####:  107:      permuteVectorOffset(builder, loc, indices, memrefTy, srcDim, tgtDim);
+call    0 never executed
+    #####:  108:}
+        -:  109:
+function _Z10getIndicesPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:  110:Operation::operand_range getIndices(Operation *op) {
+    #####:  111:  if (auto ldmatrixOp = dyn_cast<LdMatrixOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  112:    return ldmatrixOp.getIndices();
+call    0 never executed
+    #####:  113:  if (auto copyOp = dyn_cast<DeviceAsyncCopyOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  114:    return copyOp.getDstIndices();
+call    0 never executed
+    #####:  115:  if (auto loadOp = dyn_cast<memref::LoadOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  116:    return loadOp.getIndices();
+call    0 never executed
+    #####:  117:  if (auto storeOp = dyn_cast<memref::StoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  118:    return storeOp.getIndices();
+call    0 never executed
+    #####:  119:  if (auto vectorReadOp = dyn_cast<vector::LoadOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  120:    return vectorReadOp.getIndices();
+call    0 never executed
+    #####:  121:  if (auto vectorStoreOp = dyn_cast<vector::StoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  122:    return vectorStoreOp.getIndices();
+call    0 never executed
+    #####:  123:  llvm_unreachable("unsupported op type");
+call    0 never executed
+        -:  124:}
+        -:  125:
+function _Z10setIndicesPN4mlir9OperationEN4llvm8ArrayRefINS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  126:void setIndices(Operation *op, ArrayRef<Value> indices) {
+    #####:  127:  if (auto ldmatrixOp = dyn_cast<LdMatrixOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  128:    return ldmatrixOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  129:  if (auto copyOp = dyn_cast<DeviceAsyncCopyOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  130:    return copyOp.getDstIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  131:  if (auto loadOp = dyn_cast<memref::LoadOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  132:    return loadOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  133:  if (auto storeOp = dyn_cast<memref::StoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  134:    return storeOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  135:  if (auto vectorReadOp = dyn_cast<vector::LoadOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  136:    return vectorReadOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  137:  if (auto vectorStoreOp = dyn_cast<vector::StoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  138:    return vectorStoreOp.getIndicesMutable().assign(indices);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  139:  llvm_unreachable("unsupported op type");
+call    0 never executed
+        -:  140:}
+        -:  141:
+        -:  142:/// Return all operations within `parentOp` that read from or write to
+        -:  143:/// `shmMemRef`.
+        -:  144:static LogicalResult
+function _ZL21getShmReadAndWriteOpsPN4mlir9OperationENS_5ValueERN4llvm11SmallVectorIS1_Lj16EEES6_ called 0 returned 0% blocks executed 0%
+    #####:  145:getShmReadAndWriteOps(Operation *parentOp, Value shmMemRef,
+        -:  146:                      SmallVector<Operation *, 16> &readOps,
+        -:  147:                      SmallVector<Operation *, 16> &writeOps) {
+function _ZZL21getShmReadAndWriteOpsPN4mlir9OperationENS_5ValueERN4llvm11SmallVectorIS1_Lj16EEES6_ENKUlS1_E_clES1_ called 0 returned 0% blocks executed 0%
+    #####:  148:  parentOp->walk([&](Operation *op) {
+call    0 never executed
+    #####:  149:    MemoryEffectOpInterface iface = dyn_cast<MemoryEffectOpInterface>(op);
+call    0 never executed
+    #####:  150:    if (!iface)
+branch  0 never executed
+branch  1 never executed
+    #####:  151:      return;
+    #####:  152:    Optional<MemoryEffects::EffectInstance> effect =
+    #####:  153:        iface.getEffectOnValue<MemoryEffects::Read>(shmMemRef);
+call    0 never executed
+    #####:  154:    if (effect) {
+branch  0 never executed
+branch  1 never executed
+    #####:  155:      readOps.push_back(op);
+    #####:  156:      return;
+call    0 never executed
+        -:  157:    }
+    #####:  158:    effect = iface.getEffectOnValue<MemoryEffects::Write>(shmMemRef);
+call    0 never executed
+    #####:  159:    if (effect)
+branch  0 never executed
+branch  1 never executed
+    #####:  160:      writeOps.push_back(op);
+call    0 never executed
+        -:  161:  });
+        -:  162:
+        -:  163:  // Restrict to a supported set of ops. We also require at least 2D access,
+        -:  164:  // although this could be relaxed.
+function _ZZL21getShmReadAndWriteOpsPN4mlir9OperationENS_5ValueERN4llvm11SmallVectorIS1_Lj16EEES6_ENKUlS1_E0_clES1_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  165:  if (llvm::any_of(readOps, [](Operation *op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  166:        return !isa<memref::LoadOp, vector::LoadOp, nvgpu::LdMatrixOp>(op) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  167:               getIndices(op).size() < 2;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  168:      }))
+    #####:  169:    return failure();
+function _ZZL21getShmReadAndWriteOpsPN4mlir9OperationENS_5ValueERN4llvm11SmallVectorIS1_Lj16EEES6_ENKUlS1_E1_clES1_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  170:  if (llvm::any_of(writeOps, [](Operation *op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  171:        return !isa<memref::StoreOp, vector::StoreOp, nvgpu::DeviceAsyncCopyOp>(
+call    0 never executed
+    #####:  172:                   op) ||
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  173:               getIndices(op).size() < 2;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  174:      }))
+    #####:  175:    return failure();
+        -:  176:
+    #####:  177:  return success();
+        -:  178:}
+        -:  179:
+        -:  180:mlir::LogicalResult
+function _ZN4mlir5nvgpu34optimizeSharedMemoryReadsAndWritesEPNS_9OperationENS_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  181:mlir::nvgpu::optimizeSharedMemoryReadsAndWrites(Operation *parentOp,
+        -:  182:                                                Value memrefValue) {
+    #####:  183:  auto memRefType = memrefValue.getType().dyn_cast<MemRefType>();
+call    0 never executed
+    #####:  184:  if (!memRefType || memRefType.getMemorySpaceAsInt() !=
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  185:                         gpu::GPUDialect::getWorkgroupAddressSpace())
+    #####:  186:    return failure();
+        -:  187:
+        -:  188:  // Abort if the given value has any sub-views; we do not do any alias
+        -:  189:  // analysis.
+    #####:  190:  bool hasSubView = false;
+    #####:  191:  parentOp->walk([&](memref::SubViewOp subView) { hasSubView = true; });
+call    0 never executed
+    #####:  192:  if (hasSubView)
+branch  0 never executed
+branch  1 never executed
+    #####:  193:    return failure();
+        -:  194:
+        -:  195:  // Check if this is necessary given the assumption of 128b accesses:
+        -:  196:  // If dim[rank-1] is small enough to fit 8 rows in a 128B line.
+    #####:  197:  const int64_t rowSize = memRefType.getDimSize(memRefType.getRank() - 1);
+call    0 never executed
+call    1 never executed
+    #####:  198:  const int64_t rowsPerLine =
+call    0 never executed
+    #####:  199:      (8 * kSharedMemoryLineSizeBytes / memRefType.getElementTypeBitWidth()) /
+    #####:  200:      rowSize;
+    #####:  201:  const int64_t threadGroupSize =
+branch  0 never executed
+branch  1 never executed
+    #####:  202:      1LL << (7 - llvm::Log2_64(kDefaultVectorSizeBits / 8));
+    #####:  203:  if (rowsPerLine >= threadGroupSize)
+branch  0 never executed
+branch  1 never executed
+    #####:  204:    return failure();
+        -:  205:
+        -:  206:  // Get sets of operations within the function that read/write to shared
+        -:  207:  // memory.
+    #####:  208:  SmallVector<Operation *, 16> shmReadOps;
+call    0 never executed
+    #####:  209:  SmallVector<Operation *, 16> shmWriteOps;
+branch  0 never executed
+branch  1 never executed
+    #####:  210:  if (failed(getShmReadAndWriteOps(parentOp, memrefValue, shmReadOps,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  211:                                   shmWriteOps)))
+    #####:  212:    return failure();
+        -:  213:
+    #####:  214:  if (shmReadOps.empty() || shmWriteOps.empty())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  215:    return failure();
+        -:  216:
+    #####:  217:  OpBuilder builder(parentOp->getContext());
+call    0 never executed
+call    1 never executed
+        -:  218:
+    #####:  219:  int64_t tgtDim = memRefType.getRank() - 1;
+call    0 never executed
+    #####:  220:  int64_t srcDim = memRefType.getRank() - 2;
+call    0 never executed
+        -:  221:
+        -:  222:  // Transform indices for the ops writing to shared memory.
+    #####:  223:  while (!shmWriteOps.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  224:    Operation *shmWriteOp = shmWriteOps.back();
+call    0 never executed
+    #####:  225:    shmWriteOps.pop_back();
+call    0 never executed
+    #####:  226:    builder.setInsertionPoint(shmWriteOp);
+call    0 never executed
+        -:  227:
+    #####:  228:    auto indices = getIndices(shmWriteOp);
+call    0 never executed
+    #####:  229:    SmallVector<Value, 4> transformedIndices(indices.begin(), indices.end());
+call    0 never executed
+    #####:  230:    transformIndices(builder, shmWriteOp->getLoc(), transformedIndices,
+call    0 never executed
+        -:  231:                     memRefType, srcDim, tgtDim);
+    #####:  232:    setIndices(shmWriteOp, transformedIndices);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  233:  }
+        -:  234:
+        -:  235:  // Transform indices for the ops reading from shared memory.
+    #####:  236:  while (!shmReadOps.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  237:    Operation *shmReadOp = shmReadOps.back();
+call    0 never executed
+    #####:  238:    shmReadOps.pop_back();
+call    0 never executed
+    #####:  239:    builder.setInsertionPoint(shmReadOp);
+call    0 never executed
+        -:  240:
+    #####:  241:    auto indices = getIndices(shmReadOp);
+call    0 never executed
+    #####:  242:    SmallVector<Value, 4> transformedIndices(indices.begin(), indices.end());
+call    0 never executed
+    #####:  243:    transformIndices(builder, shmReadOp->getLoc(), transformedIndices,
+call    0 never executed
+        -:  244:                     memRefType, srcDim, tgtDim);
+    #####:  245:    setIndices(shmReadOp, transformedIndices);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  246:  }
+        -:  247:
+    #####:  248:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  249:}
+        -:  250:
+        -:  251:namespace {
+    #####:  252:class OptimizeSharedMemoryPass
+call    0 never executed
+        -:  253:    : public nvgpu::impl::OptimizeSharedMemoryBase<OptimizeSharedMemoryPass> {
+        -:  254:public:
+   116710:  255:  OptimizeSharedMemoryPass() = default;
+call    0 returned 100%
+        -:  256:
+function _ZN12_GLOBAL__N_124OptimizeSharedMemoryPass14runOnOperationEv called 413 returned 100% blocks executed 39%
+      413:  257:  void runOnOperation() override {
+      413:  258:    Operation *op = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      826:  259:    SmallVector<memref::AllocOp> shmAllocOps;
+call    0 returned 100%
+function _ZZN12_GLOBAL__N_124OptimizeSharedMemoryPass14runOnOperationEvENKUlN4mlir6memref7AllocOpEE_clES3_.isra.0 called 23525 returned 100% blocks executed 86%
+      413:  260:    op->walk([&](memref::AllocOp allocOp) {
+call    0 returned 100%
+    23525:  261:      if (allocOp.getMemref()
+call    0 returned 100%
+call    1 returned 100%
+    23525:  262:              .getType()
+call    0 returned 100%
+    23525:  263:              .cast<MemRefType>()
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    23525:  264:              .getMemorySpaceAsInt() !=
+call    0 returned 100%
+        -:  265:          gpu::GPUDialect::getWorkgroupAddressSpace())
+        -:  266:        return;
+    #####:  267:      shmAllocOps.push_back(allocOp);
+call    0 never executed
+        -:  268:    });
+     413*:  269:    for (auto allocOp : shmAllocOps) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  270:      if (failed(optimizeSharedMemoryReadsAndWrites(getOperation(),
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  271:                                                    allocOp.getMemref())))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  272:        return;
+branch  0 never executed
+branch  1 never executed
+        -:  273:    }
+        -:  274:  }
+        -:  275:};
+        -:  276:} // namespace
+        -:  277:
+function _ZN4mlir5nvgpu30createOptimizeSharedMemoryPassEv called 116710 returned 100% blocks executed 100%
+   116710:  278:std::unique_ptr<Pass> mlir::nvgpu::createOptimizeSharedMemoryPass() {
+   116710:  279:  return std::make_unique<OptimizeSharedMemoryPass>();
+call    0 returned 100%
+        -:  280:}

@@ -1,0 +1,1159 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/Linalg/Transforms/Loops.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Loops.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Loops.cpp.gcda
+        -:    0:Runs:116159
+        -:    1://===- Loops.cpp - conversion from Linalg named and generic ops to loops --===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Dialect/Linalg/Passes.h"
+        -:   10:
+        -:   11:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   12:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   13:#include "mlir/Dialect/Arith/Utils/Utils.h"
+        -:   14:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   15:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   16:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   17:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   18:#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+        -:   19:#include "mlir/Dialect/SCF/Utils/AffineCanonicalizationUtils.h"
+        -:   20:#include "mlir/IR/AffineExpr.h"
+        -:   21:#include "mlir/IR/AffineMap.h"
+        -:   22:#include "mlir/IR/BlockAndValueMapping.h"
+        -:   23:#include "mlir/Support/LLVM.h"
+        -:   24:#include "mlir/Transforms/DialectConversion.h"
+        -:   25:#include "mlir/Transforms/FoldUtils.h"
+        -:   26:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   27:#include "llvm/ADT/TypeSwitch.h"
+        -:   28:
+        -:   29:namespace mlir {
+        -:   30:#define GEN_PASS_DEF_LINALGLOWERTOAFFINELOOPS
+        -:   31:#define GEN_PASS_DEF_LINALGLOWERTOLOOPS
+        -:   32:#define GEN_PASS_DEF_LINALGLOWERTOPARALLELLOOPS
+        -:   33:#include "mlir/Dialect/Linalg/Passes.h.inc"
+        -:   34:} // namespace mlir
+        -:   35:
+        -:   36:using namespace mlir;
+        -:   37:using namespace mlir::linalg;
+        -:   38:
+function _ZL26makeCanonicalAffineAppliesRN4mlir9OpBuilderENS_8LocationENS_9AffineMapEN4llvm8ArrayRefINS_5ValueEEE called 51 returned 100% blocks executed 79%
+       51:   39:static SmallVector<Value> makeCanonicalAffineApplies(OpBuilder &b, Location loc,
+        -:   40:                                                     AffineMap map,
+        -:   41:                                                     ArrayRef<Value> vals) {
+       51:   42:  if (map.isEmpty())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:   43:    return {};
+        -:   44:
+      51*:   45:  assert(map.getNumInputs() == vals.size());
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+       51:   46:  SmallVector<Value> res;
+call    0 returned 100%
+       51:   47:  res.reserve(map.getNumResults());
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+       51:   48:  auto dims = map.getNumDims();
+call    0 returned 100%
+      171:   49:  for (auto e : map.getResults()) {
+call    0 returned 100%
+branch  1 taken 70% (fallthrough)
+branch  2 taken 30%
+      120:   50:    auto exprMap = AffineMap::get(dims, map.getNumSymbols(), e);
+call    0 returned 100%
+call    1 returned 100%
+      240:   51:    SmallVector<Value> operands(vals.begin(), vals.end());
+call    0 returned 100%
+      120:   52:    canonicalizeMapAndOperands(&exprMap, &operands);
+call    0 returned 100%
+      120:   53:    res.push_back(b.create<AffineApplyOp>(loc, exprMap, operands));
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:   54:  }
+      102:   55:  return res;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:   56:}
+        -:   57:
+        -:   58:template <typename LoadOpTy, typename StoreOpTy, typename OpType>
+        -:   59:static void inlineRegionAndEmitStore(OpBuilder &b, Location loc, OpType op,
+        -:   60:                                     ArrayRef<Value> indexedValues,
+        -:   61:                                     ArrayRef<SmallVector<Value>> indexing,
+        -:   62:                                     ArrayRef<Value> outputBuffers) {
+        -:   63:  auto &block = op->getRegion(0).front();
+        -:   64:  BlockAndValueMapping map;
+        -:   65:  map.map(block.getArguments(), indexedValues);
+        -:   66:  for (auto &op : block.without_terminator()) {
+        -:   67:    auto *newOp = b.clone(op, map);
+        -:   68:    map.map(op.getResults(), newOp->getResults());
+        -:   69:  }
+        -:   70:
+        -:   71:  Operation *terminator = block.getTerminator();
+        -:   72:  for (OpOperand &operand : terminator->getOpOperands()) {
+        -:   73:    Value toStore = map.lookupOrDefault(operand.get());
+        -:   74:    b.create<StoreOpTy>(loc, toStore, outputBuffers[operand.getOperandNumber()],
+        -:   75:                        indexing[operand.getOperandNumber()]);
+        -:   76:  }
+        -:   77:}
+        -:   78:
+        -:   79:// Returns a pair that contains input indices and output indices of a
+        -:   80:// SingleInputPoolingOp `op`.
+        -:   81:struct InputAndOutputIndices {
+        -:   82:  SmallVector<Value> inputs;
+        -:   83:  SmallVector<Value> outputs;
+        -:   84:};
+        -:   85:template <typename SingleInputPoolingOp>
+        -:   86:static InputAndOutputIndices
+        -:   87:getInputAndOutputIndices(OpBuilder &b, Location loc, ArrayRef<Value> allIvs,
+        -:   88:                         SingleInputPoolingOp op) {
+        -:   89:  auto mapsRange = op.getIndexingMapsArray();
+        -:   90:  auto maps = llvm::to_vector<8>(
+        -:   91:      llvm::map_range(mapsRange, [](AffineMapAttr a) { return a.getValue(); }));
+        -:   92:  return InputAndOutputIndices{
+        -:   93:      makeCanonicalAffineApplies(b, loc, maps[0], allIvs),
+        -:   94:      makeCanonicalAffineApplies(b, loc, maps[2], allIvs)};
+        -:   95:}
+        -:   96:
+        -:   97:/// Emits the MLIR for the scalar part of the generic op by:
+        -:   98:///   1. Emitting load ops for each input and output view in order. This is
+        -:   99:///      achieved by applying the appropriate input or output map to the
+        -:  100:///      enclosing induction variables.
+        -:  101:///   2. Emitting a call to `op.fun()` that takes as arguments the scalars
+        -:  102:///      from point 1. above.
+        -:  103:///   3. Emitting store ops to store the results of 2. to the output
+        -:  104:///      views.
+        -:  105:///
+        -:  106:/// An example output may resemble:
+        -:  107:///
+        -:  108:/// ```
+        -:  109:///    scf.for %i = %c0 to %0 step %c1 {
+        -:  110:///      scf.for %j = %c0 to %1 step %c1 {
+        -:  111:///        scf.for %k = %c0 to %4 step %c1 {
+        -:  112:///          %11 = load %arg0[%i, %j] :
+        -:  113:///            memref<?x?xf32, stride_specification>
+        -:  114:///          %12 = load %arg1[%i, %j, %k] :
+        -:  115:///            memref<?x?x?xf32, stride_specification>
+        -:  116:///          %13 = load %arg2[%i, %k, %j] :
+        -:  117:///            memref<?x?x?xf32, stride_specification>
+        -:  118:///          %14:2 = call @foo(%11, %12, %13) : (f32, f32, f32) -> (f32, f32)
+        -:  119:///          store %14#0, %arg1[%i, %j, %k] :
+        -:  120:///            memref<?x?x?Xf32, stride_specification>
+        -:  121:///          store %14#1, %arg2[%i, %k, %j] :
+        -:  122:///            memref<?x?x?Xf32, stride_specification>
+        -:  123:///       }
+        -:  124:///      }
+        -:  125:///    }
+        -:  126:/// ```
+        -:  127:template <typename LoadOpTy, typename StoreOpTy>
+       17:  128:static void emitScalarImplementation(OpBuilder &b, Location loc,
+        -:  129:                                     ArrayRef<Value> allIvs,
+        -:  130:                                     LinalgOp linalgOp) {
+      17*:  131:  assert(linalgOp.hasBufferSemantics() &&
+        -:  132:         "expected linalg op with buffer semantics");
+       34:  133:  SmallVector<Value> indexedValues;
+       34:  134:  indexedValues.reserve(linalgOp->getNumOperands());
+        -:  135:
+       34:  136:  auto allIvsPlusDims = SmallVector<Value>(allIvs.begin(), allIvs.end());
+        -:  137:
+        -:  138:  // TODO: Avoid the loads if the corresponding argument of the
+        -:  139:  // region has no uses.
+        -:  140:  // 1.a. Emit load from input operand or for scalars access the operand itself.
+       51:  141:  for (OpOperand *inputOperand : linalgOp.getDpsInputOperands()) {
+      17*:  142:    if (linalgOp.isScalar(inputOperand)) {
+    #####:  143:      indexedValues.push_back(inputOperand->get());
+    #####:  144:      continue;
+        -:  145:    }
+       34:  146:    auto indexing = makeCanonicalAffineApplies(
+        -:  147:        b, loc, linalgOp.getMatchingIndexingMap(inputOperand), allIvsPlusDims);
+       17:  148:    indexedValues.push_back(
+       34:  149:        b.create<LoadOpTy>(loc, inputOperand->get(), indexing));
+        -:  150:  }
+        -:  151:  // 1.b. Emit load from output views.
+       51:  152:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+       34:  153:    SmallVector<Value> indexing = makeCanonicalAffineApplies(
+        -:  154:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand), allIvsPlusDims);
+       17:  155:    indexedValues.push_back(
+       34:  156:        b.create<LoadOpTy>(loc, outputOperand->get(), indexing));
+        -:  157:  }
+        -:  158:
+        -:  159:  // TODO: When a region inliner exists, use it.
+        -:  160:  // 2. Inline region, currently only works for a single basic block.
+        -:  161:  // 3. Emit store.
+       34:  162:  SmallVector<SmallVector<Value>, 8> indexing;
+       34:  163:  SmallVector<Value> outputBuffers;
+       51:  164:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+      17*:  165:    if (!outputOperand->get().getType().isa<MemRefType>())
+    #####:  166:      continue;
+       17:  167:    indexing.push_back(makeCanonicalAffineApplies(
+        -:  168:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand),
+        -:  169:        allIvsPlusDims));
+       17:  170:    outputBuffers.push_back(outputOperand->get());
+        -:  171:  }
+       17:  172:  inlineRegionAndEmitStore<LoadOpTy, StoreOpTy>(b, loc, linalgOp, indexedValues,
+        -:  173:                                                indexing, outputBuffers);
+       17:  174:}
+------------------
+_Z24emitScalarImplementationIN4mlir6memref6LoadOpENS1_7StoreOpEEvRNS0_9OpBuilderENS0_8LocationEN4llvm8ArrayRefINS0_5ValueEEENS0_6linalg8LinalgOpE:
+function _Z24emitScalarImplementationIN4mlir6memref6LoadOpENS1_7StoreOpEEvRNS0_9OpBuilderENS0_8LocationEN4llvm8ArrayRefINS0_5ValueEEENS0_6linalg8LinalgOpE called 12 returned 100% blocks executed 77%
+       12:  128:static void emitScalarImplementation(OpBuilder &b, Location loc,
+call    0 returned 100%
+        -:  129:                                     ArrayRef<Value> allIvs,
+        -:  130:                                     LinalgOp linalgOp) {
+      12*:  131:  assert(linalgOp.hasBufferSemantics() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  132:         "expected linalg op with buffer semantics");
+       24:  133:  SmallVector<Value> indexedValues;
+       24:  134:  indexedValues.reserve(linalgOp->getNumOperands());
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  135:
+       24:  136:  auto allIvsPlusDims = SmallVector<Value>(allIvs.begin(), allIvs.end());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  137:
+        -:  138:  // TODO: Avoid the loads if the corresponding argument of the
+        -:  139:  // region has no uses.
+        -:  140:  // 1.a. Emit load from input operand or for scalars access the operand itself.
+       36:  141:  for (OpOperand *inputOperand : linalgOp.getDpsInputOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+call    3 returned 100%
+      12*:  142:    if (linalgOp.isScalar(inputOperand)) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  143:      indexedValues.push_back(inputOperand->get());
+call    0 never executed
+    #####:  144:      continue;
+        -:  145:    }
+       24:  146:    auto indexing = makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+        -:  147:        b, loc, linalgOp.getMatchingIndexingMap(inputOperand), allIvsPlusDims);
+       12:  148:    indexedValues.push_back(
+call    0 returned 100%
+call    1 returned 100%
+       24:  149:        b.create<LoadOpTy>(loc, inputOperand->get(), indexing));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  150:  }
+        -:  151:  // 1.b. Emit load from output views.
+       36:  152:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+call    3 returned 100%
+       24:  153:    SmallVector<Value> indexing = makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+        -:  154:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand), allIvsPlusDims);
+       12:  155:    indexedValues.push_back(
+call    0 returned 100%
+call    1 returned 100%
+       24:  156:        b.create<LoadOpTy>(loc, outputOperand->get(), indexing));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  157:  }
+        -:  158:
+        -:  159:  // TODO: When a region inliner exists, use it.
+        -:  160:  // 2. Inline region, currently only works for a single basic block.
+        -:  161:  // 3. Emit store.
+       24:  162:  SmallVector<SmallVector<Value>, 8> indexing;
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+       24:  163:  SmallVector<Value> outputBuffers;
+call    0 returned 100%
+call    1 returned 100%
+       36:  164:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+      12*:  165:    if (!outputOperand->get().getType().isa<MemRefType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  166:      continue;
+       12:  167:    indexing.push_back(makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+        -:  168:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand),
+        -:  169:        allIvsPlusDims));
+       12:  170:    outputBuffers.push_back(outputOperand->get());
+call    0 returned 100%
+        -:  171:  }
+       12:  172:  inlineRegionAndEmitStore<LoadOpTy, StoreOpTy>(b, loc, linalgOp, indexedValues,
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  173:                                                indexing, outputBuffers);
+       12:  174:}
+------------------
+_Z24emitScalarImplementationIN4mlir12AffineLoadOpENS0_13AffineStoreOpEEvRNS0_9OpBuilderENS0_8LocationEN4llvm8ArrayRefINS0_5ValueEEENS0_6linalg8LinalgOpE:
+function _Z24emitScalarImplementationIN4mlir12AffineLoadOpENS0_13AffineStoreOpEEvRNS0_9OpBuilderENS0_8LocationEN4llvm8ArrayRefINS0_5ValueEEENS0_6linalg8LinalgOpE called 5 returned 100% blocks executed 77%
+        5:  128:static void emitScalarImplementation(OpBuilder &b, Location loc,
+call    0 returned 100%
+        -:  129:                                     ArrayRef<Value> allIvs,
+        -:  130:                                     LinalgOp linalgOp) {
+       5*:  131:  assert(linalgOp.hasBufferSemantics() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  132:         "expected linalg op with buffer semantics");
+       10:  133:  SmallVector<Value> indexedValues;
+       10:  134:  indexedValues.reserve(linalgOp->getNumOperands());
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  135:
+       10:  136:  auto allIvsPlusDims = SmallVector<Value>(allIvs.begin(), allIvs.end());
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  137:
+        -:  138:  // TODO: Avoid the loads if the corresponding argument of the
+        -:  139:  // region has no uses.
+        -:  140:  // 1.a. Emit load from input operand or for scalars access the operand itself.
+       15:  141:  for (OpOperand *inputOperand : linalgOp.getDpsInputOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+call    3 returned 100%
+       5*:  142:    if (linalgOp.isScalar(inputOperand)) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  143:      indexedValues.push_back(inputOperand->get());
+call    0 never executed
+    #####:  144:      continue;
+        -:  145:    }
+       10:  146:    auto indexing = makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+        -:  147:        b, loc, linalgOp.getMatchingIndexingMap(inputOperand), allIvsPlusDims);
+        5:  148:    indexedValues.push_back(
+call    0 returned 100%
+call    1 returned 100%
+       10:  149:        b.create<LoadOpTy>(loc, inputOperand->get(), indexing));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  150:  }
+        -:  151:  // 1.b. Emit load from output views.
+       15:  152:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+call    3 returned 100%
+       10:  153:    SmallVector<Value> indexing = makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+        -:  154:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand), allIvsPlusDims);
+        5:  155:    indexedValues.push_back(
+call    0 returned 100%
+call    1 returned 100%
+       10:  156:        b.create<LoadOpTy>(loc, outputOperand->get(), indexing));
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  157:  }
+        -:  158:
+        -:  159:  // TODO: When a region inliner exists, use it.
+        -:  160:  // 2. Inline region, currently only works for a single basic block.
+        -:  161:  // 3. Emit store.
+       10:  162:  SmallVector<SmallVector<Value>, 8> indexing;
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+       10:  163:  SmallVector<Value> outputBuffers;
+call    0 returned 100%
+call    1 returned 100%
+       15:  164:  for (OpOperand *outputOperand : linalgOp.getDpsInitOperands()) {
+branch  0 taken 50% (fallthrough)
+branch  1 taken 50%
+call    2 returned 100%
+       5*:  165:    if (!outputOperand->get().getType().isa<MemRefType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  166:      continue;
+        5:  167:    indexing.push_back(makeCanonicalAffineApplies(
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+        -:  168:        b, loc, linalgOp.getMatchingIndexingMap(outputOperand),
+        -:  169:        allIvsPlusDims));
+        5:  170:    outputBuffers.push_back(outputOperand->get());
+call    0 returned 100%
+        -:  171:  }
+        5:  172:  inlineRegionAndEmitStore<LoadOpTy, StoreOpTy>(b, loc, linalgOp, indexedValues,
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  173:                                                indexing, outputBuffers);
+        5:  174:}
+------------------
+        -:  175:
+        -:  176:/// Replace the index operations in the body of the loop nest by the matching
+        -:  177:/// induction variables.
+function _ZL35replaceIndexOpsByInductionVariablesN4mlir6linalg8LinalgOpERNS_15PatternRewriterEN4llvm8ArrayRefIPNS_9OperationEEE called 17 returned 100% blocks executed 61%
+       17:  178:static void replaceIndexOpsByInductionVariables(LinalgOp linalgOp,
+        -:  179:                                                PatternRewriter &rewriter,
+        -:  180:                                                ArrayRef<Operation *> loopOps) {
+        -:  181:  // Extract the induction variables of the loop nest from outer to inner.
+       17:  182:  SmallVector<Value> allIvs;
+       53:  183:  for (Operation *loopOp : loopOps) {
+branch  0 taken 68% (fallthrough)
+branch  1 taken 32%
+       36:  184:    llvm::TypeSwitch<Operation *>(loopOp)
+call    0 returned 100%
+function _ZZL35replaceIndexOpsByInductionVariablesN4mlir6linalg8LinalgOpERNS_15PatternRewriterEN4llvm8ArrayRefIPNS_9OperationEEEENKUlNS_3scf10ParallelOpEE_clESA_.isra.0 called 3 returned 100% blocks executed 100%
+        3:  185:        .Case([&](scf::ParallelOp parallelOp) {
+        3:  186:          allIvs.append(parallelOp.getInductionVars().begin(),
+call    0 returned 100%
+call    1 returned 100%
+        3:  187:                        parallelOp.getInductionVars().end());
+call    0 returned 100%
+call    1 returned 100%
+       36:  188:        })
+call    0 returned 100%
+function _ZZL35replaceIndexOpsByInductionVariablesN4mlir6linalg8LinalgOpERNS_15PatternRewriterEN4llvm8ArrayRefIPNS_9OperationEEEENKUlNS_3scf5ForOpEE0_clESA_.isra.0 called 21 returned 100% blocks executed 100%
+       21:  189:        .Case([&](scf::ForOp forOp) {
+       21:  190:          allIvs.push_back(forOp.getInductionVar());
+call    0 returned 100%
+call    1 returned 100%
+       36:  191:        })
+call    0 returned 100%
+function _ZZL35replaceIndexOpsByInductionVariablesN4mlir6linalg8LinalgOpERNS_15PatternRewriterEN4llvm8ArrayRefIPNS_9OperationEEEENKUlNS_11AffineForOpEE1_clES9_.isra.0 called 12 returned 100% blocks executed 100%
+       12:  192:        .Case([&](AffineForOp affineForOp) {
+       12:  193:          allIvs.push_back(affineForOp.getInductionVar());
+call    0 returned 100%
+call    1 returned 100%
+       72:  194:        })
+call    0 returned 100%
+function _ZZL35replaceIndexOpsByInductionVariablesN4mlir6linalg8LinalgOpERNS_15PatternRewriterEN4llvm8ArrayRefIPNS_9OperationEEEENKUlS7_E2_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+      36*:  195:        .Default([&](Operation *op) { assert(false && "unexpected op"); });
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  196:  }
+      17*:  197:  assert(linalgOp.getNumLoops() == allIvs.size() &&
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+        -:  198:         "expected the number of loops and induction variables to match");
+        -:  199:  // Replace the index operations in the body of the innermost loop op.
+       17:  200:  if (!loopOps.empty()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       17:  201:    LoopLikeOpInterface loopOp = loopOps.back();
+call    0 returned 100%
+call    1 returned 100%
+      17*:  202:    for (IndexOp indexOp :
+      17*:  203:         llvm::make_early_inc_range(loopOp.getLoopBody().getOps<IndexOp>()))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+call    6 never executed
+    #####:  204:      rewriter.replaceOp(indexOp, allIvs[indexOp.getDim()]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+        -:  205:  }
+       17:  206:}
+        -:  207:
+        -:  208:template <typename LoopTy>
+       17:  209:static FailureOr<LinalgLoops> linalgOpToLoopsImpl(PatternRewriter &rewriter,
+        -:  210:                                                  LinalgOp linalgOp) {
+        -:  211:  using LoadOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  212:                                      AffineLoadOp, memref::LoadOp>;
+        -:  213:  using StoreOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  214:                                       AffineStoreOp, memref::StoreOp>;
+        -:  215:
+        -:  216:  // The flattened loopToOperandRangesMaps is expected to be an invertible
+        -:  217:  // permutation map (which is asserted in the inverse calculation).
+      17*:  218:  assert(linalgOp.hasBufferSemantics() &&
+        -:  219:         "expected linalg op with buffer semantics");
+        -:  220:
+       17:  221:  auto loopRanges = linalgOp.createLoopRanges(rewriter, linalgOp.getLoc());
+       34:  222:  auto iteratorTypes = linalgOp.getIteratorTypesArray();
+        -:  223:
+       17:  224:  SmallVector<Value> allIvs;
+       17:  225:  GenerateLoopNest<LoopTy>::doit(
+        -:  226:      rewriter, linalgOp.getLoc(), loopRanges, linalgOp, iteratorTypes,
+       17:  227:      [&](OpBuilder &b, Location loc, ValueRange ivs,
+        -:  228:          ValueRange operandValuesToUse) -> scf::ValueVector {
+      17*:  229:        assert(operandValuesToUse == linalgOp->getOperands() &&
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+call    4 never executed
+call    5 returned 100%
+call    6 returned 100%
+branch  7 taken 0% (fallthrough)
+branch  8 taken 100%
+call    9 never executed
+call   10 returned 100%
+call   11 returned 100%
+branch 12 taken 0% (fallthrough)
+branch 13 taken 100%
+call   14 never executed
+        -:  230:               "expect operands are captured and not passed by loop argument");
+       17:  231:        allIvs.append(ivs.begin(), ivs.end());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       17:  232:        emitScalarImplementation<LoadOpTy, StoreOpTy>(b, loc, allIvs, linalgOp);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+       17:  233:        return scf::ValueVector{};
+        -:  234:      });
+        -:  235:  // Number of loop ops might be different from the number of ivs since some
+        -:  236:  // loops like affine.parallel and scf.parallel have multiple ivs.
+       17:  237:  SetVector<Operation *> loopSet;
+       57:  238:  for (Value iv : allIvs) {
+       40:  239:    if (!iv)
+    #####:  240:      return failure();
+        -:  241:    // The induction variable is a block argument of the entry block of the
+        -:  242:    // loop operation.
+       40:  243:    BlockArgument ivVal = iv.dyn_cast<BlockArgument>();
+       40:  244:    if (!ivVal)
+    #####:  245:      return failure();
+       40:  246:    loopSet.insert(ivVal.getOwner()->getParentOp());
+        -:  247:  }
+       34:  248:  LinalgLoops loops(loopSet.begin(), loopSet.end());
+        -:  249:  // Replace all index operations in the loop body.
+       17:  250:  replaceIndexOpsByInductionVariables(linalgOp, rewriter, loops);
+       17:  251:  return loops;
+        -:  252:}
+------------------
+_Z19linalgOpToLoopsImplIN4mlir3scf10ParallelOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE:
+function _Z19linalgOpToLoopsImplIN4mlir3scf10ParallelOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE called 3 returned 100% blocks executed 76%
+        3:  209:static FailureOr<LinalgLoops> linalgOpToLoopsImpl(PatternRewriter &rewriter,
+call    0 returned 100%
+        -:  210:                                                  LinalgOp linalgOp) {
+        -:  211:  using LoadOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  212:                                      AffineLoadOp, memref::LoadOp>;
+        -:  213:  using StoreOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  214:                                       AffineStoreOp, memref::StoreOp>;
+        -:  215:
+        -:  216:  // The flattened loopToOperandRangesMaps is expected to be an invertible
+        -:  217:  // permutation map (which is asserted in the inverse calculation).
+       3*:  218:  assert(linalgOp.hasBufferSemantics() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  219:         "expected linalg op with buffer semantics");
+        -:  220:
+        3:  221:  auto loopRanges = linalgOp.createLoopRanges(rewriter, linalgOp.getLoc());
+call    0 returned 100%
+        6:  222:  auto iteratorTypes = linalgOp.getIteratorTypesArray();
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  223:
+        3:  224:  SmallVector<Value> allIvs;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        3:  225:  GenerateLoopNest<LoopTy>::doit(
+call    0 returned 100%
+call    1 returned 100%
+        -:  226:      rewriter, linalgOp.getLoc(), loopRanges, linalgOp, iteratorTypes,
+        -:  227:      [&](OpBuilder &b, Location loc, ValueRange ivs,
+        -:  228:          ValueRange operandValuesToUse) -> scf::ValueVector {
+        -:  229:        assert(operandValuesToUse == linalgOp->getOperands() &&
+        -:  230:               "expect operands are captured and not passed by loop argument");
+        -:  231:        allIvs.append(ivs.begin(), ivs.end());
+        -:  232:        emitScalarImplementation<LoadOpTy, StoreOpTy>(b, loc, allIvs, linalgOp);
+        -:  233:        return scf::ValueVector{};
+        -:  234:      });
+        -:  235:  // Number of loop ops might be different from the number of ivs since some
+        -:  236:  // loops like affine.parallel and scf.parallel have multiple ivs.
+        3:  237:  SetVector<Operation *> loopSet;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       10:  238:  for (Value iv : allIvs) {
+branch  0 taken 70% (fallthrough)
+branch  1 taken 30%
+        7:  239:    if (!iv)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  240:      return failure();
+        -:  241:    // The induction variable is a block argument of the entry block of the
+        -:  242:    // loop operation.
+        7:  243:    BlockArgument ivVal = iv.dyn_cast<BlockArgument>();
+        7:  244:    if (!ivVal)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  245:      return failure();
+        7:  246:    loopSet.insert(ivVal.getOwner()->getParentOp());
+call    0 returned 100%
+call    1 returned 100%
+        -:  247:  }
+        6:  248:  LinalgLoops loops(loopSet.begin(), loopSet.end());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  249:  // Replace all index operations in the loop body.
+        3:  250:  replaceIndexOpsByInductionVariables(linalgOp, rewriter, loops);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        3:  251:  return loops;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  252:}
+------------------
+_Z19linalgOpToLoopsImplIN4mlir3scf5ForOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE:
+function _Z19linalgOpToLoopsImplIN4mlir3scf5ForOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE called 9 returned 100% blocks executed 76%
+        9:  209:static FailureOr<LinalgLoops> linalgOpToLoopsImpl(PatternRewriter &rewriter,
+call    0 returned 100%
+        -:  210:                                                  LinalgOp linalgOp) {
+        -:  211:  using LoadOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  212:                                      AffineLoadOp, memref::LoadOp>;
+        -:  213:  using StoreOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  214:                                       AffineStoreOp, memref::StoreOp>;
+        -:  215:
+        -:  216:  // The flattened loopToOperandRangesMaps is expected to be an invertible
+        -:  217:  // permutation map (which is asserted in the inverse calculation).
+       9*:  218:  assert(linalgOp.hasBufferSemantics() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  219:         "expected linalg op with buffer semantics");
+        -:  220:
+        9:  221:  auto loopRanges = linalgOp.createLoopRanges(rewriter, linalgOp.getLoc());
+call    0 returned 100%
+       18:  222:  auto iteratorTypes = linalgOp.getIteratorTypesArray();
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  223:
+        9:  224:  SmallVector<Value> allIvs;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        9:  225:  GenerateLoopNest<LoopTy>::doit(
+call    0 returned 100%
+call    1 returned 100%
+        -:  226:      rewriter, linalgOp.getLoc(), loopRanges, linalgOp, iteratorTypes,
+        -:  227:      [&](OpBuilder &b, Location loc, ValueRange ivs,
+        -:  228:          ValueRange operandValuesToUse) -> scf::ValueVector {
+        -:  229:        assert(operandValuesToUse == linalgOp->getOperands() &&
+        -:  230:               "expect operands are captured and not passed by loop argument");
+        -:  231:        allIvs.append(ivs.begin(), ivs.end());
+        -:  232:        emitScalarImplementation<LoadOpTy, StoreOpTy>(b, loc, allIvs, linalgOp);
+        -:  233:        return scf::ValueVector{};
+        -:  234:      });
+        -:  235:  // Number of loop ops might be different from the number of ivs since some
+        -:  236:  // loops like affine.parallel and scf.parallel have multiple ivs.
+        9:  237:  SetVector<Operation *> loopSet;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       30:  238:  for (Value iv : allIvs) {
+branch  0 taken 70% (fallthrough)
+branch  1 taken 30%
+       21:  239:    if (!iv)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  240:      return failure();
+        -:  241:    // The induction variable is a block argument of the entry block of the
+        -:  242:    // loop operation.
+       21:  243:    BlockArgument ivVal = iv.dyn_cast<BlockArgument>();
+       21:  244:    if (!ivVal)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  245:      return failure();
+       21:  246:    loopSet.insert(ivVal.getOwner()->getParentOp());
+call    0 returned 100%
+call    1 returned 100%
+        -:  247:  }
+       18:  248:  LinalgLoops loops(loopSet.begin(), loopSet.end());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  249:  // Replace all index operations in the loop body.
+        9:  250:  replaceIndexOpsByInductionVariables(linalgOp, rewriter, loops);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        9:  251:  return loops;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  252:}
+------------------
+_Z19linalgOpToLoopsImplIN4mlir11AffineForOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE:
+function _Z19linalgOpToLoopsImplIN4mlir11AffineForOpEENS0_9FailureOrIN4llvm11SmallVectorIPNS0_9OperationELj4EEEEERNS0_15PatternRewriterENS0_6linalg8LinalgOpE called 5 returned 100% blocks executed 76%
+        5:  209:static FailureOr<LinalgLoops> linalgOpToLoopsImpl(PatternRewriter &rewriter,
+call    0 returned 100%
+        -:  210:                                                  LinalgOp linalgOp) {
+        -:  211:  using LoadOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  212:                                      AffineLoadOp, memref::LoadOp>;
+        -:  213:  using StoreOpTy = std::conditional_t<std::is_same<LoopTy, AffineForOp>::value,
+        -:  214:                                       AffineStoreOp, memref::StoreOp>;
+        -:  215:
+        -:  216:  // The flattened loopToOperandRangesMaps is expected to be an invertible
+        -:  217:  // permutation map (which is asserted in the inverse calculation).
+       5*:  218:  assert(linalgOp.hasBufferSemantics() &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  219:         "expected linalg op with buffer semantics");
+        -:  220:
+        5:  221:  auto loopRanges = linalgOp.createLoopRanges(rewriter, linalgOp.getLoc());
+call    0 returned 100%
+       10:  222:  auto iteratorTypes = linalgOp.getIteratorTypesArray();
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  223:
+        5:  224:  SmallVector<Value> allIvs;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        5:  225:  GenerateLoopNest<LoopTy>::doit(
+call    0 returned 100%
+call    1 returned 100%
+        -:  226:      rewriter, linalgOp.getLoc(), loopRanges, linalgOp, iteratorTypes,
+        -:  227:      [&](OpBuilder &b, Location loc, ValueRange ivs,
+        -:  228:          ValueRange operandValuesToUse) -> scf::ValueVector {
+        -:  229:        assert(operandValuesToUse == linalgOp->getOperands() &&
+        -:  230:               "expect operands are captured and not passed by loop argument");
+        -:  231:        allIvs.append(ivs.begin(), ivs.end());
+        -:  232:        emitScalarImplementation<LoadOpTy, StoreOpTy>(b, loc, allIvs, linalgOp);
+        -:  233:        return scf::ValueVector{};
+        -:  234:      });
+        -:  235:  // Number of loop ops might be different from the number of ivs since some
+        -:  236:  // loops like affine.parallel and scf.parallel have multiple ivs.
+        5:  237:  SetVector<Operation *> loopSet;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+       17:  238:  for (Value iv : allIvs) {
+branch  0 taken 71% (fallthrough)
+branch  1 taken 29%
+       12:  239:    if (!iv)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  240:      return failure();
+        -:  241:    // The induction variable is a block argument of the entry block of the
+        -:  242:    // loop operation.
+       12:  243:    BlockArgument ivVal = iv.dyn_cast<BlockArgument>();
+       12:  244:    if (!ivVal)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  245:      return failure();
+       12:  246:    loopSet.insert(ivVal.getOwner()->getParentOp());
+call    0 returned 100%
+call    1 returned 100%
+        -:  247:  }
+       10:  248:  LinalgLoops loops(loopSet.begin(), loopSet.end());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  249:  // Replace all index operations in the loop body.
+        5:  250:  replaceIndexOpsByInductionVariables(linalgOp, rewriter, loops);
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        5:  251:  return loops;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  252:}
+------------------
+        -:  253:
+        -:  254:namespace {
+        -:  255:template <typename LoopType>
+        -:  256:class LinalgRewritePattern : public RewritePattern {
+        -:  257:public:
+       49:  258:  LinalgRewritePattern(MLIRContext *context)
+       49:  259:      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+------------------
+_ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf10ParallelOpEEC2EPNS1_11MLIRContextE:
+function _ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf10ParallelOpEEC2EPNS1_11MLIRContextE called 7 returned 100% blocks executed 100%
+        7:  258:  LinalgRewritePattern(MLIRContext *context)
+        7:  259:      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+call    0 returned 100%
+call    1 returned 100%
+------------------
+_ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf5ForOpEEC2EPNS1_11MLIRContextE:
+function _ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf5ForOpEEC2EPNS1_11MLIRContextE called 10 returned 100% blocks executed 100%
+       10:  258:  LinalgRewritePattern(MLIRContext *context)
+       10:  259:      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+call    0 returned 100%
+call    1 returned 100%
+------------------
+_ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir11AffineForOpEEC2EPNS1_11MLIRContextE:
+function _ZN12_GLOBAL__N_120LinalgRewritePatternIN4mlir11AffineForOpEEC2EPNS1_11MLIRContextE called 32 returned 100% blocks executed 100%
+       32:  258:  LinalgRewritePattern(MLIRContext *context)
+       32:  259:      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+call    0 returned 100%
+call    1 returned 100%
+------------------
+        -:  260:
+    22416:  261:  LogicalResult matchAndRewrite(Operation *op,
+        -:  262:                                PatternRewriter &rewriter) const override {
+    22416:  263:    auto linalgOp = dyn_cast<LinalgOp>(op);
+    22416:  264:    if (!isa<LinalgOp>(op))
+    22416:  265:      return failure();
+       34:  266:    if (failed(linalgOpToLoopsImpl<LoopType>(rewriter, linalgOp)))
+    22416:  267:      return failure();
+       17:  268:    rewriter.eraseOp(op);
+    22416:  269:    return success();
+        -:  270:  }
+------------------
+_ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir11AffineForOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir11AffineForOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE called 7769 returned 100% blocks executed 85%
+     7769:  261:  LogicalResult matchAndRewrite(Operation *op,
+        -:  262:                                PatternRewriter &rewriter) const override {
+     7769:  263:    auto linalgOp = dyn_cast<LinalgOp>(op);
+call    0 returned 100%
+     7769:  264:    if (!isa<LinalgOp>(op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+     7769:  265:      return failure();
+       10:  266:    if (failed(linalgOpToLoopsImpl<LoopType>(rewriter, linalgOp)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+     7769:  267:      return failure();
+        5:  268:    rewriter.eraseOp(op);
+call    0 returned 100%
+     7769:  269:    return success();
+        -:  270:  }
+------------------
+_ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf5ForOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf5ForOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE called 9427 returned 100% blocks executed 85%
+     9427:  261:  LogicalResult matchAndRewrite(Operation *op,
+        -:  262:                                PatternRewriter &rewriter) const override {
+     9427:  263:    auto linalgOp = dyn_cast<LinalgOp>(op);
+call    0 returned 100%
+     9427:  264:    if (!isa<LinalgOp>(op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+     9427:  265:      return failure();
+       18:  266:    if (failed(linalgOpToLoopsImpl<LoopType>(rewriter, linalgOp)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+     9427:  267:      return failure();
+        9:  268:    rewriter.eraseOp(op);
+call    0 returned 100%
+     9427:  269:    return success();
+        -:  270:  }
+------------------
+_ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf10ParallelOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_120LinalgRewritePatternIN4mlir3scf10ParallelOpEE15matchAndRewriteEPNS1_9OperationERNS1_15PatternRewriterE called 5220 returned 100% blocks executed 85%
+     5220:  261:  LogicalResult matchAndRewrite(Operation *op,
+        -:  262:                                PatternRewriter &rewriter) const override {
+     5220:  263:    auto linalgOp = dyn_cast<LinalgOp>(op);
+call    0 returned 100%
+     5220:  264:    if (!isa<LinalgOp>(op))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 1%
+     5220:  265:      return failure();
+        6:  266:    if (failed(linalgOpToLoopsImpl<LoopType>(rewriter, linalgOp)))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+     5220:  267:      return failure();
+        3:  268:    rewriter.eraseOp(op);
+call    0 returned 100%
+     5220:  269:    return success();
+        -:  270:  }
+------------------
+        -:  271:};
+        -:  272:
+        -:  273:/// Local folding pattern for AffineApplyOp that we can apply greedily.
+        -:  274:/// This replaces AffineApplyOp by the proper value in cases where the
+        -:  275:/// associated map is trivial.
+        -:  276:/// A trivial map here is defined as a map with a single result and either:
+        -:  277:///   1. Zero operand + returns a single AffineConstantExpr
+        -:  278:///   2. One operand + returns a single AffineDimExpr
+        -:  279:///   3. One operand + returns a single AffineSymbolExpr
+        -:  280://
+        -:  281:/// In the first case, the AffineApplyOp is replaced by a new constant. In the
+        -:  282:/// other cases, it is replaced by its unique operand.
+        -:  283:struct FoldAffineOp : public RewritePattern {
+function _ZN12_GLOBAL__N_112FoldAffineOpC2EPN4mlir11MLIRContextE called 47 returned 100% blocks executed 100%
+       47:  284:  FoldAffineOp(MLIRContext *context)
+       47:  285:      : RewritePattern(AffineApplyOp::getOperationName(), 0, context) {}
+call    0 returned 100%
+call    1 returned 100%
+        -:  286:
+function _ZNK12_GLOBAL__N_112FoldAffineOp15matchAndRewriteEPN4mlir9OperationERNS1_15PatternRewriterE called 10 returned 100% blocks executed 62%
+       10:  287:  LogicalResult matchAndRewrite(Operation *op,
+        -:  288:                                PatternRewriter &rewriter) const override {
+       10:  289:    AffineApplyOp affineApplyOp = cast<AffineApplyOp>(op);
+call    0 returned 100%
+       10:  290:    auto map = affineApplyOp.getAffineMap();
+call    0 returned 100%
+       10:  291:    if (map.getNumResults() != 1 || map.getNumInputs() > 1)
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+call    3 returned 100%
+branch  4 taken 50% (fallthrough)
+branch  5 taken 50%
+        5:  292:      return failure();
+        -:  293:
+        5:  294:    AffineExpr expr = map.getResult(0);
+call    0 returned 100%
+        5:  295:    if (map.getNumInputs() == 0) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  296:      if (auto val = expr.dyn_cast<AffineConstantExpr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  297:        rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(op, val.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  298:        return success();
+        -:  299:      }
+    #####:  300:      return failure();
+        -:  301:    }
+       5*:  302:    if (expr.dyn_cast<AffineDimExpr>() || expr.dyn_cast<AffineSymbolExpr>()) {
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+call    3 returned 100%
+branch  4 taken 100% (fallthrough)
+branch  5 taken 0%
+    #####:  303:      rewriter.replaceOp(op, op->getOperand(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  304:      return success();
+        -:  305:    }
+        5:  306:    return failure();
+        -:  307:  }
+        -:  308:};
+        -:  309:
+        -:  310:template <typename LoopType>
+       49:  311:static void lowerLinalgToLoopsImpl(func::FuncOp funcOp) {
+       49:  312:  MLIRContext *context = funcOp.getContext();
+       49:  313:  RewritePatternSet patterns(context);
+       49:  314:  patterns.add<LinalgRewritePattern<LoopType>>(context);
+       48:  315:  memref::DimOp::getCanonicalizationPatterns(patterns, context);
+       45:  316:  tensor::DimOp::getCanonicalizationPatterns(patterns, context);
+       48:  317:  AffineApplyOp::getCanonicalizationPatterns(patterns, context);
+       47:  318:  patterns.add<FoldAffineOp>(context);
+        -:  319:  // Just apply the patterns greedily.
+       45:  320:  (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+       48:  321:}
+------------------
+_ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir3scf10ParallelOpEEEvNS1_4func6FuncOpE:
+function _ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir3scf10ParallelOpEEEvNS1_4func6FuncOpE called 7 returned 100% blocks executed 100%
+        7:  311:static void lowerLinalgToLoopsImpl(func::FuncOp funcOp) {
+call    0 returned 100%
+        7:  312:  MLIRContext *context = funcOp.getContext();
+        7:  313:  RewritePatternSet patterns(context);
+call    0 returned 100%
+        7:  314:  patterns.add<LinalgRewritePattern<LoopType>>(context);
+call    0 returned 100%
+        7:  315:  memref::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+        7:  316:  tensor::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+        7:  317:  AffineApplyOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+        7:  318:  patterns.add<FoldAffineOp>(context);
+call    0 returned 100%
+        -:  319:  // Just apply the patterns greedily.
+        7:  320:  (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        7:  321:}
+------------------
+_ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir3scf5ForOpEEEvNS1_4func6FuncOpE:
+function _ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir3scf5ForOpEEEvNS1_4func6FuncOpE called 10 returned 100% blocks executed 100%
+       10:  311:static void lowerLinalgToLoopsImpl(func::FuncOp funcOp) {
+call    0 returned 100%
+       10:  312:  MLIRContext *context = funcOp.getContext();
+       10:  313:  RewritePatternSet patterns(context);
+call    0 returned 100%
+       10:  314:  patterns.add<LinalgRewritePattern<LoopType>>(context);
+call    0 returned 100%
+       10:  315:  memref::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+       10:  316:  tensor::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+       10:  317:  AffineApplyOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 100%
+       10:  318:  patterns.add<FoldAffineOp>(context);
+call    0 returned 100%
+        -:  319:  // Just apply the patterns greedily.
+       10:  320:  (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+       10:  321:}
+------------------
+_ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir11AffineForOpEEEvNS1_4func6FuncOpE:
+function _ZN12_GLOBAL__N_1L22lowerLinalgToLoopsImplIN4mlir11AffineForOpEEEvNS1_4func6FuncOpE called 32 returned 97% blocks executed 100%
+       32:  311:static void lowerLinalgToLoopsImpl(func::FuncOp funcOp) {
+call    0 returned 100%
+       32:  312:  MLIRContext *context = funcOp.getContext();
+       32:  313:  RewritePatternSet patterns(context);
+call    0 returned 97%
+       32:  314:  patterns.add<LinalgRewritePattern<LoopType>>(context);
+call    0 returned 97%
+       31:  315:  memref::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 90%
+       28:  316:  tensor::DimOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 111%
+       31:  317:  AffineApplyOp::getCanonicalizationPatterns(patterns, context);
+call    0 returned 97%
+       30:  318:  patterns.add<FoldAffineOp>(context);
+call    0 returned 93%
+        -:  319:  // Just apply the patterns greedily.
+       28:  320:  (void)applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
+call    0 returned 93%
+call    1 returned 123%
+call    2 returned 97%
+call    3 returned 100%
+       31:  321:}
+------------------
+        -:  322:
+   116892:  323:struct LowerToAffineLoops
+call    0 returned 100%
+call    1 returned 100%
+        -:  324:    : public impl::LinalgLowerToAffineLoopsBase<LowerToAffineLoops> {
+function _ZNK12_GLOBAL__N_118LowerToAffineLoops20getDependentDialectsERN4mlir15DialectRegistryE called 13 returned 100% blocks executed 100%
+       13:  325:  void getDependentDialects(DialectRegistry &registry) const override {
+       13:  326:    registry.insert<memref::MemRefDialect>();
+call    0 returned 100%
+       13:  327:  }
+function _ZN12_GLOBAL__N_118LowerToAffineLoops14runOnOperationEv called 32 returned 97% blocks executed 100%
+       32:  328:  void runOnOperation() override {
+       32:  329:    lowerLinalgToLoopsImpl<AffineForOp>(getOperation());
+call    0 returned 100%
+call    1 returned 97%
+       31:  330:  }
+        -:  331:};
+        -:  332:
+   117640:  333:struct LowerToLoops : public impl::LinalgLowerToLoopsBase<LowerToLoops> {
+call    0 returned 100%
+call    1 returned 100%
+function _ZNK12_GLOBAL__N_112LowerToLoops20getDependentDialectsERN4mlir15DialectRegistryE called 401 returned 100% blocks executed 100%
+      401:  334:  void getDependentDialects(DialectRegistry &registry) const override {
+      401:  335:    registry.insert<memref::MemRefDialect, scf::SCFDialect>();
+call    0 returned 100%
+      401:  336:  }
+function _ZN12_GLOBAL__N_112LowerToLoops14runOnOperationEv called 10 returned 100% blocks executed 100%
+       10:  337:  void runOnOperation() override {
+       10:  338:    lowerLinalgToLoopsImpl<scf::ForOp>(getOperation());
+call    0 returned 100%
+call    1 returned 100%
+       10:  339:  }
+        -:  340:};
+        -:  341:
+   116674:  342:struct LowerToParallelLoops
+call    0 returned 100%
+call    1 returned 100%
+        -:  343:    : public impl::LinalgLowerToParallelLoopsBase<LowerToParallelLoops> {
+function _ZN12_GLOBAL__N_120LowerToParallelLoops14runOnOperationEv called 7 returned 100% blocks executed 100%
+        7:  344:  void runOnOperation() override {
+        7:  345:    lowerLinalgToLoopsImpl<scf::ParallelOp>(getOperation());
+call    0 returned 100%
+call    1 returned 100%
+        7:  346:  }
+        -:  347:};
+        -:  348:
+        -:  349:} // namespace
+        -:  350:
+        -:  351:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir30createConvertLinalgToLoopsPassEv called 116560 returned 100% blocks executed 100%
+   116560:  352:mlir::createConvertLinalgToLoopsPass() {
+   116560:  353:  return std::make_unique<LowerToLoops>();
+call    0 returned 100%
+        -:  354:}
+        -:  355:
+        -:  356:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir38createConvertLinalgToParallelLoopsPassEv called 116170 returned 100% blocks executed 100%
+   116170:  357:mlir::createConvertLinalgToParallelLoopsPass() {
+   116170:  358:  return std::make_unique<LowerToParallelLoops>();
+call    0 returned 100%
+        -:  359:}
+        -:  360:
+        -:  361:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir36createConvertLinalgToAffineLoopsPassEv called 116172 returned 100% blocks executed 100%
+   116172:  362:mlir::createConvertLinalgToAffineLoopsPass() {
+   116172:  363:  return std::make_unique<LowerToAffineLoops>();
+call    0 returned 100%
+        -:  364:}
+        -:  365:
+        -:  366:/// Emits a loop nest of `affine.for` with the proper body for `linalgOp`.
+        -:  367:FailureOr<LinalgLoops>
+function _ZN4mlir6linalg21linalgOpToAffineLoopsERNS_15PatternRewriterENS0_8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  368:mlir::linalg::linalgOpToAffineLoops(PatternRewriter &rewriter,
+        -:  369:                                    LinalgOp linalgOp) {
+    #####:  370:  return linalgOpToLoopsImpl<AffineForOp>(rewriter, linalgOp);
+call    0 never executed
+        -:  371:}
+        -:  372:
+        -:  373:/// Emits a loop nest of `scf.for` with the proper body for `linalgOp`.
+function _ZN4mlir6linalg15linalgOpToLoopsERNS_15PatternRewriterENS0_8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  374:FailureOr<LinalgLoops> mlir::linalg::linalgOpToLoops(PatternRewriter &rewriter,
+        -:  375:                                                     LinalgOp linalgOp) {
+    #####:  376:  return linalgOpToLoopsImpl<scf::ForOp>(rewriter, linalgOp);
+call    0 never executed
+        -:  377:}
+        -:  378:
+        -:  379:/// Emits a loop nest of `scf.parallel` with the proper body for `linalgOp`.
+        -:  380:FailureOr<LinalgLoops>
+function _ZN4mlir6linalg23linalgOpToParallelLoopsERNS_15PatternRewriterENS0_8LinalgOpE called 0 returned 0% blocks executed 0%
+    #####:  381:mlir::linalg::linalgOpToParallelLoops(PatternRewriter &rewriter,
+        -:  382:                                      LinalgOp linalgOp) {
+    #####:  383:  return linalgOpToLoopsImpl<scf::ParallelOp>(rewriter, linalgOp);
+call    0 never executed
+        -:  384:}

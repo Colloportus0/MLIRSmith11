@@ -1,0 +1,683 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Conversion/GPUToNVVM/WmmaOpsToNvvm.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/GPUToNVVM/CMakeFiles/obj.MLIRGPUToNVVMTransforms.dir/WmmaOpsToNvvm.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/GPUToNVVM/CMakeFiles/obj.MLIRGPUToNVVMTransforms.dir/WmmaOpsToNvvm.cpp.gcda
+        -:    0:Runs:325556
+        -:    1://===------ WmmaOpsToNVVM.cpp - WMMA LD/ST/Compute to NVVM lowering -------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file contains definitions of patterns to lower GPU Subgroup MMA ops to
+        -:   10:// NVVM Dialect.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+        -:   15:#include "mlir/Conversion/LLVMCommon/Pattern.h"
+        -:   16:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   17:#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+        -:   18:#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+        -:   19:#include "mlir/IR/TypeUtilities.h"
+        -:   20:
+        -:   21:using namespace mlir;
+        -:   22:
+        -:   23:namespace {
+        -:   24:
+        -:   25:/// Checks if all the operands of the op being lowered are of LLVM Types. The
+        -:   26:/// types are expected to be converted by the `LLVMTypeConverter` before the op
+        -:   27:/// is actually lowered. If the type of an operands is not already converted it
+        -:   28:/// hints a missing typeConversion and failure is returned in that case.
+function _ZN12_GLOBAL__N_1L15areAllLLVMTypesEPN4mlir9OperationENS0_10ValueRangeERNS0_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   29:static LogicalResult areAllLLVMTypes(Operation *op, ValueRange operands,
+        -:   30:                                     ConversionPatternRewriter &rewriter) {
+    #####:   31:  if (!llvm::all_of(operands, [](Value value) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   32:        return LLVM::isCompatibleType(value.getType());
+        -:   33:      })) {
+    #####:   34:    return rewriter.notifyMatchFailure(
+    #####:   35:        op, "cannot convert if operands aren't of LLVM type.");
+call    0 never executed
+        -:   36:  }
+        -:   37:
+    #####:   38:  return success();
+        -:   39:}
+        -:   40:
+        -:   41:/// Error string to emit when an unimplemented WMMA variant is encountered.
+        -:   42:static constexpr StringRef kInvalidCaseStr = "Unsupported WMMA variant.";
+        -:   43:
+function _ZN12_GLOBAL__N_1L14convertOperandEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:   44:static NVVM::MMAFrag convertOperand(StringRef operandName) {
+    #####:   45:  if (operandName.equals("AOp"))
+branch  0 never executed
+branch  1 never executed
+        -:   46:    return NVVM::MMAFrag::a;
+    #####:   47:  if (operandName.equals("BOp"))
+branch  0 never executed
+branch  1 never executed
+        -:   48:    return NVVM::MMAFrag::b;
+    #####:   49:  if (operandName.equals("COp"))
+branch  0 never executed
+branch  1 never executed
+        -:   50:    return NVVM::MMAFrag::c;
+    #####:   51:  llvm_unreachable("Unknown operand name");
+call    0 never executed
+        -:   52:}
+        -:   53:
+function _ZN12_GLOBAL__N_1L14getElementTypeEN4mlir3gpu13MMAMatrixTypeE called 0 returned 0% blocks executed 0%
+    #####:   54:static NVVM::MMATypes getElementType(gpu::MMAMatrixType type) {
+    #####:   55:  if (type.getElementType().isF16())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:   56:    return NVVM::MMATypes::f16;
+    #####:   57:  if (type.getElementType().isF32())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   58:    return type.getOperand().equals("COp") ? NVVM::MMATypes::f32
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   59:                                           : NVVM::MMATypes::tf32;
+    #####:   60:  llvm_unreachable("Unsupported type");
+call    0 never executed
+        -:   61:}
+        -:   62:
+        -:   63:/// This class implements the conversion of GPU MMA loadOp to wmma.load op
+        -:   64:/// in the NVVM dialect. The conversion not only emits the NVVM op but also
+        -:   65:/// emits code that is necessary to store the data in the destination memref
+        -:   66:/// after it has been loaded.
+        -:   67:struct WmmaLoadOpToNVVMLowering
+        -:   68:    : public ConvertOpToLLVMPattern<gpu::SubgroupMmaLoadMatrixOp> {
+        -:   69:  using ConvertOpToLLVMPattern<
+    #####:   70:      gpu::SubgroupMmaLoadMatrixOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:   71:
+        -:   72:  LogicalResult
+function _ZNK12_GLOBAL__N_124WmmaLoadOpToNVVMLowering15matchAndRewriteEN4mlir3gpu23SubgroupMmaLoadMatrixOpENS2_30SubgroupMmaLoadMatrixOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   73:  matchAndRewrite(gpu::SubgroupMmaLoadMatrixOp subgroupMmaLoadMatrixOp,
+        -:   74:                  OpAdaptor adaptor,
+        -:   75:                  ConversionPatternRewriter &rewriter) const override {
+    #####:   76:    Operation *op = subgroupMmaLoadMatrixOp.getOperation();
+call    0 never executed
+    #####:   77:    if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   78:      return failure();
+        -:   79:
+        -:   80:    // Get the shape of the MMAMatrix type being returned. The shape will
+        -:   81:    // choose which intrinsic this op will be lowered to.
+    #####:   82:    gpu::MMAMatrixType retType =
+    #####:   83:        subgroupMmaLoadMatrixOp.getRes().getType().cast<gpu::MMAMatrixType>();
+call    0 never executed
+call    1 never executed
+    #####:   84:    ArrayRef<int64_t> retTypeShape = retType.getShape();
+call    0 never executed
+    #####:   85:    int64_t m = 0;
+    #####:   86:    int64_t n = 0;
+    #####:   87:    int64_t k = 0;
+    #####:   88:    NVVM::MMATypes eltype = getElementType(retType);
+call    0 never executed
+        -:   89:    // NVVM intrinsics require to give mxnxk dimensions, infer the missing
+        -:   90:    // dimension based on the valid intrinsics available.
+    #####:   91:    if (retType.getOperand().equals("AOp")) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   92:      m = retTypeShape[0];
+branch  0 never executed
+branch  1 never executed
+    #####:   93:      k = retTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:   94:      n = NVVM::WMMALoadOp::inferNDimension(m, k, eltype);
+call    0 never executed
+    #####:   95:    } else if (retType.getOperand().equals("BOp")) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   96:      k = retTypeShape[0];
+branch  0 never executed
+branch  1 never executed
+    #####:   97:      n = retTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:   98:      m = NVVM::WMMALoadOp::inferMDimension(k, n, eltype);
+call    0 never executed
+    #####:   99:    } else if (retType.getOperand().equals("COp")) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  100:      m = retTypeShape[0];
+branch  0 never executed
+branch  1 never executed
+    #####:  101:      n = retTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:  102:      k = NVVM::WMMALoadOp::inferKDimension(m, n, eltype);
+call    0 never executed
+        -:  103:    }
+    #####:  104:    NVVM::MMALayout layout = NVVM::MMALayout::row;
+    #####:  105:    NVVM::MMAFrag frag = convertOperand(retType.getOperand());
+call    0 never executed
+call    1 never executed
+        -:  106:    // Check that there is an exisiting instruction for the combination we need.
+    #####:  107:    if (NVVM::WMMALoadOp::getIntrinsicID(m, n, k, layout, eltype, frag) == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  108:      return rewriter.notifyMatchFailure(op, kInvalidCaseStr);
+call    0 never executed
+call    1 never executed
+        -:  109:
+    #####:  110:    Type resType = convertMMAToLLVMType(retType);
+call    0 never executed
+    #####:  111:    Location loc = op->getLoc();
+call    0 never executed
+        -:  112:
+        -:  113:    // Create nvvm.mma_load op according to the operand types.
+    #####:  114:    Value dataPtr = getStridedElementPtr(
+        -:  115:        loc,
+    #####:  116:        subgroupMmaLoadMatrixOp.getSrcMemref().getType().cast<MemRefType>(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  117:        adaptor.getSrcMemref(), adaptor.getIndices(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  118:
+    #####:  119:    Value leadingDim = rewriter.create<LLVM::ConstantOp>(
+    #####:  120:        loc, rewriter.getI32Type(),
+call    0 never executed
+    #####:  121:        subgroupMmaLoadMatrixOp.getLeadDimensionAttr());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  122:    rewriter.replaceOpWithNewOp<NVVM::WMMALoadOp>(
+    #####:  123:        op, resType, dataPtr, leadingDim, m, n, k, layout, eltype, frag);
+call    0 never executed
+    #####:  124:    return success();
+        -:  125:  }
+        -:  126:};
+        -:  127:
+        -:  128:/// This class implements the conversion of GPU MMA storeOp to wmma.store op
+        -:  129:/// in the NVVM dialect. The conversion not only emits the NVVM op but also
+        -:  130:/// emits code that is necessary to unpack the data in the source and
+        -:  131:/// convert the data in the format that is needed by the NVVM op.
+        -:  132:struct WmmaStoreOpToNVVMLowering
+        -:  133:    : public ConvertOpToLLVMPattern<gpu::SubgroupMmaStoreMatrixOp> {
+        -:  134:  using ConvertOpToLLVMPattern<
+    #####:  135:      gpu::SubgroupMmaStoreMatrixOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:  136:
+        -:  137:  LogicalResult
+function _ZNK12_GLOBAL__N_125WmmaStoreOpToNVVMLowering15matchAndRewriteEN4mlir3gpu24SubgroupMmaStoreMatrixOpENS2_31SubgroupMmaStoreMatrixOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  138:  matchAndRewrite(gpu::SubgroupMmaStoreMatrixOp subgroupMmaStoreMatrixOp,
+        -:  139:                  OpAdaptor adaptor,
+        -:  140:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  141:    Operation *op = subgroupMmaStoreMatrixOp.getOperation();
+call    0 never executed
+    #####:  142:    if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  143:      return failure();
+        -:  144:
+    #####:  145:    Location loc = op->getLoc();
+call    0 never executed
+        -:  146:
+    #####:  147:    SmallVector<Value, 4> storeOpOperands;
+call    0 never executed
+        -:  148:    // Get the shape of the MMAMatrix type being stored. The shape will
+        -:  149:    // choose which intrinsic this op will be lowered to.
+    #####:  150:    gpu::MMAMatrixType srcType =
+    #####:  151:        subgroupMmaStoreMatrixOp.getSrc().getType().cast<gpu::MMAMatrixType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  152:    ArrayRef<int64_t> srcTypeShape = srcType.getShape();
+call    0 never executed
+    #####:  153:    NVVM::MMALayout layout = NVVM::MMALayout::row;
+    #####:  154:    NVVM::MMATypes eltype = getElementType(srcType);
+call    0 never executed
+    #####:  155:    int64_t m = srcTypeShape[0];
+branch  0 never executed
+branch  1 never executed
+    #####:  156:    int64_t n = srcTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:  157:    int64_t k = NVVM::WMMAStoreOp::inferKDimension(m, n, eltype);
+call    0 never executed
+    #####:  158:    if (NVVM::WMMAStoreOp::getIntrinsicID(m, n, k, layout, eltype) == 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  159:      return rewriter.notifyMatchFailure(op, kInvalidCaseStr);
+call    0 never executed
+call    1 never executed
+        -:  160:
+    #####:  161:    auto matrixType = adaptor.getSrc().getType().cast<LLVM::LLVMStructType>();
+call    0 never executed
+call    1 never executed
+    #####:  162:    for (unsigned i = 0, e = matrixType.getBody().size(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  163:      Value toUse =
+    #####:  164:          rewriter.create<LLVM::ExtractValueOp>(loc, adaptor.getSrc(), i);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  165:      storeOpOperands.push_back(toUse);
+call    0 never executed
+        -:  166:    }
+        -:  167:
+    #####:  168:    Value dataPtr = getStridedElementPtr(
+        -:  169:        loc,
+    #####:  170:        subgroupMmaStoreMatrixOp.getDstMemref().getType().cast<MemRefType>(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  171:        adaptor.getDstMemref(), adaptor.getIndices(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  172:    Value leadingDim = rewriter.create<LLVM::ConstantOp>(
+    #####:  173:        loc, rewriter.getI32Type(),
+call    0 never executed
+    #####:  174:        subgroupMmaStoreMatrixOp.getLeadDimensionAttr());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  175:    rewriter.replaceOpWithNewOp<NVVM::WMMAStoreOp>(
+    #####:  176:        op, dataPtr, m, n, k, layout, eltype, storeOpOperands, leadingDim);
+call    0 never executed
+    #####:  177:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  178:  }
+        -:  179:};
+        -:  180:
+        -:  181:/// This class implements the conversion of GPU MMA computeOp to wmma.mma op
+        -:  182:/// in the NVVM dialect.
+        -:  183:struct WmmaMmaOpToNVVMLowering
+        -:  184:    : public ConvertOpToLLVMPattern<gpu::SubgroupMmaComputeOp> {
+        -:  185:  using ConvertOpToLLVMPattern<
+    #####:  186:      gpu::SubgroupMmaComputeOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:  187:
+        -:  188:  LogicalResult
+function _ZNK12_GLOBAL__N_123WmmaMmaOpToNVVMLowering15matchAndRewriteEN4mlir3gpu20SubgroupMmaComputeOpENS2_27SubgroupMmaComputeOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  189:  matchAndRewrite(gpu::SubgroupMmaComputeOp subgroupMmaComputeOp,
+        -:  190:                  OpAdaptor adaptor,
+        -:  191:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  192:    Operation *op = subgroupMmaComputeOp.getOperation();
+call    0 never executed
+    #####:  193:    if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  194:      return failure();
+        -:  195:
+    #####:  196:    Location loc = op->getLoc();
+call    0 never executed
+        -:  197:
+        -:  198:    // The wmma.mma intrinsic in llvm requires the operands as individual
+        -:  199:    // values. So individual elements from the memrefs need to be extracted and
+        -:  200:    // then passed on to the intrinsic call. Emit llvm ops to extract individual
+        -:  201:    // values form lowered memrefs.
+    #####:  202:    SmallVector<Value> unpackedOps;
+call    0 never executed
+        -:  203:
+function _ZZNK12_GLOBAL__N_123WmmaMmaOpToNVVMLowering15matchAndRewriteEN4mlir3gpu20SubgroupMmaComputeOpENS2_27SubgroupMmaComputeOpAdaptorERNS1_25ConversionPatternRewriterEENKUlNS1_5ValueEE_clES7_ called 0 returned 0% blocks executed 0%
+    #####:  204:    auto unpackOp = [&](Value operand) {
+    #####:  205:      auto structType = operand.getType().cast<LLVM::LLVMStructType>();
+call    0 never executed
+    #####:  206:      for (size_t i = 0, e = structType.getBody().size(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  207:        Value toUse = rewriter.create<LLVM::ExtractValueOp>(loc, operand, i);
+call    0 never executed
+call    1 never executed
+    #####:  208:        unpackedOps.push_back(toUse);
+call    0 never executed
+        -:  209:      }
+    #####:  210:    };
+        -:  211:
+        -:  212:    // Get the shapes of the MMAMatrix type being used. The shapes will
+        -:  213:    // choose which intrinsic this op will be lowered to.
+    #####:  214:    gpu::MMAMatrixType aType =
+    #####:  215:        subgroupMmaComputeOp.getOpA().getType().cast<gpu::MMAMatrixType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  216:    ArrayRef<int64_t> aTypeShape = aType.getShape();
+call    0 never executed
+    #####:  217:    gpu::MMAMatrixType cType =
+    #####:  218:        subgroupMmaComputeOp.getOpC().getType().cast<gpu::MMAMatrixType>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  219:    ArrayRef<int64_t> cTypeShape = cType.getShape();
+call    0 never executed
+    #####:  220:    int64_t m = cTypeShape[0];
+branch  0 never executed
+branch  1 never executed
+    #####:  221:    int64_t n = cTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:  222:    int64_t k = aTypeShape[1];
+branch  0 never executed
+branch  1 never executed
+    #####:  223:    NVVM::MMALayout layout = NVVM::MMALayout::row;
+    #####:  224:    NVVM::MMATypes sourceType = getElementType(aType);
+call    0 never executed
+    #####:  225:    NVVM::MMATypes destType = getElementType(cType);
+call    0 never executed
+    #####:  226:    if (NVVM::WMMAMmaOp::getIntrinsicID(m, n, k, layout, layout, sourceType,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  227:                                        destType) == 0)
+    #####:  228:      return rewriter.notifyMatchFailure(op, kInvalidCaseStr);
+call    0 never executed
+call    1 never executed
+        -:  229:
+    #####:  230:    unpackOp(adaptor.getOpA());
+call    0 never executed
+call    1 never executed
+    #####:  231:    unpackOp(adaptor.getOpB());
+call    0 never executed
+call    1 never executed
+    #####:  232:    unpackOp(adaptor.getOpC());
+call    0 never executed
+call    1 never executed
+        -:  233:
+    #####:  234:    rewriter.replaceOpWithNewOp<NVVM::WMMAMmaOp>(
+    #####:  235:        op, adaptor.getOpC().getType(), m, n, k, layout, layout, sourceType,
+call    0 never executed
+    #####:  236:        destType, unpackedOps);
+call    0 never executed
+call    1 never executed
+    #####:  237:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  238:  }
+        -:  239:};
+        -:  240:
+        -:  241:/// Convert GPU MMA ConstantMatrixOp to a chain of InsertValueOp.
+        -:  242:struct WmmaConstantOpToNVVMLowering
+        -:  243:    : public ConvertOpToLLVMPattern<gpu::SubgroupMmaConstantMatrixOp> {
+        -:  244:  using ConvertOpToLLVMPattern<
+    #####:  245:      gpu::SubgroupMmaConstantMatrixOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:  246:
+        -:  247:  LogicalResult
+function _ZNK12_GLOBAL__N_128WmmaConstantOpToNVVMLowering15matchAndRewriteEN4mlir3gpu27SubgroupMmaConstantMatrixOpENS2_34SubgroupMmaConstantMatrixOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  248:  matchAndRewrite(gpu::SubgroupMmaConstantMatrixOp subgroupMmaConstantOp,
+        -:  249:                  OpAdaptor adaptor,
+        -:  250:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  251:    if (failed(areAllLLVMTypes(subgroupMmaConstantOp.getOperation(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  252:                               adaptor.getOperands(), rewriter)))
+    #####:  253:      return failure();
+    #####:  254:    Location loc = subgroupMmaConstantOp.getLoc();
+call    0 never executed
+    #####:  255:    Value cst = adaptor.getOperands()[0];
+call    0 never executed
+call    1 never executed
+    #####:  256:    LLVM::LLVMStructType type = convertMMAToLLVMType(
+    #####:  257:        subgroupMmaConstantOp.getType().cast<gpu::MMAMatrixType>());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  258:    // If the element type is a vector create a vector from the operand.
+    #####:  259:    if (auto vecType = type.getBody()[0].dyn_cast<VectorType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  260:      Value vecCst = rewriter.create<LLVM::UndefOp>(loc, vecType);
+call    0 never executed
+    #####:  261:      for (int64_t vecEl = 0; vecEl < vecType.getNumElements(); vecEl++) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  262:        Value idx = rewriter.create<LLVM::ConstantOp>(
+    #####:  263:            loc, rewriter.getI32Type(), vecEl);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  264:        vecCst = rewriter.create<LLVM::InsertElementOp>(loc, vecType, vecCst,
+    #####:  265:                                                        cst, idx);
+call    0 never executed
+        -:  266:      }
+    #####:  267:      cst = vecCst;
+        -:  268:    }
+    #####:  269:    Value matrixStruct = rewriter.create<LLVM::UndefOp>(loc, type);
+call    0 never executed
+call    1 never executed
+    #####:  270:    for (size_t i : llvm::seq(size_t(0), type.getBody().size())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  271:      matrixStruct =
+    #####:  272:          rewriter.create<LLVM::InsertValueOp>(loc, matrixStruct, cst, i);
+call    0 never executed
+call    1 never executed
+        -:  273:    }
+    #####:  274:    rewriter.replaceOp(subgroupMmaConstantOp, matrixStruct);
+call    0 never executed
+call    1 never executed
+    #####:  275:    return success();
+        -:  276:  }
+        -:  277:};
+        -:  278:
+function _ZN12_GLOBAL__N_1L13createMinMaxFERN4mlir9OpBuilderENS0_8LocationENS0_5ValueES4_b called 0 returned 0% blocks executed 0%
+    #####:  279:static Value createMinMaxF(OpBuilder &builder, Location loc, Value lhs,
+        -:  280:                           Value rhs, bool isMin) {
+    #####:  281:  auto floatType = getElementTypeOrSelf(lhs.getType()).cast<FloatType>();
+call    0 never executed
+call    1 never executed
+    #####:  282:  Type i1Type = builder.getI1Type();
+call    0 never executed
+    #####:  283:  if (auto vecType = lhs.getType().dyn_cast<VectorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  284:    i1Type = VectorType::get(vecType.getShape(), i1Type);
+call    0 never executed
+call    1 never executed
+    #####:  285:  Value cmp = builder.create<LLVM::FCmpOp>(
+    #####:  286:      loc, i1Type, isMin ? LLVM::FCmpPredicate::olt : LLVM::FCmpPredicate::ogt,
+branch  0 never executed
+branch  1 never executed
+    #####:  287:      lhs, rhs);
+call    0 never executed
+call    1 never executed
+    #####:  288:  Value sel = builder.create<LLVM::SelectOp>(loc, cmp, lhs, rhs);
+call    0 never executed
+call    1 never executed
+    #####:  289:  Value isNan = builder.create<LLVM::FCmpOp>(
+    #####:  290:      loc, i1Type, LLVM::FCmpPredicate::uno, lhs, rhs);
+call    0 never executed
+call    1 never executed
+    #####:  291:  Value nan = builder.create<LLVM::ConstantOp>(
+    #####:  292:      loc, lhs.getType(),
+call    0 never executed
+    #####:  293:      builder.getFloatAttr(floatType,
+call    0 never executed
+    #####:  294:                           APFloat::getQNaN(floatType.getFloatSemantics())));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  295:  return builder.create<LLVM::SelectOp>(loc, isNan, nan, sel);
+call    0 never executed
+        -:  296:}
+        -:  297:
+function _ZN12_GLOBAL__N_1L14createScalarOpERN4mlir9OpBuilderENS0_8LocationENS0_3gpu16MMAElementwiseOpEN4llvm8ArrayRefINS0_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  298:static Value createScalarOp(OpBuilder &builder, Location loc,
+        -:  299:                            gpu::MMAElementwiseOp op,
+        -:  300:                            ArrayRef<Value> operands) {
+    #####:  301:  switch (op) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  302:  case gpu::MMAElementwiseOp::ADDF:
+    #####:  303:    return builder.create<LLVM::FAddOp>(loc, operands[0].getType(), operands);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  304:  case gpu::MMAElementwiseOp::MULF:
+    #####:  305:    return builder.create<LLVM::FMulOp>(loc, operands[0].getType(), operands);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  306:  case gpu::MMAElementwiseOp::DIVF:
+    #####:  307:    return builder.create<LLVM::FDivOp>(loc, operands[0].getType(), operands);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  308:  case gpu::MMAElementwiseOp::MAXF:
+    #####:  309:    return createMinMaxF(builder, loc, operands[0], operands[1],
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  310:                         /*isMin=*/false);
+call    0 never executed
+    #####:  311:  case gpu::MMAElementwiseOp::MINF:
+    #####:  312:    return createMinMaxF(builder, loc, operands[0], operands[1],
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  313:                         /*isMin=*/true);
+call    0 never executed
+    #####:  314:  default:
+    #####:  315:    llvm_unreachable("unknown op");
+call    0 never executed
+        -:  316:  }
+        -:  317:}
+        -:  318:
+        -:  319:/// Convert GPU MMA elementwise ops to extract + op + insert.
+        -:  320:struct WmmaElementwiseOpToNVVMLowering
+        -:  321:    : public ConvertOpToLLVMPattern<gpu::SubgroupMmaElementwiseOp> {
+        -:  322:  using ConvertOpToLLVMPattern<
+    #####:  323:      gpu::SubgroupMmaElementwiseOp>::ConvertOpToLLVMPattern;
+call    0 never executed
+        -:  324:
+        -:  325:  LogicalResult
+function _ZNK12_GLOBAL__N_131WmmaElementwiseOpToNVVMLowering15matchAndRewriteEN4mlir3gpu24SubgroupMmaElementwiseOpENS2_31SubgroupMmaElementwiseOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  326:  matchAndRewrite(gpu::SubgroupMmaElementwiseOp subgroupMmaElementwiseOp,
+        -:  327:                  OpAdaptor adaptor,
+        -:  328:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  329:    if (failed(areAllLLVMTypes(subgroupMmaElementwiseOp.getOperation(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  330:                               adaptor.getOperands(), rewriter)))
+    #####:  331:      return failure();
+    #####:  332:    Location loc = subgroupMmaElementwiseOp.getLoc();
+call    0 never executed
+    #####:  333:    size_t numOperands = adaptor.getOperands().size();
+call    0 never executed
+call    1 never executed
+    #####:  334:    LLVM::LLVMStructType destType = convertMMAToLLVMType(
+    #####:  335:        subgroupMmaElementwiseOp.getType().cast<gpu::MMAMatrixType>());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  336:    Value matrixStruct = rewriter.create<LLVM::UndefOp>(loc, destType);
+call    0 never executed
+call    1 never executed
+    #####:  337:    for (size_t i = 0, e = destType.getBody().size(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  338:      SmallVector<Value> extractedOperands;
+    #####:  339:      for (size_t opIdx = 0; opIdx < numOperands; opIdx++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  340:        extractedOperands.push_back(rewriter.create<LLVM::ExtractValueOp>(
+call    0 never executed
+    #####:  341:            loc, adaptor.getOperands()[opIdx], i));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  342:      }
+    #####:  343:      Value element =
+call    0 never executed
+        -:  344:          createScalarOp(rewriter, loc, subgroupMmaElementwiseOp.getOpType(),
+    #####:  345:                         extractedOperands);
+call    0 never executed
+call    1 never executed
+    #####:  346:      matrixStruct =
+    #####:  347:          rewriter.create<LLVM::InsertValueOp>(loc, matrixStruct, element, i);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  348:    }
+    #####:  349:    rewriter.replaceOp(subgroupMmaElementwiseOp, matrixStruct);
+call    0 never executed
+call    1 never executed
+    #####:  350:    return success();
+        -:  351:  }
+        -:  352:};
+        -:  353:
+        -:  354:} // namespace
+        -:  355:
+        -:  356:/// Return the LLVMStructureType corresponding to the MMAMatrixType `type`.
+function _ZN4mlir20convertMMAToLLVMTypeENS_3gpu13MMAMatrixTypeE called 0 returned 0% blocks executed 0%
+    #####:  357:LLVM::LLVMStructType mlir::convertMMAToLLVMType(gpu::MMAMatrixType type) {
+    #####:  358:  NVVM::MMAFrag frag = convertOperand(type.getOperand());
+call    0 never executed
+call    1 never executed
+    #####:  359:  NVVM::MMATypes eltType = getElementType(type);
+call    0 never executed
+    #####:  360:  std::pair<Type, unsigned> typeInfo =
+    #####:  361:      NVVM::inferMMAType(eltType, frag, type.getContext());
+call    0 never executed
+call    1 never executed
+    #####:  362:  return LLVM::LLVMStructType::getLiteral(
+    #####:  363:      type.getContext(), SmallVector<Type, 8>(typeInfo.second, typeInfo.first));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  364:}
+        -:  365:
+function _ZN4mlir39populateGpuWMMAToNVVMConversionPatternsERNS_17LLVMTypeConverterERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+    #####:  366:void mlir::populateGpuWMMAToNVVMConversionPatterns(
+        -:  367:    LLVMTypeConverter &converter, RewritePatternSet &patterns) {
+    #####:  368:  patterns.add<WmmaLoadOpToNVVMLowering, WmmaMmaOpToNVVMLowering,
+        -:  369:               WmmaStoreOpToNVVMLowering, WmmaConstantOpToNVVMLowering,
+    #####:  370:               WmmaElementwiseOpToNVVMLowering>(converter);
+call    0 never executed
+    #####:  371:}

@@ -1,0 +1,806 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Bufferization/Transforms/OneShotModuleBufferize.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/OneShotModuleBufferize.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/OneShotModuleBufferize.cpp.gcda
+        -:    0:Runs:128625
+        -:    1://===- ModuleBufferization.cpp - Bufferization across Func. Boundaries ----===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// Module Bufferization is an extension of One-Shot Bufferize that
+        -:   10:// bufferizes function boundaries. It provides `BufferizableOpInterface`
+        -:   11:// implementations for FuncOp, CallOp and ReturnOp.
+        -:   12://
+        -:   13:// Module Bufferization is run via `runOneShotModuleBufferize(ModuleOp, ...)`.
+        -:   14:// This function analyzes the given module and determines the order of analysis
+        -:   15:// and bufferization: Functions that are called are processed before their
+        -:   16:// respective callers.
+        -:   17://
+        -:   18:// After analyzing a FuncOp, additional information about its bbArgs is
+        -:   19:// gathered and stored in `FuncAnalysisState`.
+        -:   20://
+        -:   21:// * `aliasingFuncOpBBArgsAnalysis` determines the equivalent/aliasing bbArgs
+        -:   22:// for
+        -:   23://   each tensor return value (if any).
+        -:   24:// * `funcOpBbArgReadWriteAnalysis` determines whether or not a tensor bbArg is
+        -:   25://   read/written.
+        -:   26://
+        -:   27:// Module Bufferization implements the following calling convention.
+        -:   28://
+        -:   29:// * In the absence of conflicts within a FuncOp, the FuncOp's bbArgs may always
+        -:   30://   be written to in-place.
+        -:   31:// * If a tensor operand of a CallOp is read after the CallOp, the operand of
+        -:   32://   the CallOp must bufferize out-of-place.
+        -:   33://
+        -:   34:// Example: The tensor.insert op bufferizes in-place because it is allowed to
+        -:   35:// modify the buffer of `%t1` directly. The CallOp in `caller` must bufferize
+        -:   36:// out-of-place because `%t0` is modified by the callee but read by the
+        -:   37:// tensor.extract op. The analysis of CallOps decides whether an OpOperand must
+        -:   38:// bufferize out-of-place based on results of `funcOpBbArgReadWriteAnalysis`.
+        -:   39:// ```
+        -:   40:// func @callee(%t1 : tensor<?xf32>) -> tensor<?xf32> {
+        -:   41://   %f = ... : f32
+        -:   42://   %0 = tensor.insert %f into %t1[...] : tensor<?xf32>
+        -:   43://   return %0 : tensor<?xf32>
+        -:   44:// }
+        -:   45://
+        -:   46:// func @caller() -> () {
+        -:   47://   %t0 = ... : tensor<?xf32>
+        -:   48://   %1 = call @callee(%t0) : (tensor<?xf32>) -> (tensor<?xf32>)
+        -:   49://   %2 = tensor.extract %1[...]  : tensor<?xf32>
+        -:   50:// }
+        -:   51:// ```
+        -:   52://
+        -:   53:// Note: If a function is external, `funcOpBbArgReadWriteAnalysis` cannot
+        -:   54:// analyze the function body. In such a case, the CallOp analysis conservatively
+        -:   55:// assumes that each tensor OpOperand is both read and written.
+        -:   56://
+        -:   57:// TODO: Add FuncOp attributes so that bbArgs of external FuncOps can be marked
+        -:   58:// as "not reading" and/or "not writing".
+        -:   59:
+        -:   60:#include "mlir/Dialect/Bufferization/Transforms/OneShotModuleBufferize.h"
+        -:   61:
+        -:   62:#include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
+        -:   63:#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+        -:   64:#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+        -:   65:#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+        -:   66:#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+        -:   67:#include "mlir/Dialect/Bufferization/Transforms/TensorCopyInsertion.h"
+        -:   68:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   69:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   70:#include "mlir/IR/Operation.h"
+        -:   71:
+        -:   72:using namespace mlir;
+        -:   73:using namespace mlir::bufferization;
+        -:   74:using namespace mlir::bufferization::func_ext;
+        -:   75:
+        -:   76:/// A mapping of FuncOps to their callers.
+        -:   77:using FuncCallerMap = DenseMap<func::FuncOp, DenseSet<Operation *>>;
+        -:   78:
+        -:   79:/// Get FuncAnalysisState.
+        -:   80:static const FuncAnalysisState &
+        -:   81:getFuncAnalysisState(const AnalysisState &state) {
+        -:   82:  Optional<const FuncAnalysisState *> maybeState =
+        -:   83:      state.getDialectState<FuncAnalysisState>(
+        -:   84:          func::FuncDialect::getDialectNamespace());
+        -:   85:  assert(maybeState && "FuncAnalysisState does not exist");
+        -:   86:  return **maybeState;
+        -:   87:}
+        -:   88:
+        -:   89:/// Get or create FuncAnalysisState.
+     507*:   90:static FuncAnalysisState &getFuncAnalysisState(AnalysisState &state) {
+     507*:   91:  return state.getOrCreateDialectState<FuncAnalysisState>(
+    1014*:   92:      func::FuncDialect::getDialectNamespace());
+        -:   93:}
+        -:   94:
+        -:   95:/// Return the state (phase) of analysis of the FuncOp.
+        -:   96:/// Used for debug modes.
+        -:   97:LLVM_ATTRIBUTE_UNUSED
+        -:   98:static FuncOpAnalysisState getFuncOpAnalysisState(const AnalysisState &state,
+        -:   99:                                                  func::FuncOp funcOp) {
+        -:  100:  const FuncAnalysisState &funcState = getFuncAnalysisState(state);
+        -:  101:  auto it = funcState.analyzedFuncOps.find(funcOp);
+        -:  102:  if (it == funcState.analyzedFuncOps.end())
+        -:  103:    return FuncOpAnalysisState::NotAnalyzed;
+        -:  104:  return it->second;
+        -:  105:}
+        -:  106:
+        -:  107:/// Return the unique ReturnOp that terminates `funcOp`.
+        -:  108:/// Return nullptr if there is no such unique ReturnOp.
+function _ZL24getAssumedUniqueReturnOpN4mlir4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  109:static func::ReturnOp getAssumedUniqueReturnOp(func::FuncOp funcOp) {
+    #####:  110:  func::ReturnOp returnOp;
+call    0 never executed
+    #####:  111:  for (Block &b : funcOp.getBody()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  112:    if (auto candidateOp = dyn_cast<func::ReturnOp>(b.getTerminator())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  113:      if (returnOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  114:        return nullptr;
+        -:  115:      returnOp = candidateOp;
+        -:  116:    }
+        -:  117:  }
+    #####:  118:  return returnOp;
+        -:  119:}
+        -:  120:
+        -:  121:namespace {
+        -:  122:
+        -:  123:/// Annotate IR with the results of the analysis. For testing purposes only.
+function _ZN12_GLOBAL__N_1L29annotateEquivalentReturnBbArgERN4mlir9OpOperandENS0_13BlockArgumentE called 0 returned 0% blocks executed 0%
+    #####:  124:static void annotateEquivalentReturnBbArg(OpOperand &returnVal,
+        -:  125:                                          BlockArgument bbArg) {
+    #####:  126:  const char *kEquivalentArgsAttr = "__equivalent_func_args__";
+    #####:  127:  Operation *op = returnVal.getOwner();
+call    0 never executed
+        -:  128:
+    #####:  129:  SmallVector<int64_t> equivBbArgs;
+call    0 never executed
+    #####:  130:  if (op->hasAttr(kEquivalentArgsAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  131:    auto attr = op->getAttr(kEquivalentArgsAttr).cast<ArrayAttr>();
+call    0 never executed
+call    1 never executed
+function _ZZN12_GLOBAL__N_1L29annotateEquivalentReturnBbArgERN4mlir9OpOperandENS0_13BlockArgumentEENKUlNS0_9AttributeEE_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  132:    equivBbArgs = llvm::to_vector<4>(llvm::map_range(attr, [](Attribute a) {
+call    0 never executed
+call    1 never executed
+    #####:  133:      return a.cast<IntegerAttr>().getValue().getSExtValue();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  134:    }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  135:  } else {
+    #####:  136:    equivBbArgs.append(op->getNumOperands(), -1);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  137:  }
+    #####:  138:  equivBbArgs[returnVal.getOperandNumber()] = bbArg.getArgNumber();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  139:
+    #####:  140:  OpBuilder b(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  141:  op->setAttr(kEquivalentArgsAttr, b.getI64ArrayAttr(equivBbArgs));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  142:}
+        -:  143:
+        -:  144:/// Store function BlockArguments that are equivalent to/aliasing a returned
+        -:  145:/// value in FuncAnalysisState.
+function _ZN12_GLOBAL__N_1L28aliasingFuncOpBBArgsAnalysisEN4mlir4func6FuncOpERNS0_13bufferization20OneShotAnalysisStateE called 0 returned 0% blocks executed 0%
+    #####:  146:static LogicalResult aliasingFuncOpBBArgsAnalysis(FuncOp funcOp,
+        -:  147:                                                  OneShotAnalysisState &state) {
+    #####:  148:  FuncAnalysisState &funcState = getFuncAnalysisState(state);
+call    0 never executed
+        -:  149:
+        -:  150:  // Support only single return-terminated block in the function.
+    #####:  151:  func::ReturnOp returnOp = getAssumedUniqueReturnOp(funcOp);
+call    0 never executed
+    #####:  152:  assert(returnOp && "expected func with single return op");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  153:
+    #####:  154:  for (OpOperand &returnVal : returnOp->getOpOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  155:    if (returnVal.get().getType().isa<RankedTensorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  156:      for (BlockArgument bbArg : funcOp.getArguments())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  157:        if (bbArg.getType().isa<RankedTensorType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  158:          int64_t returnIdx = returnVal.getOperandNumber();
+call    0 never executed
+    #####:  159:          int64_t bbArgIdx = bbArg.getArgNumber();
+call    0 never executed
+    #####:  160:          if (state.areEquivalentBufferizedValues(returnVal.get(), bbArg)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  161:            funcState.equivalentFuncArgs[funcOp][returnIdx] = bbArgIdx;
+call    0 never executed
+call    1 never executed
+    #####:  162:            if (state.getOptions().testAnalysisOnly)
+branch  0 never executed
+branch  1 never executed
+    #####:  163:              annotateEquivalentReturnBbArg(returnVal, bbArg);
+call    0 never executed
+        -:  164:          }
+    #####:  165:          if (state.areAliasingBufferizedValues(returnVal.get(), bbArg)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  166:            funcState.aliasingFuncArgs[funcOp][returnIdx].push_back(bbArgIdx);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  167:            funcState.aliasingReturnVals[funcOp][bbArgIdx].push_back(returnIdx);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  168:          }
+        -:  169:        }
+        -:  170:
+    #####:  171:  return success();
+        -:  172:}
+        -:  173:
+function _ZN12_GLOBAL__N_1L21annotateFuncArgAccessEN4mlir4func6FuncOpENS0_13BlockArgumentEbb called 0 returned 0% blocks executed 0%
+    #####:  174:static void annotateFuncArgAccess(func::FuncOp funcOp, BlockArgument bbArg,
+        -:  175:                                  bool isRead, bool isWritten) {
+    #####:  176:  OpBuilder b(funcOp.getContext());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  177:  Attribute accessType;
+    #####:  178:  if (isRead && isWritten) {
+branch  0 never executed
+branch  1 never executed
+    #####:  179:    accessType = b.getStringAttr("read-write");
+call    0 never executed
+call    1 never executed
+    #####:  180:  } else if (isRead) {
+branch  0 never executed
+branch  1 never executed
+    #####:  181:    accessType = b.getStringAttr("read");
+call    0 never executed
+call    1 never executed
+    #####:  182:  } else if (isWritten) {
+branch  0 never executed
+branch  1 never executed
+    #####:  183:    accessType = b.getStringAttr("write");
+call    0 never executed
+call    1 never executed
+        -:  184:  } else {
+    #####:  185:    accessType = b.getStringAttr("none");
+call    0 never executed
+call    1 never executed
+        -:  186:  }
+    #####:  187:  funcOp.setArgAttr(bbArg.getArgNumber(), "bufferization.access", accessType);
+call    0 never executed
+    #####:  188:}
+        -:  189:
+        -:  190:/// Determine which FuncOp bbArgs are read and which are written. When run on a
+        -:  191:/// function with unknown ops, we conservatively assume that such ops bufferize
+        -:  192:/// to a read + write.
+function _ZN12_GLOBAL__N_1L28funcOpBbArgReadWriteAnalysisEN4mlir4func6FuncOpERNS0_13bufferization20OneShotAnalysisStateE called 0 returned 0% blocks executed 0%
+    #####:  193:static LogicalResult funcOpBbArgReadWriteAnalysis(FuncOp funcOp,
+        -:  194:                                                  OneShotAnalysisState &state) {
+    #####:  195:  FuncAnalysisState &funcState = getFuncAnalysisState(state);
+call    0 never executed
+        -:  196:
+        -:  197:  // If the function has no body, conservatively assume that all args are
+        -:  198:  // read + written.
+    #####:  199:  if (funcOp.getBody().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  200:    for (BlockArgument bbArg : funcOp.getArguments()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  201:      funcState.readBbArgs[funcOp].insert(bbArg.getArgNumber());
+call    0 never executed
+call    1 never executed
+    #####:  202:      funcState.writtenBbArgs[funcOp].insert(bbArg.getArgNumber());
+call    0 never executed
+call    1 never executed
+        -:  203:    }
+        -:  204:
+    #####:  205:    return success();
+        -:  206:  }
+        -:  207:
+    #####:  208:  for (BlockArgument bbArg : funcOp.getArguments()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  209:    if (!bbArg.getType().isa<TensorType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  210:      continue;
+    #####:  211:    bool isRead = state.isValueRead(bbArg);
+call    0 never executed
+    #####:  212:    bool isWritten = state.isValueWritten(bbArg);
+call    0 never executed
+    #####:  213:    if (state.getOptions().testAnalysisOnly)
+branch  0 never executed
+branch  1 never executed
+    #####:  214:      annotateFuncArgAccess(funcOp, bbArg, isRead, isWritten);
+call    0 never executed
+    #####:  215:    if (isRead)
+branch  0 never executed
+branch  1 never executed
+    #####:  216:      funcState.readBbArgs[funcOp].insert(bbArg.getArgNumber());
+call    0 never executed
+call    1 never executed
+    #####:  217:    if (isWritten)
+branch  0 never executed
+branch  1 never executed
+    #####:  218:      funcState.writtenBbArgs[funcOp].insert(bbArg.getArgNumber());
+call    0 never executed
+call    1 never executed
+        -:  219:  }
+        -:  220:
+    #####:  221:  return success();
+        -:  222:}
+        -:  223:} // namespace
+        -:  224:
+        -:  225:/// Remove bufferization attributes on FuncOp arguments.
+function _ZL29removeBufferizationAttributesN4mlir13BlockArgumentE called 0 returned 0% blocks executed 0%
+    #####:  226:static void removeBufferizationAttributes(BlockArgument bbArg) {
+    #####:  227:  auto funcOp = cast<func::FuncOp>(bbArg.getOwner()->getParentOp());
+call    0 never executed
+call    1 never executed
+    #####:  228:  funcOp.removeArgAttr(bbArg.getArgNumber(),
+call    0 never executed
+    #####:  229:                       BufferizationDialect::kBufferLayoutAttrName);
+call    0 never executed
+    #####:  230:  funcOp.removeArgAttr(bbArg.getArgNumber(),
+call    0 never executed
+    #####:  231:                       BufferizationDialect::kWritableAttrName);
+call    0 never executed
+    #####:  232:}
+        -:  233:
+        -:  234:/// Return the func::FuncOp called by `callOp`.
+function _ZL17getCalledFunctionN4mlir15CallOpInterfaceE called 0 returned 0% blocks executed 0%
+    #####:  235:static func::FuncOp getCalledFunction(CallOpInterface callOp) {
+    #####:  236:  SymbolRefAttr sym = callOp.getCallableForCallee().dyn_cast<SymbolRefAttr>();
+call    0 never executed
+call    1 never executed
+    #####:  237:  if (!sym)
+branch  0 never executed
+branch  1 never executed
+    #####:  238:    return nullptr;
+    #####:  239:  return dyn_cast_or_null<func::FuncOp>(
+    #####:  240:      SymbolTable::lookupNearestSymbolFrom(callOp, sym));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  241:}
+        -:  242:
+        -:  243:/// Gather equivalence info of CallOps.
+        -:  244:/// Note: This only adds new equivalence info if the called function was already
+        -:  245:/// analyzed.
+        -:  246:// TODO: This does not handle cyclic function call graphs etc.
+function _ZL19equivalenceAnalysisN4mlir4func6FuncOpERNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateE called 0 returned 0% blocks executed 0%
+    #####:  247:static void equivalenceAnalysis(func::FuncOp funcOp,
+        -:  248:                                BufferizationAliasInfo &aliasInfo,
+        -:  249:                                OneShotAnalysisState &state) {
+    #####:  250:  FuncAnalysisState &funcState = getFuncAnalysisState(state);
+call    0 never executed
+function _ZZL19equivalenceAnalysisN4mlir4func6FuncOpERNS_13bufferization22BufferizationAliasInfoERNS2_20OneShotAnalysisStateEENKUlNS0_6CallOpEE_clES7_ called 0 returned 0% blocks executed 0%
+    #####:  251:  funcOp->walk([&](func::CallOp callOp) {
+    #####:  252:    func::FuncOp calledFunction = getCalledFunction(callOp);
+call    0 never executed
+call    1 never executed
+    #####:  253:    assert(calledFunction && "could not retrieved called func::FuncOp");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  254:
+        -:  255:    // No equivalence info available for the called function.
+    #####:  256:    if (!funcState.equivalentFuncArgs.count(calledFunction))
+call    0 never executed
+    #####:  257:      return WalkResult::skip();
+        -:  258:
+    #####:  259:    for (auto it : funcState.equivalentFuncArgs[calledFunction]) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  260:      int64_t returnIdx = it.first;
+    #####:  261:      int64_t bbargIdx = it.second;
+    #####:  262:      if (!state.isInPlace(callOp->getOpOperand(bbargIdx)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  263:        continue;
+    #####:  264:      Value returnVal = callOp.getResult(returnIdx);
+branch  0 never executed
+branch  1 never executed
+    #####:  265:      Value argVal = callOp->getOperand(bbargIdx);
+call    0 never executed
+    #####:  266:      aliasInfo.unionEquivalenceClasses(returnVal, argVal);
+call    0 never executed
+        -:  267:    }
+        -:  268:
+    #####:  269:    return WalkResult::advance();
+    #####:  270:  });
+call    0 never executed
+    #####:  271:}
+        -:  272:
+        -:  273:/// Store all functions of the `moduleOp` in `orderedFuncOps`, sorted by
+        -:  274:/// callee-caller order (i.e. callees without callers first).
+        -:  275:/// Store the map of FuncOp to all its callers in `callerMap`.
+        -:  276:/// Return `failure()` if a cycle of calls is detected or if we are unable to
+        -:  277:/// retrieve the called FuncOp from any CallOpInterface.
+        -:  278:static LogicalResult
+function _ZL24getFuncOpsOrderedByCallsN4mlir8ModuleOpERN4llvm15SmallVectorImplINS_4func6FuncOpEEERNS1_8DenseMapIS4_NS1_8DenseSetIPNS_9OperationENS1_12DenseMapInfoISA_vEEEENSB_IS4_vEENS1_6detail12DenseMapPairIS4_SD_EEEE called 507 returned 100% blocks executed 28%
+      507:  279:getFuncOpsOrderedByCalls(ModuleOp moduleOp,
+        -:  280:                         SmallVectorImpl<func::FuncOp> &orderedFuncOps,
+        -:  281:                         FuncCallerMap &callerMap) {
+        -:  282:  // For each FuncOp, the set of functions called by it (i.e. the union of
+        -:  283:  // symbols of all nested CallOpInterfaceOp).
+      507:  284:  DenseMap<func::FuncOp, DenseSet<func::FuncOp>> calledBy;
+call    0 returned 100%
+        -:  285:  // For each FuncOp, the number of CallOpInterface it contains.
+     1014:  286:  DenseMap<func::FuncOp, unsigned> numberCallOpsContainedInFuncOp;
+call    0 returned 100%
+call    1 returned 100%
+function _ZZL24getFuncOpsOrderedByCallsN4mlir8ModuleOpERN4llvm15SmallVectorImplINS_4func6FuncOpEEERNS1_8DenseMapIS4_NS1_8DenseSetIPNS_9OperationENS1_12DenseMapInfoISA_vEEEENSB_IS4_vEENS1_6detail12DenseMapPairIS4_SD_EEEEENKUlS4_E_clES4_ called 0 returned 0% blocks executed 0%
+     507*:  287:  WalkResult res = moduleOp.walk([&](func::FuncOp funcOp) -> WalkResult {
+    #####:  288:    if (!funcOp.getBody().empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  289:      func::ReturnOp returnOp = getAssumedUniqueReturnOp(funcOp);
+call    0 never executed
+    #####:  290:      if (!returnOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  291:        return funcOp->emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  292:               << "cannot bufferize a FuncOp with tensors and "
+    #####:  293:                  "without a unique ReturnOp";
+call    0 never executed
+        -:  294:    }
+        -:  295:
+    #####:  296:    numberCallOpsContainedInFuncOp[funcOp] = 0;
+call    0 never executed
+function _ZZZL24getFuncOpsOrderedByCallsN4mlir8ModuleOpERN4llvm15SmallVectorImplINS_4func6FuncOpEEERNS1_8DenseMapIS4_NS1_8DenseSetIPNS_9OperationENS1_12DenseMapInfoISA_vEEEENSB_IS4_vEENS1_6detail12DenseMapPairIS4_SD_EEEEENKUlS4_E_clES4_ENKUlNS_15CallOpInterfaceEE_clESL_ called 0 returned 0% blocks executed 0%
+    #####:  297:    return funcOp.walk([&](CallOpInterface callOp) -> WalkResult {
+        -:  298:      // Only support CallOp for now.
+    #####:  299:      if (!isa<func::CallOp>(callOp.getOperation()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  300:        return callOp->emitError() << "expected a CallOp";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  301:      func::FuncOp calledFunction = getCalledFunction(callOp);
+call    0 never executed
+    #####:  302:      assert(calledFunction && "could not retrieved called func::FuncOp");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  303:      callerMap[calledFunction].insert(callOp);
+call    0 never executed
+call    1 never executed
+    #####:  304:      if (calledBy[calledFunction].insert(funcOp).second) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  305:        numberCallOpsContainedInFuncOp[funcOp]++;
+call    0 never executed
+        -:  306:      }
+    #####:  307:      return WalkResult::advance();
+    #####:  308:    });
+call    0 never executed
+      507:  309:  });
+call    0 returned 100%
+      507:  310:  if (res.wasInterrupted())
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  311:    return failure();
+        -:  312:  // Iteratively remove function operation that do not call any of the
+        -:  313:  // functions remaining in the callCounter map and add them to the worklist.
+      507:  314:  while (!numberCallOpsContainedInFuncOp.empty()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  315:    auto it = llvm::find_if(numberCallOpsContainedInFuncOp,
+    #####:  316:                            [](auto entry) { return entry.getSecond() == 0; });
+call    0 never executed
+    #####:  317:    if (it == numberCallOpsContainedInFuncOp.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  318:      return moduleOp.emitOpError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  319:          "expected callgraph to be free of circular dependencies.");
+call    0 never executed
+    #####:  320:    orderedFuncOps.push_back(it->getFirst());
+call    0 never executed
+call    1 never executed
+    #####:  321:    for (auto callee : calledBy[it->getFirst()])
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  322:      numberCallOpsContainedInFuncOp[callee]--;
+call    0 never executed
+call    1 never executed
+    #####:  323:    numberCallOpsContainedInFuncOp.erase(it);
+call    0 never executed
+        -:  324:  }
+      507:  325:  return success();
+call    0 returned 100%
+        -:  326:}
+        -:  327:
+        -:  328:/// Fold return values that are memref casts and update function return types.
+        -:  329:///
+        -:  330:/// During FuncOp bufferization, the exact type of the returned memrefs (if any)
+        -:  331:/// is not known yet. Therefore, the bufferization uses memref types with the
+        -:  332:/// most generic layout map as function return types. After bufferizing the
+        -:  333:/// entire function body, a more concise memref type can potentially be used for
+        -:  334:/// the return type of the function.
+function _ZL15foldMemRefCastsN4mlir4func6FuncOpE called 0 returned 0% blocks executed 0%
+    #####:  335:static void foldMemRefCasts(func::FuncOp funcOp) {
+    #####:  336:  if (funcOp.getBody().empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  337:    return;
+        -:  338:
+    #####:  339:  func::ReturnOp returnOp = getAssumedUniqueReturnOp(funcOp);
+call    0 never executed
+    #####:  340:  SmallVector<Type> resultTypes;
+call    0 never executed
+        -:  341:
+    #####:  342:  for (OpOperand &operand : returnOp->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  343:    if (auto castOp = operand.get().getDefiningOp<memref::CastOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  344:      operand.set(castOp.getSource());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  345:      resultTypes.push_back(castOp.getSource().getType());
+call    0 never executed
+call    1 never executed
+        -:  346:    } else {
+    #####:  347:      resultTypes.push_back(operand.get().getType());
+call    0 never executed
+        -:  348:    }
+        -:  349:  }
+        -:  350:
+    #####:  351:  auto newFuncType = FunctionType::get(
+call    0 never executed
+    #####:  352:      funcOp.getContext(), funcOp.getFunctionType().getInputs(), resultTypes);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  353:  funcOp.setType(newFuncType);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  354:}
+        -:  355:
+        -:  356:LogicalResult
+function _ZN4mlir13bufferization15analyzeModuleOpENS_8ModuleOpERNS0_20OneShotAnalysisStateE called 507 returned 100% blocks executed 39%
+      507:  357:mlir::bufferization::analyzeModuleOp(ModuleOp moduleOp,
+        -:  358:                                     OneShotAnalysisState &state) {
+      507:  359:  OneShotBufferizationOptions options =
+      507:  360:      static_cast<const OneShotBufferizationOptions &>(state.getOptions());
+call    0 returned 100%
+     507*:  361:  assert(options.bufferizeFunctionBoundaries &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+        -:  362:         "expected that function boundary bufferization is activated");
+      507:  363:  FuncAnalysisState &funcState = getFuncAnalysisState(state);
+call    0 returned 100%
+      507:  364:  BufferizationAliasInfo &aliasInfo = state.getAliasInfo();
+call    0 returned 100%
+        -:  365:
+        -:  366:  // A list of functions in the order in which they are analyzed + bufferized.
+     1014:  367:  SmallVector<func::FuncOp> orderedFuncOps;
+call    0 returned 100%
+call    1 returned 100%
+        -:  368:
+        -:  369:  // A mapping of FuncOps to their callers.
+     1014:  370:  FuncCallerMap callerMap;
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  371:
+      507:  372:  if (failed(getFuncOpsOrderedByCalls(moduleOp, orderedFuncOps, callerMap)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  373:    return failure();
+        -:  374:
+        -:  375:  // Analyze ops.
+     507*:  376:  for (func::FuncOp funcOp : orderedFuncOps) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  377:    // No body => no analysis.
+    #####:  378:    if (funcOp.getBody().empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  379:      continue;
+        -:  380:
+        -:  381:    // Now analyzing function.
+    #####:  382:    funcState.startFunctionAnalysis(funcOp);
+call    0 never executed
+        -:  383:
+        -:  384:    // Gather equivalence info for CallOps.
+    #####:  385:    equivalenceAnalysis(funcOp, aliasInfo, state);
+call    0 never executed
+        -:  386:
+        -:  387:    // Analyze funcOp.
+    #####:  388:    if (failed(analyzeOp(funcOp, state)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  389:      return failure();
+        -:  390:
+        -:  391:    // Run some extra function analyses.
+    #####:  392:    if (failed(aliasingFuncOpBBArgsAnalysis(funcOp, state)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  393:        failed(funcOpBbArgReadWriteAnalysis(funcOp, state)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  394:      return failure();
+        -:  395:
+        -:  396:    // Mark op as fully analyzed.
+    #####:  397:    funcState.analyzedFuncOps[funcOp] = FuncOpAnalysisState::Analyzed;
+call    0 never executed
+        -:  398:  }
+        -:  399:
+      507:  400:  return success();
+call    0 returned 100%
+        -:  401:}
+        -:  402:
+function _ZN4mlir13bufferization17bufferizeModuleOpENS_8ModuleOpERKNS0_27OneShotBufferizationOptionsE called 0 returned 0% blocks executed 0%
+    #####:  403:LogicalResult mlir::bufferization::bufferizeModuleOp(
+        -:  404:    ModuleOp moduleOp, const OneShotBufferizationOptions &options) {
+    #####:  405:  assert(options.bufferizeFunctionBoundaries &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  406:         "expected that function boundary bufferization is activated");
+    #####:  407:  IRRewriter rewriter(moduleOp.getContext());
+call    0 never executed
+call    1 never executed
+        -:  408:
+        -:  409:  // A list of functions in the order in which they are analyzed + bufferized.
+    #####:  410:  SmallVector<func::FuncOp> orderedFuncOps;
+call    0 never executed
+call    1 never executed
+        -:  411:
+        -:  412:  // A mapping of FuncOps to their callers.
+    #####:  413:  FuncCallerMap callerMap;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  414:
+    #####:  415:  if (failed(getFuncOpsOrderedByCalls(moduleOp, orderedFuncOps, callerMap)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  416:    return failure();
+        -:  417:
+        -:  418:  // Bufferize functions.
+    #####:  419:  for (func::FuncOp funcOp : orderedFuncOps) {
+branch  0 never executed
+branch  1 never executed
+        -:  420:    // Note: It would be good to apply cleanups here but we cannot as aliasInfo
+        -:  421:    // would be invalidated.
+    #####:  422:    if (failed(bufferizeOp(funcOp, options, options.copyBeforeWrite)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  423:      return failure();
+        -:  424:    // Change buffer return types to more precise layout maps.
+    #####:  425:    if (options.functionBoundaryTypeConversion ==
+branch  0 never executed
+branch  1 never executed
+        -:  426:        BufferizationOptions::LayoutMapOption::InferLayoutMap)
+    #####:  427:      foldMemRefCasts(funcOp);
+call    0 never executed
+        -:  428:  }
+        -:  429:
+        -:  430:  // Post-pass cleanup of function argument attributes.
+function _ZZN4mlir13bufferization17bufferizeModuleOpENS_8ModuleOpERKNS0_27OneShotBufferizationOptionsEENKUlNS_4func6FuncOpEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  431:  moduleOp.walk([&](func::FuncOp op) {
+call    0 never executed
+    #####:  432:    for (BlockArgument bbArg : op.getArguments())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  433:      removeBufferizationAttributes(bbArg);
+call    0 never executed
+    #####:  434:  });
+        -:  435:
+    #####:  436:  return success();
+call    0 never executed
+        -:  437:}
+        -:  438:
+function _ZN4mlir13bufferization25runOneShotModuleBufferizeENS_8ModuleOpERKNS0_27OneShotBufferizationOptionsE called 0 returned 0% blocks executed 0%
+    #####:  439:LogicalResult mlir::bufferization::runOneShotModuleBufferize(
+        -:  440:    ModuleOp moduleOp, const OneShotBufferizationOptions &options) {
+    #####:  441:  assert(options.bufferizeFunctionBoundaries &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  442:         "expected that function boundary bufferization is activated");
+    #####:  443:  assert(!(options.copyBeforeWrite && options.testAnalysisOnly) &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  444:         "invalid combination of bufferization flags");
+    #####:  445:  if (!options.copyBeforeWrite) {
+branch  0 never executed
+branch  1 never executed
+    #####:  446:    OneShotAnalysisState analysisState(moduleOp, options);
+call    0 never executed
+call    1 never executed
+    #####:  447:    if (failed(insertTensorCopies(moduleOp, options)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  448:      return failure();
+call    0 never executed
+        -:  449:  }
+    #####:  450:  if (options.testAnalysisOnly)
+branch  0 never executed
+branch  1 never executed
+    #####:  451:    return success();
+    #####:  452:  if (failed(bufferizeModuleOp(moduleOp, options)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  453:    return failure();
+    #####:  454:  return success();
+        -:  455:}

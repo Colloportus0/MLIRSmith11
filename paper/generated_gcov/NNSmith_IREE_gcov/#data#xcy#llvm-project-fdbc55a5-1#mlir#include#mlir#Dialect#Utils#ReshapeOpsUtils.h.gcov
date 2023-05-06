@@ -1,0 +1,534 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/include/mlir/Dialect/Utils/ReshapeOpsUtils.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/Tensor/Transforms/CMakeFiles/obj.MLIRTensorTransforms.dir/ExtractSliceFromReshapeUtils.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Tensor/Transforms/CMakeFiles/obj.MLIRTensorTransforms.dir/ExtractSliceFromReshapeUtils.cpp.gcda
+        -:    0:Runs:325587
+        -:    1://===- ReshapeOpsUtils.h - Utilities used by reshape ops --*- C++ -*------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This header file defines utilities and common canonicalization patterns for
+        -:   10:// reshape operations.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_DIALECT_UTILS_RESHAPEOPSUTILS_H
+        -:   15:#define MLIR_DIALECT_UTILS_RESHAPEOPSUTILS_H
+        -:   16:
+        -:   17:#include "mlir/Dialect/Utils/StaticValueUtils.h"
+        -:   18:#include "mlir/IR/OpImplementation.h"
+        -:   19:#include "mlir/IR/PatternMatch.h"
+        -:   20:#include "mlir/Support/LLVM.h"
+        -:   21:#include "llvm/ADT/StringRef.h"
+        -:   22:
+        -:   23:namespace mlir {
+        -:   24:
+        -:   25:using ReassociationIndices = SmallVector<int64_t, 2>;
+        -:   26:using ReassociationIndicesRef = ArrayRef<int64_t>;
+        -:   27:using ReassociationExprs = SmallVector<AffineExpr, 2>;
+        -:   28:
+        -:   29:/// Attribute name for the ArrayAttr which encodes reassociation indices.
+        -:   30:constexpr StringRef getReassociationAttrName() { return "reassociation"; }
+        -:   31:
+        -:   32:/// Compose reassociation maps that are used in pair of reshape ops where one
+        -:   33:/// is a producer and other is the consumer. Only valid to use this method when
+        -:   34:/// both the producer and consumer are collapsing dimensions or both are
+        -:   35:/// expanding dimensions.
+        -:   36:///
+        -:   37:/// For example,
+        -:   38:///   producerReassociation = [[0, 1], [2], [3, 4]]
+        -:   39:///   consumerReassociation = [[0, 1], [2]]
+        -:   40:///
+        -:   41:/// is folded into
+        -:   42:///
+        -:   43:///   result = [[0, 1, 2], [3, 4]].
+        -:   44:Optional<SmallVector<ReassociationIndices>> composeReassociationIndices(
+        -:   45:    ArrayRef<ReassociationIndices> producerReassociations,
+        -:   46:    ArrayRef<ReassociationIndices> consumerReassociations,
+        -:   47:    MLIRContext *context);
+        -:   48:
+        -:   49:/// Convert reassociation indices to affine expressions.
+        -:   50:SmallVector<SmallVector<AffineExpr, 2>, 2> convertReassociationIndicesToExprs(
+        -:   51:    MLIRContext *context, ArrayRef<ReassociationIndices> reassociationIndices);
+        -:   52:
+        -:   53:/// Constructs affine maps out of Array<Array<AffineExpr>>.
+        -:   54:SmallVector<AffineMap, 4>
+        -:   55:getSymbolLessAffineMaps(ArrayRef<ReassociationExprs> reassociation);
+        -:   56:
+        -:   57:/// Wraps a list of reassociations in an ArrayAttr.
+        -:   58:ArrayAttr
+        -:   59:getReassociationIndicesAttribute(OpBuilder &b,
+        -:   60:                                 ArrayRef<ReassociationIndices> reassociation);
+        -:   61:
+        -:   62:/// Convert Array<Array<AffineExpr>> to Array<Array<int64_t>>.
+        -:   63:SmallVector<ReassociationIndices, 2> convertReassociationMapsToIndices(
+        -:   64:    OpBuilder &b, ArrayRef<ReassociationExprs> reassociationExprs);
+        -:   65:
+        -:   66:/// Return the reassociations maps to use to reshape given the source type and
+        -:   67:/// the target type when possible. Return llvm::None when this computation
+        -:   68:/// failed.
+        -:   69:Optional<SmallVector<ReassociationIndices>>
+        -:   70:getReassociationIndicesForReshape(ShapedType sourceType, ShapedType targetType);
+        -:   71:
+        -:   72:/// Returns the reassociation maps to collapse `sourceShape` to `targetShape` if
+        -:   73:/// possible.
+        -:   74:Optional<SmallVector<ReassociationIndices>>
+        -:   75:getReassociationIndicesForCollapse(ArrayRef<int64_t> sourceShape,
+        -:   76:                                   ArrayRef<int64_t> targetShape);
+        -:   77:
+        -:   78:/// Return true if the reassociation specification is valid, false otherwise.
+        -:   79:/// When false, the `invalidIndex` integer pointer is optionally filled with the
+        -:   80:/// index of the offending reassociation map.
+        -:   81:bool isReassociationValid(ArrayRef<AffineMap> reassociation,
+        -:   82:                          int *invalidIndex = nullptr);
+        -:   83:
+        -:   84:template <typename ReshapeOpTy, typename InverseReshapeOpTy>
+        -:   85:static OpFoldResult foldReshapeOp(ReshapeOpTy reshapeOp,
+        -:   86:                                  ArrayRef<Attribute> operands) {
+        -:   87:  // Fold producer-consumer reshape ops that where the operand type of the
+        -:   88:  // producer is same as the return type of the consumer.
+        -:   89:  auto reshapeSrcOp =
+        -:   90:      reshapeOp.getSrc().template getDefiningOp<InverseReshapeOpTy>();
+        -:   91:  if (reshapeSrcOp && reshapeSrcOp.getSrcType() == reshapeOp.getResultType())
+        -:   92:    return reshapeSrcOp.getSrc();
+        -:   93:  // Reshape of a constant can be replaced with a new constant.
+        -:   94:  if (auto elements = operands.front().dyn_cast_or_null<DenseElementsAttr>()) {
+        -:   95:    return elements.reshape(
+        -:   96:        reshapeOp.getResult().getType().template cast<ShapedType>());
+        -:   97:  }
+        -:   98:  return nullptr;
+        -:   99:}
+        -:  100:
+        -:  101:/// Common verifier for reshape-like types. Fills `expandedType` and
+        -:  102:///`collapsedType` with the proper `src` or `result` type.
+        -:  103:template <typename Op, typename T>
+        -:  104:static LogicalResult verifyReshapeLikeTypes(Op op, T expandedType,
+        -:  105:                                            T collapsedType, bool isExpansion) {
+        -:  106:  unsigned expandedRank = expandedType.getRank();
+        -:  107:  unsigned collapsedRank = collapsedType.getRank();
+        -:  108:  if (expandedRank < collapsedRank)
+        -:  109:    return op.emitOpError("expected the type ")
+        -:  110:           << expandedType
+        -:  111:           << " to have higher rank than the type = " << collapsedType;
+        -:  112:  if (expandedRank == 0)
+        -:  113:    return op.emitOpError("expected non-zero memref ranks");
+        -:  114:  if (expandedRank == collapsedRank)
+        -:  115:    return op.emitOpError("expected to collapse or expand dims");
+        -:  116:
+        -:  117:  if (collapsedRank == 0) {
+        -:  118:    // If collapsed rank is 0, then expanded type must be static shaped and of
+        -:  119:    // sizes 1.
+        -:  120:    if (llvm::any_of(expandedType.getShape(),
+        -:  121:                     [](int64_t dim) -> bool { return dim != 1; }))
+        -:  122:      return op.emitOpError("invalid to reshape tensor/memref with non-unit "
+        -:  123:                            "extent dimensions to zero-rank tensor/memref");
+        -:  124:    return success();
+        -:  125:  }
+        -:  126:  if (collapsedRank != op.getReassociation().size())
+        -:  127:    return op.emitOpError("expected rank of the collapsed type(")
+        -:  128:           << collapsedRank << ") to be the number of reassociation maps("
+        -:  129:           << op.getReassociation().size() << ")";
+        -:  130:  auto maps = op.getReassociationMaps();
+        -:  131:  for (auto it : llvm::enumerate(maps))
+        -:  132:    if (it.value().getNumDims() != expandedRank)
+        -:  133:      return op.emitOpError("expected reassociation map #")
+        -:  134:             << it.index() << " of same rank as expanded memref("
+        -:  135:             << expandedRank << "), but got " << it.value().getNumDims();
+        -:  136:  int invalidIdx = 0;
+        -:  137:  if (!isReassociationValid(maps, &invalidIdx))
+        -:  138:    return op.emitOpError("expected reassociation map #")
+        -:  139:           << invalidIdx << " to be valid and contiguous";
+        -:  140:  return verifyReshapeLikeShapes(op, collapsedType, expandedType, isExpansion);
+        -:  141:}
+        -:  142:
+        -:  143:/// Verify that shapes of the reshaped types using following rules
+        -:  144:/// 1) if a dimension in the collapsed type is static, then the corresponding
+        -:  145:///    dimensions in the expanded shape should be
+        -:  146:///    a) static
+        -:  147:///    b) the product should be same as the collaped shape.
+        -:  148:/// 2) if a dimension in the collaped type is dynamic, one and only one of the
+        -:  149:///    corresponding dimensions in the expanded type should be dynamic. This
+        -:  150:///    rule is only needed with reshape operations that are expanding.
+        -:  151:LogicalResult reshapeLikeShapesAreCompatible(
+        -:  152:    function_ref<LogicalResult(const Twine &)> emitError,
+        -:  153:    ArrayRef<int64_t> collapsedShape, ArrayRef<int64_t> expandedShape,
+        -:  154:    ArrayRef<ReassociationIndices> reassociationMaps, bool isExpandingReshape);
+        -:  155:
+        -:  156:template <typename OpTy>
+        -:  157:static LogicalResult verifyReshapeLikeShapes(OpTy op, ShapedType collapsedType,
+        -:  158:                                             ShapedType expandedType,
+        -:  159:                                             bool isExpandingReshape) {
+        -:  160:  return reshapeLikeShapesAreCompatible(
+        -:  161:      [&](const Twine &msg) { return op->emitOpError(msg); },
+        -:  162:      collapsedType.getShape(), expandedType.getShape(),
+        -:  163:      op.getReassociationIndices(), isExpandingReshape);
+        -:  164:}
+        -:  165:
+        -:  166:/// Returns true iff the type is a MemRefType and has a non-identity layout.
+        -:  167:bool hasNonIdentityLayout(Type type);
+        -:  168:
+        -:  169:/// Pattern to collapse producer/consumer reshape ops that are both collapsing
+        -:  170:/// dimensions or are both expanding dimensions.
+        -:  171:template <typename ReshapeOpTy>
+        -:  172:struct ComposeReassociativeReshapeOps : public OpRewritePattern<ReshapeOpTy> {
+        -:  173:  using OpRewritePattern<ReshapeOpTy>::OpRewritePattern;
+        -:  174:  LogicalResult matchAndRewrite(ReshapeOpTy reshapeOp,
+        -:  175:                                PatternRewriter &rewriter) const override {
+        -:  176:    auto srcReshapeOp =
+        -:  177:        reshapeOp.getSrc().template getDefiningOp<ReshapeOpTy>();
+        -:  178:    if (!srcReshapeOp)
+        -:  179:      return failure();
+        -:  180:
+        -:  181:    ShapedType resultType = reshapeOp.getResultType();
+        -:  182:
+        -:  183:    if (hasNonIdentityLayout(srcReshapeOp.getSrc().getType()) ||
+        -:  184:        hasNonIdentityLayout(reshapeOp.getSrc().getType()) ||
+        -:  185:        hasNonIdentityLayout(reshapeOp.getResult().getType()))
+        -:  186:      return failure();
+        -:  187:
+        -:  188:    Optional<SmallVector<ReassociationIndices>> reassociationIndices =
+        -:  189:        composeReassociationIndices(srcReshapeOp.getReassociationIndices(),
+        -:  190:                                    reshapeOp.getReassociationIndices(),
+        -:  191:                                    rewriter.getContext());
+        -:  192:    if (!reassociationIndices)
+        -:  193:      return failure();
+        -:  194:    rewriter.replaceOpWithNewOp<ReshapeOpTy>(
+        -:  195:        reshapeOp, resultType, srcReshapeOp.getSrc(), *reassociationIndices);
+        -:  196:    return success();
+        -:  197:  }
+        -:  198:};
+        -:  199:
+        -:  200:/// Pattern to compose
+        -:  201:/// `collapse_shape(expand_shape(%src, reassociation_1), reassociation_2)`.
+        -:  202:/// In that case both `srcType` and `resultType` can be expressed as a function
+        -:  203:/// of `intermediateType`.
+        -:  204:/// In order to demonstrate the approach, let's assume that `rank(srcType) >
+        -:  205:/// `rank(resultType)`, i.e. the resulting operation should be `collapse_shape`.
+        -:  206:/// In that case, we can iterate over every set of indices in `reassociation_2`
+        -:  207:/// and try to find ids of sets of indices in `reassociation_1` that cover it
+        -:  208:/// completely.
+        -:  209:///
+        -:  210:/// Example:
+        -:  211:///
+        -:  212:///   %0 = tensor.expand_shape %arg [[0], [1], [2, 3]]
+        -:  213:///     : tensor<?x?x?xi64> into tensor<?x?x?x1xi64>
+        -:  214:///   %1 = tensor.collapse_shape %0 [[0, 1], [2, 3]]
+        -:  215:///     : tensor<?x?x?x1xi64> into tensor<?x?xi64>
+        -:  216:///
+        -:  217:/// can be canonicalized into
+        -:  218:///
+        -:  219:///   %0 = tensor.collapse_shape %arg [[0, 1], [2]]
+        -:  220:///     : tensor<?x?x?xi64> into tensor<?x?xi64>
+        -:  221:///
+        -:  222:/// because [0] and [1] from `expand_shape` reassociation cover completely
+        -:  223:/// `[0, 1]` from `collapse_shape`. If it is impossible to find such union of
+        -:  224:/// indices, then we fail.
+        -:  225://
+        -:  226:/// When `rank(srcType) < rank(resultType)`, then we just swap `reassociation_1`
+        -:  227:/// `reassociation_2` and produce `expand_shape`.
+        -:  228:template <typename CollapseOpTy, typename ExpandOpTy>
+        -:  229:struct ComposeCollapseOfExpandOp : public OpRewritePattern<CollapseOpTy> {
+        -:  230:  using OpRewritePattern<CollapseOpTy>::OpRewritePattern;
+        -:  231:  LogicalResult matchAndRewrite(CollapseOpTy collapseOp,
+        -:  232:                                PatternRewriter &rewriter) const override {
+        -:  233:    auto expandOp = collapseOp.getSrc().template getDefiningOp<ExpandOpTy>();
+        -:  234:    if (!expandOp)
+        -:  235:      return failure();
+        -:  236:
+        -:  237:    ShapedType srcType = expandOp.getSrcType();
+        -:  238:    ShapedType resultType = collapseOp.getResultType();
+        -:  239:
+        -:  240:    if (hasNonIdentityLayout(collapseOp.getSrc().getType()) ||
+        -:  241:        hasNonIdentityLayout(expandOp.getSrc().getType()) ||
+        -:  242:        hasNonIdentityLayout(expandOp.getResult().getType()))
+        -:  243:      return failure();
+        -:  244:
+        -:  245:    int64_t srcRank = srcType.getRank();
+        -:  246:    int64_t resultRank = resultType.getRank();
+        -:  247:    if (srcType == resultType)
+        -:  248:      return failure();
+        -:  249:
+        -:  250:    SmallVector<ReassociationIndices, 4> higherRankReassociation,
+        -:  251:        lowerRankReassociation;
+        -:  252:
+        -:  253:    bool isResultCollapsed = srcRank > resultRank;
+        -:  254:    if (isResultCollapsed) {
+        -:  255:      higherRankReassociation = expandOp.getReassociationIndices();
+        -:  256:      lowerRankReassociation = collapseOp.getReassociationIndices();
+        -:  257:    } else {
+        -:  258:      higherRankReassociation = collapseOp.getReassociationIndices();
+        -:  259:      lowerRankReassociation = expandOp.getReassociationIndices();
+        -:  260:    }
+        -:  261:
+        -:  262:    size_t higherRankIndicesID = 0;
+        -:  263:    SmallVector<ReassociationIndices, 4> composedReassociation;
+        -:  264:    for (const auto &lowerRankIndices : lowerRankReassociation) {
+        -:  265:      ReassociationIndices composedIndices;
+        -:  266:      while (higherRankIndicesID < higherRankReassociation.size()) {
+        -:  267:        auto rightmostIndex =
+        -:  268:            higherRankReassociation[higherRankIndicesID].back();
+        -:  269:        if (rightmostIndex > lowerRankIndices.back())
+        -:  270:          return failure();
+        -:  271:        composedIndices.push_back(higherRankIndicesID++);
+        -:  272:        if (rightmostIndex == lowerRankIndices.back())
+        -:  273:          break;
+        -:  274:      }
+        -:  275:      composedReassociation.push_back(composedIndices);
+        -:  276:    }
+        -:  277:    if (isResultCollapsed)
+        -:  278:      rewriter.replaceOpWithNewOp<CollapseOpTy>(
+        -:  279:          collapseOp, resultType, expandOp.getSrc(), composedReassociation);
+        -:  280:    else
+        -:  281:      rewriter.replaceOpWithNewOp<ExpandOpTy>(
+        -:  282:          collapseOp, resultType, expandOp.getSrc(), composedReassociation);
+        -:  283:    return success();
+        -:  284:  }
+        -:  285:};
+        -:  286:
+        -:  287:template <typename ExpandOpTy, typename CollapseOpTy>
+        -:  288:struct ComposeExpandOfCollapseOp : public OpRewritePattern<ExpandOpTy> {
+        -:  289:  using OpRewritePattern<ExpandOpTy>::OpRewritePattern;
+        -:  290:  LogicalResult matchAndRewrite(ExpandOpTy expandOp,
+        -:  291:                                PatternRewriter &rewriter) const override {
+        -:  292:    auto collapseOp = expandOp.getSrc().template getDefiningOp<CollapseOpTy>();
+        -:  293:    if (!collapseOp)
+        -:  294:      return failure();
+        -:  295:
+        -:  296:    ShapedType srcType = collapseOp.getSrcType();
+        -:  297:    ShapedType resultType = expandOp.getResultType();
+        -:  298:
+        -:  299:    if (hasNonIdentityLayout(expandOp.getSrc().getType()) ||
+        -:  300:        hasNonIdentityLayout(collapseOp.getSrc().getType()) ||
+        -:  301:        hasNonIdentityLayout(collapseOp.getResult().getType()))
+        -:  302:      return failure();
+        -:  303:
+        -:  304:    int64_t srcRank = srcType.getRank();
+        -:  305:    int64_t resultRank = resultType.getRank();
+        -:  306:    if (srcType == resultType)
+        -:  307:      return failure();
+        -:  308:
+        -:  309:    auto srcReassociation = collapseOp.getReassociationIndices();
+        -:  310:    auto resultReassociation = expandOp.getReassociationIndices();
+        -:  311:    if (srcRank > resultRank) {
+        -:  312:      auto composedReassociation = findCollapsingReassociation(
+        -:  313:          srcReassociation, resultReassociation, srcType.getShape(),
+        -:  314:          resultType.getShape());
+        -:  315:      if (!composedReassociation)
+        -:  316:        return failure();
+        -:  317:
+        -:  318:      rewriter.replaceOpWithNewOp<CollapseOpTy>(
+        -:  319:          expandOp, resultType, collapseOp.getSrc(), *composedReassociation);
+        -:  320:      return success();
+        -:  321:    }
+        -:  322:    auto composedReassociation =
+        -:  323:        findCollapsingReassociation(resultReassociation, srcReassociation,
+        -:  324:                                    resultType.getShape(), srcType.getShape());
+        -:  325:    if (!composedReassociation)
+        -:  326:      return failure();
+        -:  327:
+        -:  328:    rewriter.replaceOpWithNewOp<ExpandOpTy>(
+        -:  329:        expandOp, resultType, collapseOp.getSrc(), *composedReassociation);
+        -:  330:    return success();
+        -:  331:  }
+        -:  332:
+        -:  333:private:
+        -:  334:  // Attempts to find a way to collapse `srcShape` to `resultShape` by
+        -:  335:  // collapsing subshapes defined by the reassociation indices.
+        -:  336:  Optional<SmallVector<ReassociationIndices>> findCollapsingReassociation(
+        -:  337:      ArrayRef<ReassociationIndices> srcReassociation,
+        -:  338:      ArrayRef<ReassociationIndices> resultReassociation,
+        -:  339:      ArrayRef<int64_t> srcShape, ArrayRef<int64_t> resultShape) const {
+        -:  340:    SmallVector<ReassociationIndices, 4> composedReassociation;
+        -:  341:
+        -:  342:    if (srcReassociation.empty())
+        -:  343:      return {getReassociationIndicesForCollapse(srcShape, resultShape)};
+        -:  344:
+        -:  345:    for (auto item : llvm::zip(srcReassociation, resultReassociation)) {
+        -:  346:      auto &srcIndices = std::get<0>(item);
+        -:  347:      auto &resultIndices = std::get<1>(item);
+        -:  348:      auto srcSubShape = srcShape.slice(srcIndices.front(), srcIndices.size());
+        -:  349:      auto resultSubShape =
+        -:  350:          resultShape.slice(resultIndices.front(), resultIndices.size());
+        -:  351:
+        -:  352:      if (srcSubShape.size() == resultSubShape.size()) {
+        -:  353:        if (srcSubShape == resultSubShape)
+        -:  354:          composedReassociation.push_back(srcIndices);
+        -:  355:        else
+        -:  356:          return llvm::None;
+        -:  357:      }
+        -:  358:
+        -:  359:      // Find reassociation to collapse `srcSubShape` into `resultSubShape`.
+        -:  360:      auto subShapeReassociation =
+        -:  361:          getReassociationIndicesForCollapse(srcSubShape, resultSubShape);
+        -:  362:      if (!subShapeReassociation)
+        -:  363:        return llvm::None;
+        -:  364:
+        -:  365:      // Remap the subshape indices back to the original srcShape.
+        -:  366:      for (auto &subshape_indices : *subShapeReassociation) {
+        -:  367:        ReassociationIndices shape_indices;
+        -:  368:        for (int64_t index : subshape_indices)
+        -:  369:          shape_indices.push_back(srcIndices.front() + index);
+        -:  370:        composedReassociation.push_back(shape_indices);
+        -:  371:      }
+        -:  372:    }
+        -:  373:    return {std::move(composedReassociation)};
+        -:  374:  }
+        -:  375:};
+        -:  376:
+        -:  377:/// The input parameters `offsets`, `sizes`, `strides` specify a rectangular
+        -:  378:/// non rank-reducing slice of the collapse_shape output. Try to find which
+        -:  379:/// dimensions have been sliced and which dimensions are not sliced (offset = 0,
+        -:  380:/// size = dim, size = 1). Note that this conservative as it cannot detect if a
+        -:  381:/// dynamic size corresponds to the full tensor dimension or not.
+        -:  382:llvm::SmallBitVector getSlicedDimensions(ArrayRef<OpFoldResult> sliceInputShape,
+        -:  383:                                         ArrayRef<Range> sliceParams);
+        -:  384:
+        -:  385:/// Determine which dimensions are linearized by a `tensor.collapse_shape` op by
+        -:  386:/// inspecting its reassociation indices.
+        -:  387:llvm::SmallBitVector
+        -:  388:getLinearizedDimensions(ArrayRef<ReassociationIndices> reassociationIndices);
+        -:  389:
+        -:  390:/// Given the parameters for both operations in a `CollapseShape->ExtractSlice`
+        -:  391:/// chain and reified source and result shapes of the CollapseShapeOp, this
+        -:  392:/// class provides two functions that assist with directly forming the result
+        -:  393:/// of the extract slice by "tiling the CollapseShapeOp by 1".
+        -:  394://// Example:
+        -:  395:// clang-format off
+        -:  396:/// ```
+        -:  397:/// %0 = linalg.generic ... -> tensor<3x7x11x10xf32>
+        -:  398:/// %1 = tensor.collapse_shape %0 [[0, 1, 2], [3]] : ... to tensor<341x10xf32>
+        -:  399:/// %2 = tensor.extract_slice %1 [13, 0] [10, 10] [2, 1] : .... tensor<10x10xf32>
+        -:  400:/// ```
+        -:  401:/// This class helps build the below IR to replace %2:
+        -:  402:/// ```
+        -:  403:/// %dest = tensor.empty() : tensor<10x10xf32>
+        -:  404:/// %2 = scf.for %iv = %c0 to %c10 step %c1 iter_args(%arg0) -> tensor<10x10xf32> {
+        -:  405:///    %linear_index = affine.apply affine_map<(d0)[]->(d0*2 + 11)>(%iv)
+        -:  406:///    %3:3 = arith.delinearize_index %iv into (3, 7, 11)
+        -:  407:///
+        -:  408:///    // This function takes %3 (multiIndices) and the parameters for the slice below.
+        -:  409:///    %4 = tensor.extract_slice %0 [%3#0, %3#1, %3#2, 0] [1, 1, 1, 10] [1, 1, 1, 1] :
+        -:  410:///          tensor<3x7x11x10xf32> to tensor<1x1x1x10xf32>
+        -:  411:///
+        -:  412:///    %5 = tensor.collapse_shape %4 [[0, 1, 2], [3]] : 
+        -:  413:///          tensor<1x1x1x10xf32> into tensor<1x10xf32>
+        -:  414:///    %6 = tensor.insert_slice %5 into %arg0 [%iv, 0] [1, 10] [1, 1] :
+        -:  415:///          tensor<1x10xf32> into tensor<10x10xf32>
+        -:  416:///    scf.yield %6 : tensor<10x10xf32>
+        -:  417:/// }
+        -:  418:/// ```
+        -:  419:// clang-format on
+        -:  420:class SliceFromCollapseHelper {
+        -:  421:public:
+function _ZN4mlir23SliceFromCollapseHelperC2EN4llvm8ArrayRefINS1_11SmallVectorIlLj2EEEEENS2_INS_12OpFoldResultEEES7_NS2_INS_5RangeEEE called 0 returned 0% blocks executed 0%
+    #####:  422:  SliceFromCollapseHelper(ArrayRef<ReassociationIndices> reassociationIndices,
+        -:  423:                          ArrayRef<OpFoldResult> collapseShapeInputShape,
+        -:  424:                          ArrayRef<OpFoldResult> collapseShapeOutputShape,
+        -:  425:                          ArrayRef<Range> extractSliceParams)
+    #####:  426:      : reassociationIndices(reassociationIndices),
+        -:  427:        collapseShapeInputShape(collapseShapeInputShape),
+        -:  428:        collapseShapeOutputShape(collapseShapeOutputShape),
+        -:  429:        sliceParams(extractSliceParams),
+        -:  430:        linearizedDimensions(getLinearizedDimensions(reassociationIndices)),
+        -:  431:        slicedDimensions(getSlicedDimensions(collapseShapeOutputShape,
+    #####:  432:                                             extractSliceParams)) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+        -:  433:
+        -:  434:  /// This function takes multi-indices and maps them to ExtractSlice parameters
+        -:  435:  /// in the index space of the CollapseShape's source tensor. This function's
+        -:  436:  /// signature can be described by `(D_0, D_1,.. D_{n-1}) -> (offsets, sizes,
+        -:  437:  /// strides)` where `n` the number of "tiled dimensions", which are the
+        -:  438:  /// dimensions of the output that are linearized by the collapse shape op and
+        -:  439:  /// are also sliced. Each `D_i` is a tuple that must represent a valid
+        -:  440:  /// multi-index for the `i-th` tiled dimension. In the example above, there is
+        -:  441:  /// only one tiled dimension (D_0) and `arith.delinearize_index` produces the
+        -:  442:  /// multi-index (%3) that would be passed to this function to generate the
+        -:  443:  /// parameters for the `tensor.extract_slice` op (%4).
+        -:  444:  SmallVector<Range> getExtractSliceParams(MLIRContext *ctx,
+        -:  445:                                           ArrayRef<ValueRange> multiIndices);
+        -:  446:
+        -:  447:  /// This function takes indices in the index space of the "tiled dimensions"
+        -:  448:  /// described above and returns a set of Range variables that describe how the
+        -:  449:  /// slice should be inserted into the destination. In the example above, `%iv`
+        -:  450:  /// would be passed to this function to generate the parameters for the
+        -:  451:  /// `tensor.insert_slice` op producing %6.
+        -:  452:  SmallVector<Range> getInsertSliceParams(MLIRContext *ctx,
+        -:  453:                                          ValueRange tileIndices);
+        -:  454:
+        -:  455:private:
+        -:  456:  SmallVector<ReassociationIndices> reassociationIndices;
+        -:  457:  SmallVector<OpFoldResult> collapseShapeInputShape;
+        -:  458:  SmallVector<OpFoldResult> collapseShapeOutputShape;
+        -:  459:  SmallVector<Range> sliceParams;
+        -:  460:  llvm::SmallBitVector linearizedDimensions;
+        -:  461:  llvm::SmallBitVector slicedDimensions;
+        -:  462:};
+        -:  463:
+        -:  464:/// Parameters required to simplify a collapsing reshape op with a rank-reducing
+        -:  465:/// slice operation. See `getSimplifyCollapseShapeWithRankReducingSliceInfo`.
+    #####:  466:struct CollapseShapeRankReducingSliceSimplificationInfo {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  467:  /// The shape of the output of the rank-reducing slice.
+        -:  468:  RankedTensorType sliceResultType;
+        -:  469:  /// The reassociation indices for the new collapse shape op, if required. If
+        -:  470:  /// `None`, the slice should replace the collapse shape op.
+        -:  471:  Optional<SmallVector<ReassociationIndices>> newReassociationIndices;
+        -:  472:};
+        -:  473:
+        -:  474:/// A collapsing reshape operation can sometimes be simplified or eliminated by
+        -:  475:/// inserting a single rank-reducing slice operation between it and the source
+        -:  476:/// tensor. The slice op will either take the place of the source, allowing for
+        -:  477:/// a new, simpler reshape op to replace the original, or the reshape op will be
+        -:  478:/// completely replaced by the slice result.
+        -:  479:///
+        -:  480:/// This function returns the parameters required to implement this pattern. If
+        -:  481:/// the pattern is not applicable, then failure is returned.
+        -:  482:///
+        -:  483:/// ### Example:
+        -:  484:/// ```
+        -:  485:/// %result = tensor.collapse_shape %0 [[0, 1], [2, 3]]
+        -:  486:///    : tensor<?x1x30x10xf32> to tensor<?x300xf32>
+        -:  487:/// ```
+        -:  488:/// can be transformed to
+        -:  489:/// ```
+        -:  490:/// %tmp = tensor.extract_slice %0 [0, 0, 0, 0]
+        -:  491:///                         [0, %dim1, 30, 30]
+        -:  492:///                         [1, 1, 1 1]
+        -:  493:///   : tensor<?x1x30x10xf32> to tensor<?x30x10xf32>
+        -:  494:/// %result = tensor.collapse_shape %tmp [[0], [1, 2]]
+        -:  495:///   : tensor<?x30x10xf32> to tensor<?x300xf32>
+        -:  496:/// ```
+        -:  497:///
+        -:  498:/// ### Example:
+        -:  499:/// ```
+        -:  500:/// %result = tensor.collapse_shape %1 [[0, 1], [2]]
+        -:  501:///    : tensor<?x1x30xf32> to tensor<?x30xf32>
+        -:  502:/// ```
+        -:  503:/// can be transformed to
+        -:  504:/// ```
+        -:  505:/// %result = tensor.extract_slice %1 [0, 0, 0]
+        -:  506:///                                   [%dim2, 1, 30]
+        -:  507:///                                   [1, 1, 1]
+        -:  508:///    : tensor<?x1x30xf32> to tensor<?x30xf32>
+        -:  509:/// ```
+        -:  510:FailureOr<CollapseShapeRankReducingSliceSimplificationInfo>
+        -:  511:getSimplifyCollapseShapeWithRankReducingSliceInfo(
+        -:  512:    RankedTensorType sourceType,
+        -:  513:    ArrayRef<ReassociationIndices> reassociationIndices);
+        -:  514:
+        -:  515:} // namespace mlir
+        -:  516:
+        -:  517:#endif // MLIR_DIALECT_UTILS_RESHAPEOPSUTILS_H

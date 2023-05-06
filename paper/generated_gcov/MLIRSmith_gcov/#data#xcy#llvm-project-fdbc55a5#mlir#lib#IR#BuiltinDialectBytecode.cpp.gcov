@@ -1,0 +1,1628 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/IR/BuiltinDialectBytecode.cpp
+        -:    0:Graph:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/BuiltinDialectBytecode.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/BuiltinDialectBytecode.cpp.gcda
+        -:    0:Runs:116163
+        -:    1://===- BuiltinDialectBytecode.cpp - Builtin Bytecode Implementation -------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "BuiltinDialectBytecode.h"
+        -:   10:#include "mlir/Bytecode/BytecodeImplementation.h"
+        -:   11:#include "mlir/IR/BuiltinDialect.h"
+        -:   12:#include "mlir/IR/BuiltinTypes.h"
+        -:   13:#include "mlir/IR/Diagnostics.h"
+        -:   14:#include "mlir/IR/DialectResourceBlobManager.h"
+        -:   15:#include "llvm/ADT/TypeSwitch.h"
+        -:   16:
+        -:   17:using namespace mlir;
+        -:   18:
+        -:   19://===----------------------------------------------------------------------===//
+        -:   20:// Encoding
+        -:   21://===----------------------------------------------------------------------===//
+        -:   22:
+        -:   23:namespace {
+        -:   24:namespace builtin_encoding {
+        -:   25:/// This enum contains marker codes used to indicate which attribute is
+        -:   26:/// currently being decoded, and how it should be decoded. The order of these
+        -:   27:/// codes should generally be unchanged, as any changes will inevitably break
+        -:   28:/// compatibility with older bytecode.
+        -:   29:enum AttributeCode {
+        -:   30:  ///   ArrayAttr {
+        -:   31:  ///     elements: Attribute[]
+        -:   32:  ///   }
+        -:   33:  ///
+        -:   34:  kArrayAttr = 0,
+        -:   35:
+        -:   36:  ///   DictionaryAttr {
+        -:   37:  ///     attrs: <StringAttr, Attribute>[]
+        -:   38:  ///   }
+        -:   39:  kDictionaryAttr = 1,
+        -:   40:
+        -:   41:  ///   StringAttr {
+        -:   42:  ///     value: string
+        -:   43:  ///   }
+        -:   44:  kStringAttr = 2,
+        -:   45:
+        -:   46:  ///   StringAttrWithType {
+        -:   47:  ///     value: string,
+        -:   48:  ///     type: Type
+        -:   49:  ///   }
+        -:   50:  /// A variant of StringAttr with a type.
+        -:   51:  kStringAttrWithType = 3,
+        -:   52:
+        -:   53:  ///   FlatSymbolRefAttr {
+        -:   54:  ///     rootReference: StringAttr
+        -:   55:  ///   }
+        -:   56:  /// A variant of SymbolRefAttr with no leaf references.
+        -:   57:  kFlatSymbolRefAttr = 4,
+        -:   58:
+        -:   59:  ///   SymbolRefAttr {
+        -:   60:  ///     rootReference: StringAttr,
+        -:   61:  ///     leafReferences: FlatSymbolRefAttr[]
+        -:   62:  ///   }
+        -:   63:  kSymbolRefAttr = 5,
+        -:   64:
+        -:   65:  ///   TypeAttr {
+        -:   66:  ///     value: Type
+        -:   67:  ///   }
+        -:   68:  kTypeAttr = 6,
+        -:   69:
+        -:   70:  ///   UnitAttr {
+        -:   71:  ///   }
+        -:   72:  kUnitAttr = 7,
+        -:   73:
+        -:   74:  ///   IntegerAttr {
+        -:   75:  ///     type: Type
+        -:   76:  ///     value: APInt,
+        -:   77:  ///   }
+        -:   78:  kIntegerAttr = 8,
+        -:   79:
+        -:   80:  ///   FloatAttr {
+        -:   81:  ///     type: FloatType
+        -:   82:  ///     value: APFloat
+        -:   83:  ///   }
+        -:   84:  kFloatAttr = 9,
+        -:   85:
+        -:   86:  ///   CallSiteLoc {
+        -:   87:  ///    callee: LocationAttr,
+        -:   88:  ///    caller: LocationAttr
+        -:   89:  ///   }
+        -:   90:  kCallSiteLoc = 10,
+        -:   91:
+        -:   92:  ///   FileLineColLoc {
+        -:   93:  ///     file: StringAttr,
+        -:   94:  ///     line: varint,
+        -:   95:  ///     column: varint
+        -:   96:  ///   }
+        -:   97:  kFileLineColLoc = 11,
+        -:   98:
+        -:   99:  ///   FusedLoc {
+        -:  100:  ///     locations: LocationAttr[]
+        -:  101:  ///   }
+        -:  102:  kFusedLoc = 12,
+        -:  103:
+        -:  104:  ///   FusedLocWithMetadata {
+        -:  105:  ///     locations: LocationAttr[],
+        -:  106:  ///     metadata: Attribute
+        -:  107:  ///   }
+        -:  108:  /// A variant of FusedLoc with metadata.
+        -:  109:  kFusedLocWithMetadata = 13,
+        -:  110:
+        -:  111:  ///   NameLoc {
+        -:  112:  ///     name: StringAttr,
+        -:  113:  ///     childLoc: LocationAttr
+        -:  114:  ///   }
+        -:  115:  kNameLoc = 14,
+        -:  116:
+        -:  117:  ///   UnknownLoc {
+        -:  118:  ///   }
+        -:  119:  kUnknownLoc = 15,
+        -:  120:
+        -:  121:  ///   DenseResourceElementsAttr {
+        -:  122:  ///     type: Type,
+        -:  123:  ///     handle: ResourceHandle
+        -:  124:  ///   }
+        -:  125:  kDenseResourceElementsAttr = 16,
+        -:  126:
+        -:  127:  ///   DenseArrayAttr {
+        -:  128:  ///     type: RankedTensorType,
+        -:  129:  ///     data: blob
+        -:  130:  ///   }
+        -:  131:  kDenseArrayAttr = 17,
+        -:  132:
+        -:  133:  ///   DenseIntOrFPElementsAttr {
+        -:  134:  ///     type: ShapedType,
+        -:  135:  ///     data: blob
+        -:  136:  ///   }
+        -:  137:  kDenseIntOrFPElementsAttr = 18,
+        -:  138:
+        -:  139:  ///   DenseStringElementsAttr {
+        -:  140:  ///     type: ShapedType,
+        -:  141:  ///     isSplat: varint,
+        -:  142:  ///     data: string[]
+        -:  143:  ///   }
+        -:  144:  kDenseStringElementsAttr = 19,
+        -:  145:
+        -:  146:  ///   SparseElementsAttr {
+        -:  147:  ///     type: ShapedType,
+        -:  148:  ///     indices: DenseIntElementsAttr,
+        -:  149:  ///     values: DenseElementsAttr
+        -:  150:  ///   }
+        -:  151:  kSparseElementsAttr = 20,
+        -:  152:};
+        -:  153:
+        -:  154:/// This enum contains marker codes used to indicate which type is currently
+        -:  155:/// being decoded, and how it should be decoded. The order of these codes should
+        -:  156:/// generally be unchanged, as any changes will inevitably break compatibility
+        -:  157:/// with older bytecode.
+        -:  158:enum TypeCode {
+        -:  159:  ///   IntegerType {
+        -:  160:  ///     widthAndSignedness: varint // (width << 2) | (signedness)
+        -:  161:  ///   }
+        -:  162:  ///
+        -:  163:  kIntegerType = 0,
+        -:  164:
+        -:  165:  ///   IndexType {
+        -:  166:  ///   }
+        -:  167:  ///
+        -:  168:  kIndexType = 1,
+        -:  169:
+        -:  170:  ///   FunctionType {
+        -:  171:  ///     inputs: Type[],
+        -:  172:  ///     results: Type[]
+        -:  173:  ///   }
+        -:  174:  ///
+        -:  175:  kFunctionType = 2,
+        -:  176:
+        -:  177:  ///   BFloat16Type {
+        -:  178:  ///   }
+        -:  179:  ///
+        -:  180:  kBFloat16Type = 3,
+        -:  181:
+        -:  182:  ///   Float16Type {
+        -:  183:  ///   }
+        -:  184:  ///
+        -:  185:  kFloat16Type = 4,
+        -:  186:
+        -:  187:  ///   Float32Type {
+        -:  188:  ///   }
+        -:  189:  ///
+        -:  190:  kFloat32Type = 5,
+        -:  191:
+        -:  192:  ///   Float64Type {
+        -:  193:  ///   }
+        -:  194:  ///
+        -:  195:  kFloat64Type = 6,
+        -:  196:
+        -:  197:  ///   Float80Type {
+        -:  198:  ///   }
+        -:  199:  ///
+        -:  200:  kFloat80Type = 7,
+        -:  201:
+        -:  202:  ///   Float128Type {
+        -:  203:  ///   }
+        -:  204:  ///
+        -:  205:  kFloat128Type = 8,
+        -:  206:
+        -:  207:  ///   ComplexType {
+        -:  208:  ///     elementType: Type
+        -:  209:  ///   }
+        -:  210:  ///
+        -:  211:  kComplexType = 9,
+        -:  212:
+        -:  213:  ///   MemRefType {
+        -:  214:  ///     shape: svarint[],
+        -:  215:  ///     elementType: Type,
+        -:  216:  ///     layout: Attribute
+        -:  217:  ///   }
+        -:  218:  ///
+        -:  219:  kMemRefType = 10,
+        -:  220:
+        -:  221:  ///   MemRefTypeWithMemSpace {
+        -:  222:  ///     memorySpace: Attribute,
+        -:  223:  ///     shape: svarint[],
+        -:  224:  ///     elementType: Type,
+        -:  225:  ///     layout: Attribute
+        -:  226:  ///   }
+        -:  227:  /// Variant of MemRefType with non-default memory space.
+        -:  228:  kMemRefTypeWithMemSpace = 11,
+        -:  229:
+        -:  230:  ///   NoneType {
+        -:  231:  ///   }
+        -:  232:  ///
+        -:  233:  kNoneType = 12,
+        -:  234:
+        -:  235:  ///   RankedTensorType {
+        -:  236:  ///     shape: svarint[],
+        -:  237:  ///     elementType: Type,
+        -:  238:  ///   }
+        -:  239:  ///
+        -:  240:  kRankedTensorType = 13,
+        -:  241:
+        -:  242:  ///   RankedTensorTypeWithEncoding {
+        -:  243:  ///     encoding: Attribute,
+        -:  244:  ///     shape: svarint[],
+        -:  245:  ///     elementType: Type
+        -:  246:  ///   }
+        -:  247:  /// Variant of RankedTensorType with an encoding.
+        -:  248:  kRankedTensorTypeWithEncoding = 14,
+        -:  249:
+        -:  250:  ///   TupleType {
+        -:  251:  ///     elementTypes: Type[]
+        -:  252:  ///   }
+        -:  253:  kTupleType = 15,
+        -:  254:
+        -:  255:  ///   UnrankedMemRefType {
+        -:  256:  ///     shape: svarint[]
+        -:  257:  ///   }
+        -:  258:  ///
+        -:  259:  kUnrankedMemRefType = 16,
+        -:  260:
+        -:  261:  ///   UnrankedMemRefTypeWithMemSpace {
+        -:  262:  ///     memorySpace: Attribute,
+        -:  263:  ///     shape: svarint[]
+        -:  264:  ///   }
+        -:  265:  /// Variant of UnrankedMemRefType with non-default memory space.
+        -:  266:  kUnrankedMemRefTypeWithMemSpace = 17,
+        -:  267:
+        -:  268:  ///   UnrankedTensorType {
+        -:  269:  ///     elementType: Type
+        -:  270:  ///   }
+        -:  271:  ///
+        -:  272:  kUnrankedTensorType = 18,
+        -:  273:
+        -:  274:  ///   VectorType {
+        -:  275:  ///     shape: svarint[],
+        -:  276:  ///     elementType: Type
+        -:  277:  ///   }
+        -:  278:  ///
+        -:  279:  kVectorType = 19,
+        -:  280:
+        -:  281:  ///   VectorTypeWithScalableDims {
+        -:  282:  ///     numScalableDims: varint,
+        -:  283:  ///     shape: svarint[],
+        -:  284:  ///     elementType: Type
+        -:  285:  ///   }
+        -:  286:  /// Variant of VectorType with scalable dimensions.
+        -:  287:  kVectorTypeWithScalableDims = 20,
+        -:  288:};
+        -:  289:
+        -:  290:} // namespace builtin_encoding
+        -:  291:} // namespace
+        -:  292:
+        -:  293://===----------------------------------------------------------------------===//
+        -:  294:// BuiltinDialectBytecodeInterface
+        -:  295://===----------------------------------------------------------------------===//
+        -:  296:
+        -:  297:namespace {
+        -:  298:/// This class implements the bytecode interface for the builtin dialect.
+        -:  299:struct BuiltinDialectBytecodeInterface : public BytecodeDialectInterface {
+        -:  300:  BuiltinDialectBytecodeInterface(Dialect *dialect)
+        -:  301:      : BytecodeDialectInterface(dialect) {}
+        -:  302:
+        -:  303:  //===--------------------------------------------------------------------===//
+        -:  304:  // Attributes
+        -:  305:
+        -:  306:  Attribute readAttribute(DialectBytecodeReader &reader) const override;
+        -:  307:  ArrayAttr readArrayAttr(DialectBytecodeReader &reader) const;
+        -:  308:  DenseArrayAttr readDenseArrayAttr(DialectBytecodeReader &reader) const;
+        -:  309:  DenseElementsAttr
+        -:  310:  readDenseIntOrFPElementsAttr(DialectBytecodeReader &reader) const;
+        -:  311:  DenseStringElementsAttr
+        -:  312:  readDenseStringElementsAttr(DialectBytecodeReader &reader) const;
+        -:  313:  DenseResourceElementsAttr
+        -:  314:  readDenseResourceElementsAttr(DialectBytecodeReader &reader) const;
+        -:  315:  DictionaryAttr readDictionaryAttr(DialectBytecodeReader &reader) const;
+        -:  316:  FloatAttr readFloatAttr(DialectBytecodeReader &reader) const;
+        -:  317:  IntegerAttr readIntegerAttr(DialectBytecodeReader &reader) const;
+        -:  318:  SparseElementsAttr
+        -:  319:  readSparseElementsAttr(DialectBytecodeReader &reader) const;
+        -:  320:  StringAttr readStringAttr(DialectBytecodeReader &reader, bool hasType) const;
+        -:  321:  SymbolRefAttr readSymbolRefAttr(DialectBytecodeReader &reader,
+        -:  322:                                  bool hasNestedRefs) const;
+        -:  323:  TypeAttr readTypeAttr(DialectBytecodeReader &reader) const;
+        -:  324:
+        -:  325:  LocationAttr readCallSiteLoc(DialectBytecodeReader &reader) const;
+        -:  326:  LocationAttr readFileLineColLoc(DialectBytecodeReader &reader) const;
+        -:  327:  LocationAttr readFusedLoc(DialectBytecodeReader &reader,
+        -:  328:                            bool hasMetadata) const;
+        -:  329:  LocationAttr readNameLoc(DialectBytecodeReader &reader) const;
+        -:  330:
+        -:  331:  LogicalResult writeAttribute(Attribute attr,
+        -:  332:                               DialectBytecodeWriter &writer) const override;
+        -:  333:  void write(ArrayAttr attr, DialectBytecodeWriter &writer) const;
+        -:  334:  void write(DenseArrayAttr attr, DialectBytecodeWriter &writer) const;
+        -:  335:  void write(DenseIntOrFPElementsAttr attr,
+        -:  336:             DialectBytecodeWriter &writer) const;
+        -:  337:  void write(DenseStringElementsAttr attr, DialectBytecodeWriter &writer) const;
+        -:  338:  void write(DenseResourceElementsAttr attr,
+        -:  339:             DialectBytecodeWriter &writer) const;
+        -:  340:  void write(DictionaryAttr attr, DialectBytecodeWriter &writer) const;
+        -:  341:  void write(IntegerAttr attr, DialectBytecodeWriter &writer) const;
+        -:  342:  void write(FloatAttr attr, DialectBytecodeWriter &writer) const;
+        -:  343:  void write(SparseElementsAttr attr, DialectBytecodeWriter &writer) const;
+        -:  344:  void write(StringAttr attr, DialectBytecodeWriter &writer) const;
+        -:  345:  void write(SymbolRefAttr attr, DialectBytecodeWriter &writer) const;
+        -:  346:  void write(TypeAttr attr, DialectBytecodeWriter &writer) const;
+        -:  347:
+        -:  348:  void write(CallSiteLoc attr, DialectBytecodeWriter &writer) const;
+        -:  349:  void write(FileLineColLoc attr, DialectBytecodeWriter &writer) const;
+        -:  350:  void write(FusedLoc attr, DialectBytecodeWriter &writer) const;
+        -:  351:  void write(NameLoc attr, DialectBytecodeWriter &writer) const;
+        -:  352:  LogicalResult write(OpaqueLoc attr, DialectBytecodeWriter &writer) const;
+        -:  353:
+        -:  354:  //===--------------------------------------------------------------------===//
+        -:  355:  // Types
+        -:  356:
+        -:  357:  Type readType(DialectBytecodeReader &reader) const override;
+        -:  358:  ComplexType readComplexType(DialectBytecodeReader &reader) const;
+        -:  359:  IntegerType readIntegerType(DialectBytecodeReader &reader) const;
+        -:  360:  FunctionType readFunctionType(DialectBytecodeReader &reader) const;
+        -:  361:  MemRefType readMemRefType(DialectBytecodeReader &reader,
+        -:  362:                            bool hasMemSpace) const;
+        -:  363:  RankedTensorType readRankedTensorType(DialectBytecodeReader &reader,
+        -:  364:                                        bool hasEncoding) const;
+        -:  365:  TupleType readTupleType(DialectBytecodeReader &reader) const;
+        -:  366:  UnrankedMemRefType readUnrankedMemRefType(DialectBytecodeReader &reader,
+        -:  367:                                            bool hasMemSpace) const;
+        -:  368:  UnrankedTensorType
+        -:  369:  readUnrankedTensorType(DialectBytecodeReader &reader) const;
+        -:  370:  VectorType readVectorType(DialectBytecodeReader &reader,
+        -:  371:                            bool hasScalableDims) const;
+        -:  372:
+        -:  373:  LogicalResult writeType(Type type,
+        -:  374:                          DialectBytecodeWriter &writer) const override;
+        -:  375:  void write(ComplexType type, DialectBytecodeWriter &writer) const;
+        -:  376:  void write(IntegerType type, DialectBytecodeWriter &writer) const;
+        -:  377:  void write(FunctionType type, DialectBytecodeWriter &writer) const;
+        -:  378:  void write(MemRefType type, DialectBytecodeWriter &writer) const;
+        -:  379:  void write(RankedTensorType type, DialectBytecodeWriter &writer) const;
+        -:  380:  void write(TupleType type, DialectBytecodeWriter &writer) const;
+        -:  381:  void write(UnrankedMemRefType type, DialectBytecodeWriter &writer) const;
+        -:  382:  void write(UnrankedTensorType type, DialectBytecodeWriter &writer) const;
+        -:  383:  void write(VectorType type, DialectBytecodeWriter &writer) const;
+        -:  384:};
+        -:  385:} // namespace
+        -:  386:
+function _ZN4mlir22builtin_dialect_detail20addBytecodeInterfaceEPNS_14BuiltinDialectE called 189144 returned 100% blocks executed 100%
+   189144:  387:void builtin_dialect_detail::addBytecodeInterface(BuiltinDialect *dialect) {
+   189144:  388:  dialect->addInterfaces<BuiltinDialectBytecodeInterface>();
+call    0 returned 100%
+   189144:  389:}
+        -:  390:
+        -:  391://===----------------------------------------------------------------------===//
+        -:  392:// Attributes
+        -:  393://===----------------------------------------------------------------------===//
+        -:  394:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface13readAttributeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  395:Attribute BuiltinDialectBytecodeInterface::readAttribute(
+        -:  396:    DialectBytecodeReader &reader) const {
+    #####:  397:  uint64_t code;
+    #####:  398:  if (failed(reader.readVarInt(code)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  399:    return Attribute();
+    #####:  400:  switch (code) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+branch 20 never executed
+branch 21 never executed
+    #####:  401:  case builtin_encoding::kArrayAttr:
+    #####:  402:    return readArrayAttr(reader);
+call    0 never executed
+    #####:  403:  case builtin_encoding::kDictionaryAttr:
+    #####:  404:    return readDictionaryAttr(reader);
+call    0 never executed
+    #####:  405:  case builtin_encoding::kStringAttr:
+    #####:  406:    return readStringAttr(reader, /*hasType=*/false);
+call    0 never executed
+    #####:  407:  case builtin_encoding::kStringAttrWithType:
+    #####:  408:    return readStringAttr(reader, /*hasType=*/true);
+call    0 never executed
+    #####:  409:  case builtin_encoding::kFlatSymbolRefAttr:
+    #####:  410:    return readSymbolRefAttr(reader, /*hasNestedRefs=*/false);
+call    0 never executed
+    #####:  411:  case builtin_encoding::kSymbolRefAttr:
+    #####:  412:    return readSymbolRefAttr(reader, /*hasNestedRefs=*/true);
+call    0 never executed
+    #####:  413:  case builtin_encoding::kTypeAttr:
+    #####:  414:    return readTypeAttr(reader);
+call    0 never executed
+    #####:  415:  case builtin_encoding::kUnitAttr:
+    #####:  416:    return UnitAttr::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  417:  case builtin_encoding::kIntegerAttr:
+    #####:  418:    return readIntegerAttr(reader);
+call    0 never executed
+    #####:  419:  case builtin_encoding::kFloatAttr:
+    #####:  420:    return readFloatAttr(reader);
+call    0 never executed
+    #####:  421:  case builtin_encoding::kCallSiteLoc:
+    #####:  422:    return readCallSiteLoc(reader);
+call    0 never executed
+    #####:  423:  case builtin_encoding::kFileLineColLoc:
+    #####:  424:    return readFileLineColLoc(reader);
+call    0 never executed
+    #####:  425:  case builtin_encoding::kFusedLoc:
+    #####:  426:    return readFusedLoc(reader, /*hasMetadata=*/false);
+call    0 never executed
+    #####:  427:  case builtin_encoding::kFusedLocWithMetadata:
+    #####:  428:    return readFusedLoc(reader, /*hasMetadata=*/true);
+call    0 never executed
+    #####:  429:  case builtin_encoding::kNameLoc:
+    #####:  430:    return readNameLoc(reader);
+call    0 never executed
+    #####:  431:  case builtin_encoding::kUnknownLoc:
+    #####:  432:    return UnknownLoc::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  433:  case builtin_encoding::kDenseResourceElementsAttr:
+    #####:  434:    return readDenseResourceElementsAttr(reader);
+call    0 never executed
+    #####:  435:  case builtin_encoding::kDenseArrayAttr:
+    #####:  436:    return readDenseArrayAttr(reader);
+call    0 never executed
+    #####:  437:  case builtin_encoding::kDenseIntOrFPElementsAttr:
+    #####:  438:    return readDenseIntOrFPElementsAttr(reader);
+call    0 never executed
+    #####:  439:  case builtin_encoding::kDenseStringElementsAttr:
+    #####:  440:    return readDenseStringElementsAttr(reader);
+call    0 never executed
+    #####:  441:  case builtin_encoding::kSparseElementsAttr:
+    #####:  442:    return readSparseElementsAttr(reader);
+call    0 never executed
+    #####:  443:  default:
+    #####:  444:    reader.emitError() << "unknown builtin attribute code: " << code;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  445:    return Attribute();
+        -:  446:  }
+        -:  447:}
+        -:  448:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface14writeAttributeEN4mlir9AttributeERNS1_21DialectBytecodeWriterE called 1870378 returned 100% blocks executed 100%
+  1870378:  449:LogicalResult BuiltinDialectBytecodeInterface::writeAttribute(
+        -:  450:    Attribute attr, DialectBytecodeWriter &writer) const {
+  1870378:  451:  return TypeSwitch<Attribute, LogicalResult>(attr)
+call    0 returned 100%
+        -:  452:      .Case<ArrayAttr, DenseArrayAttr, DenseIntOrFPElementsAttr,
+        -:  453:            DenseStringElementsAttr, DenseResourceElementsAttr, DictionaryAttr,
+        -:  454:            FloatAttr, IntegerAttr, SparseElementsAttr, StringAttr,
+  297338*:  455:            SymbolRefAttr, TypeAttr>([&](auto attr) {
+  297338*:  456:        write(attr, writer);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 returned 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+call    6 returned 100%
+branch  7 taken 0% (fallthrough)
+branch  8 taken 100%
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+call   12 returned 100%
+branch 13 taken 0% (fallthrough)
+branch 14 taken 100%
+call   15 returned 100%
+branch 16 taken 0% (fallthrough)
+branch 17 taken 100%
+call   18 returned 100%
+branch 19 taken 0% (fallthrough)
+branch 20 taken 100%
+call   21 never executed
+branch 22 never executed
+branch 23 never executed
+call   24 never executed
+branch 25 never executed
+branch 26 never executed
+call   27 returned 100%
+branch 28 taken 0% (fallthrough)
+branch 29 taken 100%
+call   30 returned 100%
+branch 31 taken 0% (fallthrough)
+branch 32 taken 100%
+call   33 returned 100%
+branch 34 taken 0% (fallthrough)
+branch 35 taken 100%
+  297338*:  457:        return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+branch  6 never executed
+branch  7 never executed
+branch  8 taken 0% (fallthrough)
+branch  9 taken 100%
+branch 10 taken 0% (fallthrough)
+branch 11 taken 100%
+branch 12 taken 0% (fallthrough)
+branch 13 taken 100%
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 taken 0% (fallthrough)
+branch 19 taken 100%
+branch 20 taken 0% (fallthrough)
+branch 21 taken 100%
+branch 22 taken 0% (fallthrough)
+branch 23 taken 100%
+  1870378:  458:      })
+call    0 returned 100%
+ 1531214*:  459:      .Case<CallSiteLoc, FileLineColLoc, FusedLoc, NameLoc>([&](auto attr) {
+ 1531214*:  460:        write(attr, writer);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 returned 100%
+branch  7 taken 0% (fallthrough)
+branch  8 taken 100%
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+ 1531214*:  461:        return success();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+branch  6 never executed
+branch  7 never executed
+  1870378:  462:      })
+call    0 returned 100%
+ 1870378*:  463:      .Case([&](OpaqueLoc attr) { return write(attr, writer); })
+call    0 never executed
+call    1 returned 100%
+       10:  464:      .Case([&](UnitAttr) {
+       10:  465:        writer.writeVarInt(builtin_encoding::kUnitAttr);
+call    0 returned 100%
+       10:  466:        return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+  1870378:  467:      })
+call    0 returned 100%
+      702:  468:      .Case([&](UnknownLoc) {
+      702:  469:        writer.writeVarInt(builtin_encoding::kUnknownLoc);
+call    0 returned 100%
+      702:  470:        return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+  1870378:  471:      })
+call    0 returned 100%
+  1870378:  472:      .Default([&](Attribute) { return failure(); });
+branch  0 taken 98% (fallthrough)
+branch  1 taken 2%
+        -:  473:}
+        -:  474:
+        -:  475://===----------------------------------------------------------------------===//
+        -:  476:// ArrayAttr
+        -:  477:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface13readArrayAttrERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  478:ArrayAttr BuiltinDialectBytecodeInterface::readArrayAttr(
+        -:  479:    DialectBytecodeReader &reader) const {
+    #####:  480:  SmallVector<Attribute> elements;
+call    0 never executed
+    #####:  481:  if (failed(reader.readAttributes(elements)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  482:    return ArrayAttr();
+    #####:  483:  return ArrayAttr::get(getContext(), elements);
+call    0 never executed
+call    1 never executed
+        -:  484:}
+        -:  485:
+        -:  486:void BuiltinDialectBytecodeInterface::write(
+        -:  487:    ArrayAttr attr, DialectBytecodeWriter &writer) const {
+        -:  488:  writer.writeVarInt(builtin_encoding::kArrayAttr);
+        -:  489:  writer.writeAttributes(attr.getValue());
+        -:  490:}
+        -:  491:
+        -:  492://===----------------------------------------------------------------------===//
+        -:  493:// DenseArrayAttr
+        -:  494:
+        -:  495:DenseArrayAttr BuiltinDialectBytecodeInterface::readDenseArrayAttr(
+        -:  496:    DialectBytecodeReader &reader) const {
+        -:  497:  RankedTensorType type;
+        -:  498:  ArrayRef<char> blob;
+        -:  499:  if (failed(reader.readType(type)) || failed(reader.readBlob(blob)))
+        -:  500:    return DenseArrayAttr();
+        -:  501:  return DenseArrayAttr::get(type, blob);
+        -:  502:}
+        -:  503:
+        -:  504:void BuiltinDialectBytecodeInterface::write(
+        -:  505:    DenseArrayAttr attr, DialectBytecodeWriter &writer) const {
+        -:  506:  writer.writeVarInt(builtin_encoding::kDenseArrayAttr);
+        -:  507:  writer.writeType(attr.getType());
+        -:  508:  writer.writeOwnedBlob(attr.getRawData());
+        -:  509:}
+        -:  510:
+        -:  511://===----------------------------------------------------------------------===//
+        -:  512:// DenseIntOrFPElementsAttr
+        -:  513:
+        -:  514:DenseElementsAttr BuiltinDialectBytecodeInterface::readDenseIntOrFPElementsAttr(
+        -:  515:    DialectBytecodeReader &reader) const {
+        -:  516:  ShapedType type;
+        -:  517:  ArrayRef<char> blob;
+        -:  518:  if (failed(reader.readType(type)) || failed(reader.readBlob(blob)))
+        -:  519:    return DenseIntOrFPElementsAttr();
+        -:  520:  return DenseIntOrFPElementsAttr::getFromRawBuffer(type, blob);
+        -:  521:}
+        -:  522:
+        -:  523:void BuiltinDialectBytecodeInterface::write(
+        -:  524:    DenseIntOrFPElementsAttr attr, DialectBytecodeWriter &writer) const {
+        -:  525:  writer.writeVarInt(builtin_encoding::kDenseIntOrFPElementsAttr);
+        -:  526:  writer.writeType(attr.getType());
+        -:  527:  writer.writeOwnedBlob(attr.getRawData());
+        -:  528:}
+        -:  529:
+        -:  530://===----------------------------------------------------------------------===//
+        -:  531:// DenseStringElementsAttr
+        -:  532:
+        -:  533:DenseStringElementsAttr
+        -:  534:BuiltinDialectBytecodeInterface::readDenseStringElementsAttr(
+        -:  535:    DialectBytecodeReader &reader) const {
+        -:  536:  ShapedType type;
+        -:  537:  uint64_t isSplat;
+        -:  538:  if (failed(reader.readType(type)) || failed(reader.readVarInt(isSplat)))
+        -:  539:    return DenseStringElementsAttr();
+        -:  540:
+        -:  541:  SmallVector<StringRef> values(isSplat ? 1 : type.getNumElements());
+        -:  542:  for (StringRef &value : values)
+        -:  543:    if (failed(reader.readString(value)))
+        -:  544:      return DenseStringElementsAttr();
+        -:  545:  return DenseStringElementsAttr::get(type, values);
+        -:  546:}
+        -:  547:
+        -:  548:void BuiltinDialectBytecodeInterface::write(
+        -:  549:    DenseStringElementsAttr attr, DialectBytecodeWriter &writer) const {
+        -:  550:  writer.writeVarInt(builtin_encoding::kDenseStringElementsAttr);
+        -:  551:  writer.writeType(attr.getType());
+        -:  552:
+        -:  553:  bool isSplat = attr.isSplat();
+        -:  554:  writer.writeVarInt(isSplat);
+        -:  555:
+        -:  556:  // If the attribute is a splat, only write out the single value.
+        -:  557:  if (isSplat)
+        -:  558:    return writer.writeOwnedString(attr.getRawStringData().front());
+        -:  559:
+        -:  560:  for (StringRef str : attr.getRawStringData())
+        -:  561:    writer.writeOwnedString(str);
+        -:  562:}
+        -:  563:
+        -:  564://===----------------------------------------------------------------------===//
+        -:  565:// DenseResourceElementsAttr
+        -:  566:
+        -:  567:DenseResourceElementsAttr
+        -:  568:BuiltinDialectBytecodeInterface::readDenseResourceElementsAttr(
+        -:  569:    DialectBytecodeReader &reader) const {
+        -:  570:  ShapedType type;
+        -:  571:  if (failed(reader.readType(type)))
+        -:  572:    return DenseResourceElementsAttr();
+        -:  573:
+        -:  574:  FailureOr<DenseResourceElementsHandle> handle =
+        -:  575:      reader.readResourceHandle<DenseResourceElementsHandle>();
+        -:  576:  if (failed(handle))
+        -:  577:    return DenseResourceElementsAttr();
+        -:  578:
+        -:  579:  return DenseResourceElementsAttr::get(type, *handle);
+        -:  580:}
+        -:  581:
+        -:  582:void BuiltinDialectBytecodeInterface::write(
+        -:  583:    DenseResourceElementsAttr attr, DialectBytecodeWriter &writer) const {
+        -:  584:  writer.writeVarInt(builtin_encoding::kDenseResourceElementsAttr);
+        -:  585:  writer.writeType(attr.getType());
+        -:  586:  writer.writeResourceHandle(attr.getRawHandle());
+        -:  587:}
+        -:  588:
+        -:  589://===----------------------------------------------------------------------===//
+        -:  590:// DictionaryAttr
+        -:  591:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface18readDictionaryAttrERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  592:DictionaryAttr BuiltinDialectBytecodeInterface::readDictionaryAttr(
+        -:  593:    DialectBytecodeReader &reader) const {
+function _ZZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface18readDictionaryAttrERN4mlir21DialectBytecodeReaderEENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  594:  auto readNamedAttr = [&]() -> FailureOr<NamedAttribute> {
+    #####:  595:    StringAttr name;
+    #####:  596:    Attribute value;
+    #####:  597:    if (failed(reader.readAttribute(name)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  598:        failed(reader.readAttribute(value)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  599:      return failure();
+    #####:  600:    return NamedAttribute(name, value);
+call    0 never executed
+    #####:  601:  };
+    #####:  602:  SmallVector<NamedAttribute> attrs;
+call    0 never executed
+    #####:  603:  if (failed(reader.readList(attrs, readNamedAttr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  604:    return DictionaryAttr();
+    #####:  605:  return DictionaryAttr::get(getContext(), attrs);
+call    0 never executed
+call    1 never executed
+        -:  606:}
+        -:  607:
+        -:  608:void BuiltinDialectBytecodeInterface::write(
+        -:  609:    DictionaryAttr attr, DialectBytecodeWriter &writer) const {
+        -:  610:  writer.writeVarInt(builtin_encoding::kDictionaryAttr);
+function _ZZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface5writeEN4mlir14DictionaryAttrERNS1_21DialectBytecodeWriterEENKUlNS1_14NamedAttributeEE_clES5_.isra.0 called 246080 returned 100% blocks executed 100%
+   246080:  611:  writer.writeList(attr.getValue(), [&](NamedAttribute attr) {
+   246080:  612:    writer.writeAttribute(attr.getName());
+call    0 returned 100%
+call    1 returned 100%
+   246080:  613:    writer.writeAttribute(attr.getValue());
+call    0 returned 100%
+   246080:  614:  });
+        -:  615:}
+        -:  616:
+        -:  617://===----------------------------------------------------------------------===//
+        -:  618:// FloatAttr
+        -:  619:
+        -:  620:FloatAttr BuiltinDialectBytecodeInterface::readFloatAttr(
+        -:  621:    DialectBytecodeReader &reader) const {
+        -:  622:  FloatType type;
+        -:  623:  if (failed(reader.readType(type)))
+        -:  624:    return FloatAttr();
+        -:  625:  FailureOr<APFloat> value =
+        -:  626:      reader.readAPFloatWithKnownSemantics(type.getFloatSemantics());
+        -:  627:  if (failed(value))
+        -:  628:    return FloatAttr();
+        -:  629:  return FloatAttr::get(type, *value);
+        -:  630:}
+        -:  631:
+        -:  632:void BuiltinDialectBytecodeInterface::write(
+        -:  633:    FloatAttr attr, DialectBytecodeWriter &writer) const {
+        -:  634:  writer.writeVarInt(builtin_encoding::kFloatAttr);
+        -:  635:  writer.writeType(attr.getType());
+        -:  636:  writer.writeAPFloatWithKnownSemantics(attr.getValue());
+        -:  637:}
+        -:  638:
+        -:  639://===----------------------------------------------------------------------===//
+        -:  640:// IntegerAttr
+        -:  641:
+        -:  642:IntegerAttr BuiltinDialectBytecodeInterface::readIntegerAttr(
+        -:  643:    DialectBytecodeReader &reader) const {
+        -:  644:  Type type;
+        -:  645:  if (failed(reader.readType(type)))
+        -:  646:    return IntegerAttr();
+        -:  647:
+        -:  648:  // Extract the value storage width from the type.
+        -:  649:  unsigned bitWidth;
+        -:  650:  if (auto intType = type.dyn_cast<IntegerType>()) {
+        -:  651:    bitWidth = intType.getWidth();
+        -:  652:  } else if (type.isa<IndexType>()) {
+        -:  653:    bitWidth = IndexType::kInternalStorageBitWidth;
+        -:  654:  } else {
+        -:  655:    reader.emitError()
+        -:  656:        << "expected integer or index type for IntegerAttr, but got: " << type;
+        -:  657:    return IntegerAttr();
+        -:  658:  }
+        -:  659:
+        -:  660:  FailureOr<APInt> value = reader.readAPIntWithKnownWidth(bitWidth);
+        -:  661:  if (failed(value))
+        -:  662:    return IntegerAttr();
+        -:  663:  return IntegerAttr::get(type, *value);
+        -:  664:}
+        -:  665:
+        -:  666:void BuiltinDialectBytecodeInterface::write(
+        -:  667:    IntegerAttr attr, DialectBytecodeWriter &writer) const {
+        -:  668:  writer.writeVarInt(builtin_encoding::kIntegerAttr);
+        -:  669:  writer.writeType(attr.getType());
+        -:  670:  writer.writeAPIntWithKnownWidth(attr.getValue());
+        -:  671:}
+        -:  672:
+        -:  673://===----------------------------------------------------------------------===//
+        -:  674:// SparseElementsAttr
+        -:  675:
+        -:  676:SparseElementsAttr BuiltinDialectBytecodeInterface::readSparseElementsAttr(
+        -:  677:    DialectBytecodeReader &reader) const {
+        -:  678:  ShapedType type;
+        -:  679:  DenseIntElementsAttr indices;
+        -:  680:  DenseElementsAttr values;
+        -:  681:  if (failed(reader.readType(type)) || failed(reader.readAttribute(indices)) ||
+        -:  682:      failed(reader.readAttribute(values)))
+        -:  683:    return SparseElementsAttr();
+        -:  684:  return SparseElementsAttr::get(type, indices, values);
+        -:  685:}
+        -:  686:
+        -:  687:void BuiltinDialectBytecodeInterface::write(
+        -:  688:    SparseElementsAttr attr, DialectBytecodeWriter &writer) const {
+        -:  689:  writer.writeVarInt(builtin_encoding::kSparseElementsAttr);
+        -:  690:  writer.writeType(attr.getType());
+        -:  691:  writer.writeAttribute(attr.getIndices());
+        -:  692:  writer.writeAttribute(attr.getValues());
+        -:  693:}
+        -:  694:
+        -:  695://===----------------------------------------------------------------------===//
+        -:  696:// StringAttr
+        -:  697:
+        -:  698:StringAttr
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface14readStringAttrERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####:  699:BuiltinDialectBytecodeInterface::readStringAttr(DialectBytecodeReader &reader,
+        -:  700:                                                bool hasType) const {
+    #####:  701:  StringRef string;
+    #####:  702:  if (failed(reader.readString(string)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  703:    return StringAttr();
+        -:  704:
+        -:  705:  // Read the type if present.
+    #####:  706:  Type type;
+    #####:  707:  if (!hasType)
+branch  0 never executed
+branch  1 never executed
+    #####:  708:    type = NoneType::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  709:  else if (failed(reader.readType(type)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  710:    return StringAttr();
+    #####:  711:  return StringAttr::get(string, type);
+call    0 never executed
+call    1 never executed
+        -:  712:}
+        -:  713:
+        -:  714:void BuiltinDialectBytecodeInterface::write(
+        -:  715:    StringAttr attr, DialectBytecodeWriter &writer) const {
+        -:  716:  // We only encode the type if it isn't NoneType, which is significantly less
+        -:  717:  // common.
+        -:  718:  Type type = attr.getType();
+        -:  719:  if (!type.isa<NoneType>()) {
+        -:  720:    writer.writeVarInt(builtin_encoding::kStringAttrWithType);
+        -:  721:    writer.writeOwnedString(attr.getValue());
+        -:  722:    writer.writeType(type);
+        -:  723:    return;
+        -:  724:  }
+        -:  725:  writer.writeVarInt(builtin_encoding::kStringAttr);
+        -:  726:  writer.writeOwnedString(attr.getValue());
+        -:  727:}
+        -:  728:
+        -:  729://===----------------------------------------------------------------------===//
+        -:  730:// SymbolRefAttr
+        -:  731:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface17readSymbolRefAttrERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####:  732:SymbolRefAttr BuiltinDialectBytecodeInterface::readSymbolRefAttr(
+        -:  733:    DialectBytecodeReader &reader, bool hasNestedRefs) const {
+    #####:  734:  StringAttr rootReference;
+    #####:  735:  if (failed(reader.readAttribute(rootReference)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  736:    return SymbolRefAttr();
+    #####:  737:  SmallVector<FlatSymbolRefAttr> nestedReferences;
+branch  0 never executed
+branch  1 never executed
+    #####:  738:  if (hasNestedRefs && failed(reader.readAttributes(nestedReferences)))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  739:    return SymbolRefAttr();
+    #####:  740:  return SymbolRefAttr::get(rootReference, nestedReferences);
+call    0 never executed
+        -:  741:}
+        -:  742:
+        -:  743:void BuiltinDialectBytecodeInterface::write(
+        -:  744:    SymbolRefAttr attr, DialectBytecodeWriter &writer) const {
+        -:  745:  ArrayRef<FlatSymbolRefAttr> nestedRefs = attr.getNestedReferences();
+        -:  746:  writer.writeVarInt(nestedRefs.empty() ? builtin_encoding::kFlatSymbolRefAttr
+        -:  747:                                        : builtin_encoding::kSymbolRefAttr);
+        -:  748:
+        -:  749:  writer.writeAttribute(attr.getRootReference());
+        -:  750:  if (!nestedRefs.empty())
+        -:  751:    writer.writeAttributes(nestedRefs);
+        -:  752:}
+        -:  753:
+        -:  754://===----------------------------------------------------------------------===//
+        -:  755:// TypeAttr
+        -:  756:
+        -:  757:TypeAttr BuiltinDialectBytecodeInterface::readTypeAttr(
+        -:  758:    DialectBytecodeReader &reader) const {
+        -:  759:  Type type;
+        -:  760:  if (failed(reader.readType(type)))
+        -:  761:    return TypeAttr();
+        -:  762:  return TypeAttr::get(type);
+        -:  763:}
+        -:  764:
+        -:  765:void BuiltinDialectBytecodeInterface::write(
+        -:  766:    TypeAttr attr, DialectBytecodeWriter &writer) const {
+        -:  767:  writer.writeVarInt(builtin_encoding::kTypeAttr);
+        -:  768:  writer.writeType(attr.getValue());
+        -:  769:}
+        -:  770:
+        -:  771://===----------------------------------------------------------------------===//
+        -:  772:// CallSiteLoc
+        -:  773:
+        -:  774:LocationAttr BuiltinDialectBytecodeInterface::readCallSiteLoc(
+        -:  775:    DialectBytecodeReader &reader) const {
+        -:  776:  LocationAttr callee, caller;
+        -:  777:  if (failed(reader.readAttribute(callee)) ||
+        -:  778:      failed(reader.readAttribute(caller)))
+        -:  779:    return LocationAttr();
+        -:  780:  return CallSiteLoc::get(callee, caller);
+        -:  781:}
+        -:  782:
+        -:  783:void BuiltinDialectBytecodeInterface::write(
+        -:  784:    CallSiteLoc attr, DialectBytecodeWriter &writer) const {
+        -:  785:  writer.writeVarInt(builtin_encoding::kCallSiteLoc);
+        -:  786:  writer.writeAttribute(attr.getCallee());
+        -:  787:  writer.writeAttribute(attr.getCaller());
+        -:  788:}
+        -:  789:
+        -:  790://===----------------------------------------------------------------------===//
+        -:  791:// FileLineColLoc
+        -:  792:
+        -:  793:LocationAttr BuiltinDialectBytecodeInterface::readFileLineColLoc(
+        -:  794:    DialectBytecodeReader &reader) const {
+        -:  795:  StringAttr filename;
+        -:  796:  uint64_t line, column;
+        -:  797:  if (failed(reader.readAttribute(filename)) ||
+        -:  798:      failed(reader.readVarInt(line)) || failed(reader.readVarInt(column)))
+        -:  799:    return LocationAttr();
+        -:  800:  return FileLineColLoc::get(filename, line, column);
+        -:  801:}
+        -:  802:
+        -:  803:void BuiltinDialectBytecodeInterface::write(
+        -:  804:    FileLineColLoc attr, DialectBytecodeWriter &writer) const {
+        -:  805:  writer.writeVarInt(builtin_encoding::kFileLineColLoc);
+        -:  806:  writer.writeAttribute(attr.getFilename());
+        -:  807:  writer.writeVarInt(attr.getLine());
+        -:  808:  writer.writeVarInt(attr.getColumn());
+        -:  809:}
+        -:  810:
+        -:  811://===----------------------------------------------------------------------===//
+        -:  812:// FusedLoc
+        -:  813:
+        -:  814:LocationAttr
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface12readFusedLocERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####:  815:BuiltinDialectBytecodeInterface::readFusedLoc(DialectBytecodeReader &reader,
+        -:  816:                                              bool hasMetadata) const {
+        -:  817:  // Parse the child locations.
+function _ZZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface12readFusedLocERN4mlir21DialectBytecodeReaderEbENKUlvE_clEv.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  818:  auto readLoc = [&]() -> FailureOr<Location> {
+    #####:  819:    LocationAttr locAttr;
+    #####:  820:    if (failed(reader.readAttribute(locAttr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  821:      return failure();
+    #####:  822:    return Location(locAttr);
+branch  0 never executed
+branch  1 never executed
+    #####:  823:  };
+    #####:  824:  SmallVector<Location> locations;
+call    0 never executed
+    #####:  825:  if (failed(reader.readList(locations, readLoc)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  826:    return LocationAttr();
+        -:  827:
+        -:  828:  // Parse the metadata if present.
+    #####:  829:  Attribute metadata;
+    #####:  830:  if (hasMetadata && failed(reader.readAttribute(metadata)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  831:    return LocationAttr();
+        -:  832:
+    #####:  833:  return FusedLoc::get(locations, metadata, getContext());
+call    0 never executed
+call    1 never executed
+        -:  834:}
+        -:  835:
+        -:  836:void BuiltinDialectBytecodeInterface::write(
+        -:  837:    FusedLoc attr, DialectBytecodeWriter &writer) const {
+        -:  838:  if (Attribute metadata = attr.getMetadata()) {
+        -:  839:    writer.writeVarInt(builtin_encoding::kFusedLocWithMetadata);
+        -:  840:    writer.writeAttributes(attr.getLocations());
+        -:  841:    writer.writeAttribute(metadata);
+        -:  842:  } else {
+        -:  843:    writer.writeVarInt(builtin_encoding::kFusedLoc);
+        -:  844:    writer.writeAttributes(attr.getLocations());
+        -:  845:  }
+        -:  846:}
+        -:  847:
+        -:  848://===----------------------------------------------------------------------===//
+        -:  849:// NameLoc
+        -:  850:
+        -:  851:LocationAttr BuiltinDialectBytecodeInterface::readNameLoc(
+        -:  852:    DialectBytecodeReader &reader) const {
+        -:  853:  StringAttr name;
+        -:  854:  LocationAttr childLoc;
+        -:  855:  if (failed(reader.readAttribute(name)) ||
+        -:  856:      failed(reader.readAttribute(childLoc)))
+        -:  857:    return LocationAttr();
+        -:  858:  return NameLoc::get(name, childLoc);
+        -:  859:}
+        -:  860:
+        -:  861:void BuiltinDialectBytecodeInterface::write(
+        -:  862:    NameLoc attr, DialectBytecodeWriter &writer) const {
+        -:  863:  writer.writeVarInt(builtin_encoding::kNameLoc);
+        -:  864:  writer.writeAttribute(attr.getName());
+        -:  865:  writer.writeAttribute(attr.getChildLoc());
+        -:  866:}
+        -:  867:
+        -:  868://===----------------------------------------------------------------------===//
+        -:  869:// OpaqueLoc
+        -:  870:
+        -:  871:LogicalResult
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface5writeEN4mlir9OpaqueLocERNS1_21DialectBytecodeWriterE called 0 returned 0% blocks executed 0%
+    #####:  872:BuiltinDialectBytecodeInterface::write(OpaqueLoc attr,
+        -:  873:                                       DialectBytecodeWriter &writer) const {
+        -:  874:  // We can't encode an OpaqueLoc directly given that it is in-memory only, so
+        -:  875:  // encode the fallback instead.
+    #####:  876:  return writeAttribute(attr.getFallbackLocation(), writer);
+call    0 never executed
+call    1 never executed
+        -:  877:}
+        -:  878:
+        -:  879://===----------------------------------------------------------------------===//
+        -:  880:// Types
+        -:  881://===----------------------------------------------------------------------===//
+        -:  882:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface8readTypeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  883:Type BuiltinDialectBytecodeInterface::readType(
+        -:  884:    DialectBytecodeReader &reader) const {
+    #####:  885:  uint64_t code;
+    #####:  886:  if (failed(reader.readVarInt(code)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  887:    return Type();
+    #####:  888:  switch (code) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+branch 14 never executed
+branch 15 never executed
+branch 16 never executed
+branch 17 never executed
+branch 18 never executed
+branch 19 never executed
+branch 20 never executed
+branch 21 never executed
+    #####:  889:  case builtin_encoding::kIntegerType:
+    #####:  890:    return readIntegerType(reader);
+call    0 never executed
+    #####:  891:  case builtin_encoding::kIndexType:
+    #####:  892:    return IndexType::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  893:  case builtin_encoding::kFunctionType:
+    #####:  894:    return readFunctionType(reader);
+call    0 never executed
+    #####:  895:  case builtin_encoding::kBFloat16Type:
+    #####:  896:    return BFloat16Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  897:  case builtin_encoding::kFloat16Type:
+    #####:  898:    return Float16Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  899:  case builtin_encoding::kFloat32Type:
+    #####:  900:    return Float32Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  901:  case builtin_encoding::kFloat64Type:
+    #####:  902:    return Float64Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  903:  case builtin_encoding::kFloat80Type:
+    #####:  904:    return Float80Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  905:  case builtin_encoding::kFloat128Type:
+    #####:  906:    return Float128Type::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  907:  case builtin_encoding::kComplexType:
+    #####:  908:    return readComplexType(reader);
+call    0 never executed
+    #####:  909:  case builtin_encoding::kMemRefType:
+    #####:  910:    return readMemRefType(reader, /*hasMemSpace=*/false);
+call    0 never executed
+    #####:  911:  case builtin_encoding::kMemRefTypeWithMemSpace:
+    #####:  912:    return readMemRefType(reader, /*hasMemSpace=*/true);
+call    0 never executed
+    #####:  913:  case builtin_encoding::kNoneType:
+    #####:  914:    return NoneType::get(getContext());
+call    0 never executed
+call    1 never executed
+    #####:  915:  case builtin_encoding::kRankedTensorType:
+    #####:  916:    return readRankedTensorType(reader, /*hasEncoding=*/false);
+call    0 never executed
+    #####:  917:  case builtin_encoding::kRankedTensorTypeWithEncoding:
+    #####:  918:    return readRankedTensorType(reader, /*hasEncoding=*/true);
+call    0 never executed
+    #####:  919:  case builtin_encoding::kTupleType:
+    #####:  920:    return readTupleType(reader);
+call    0 never executed
+    #####:  921:  case builtin_encoding::kUnrankedMemRefType:
+    #####:  922:    return readUnrankedMemRefType(reader, /*hasMemSpace=*/false);
+call    0 never executed
+    #####:  923:  case builtin_encoding::kUnrankedMemRefTypeWithMemSpace:
+    #####:  924:    return readUnrankedMemRefType(reader, /*hasMemSpace=*/true);
+call    0 never executed
+    #####:  925:  case builtin_encoding::kUnrankedTensorType:
+    #####:  926:    return readUnrankedTensorType(reader);
+call    0 never executed
+    #####:  927:  case builtin_encoding::kVectorType:
+    #####:  928:    return readVectorType(reader, /*hasScalableDims=*/false);
+call    0 never executed
+    #####:  929:  case builtin_encoding::kVectorTypeWithScalableDims:
+    #####:  930:    return readVectorType(reader, /*hasScalableDims=*/true);
+call    0 never executed
+        -:  931:
+    #####:  932:  default:
+    #####:  933:    reader.emitError() << "unknown builtin type code: " << code;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  934:    return Type();
+        -:  935:  }
+        -:  936:}
+        -:  937:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface9writeTypeEN4mlir4TypeERNS1_21DialectBytecodeWriterE called 123588 returned 100% blocks executed 100%
+   123588:  938:LogicalResult BuiltinDialectBytecodeInterface::writeType(
+        -:  939:    Type type, DialectBytecodeWriter &writer) const {
+   123588:  940:  return TypeSwitch<Type, LogicalResult>(type)
+call    0 returned 100%
+        -:  941:      .Case<ComplexType, IntegerType, FunctionType, MemRefType,
+        -:  942:            RankedTensorType, TupleType, UnrankedMemRefType, UnrankedTensorType,
+  121320*:  943:            VectorType>([&](auto type) {
+  121320*:  944:        write(type, writer);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+call   12 returned 100%
+branch 13 taken 0% (fallthrough)
+branch 14 taken 100%
+call   15 returned 100%
+branch 16 taken 0% (fallthrough)
+branch 17 taken 100%
+call   18 returned 100%
+branch 19 taken 0% (fallthrough)
+branch 20 taken 100%
+call   21 returned 100%
+branch 22 taken 0% (fallthrough)
+branch 23 taken 100%
+call   24 never executed
+branch 25 never executed
+branch 26 never executed
+  121320*:  945:        return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 taken 0% (fallthrough)
+branch  9 taken 100%
+branch 10 taken 0% (fallthrough)
+branch 11 taken 100%
+branch 12 taken 0% (fallthrough)
+branch 13 taken 100%
+branch 14 taken 0% (fallthrough)
+branch 15 taken 100%
+branch 16 never executed
+branch 17 never executed
+   123588:  946:      })
+call    0 returned 100%
+      756:  947:      .Case([&](IndexType) {
+      756:  948:        return writer.writeVarInt(builtin_encoding::kIndexType), success();
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+   123588:  949:      })
+call    0 returned 100%
+    #####:  950:      .Case([&](BFloat16Type) {
+    #####:  951:        return writer.writeVarInt(builtin_encoding::kBFloat16Type), success();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+   123588:  952:      })
+call    0 returned 100%
+      756:  953:      .Case([&](Float16Type) {
+      756:  954:        return writer.writeVarInt(builtin_encoding::kFloat16Type), success();
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+   123588:  955:      })
+call    0 returned 100%
+      756:  956:      .Case([&](Float32Type) {
+      756:  957:        return writer.writeVarInt(builtin_encoding::kFloat32Type), success();
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+   123588:  958:      })
+call    0 returned 100%
+    #####:  959:      .Case([&](Float64Type) {
+    #####:  960:        return writer.writeVarInt(builtin_encoding::kFloat64Type), success();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+   123588:  961:      })
+call    0 returned 100%
+    #####:  962:      .Case([&](Float80Type) {
+    #####:  963:        return writer.writeVarInt(builtin_encoding::kFloat80Type), success();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+   123588:  964:      })
+call    0 returned 100%
+    #####:  965:      .Case([&](Float128Type) {
+    #####:  966:        return writer.writeVarInt(builtin_encoding::kFloat128Type), success();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+   123588:  967:      })
+call    0 returned 100%
+    #####:  968:      .Case([&](NoneType) {
+    #####:  969:        return writer.writeVarInt(builtin_encoding::kNoneType), success();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+   123588:  970:      })
+call    0 returned 100%
+   123588:  971:      .Default([&](Type) { return failure(); });
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  972:}
+        -:  973:
+        -:  974://===----------------------------------------------------------------------===//
+        -:  975:// ComplexType
+        -:  976:
+        -:  977:ComplexType BuiltinDialectBytecodeInterface::readComplexType(
+        -:  978:    DialectBytecodeReader &reader) const {
+        -:  979:  Type elementType;
+        -:  980:  if (failed(reader.readType(elementType)))
+        -:  981:    return ComplexType();
+        -:  982:  return ComplexType::get(elementType);
+        -:  983:}
+        -:  984:
+        -:  985:void BuiltinDialectBytecodeInterface::write(
+        -:  986:    ComplexType type, DialectBytecodeWriter &writer) const {
+        -:  987:  writer.writeVarInt(builtin_encoding::kComplexType);
+        -:  988:  writer.writeType(type.getElementType());
+        -:  989:}
+        -:  990:
+        -:  991://===----------------------------------------------------------------------===//
+        -:  992:// IntegerType
+        -:  993:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface15readIntegerTypeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  994:IntegerType BuiltinDialectBytecodeInterface::readIntegerType(
+        -:  995:    DialectBytecodeReader &reader) const {
+    #####:  996:  uint64_t encoding;
+    #####:  997:  if (failed(reader.readVarInt(encoding)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  998:    return IntegerType();
+    #####:  999:  return IntegerType::get(
+    #####: 1000:      getContext(), encoding >> 2,
+    #####: 1001:      static_cast<IntegerType::SignednessSemantics>(encoding & 0x3));
+call    0 never executed
+call    1 never executed
+        -: 1002:}
+        -: 1003:
+        -: 1004:void BuiltinDialectBytecodeInterface::write(
+        -: 1005:    IntegerType type, DialectBytecodeWriter &writer) const {
+        -: 1006:  writer.writeVarInt(builtin_encoding::kIntegerType);
+        -: 1007:  writer.writeVarInt((type.getWidth() << 2) | type.getSignedness());
+        -: 1008:}
+        -: 1009:
+        -: 1010://===----------------------------------------------------------------------===//
+        -: 1011:// FunctionType
+        -: 1012:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface16readFunctionTypeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####: 1013:FunctionType BuiltinDialectBytecodeInterface::readFunctionType(
+        -: 1014:    DialectBytecodeReader &reader) const {
+    #####: 1015:  SmallVector<Type> inputs, results;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1016:  if (failed(reader.readTypes(inputs)) || failed(reader.readTypes(results)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1017:    return FunctionType();
+    #####: 1018:  return FunctionType::get(getContext(), inputs, results);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1019:}
+        -: 1020:
+        -: 1021:void BuiltinDialectBytecodeInterface::write(
+        -: 1022:    FunctionType type, DialectBytecodeWriter &writer) const {
+        -: 1023:  writer.writeVarInt(builtin_encoding::kFunctionType);
+        -: 1024:  writer.writeTypes(type.getInputs());
+        -: 1025:  writer.writeTypes(type.getResults());
+        -: 1026:}
+        -: 1027:
+        -: 1028://===----------------------------------------------------------------------===//
+        -: 1029:// MemRefType
+        -: 1030:
+        -: 1031:MemRefType
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface14readMemRefTypeERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####: 1032:BuiltinDialectBytecodeInterface::readMemRefType(DialectBytecodeReader &reader,
+        -: 1033:                                                bool hasMemSpace) const {
+    #####: 1034:  Attribute memorySpace;
+    #####: 1035:  if (hasMemSpace && failed(reader.readAttribute(memorySpace)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1036:    return MemRefType();
+    #####: 1037:  SmallVector<int64_t> shape;
+call    0 never executed
+    #####: 1038:  Type elementType;
+    #####: 1039:  MemRefLayoutAttrInterface layout;
+call    0 never executed
+    #####: 1040:  if (failed(reader.readSignedVarInts(shape)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1041:      failed(reader.readType(elementType)) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1042:      failed(reader.readAttribute(layout)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1043:    return MemRefType();
+    #####: 1044:  return MemRefType::get(shape, elementType, layout, memorySpace);
+call    0 never executed
+        -: 1045:}
+        -: 1046:
+        -: 1047:void BuiltinDialectBytecodeInterface::write(
+        -: 1048:    MemRefType type, DialectBytecodeWriter &writer) const {
+        -: 1049:  if (Attribute memSpace = type.getMemorySpace()) {
+        -: 1050:    writer.writeVarInt(builtin_encoding::kMemRefTypeWithMemSpace);
+        -: 1051:    writer.writeAttribute(memSpace);
+        -: 1052:  } else {
+        -: 1053:    writer.writeVarInt(builtin_encoding::kMemRefType);
+        -: 1054:  }
+        -: 1055:  writer.writeSignedVarInts(type.getShape());
+        -: 1056:  writer.writeType(type.getElementType());
+        -: 1057:  writer.writeAttribute(type.getLayout());
+        -: 1058:}
+        -: 1059:
+        -: 1060://===----------------------------------------------------------------------===//
+        -: 1061:// RankedTensorType
+        -: 1062:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface20readRankedTensorTypeERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####: 1063:RankedTensorType BuiltinDialectBytecodeInterface::readRankedTensorType(
+        -: 1064:    DialectBytecodeReader &reader, bool hasEncoding) const {
+    #####: 1065:  Attribute encoding;
+    #####: 1066:  if (hasEncoding && failed(reader.readAttribute(encoding)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1067:    return RankedTensorType();
+    #####: 1068:  SmallVector<int64_t> shape;
+call    0 never executed
+    #####: 1069:  Type elementType;
+    #####: 1070:  if (failed(reader.readSignedVarInts(shape)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1071:      failed(reader.readType(elementType)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1072:    return RankedTensorType();
+    #####: 1073:  return RankedTensorType::get(shape, elementType, encoding);
+call    0 never executed
+        -: 1074:}
+        -: 1075:
+        -: 1076:void BuiltinDialectBytecodeInterface::write(
+        -: 1077:    RankedTensorType type, DialectBytecodeWriter &writer) const {
+        -: 1078:  if (Attribute encoding = type.getEncoding()) {
+        -: 1079:    writer.writeVarInt(builtin_encoding::kRankedTensorTypeWithEncoding);
+        -: 1080:    writer.writeAttribute(encoding);
+        -: 1081:  } else {
+        -: 1082:    writer.writeVarInt(builtin_encoding::kRankedTensorType);
+        -: 1083:  }
+        -: 1084:  writer.writeSignedVarInts(type.getShape());
+        -: 1085:  writer.writeType(type.getElementType());
+        -: 1086:}
+        -: 1087:
+        -: 1088://===----------------------------------------------------------------------===//
+        -: 1089:// TupleType
+        -: 1090:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface13readTupleTypeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####: 1091:TupleType BuiltinDialectBytecodeInterface::readTupleType(
+        -: 1092:    DialectBytecodeReader &reader) const {
+    #####: 1093:  SmallVector<Type> elements;
+call    0 never executed
+    #####: 1094:  if (failed(reader.readTypes(elements)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1095:    return TupleType();
+    #####: 1096:  return TupleType::get(getContext(), elements);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -: 1097:}
+        -: 1098:
+        -: 1099:void BuiltinDialectBytecodeInterface::write(
+        -: 1100:    TupleType type, DialectBytecodeWriter &writer) const {
+        -: 1101:  writer.writeVarInt(builtin_encoding::kTupleType);
+        -: 1102:  writer.writeTypes(type.getTypes());
+        -: 1103:}
+        -: 1104:
+        -: 1105://===----------------------------------------------------------------------===//
+        -: 1106:// UnrankedMemRefType
+        -: 1107:
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface22readUnrankedMemRefTypeERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####: 1108:UnrankedMemRefType BuiltinDialectBytecodeInterface::readUnrankedMemRefType(
+        -: 1109:    DialectBytecodeReader &reader, bool hasMemSpace) const {
+    #####: 1110:  Attribute memorySpace;
+    #####: 1111:  if (hasMemSpace && failed(reader.readAttribute(memorySpace)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1112:    return UnrankedMemRefType();
+    #####: 1113:  Type elementType;
+    #####: 1114:  if (failed(reader.readType(elementType)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1115:    return UnrankedMemRefType();
+    #####: 1116:  return UnrankedMemRefType::get(elementType, memorySpace);
+call    0 never executed
+        -: 1117:}
+        -: 1118:
+        -: 1119:void BuiltinDialectBytecodeInterface::write(
+        -: 1120:    UnrankedMemRefType type, DialectBytecodeWriter &writer) const {
+        -: 1121:  if (Attribute memSpace = type.getMemorySpace()) {
+        -: 1122:    writer.writeVarInt(builtin_encoding::kUnrankedMemRefTypeWithMemSpace);
+        -: 1123:    writer.writeAttribute(memSpace);
+        -: 1124:  } else {
+        -: 1125:    writer.writeVarInt(builtin_encoding::kUnrankedMemRefType);
+        -: 1126:  }
+        -: 1127:  writer.writeType(type.getElementType());
+        -: 1128:}
+        -: 1129:
+        -: 1130://===----------------------------------------------------------------------===//
+        -: 1131:// UnrankedTensorType
+        -: 1132:
+        -: 1133:UnrankedTensorType BuiltinDialectBytecodeInterface::readUnrankedTensorType(
+        -: 1134:    DialectBytecodeReader &reader) const {
+        -: 1135:  Type elementType;
+        -: 1136:  if (failed(reader.readType(elementType)))
+        -: 1137:    return UnrankedTensorType();
+        -: 1138:  return UnrankedTensorType::get(elementType);
+        -: 1139:}
+        -: 1140:
+        -: 1141:void BuiltinDialectBytecodeInterface::write(
+        -: 1142:    UnrankedTensorType type, DialectBytecodeWriter &writer) const {
+        -: 1143:  writer.writeVarInt(builtin_encoding::kUnrankedTensorType);
+        -: 1144:  writer.writeType(type.getElementType());
+        -: 1145:}
+        -: 1146:
+        -: 1147://===----------------------------------------------------------------------===//
+        -: 1148:// VectorType
+        -: 1149:
+        -: 1150:VectorType
+function _ZNK12_GLOBAL__N_131BuiltinDialectBytecodeInterface14readVectorTypeERN4mlir21DialectBytecodeReaderEb called 0 returned 0% blocks executed 0%
+    #####: 1151:BuiltinDialectBytecodeInterface::readVectorType(DialectBytecodeReader &reader,
+        -: 1152:                                                bool hasScalableDims) const {
+    #####: 1153:  uint64_t numScalableDims = 0;
+    #####: 1154:  if (hasScalableDims && failed(reader.readVarInt(numScalableDims)))
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1155:    return VectorType();
+    #####: 1156:  SmallVector<int64_t> shape;
+call    0 never executed
+    #####: 1157:  Type elementType;
+    #####: 1158:  if (failed(reader.readSignedVarInts(shape)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1159:      failed(reader.readType(elementType)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1160:    return VectorType();
+    #####: 1161:  return VectorType::get(shape, elementType, numScalableDims);
+call    0 never executed
+        -: 1162:}
+        -: 1163:
+        -: 1164:void BuiltinDialectBytecodeInterface::write(
+        -: 1165:    VectorType type, DialectBytecodeWriter &writer) const {
+        -: 1166:  if (unsigned numScalableDims = type.getNumScalableDims()) {
+        -: 1167:    writer.writeVarInt(builtin_encoding::kVectorTypeWithScalableDims);
+        -: 1168:    writer.writeVarInt(numScalableDims);
+        -: 1169:  } else {
+        -: 1170:    writer.writeVarInt(builtin_encoding::kVectorType);
+        -: 1171:  }
+        -: 1172:  writer.writeSignedVarInts(type.getShape());
+        -: 1173:  writer.writeType(type.getElementType());
+        -: 1174:}

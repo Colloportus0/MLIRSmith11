@@ -1,0 +1,621 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/SCF/Transforms/LoopCanonicalization.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/SCF/Transforms/CMakeFiles/obj.MLIRSCFTransforms.dir/LoopCanonicalization.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/SCF/Transforms/CMakeFiles/obj.MLIRSCFTransforms.dir/LoopCanonicalization.cpp.gcda
+        -:    0:Runs:325550
+        -:    1://===- LoopCanonicalization.cpp - Cross-dialect canonicalization patterns -===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file contains cross-dialect canonicalization patterns that cannot be
+        -:   10:// actual canonicalization patterns due to undesired additional dependencies.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#include "mlir/Dialect/SCF/Transforms/Passes.h"
+        -:   15:
+        -:   16:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   17:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   18:#include "mlir/Dialect/SCF/IR/SCF.h"
+        -:   19:#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+        -:   20:#include "mlir/Dialect/SCF/Utils/AffineCanonicalizationUtils.h"
+        -:   21:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   22:#include "mlir/IR/PatternMatch.h"
+        -:   23:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   24:#include "llvm/ADT/TypeSwitch.h"
+        -:   25:
+        -:   26:namespace mlir {
+        -:   27:#define GEN_PASS_DEF_SCFFORLOOPCANONICALIZATION
+        -:   28:#include "mlir/Dialect/SCF/Transforms/Passes.h.inc"
+        -:   29:} // namespace mlir
+        -:   30:
+        -:   31:using namespace mlir;
+        -:   32:using namespace mlir::scf;
+        -:   33:
+        -:   34:/// A simple, conservative analysis to determine if the loop is shape
+        -:   35:/// conserving. I.e., the type of the arg-th yielded value is the same as the
+        -:   36:/// type of the corresponding basic block argument of the loop.
+        -:   37:/// Note: This function handles only simple cases. Expand as needed.
+function _ZL17isShapePreservingN4mlir3scf5ForOpEl called 0 returned 0% blocks executed 0%
+    #####:   38:static bool isShapePreserving(ForOp forOp, int64_t arg) {
+    #####:   39:  auto yieldOp = cast<YieldOp>(forOp.getBody()->getTerminator());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   40:  assert(arg < static_cast<int64_t>(yieldOp.getResults().size()) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:   41:         "arg is out of bounds");
+    #####:   42:  Value value = yieldOp.getResults()[arg];
+call    0 never executed
+call    1 never executed
+    #####:   43:  while (value) {
+branch  0 never executed
+branch  1 never executed
+    #####:   44:    if (value == forOp.getRegionIterArgs()[arg])
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   45:      return true;
+    #####:   46:    OpResult opResult = value.dyn_cast<OpResult>();
+call    0 never executed
+    #####:   47:    if (!opResult)
+branch  0 never executed
+branch  1 never executed
+        -:   48:      return false;
+        -:   49:
+    #####:   50:    using tensor::InsertSliceOp;
+    #####:   51:    value =
+call    0 never executed
+    #####:   52:        llvm::TypeSwitch<Operation *, Value>(opResult.getOwner())
+call    0 never executed
+        -:   53:            .template Case<InsertSliceOp>(
+    #####:   54:                [&](InsertSliceOp op) { return op.getDest(); })
+call    0 never executed
+function _ZZL17isShapePreservingN4mlir3scf5ForOpElENKUlS1_E0_clES1_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:   55:            .template Case<ForOp>([&](ForOp forOp) {
+    #####:   56:              return isShapePreserving(forOp, opResult.getResultNumber())
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:   57:                         ? forOp.getIterOperands()[opResult.getResultNumber()]
+call    0 never executed
+call    1 never executed
+    #####:   58:                         : Value();
+branch  0 never executed
+branch  1 never executed
+    #####:   59:            })
+call    0 never executed
+    #####:   60:            .Default([&](auto op) { return Value(); });
+branch  0 never executed
+branch  1 never executed
+        -:   61:  }
+        -:   62:  return false;
+        -:   63:}
+        -:   64:
+        -:   65:namespace {
+        -:   66:/// Fold dim ops of iter_args to dim ops of their respective init args. E.g.:
+        -:   67:///
+        -:   68:/// ```
+        -:   69:/// %0 = ... : tensor<?x?xf32>
+        -:   70:/// scf.for ... iter_args(%arg0 = %0) -> (tensor<?x?xf32>) {
+        -:   71:///   %1 = tensor.dim %arg0, %c0 : tensor<?x?xf32>
+        -:   72:///   ...
+        -:   73:/// }
+        -:   74:/// ```
+        -:   75:///
+        -:   76:/// is folded to:
+        -:   77:///
+        -:   78:/// ```
+        -:   79:/// %0 = ... : tensor<?x?xf32>
+        -:   80:/// scf.for ... iter_args(%arg0 = %0) -> (tensor<?x?xf32>) {
+        -:   81:///   %1 = tensor.dim %0, %c0 : tensor<?x?xf32>
+        -:   82:///   ...
+        -:   83:/// }
+        -:   84:/// ```
+        -:   85:///
+        -:   86:/// Note: Dim ops are folded only if it can be proven that the runtime type of
+        -:   87:/// the iter arg does not change with loop iterations.
+        -:   88:template <typename OpTy>
+        -:   89:struct DimOfIterArgFolder : public OpRewritePattern<OpTy> {
+        -:   90:  using OpRewritePattern<OpTy>::OpRewritePattern;
+        -:   91:
+    #####:   92:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:   93:                                PatternRewriter &rewriter) const override {
+    #####:   94:    auto blockArg = dimOp.getSource().template dyn_cast<BlockArgument>();
+    #####:   95:    if (!blockArg)
+    #####:   96:      return failure();
+    #####:   97:    auto forOp = dyn_cast<ForOp>(blockArg.getParentBlock()->getParentOp());
+    #####:   98:    if (!forOp)
+    #####:   99:      return failure();
+    #####:  100:    if (!isShapePreserving(forOp, blockArg.getArgNumber() - 1))
+    #####:  101:      return failure();
+        -:  102:
+    #####:  103:    Value initArg = forOp.getOpOperandForRegionIterArg(blockArg).get();
+    #####:  104:    rewriter.updateRootInPlace(
+    #####:  105:        dimOp, [&]() { dimOp.getSourceMutable().assign(initArg); });
+        -:  106:
+    #####:  107:    return success();
+        -:  108:  };
+------------------
+_ZNK12_GLOBAL__N_118DimOfIterArgFolderIN4mlir6tensor5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_118DimOfIterArgFolderIN4mlir6tensor5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   92:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:   93:                                PatternRewriter &rewriter) const override {
+    #####:   94:    auto blockArg = dimOp.getSource().template dyn_cast<BlockArgument>();
+call    0 never executed
+call    1 never executed
+    #####:   95:    if (!blockArg)
+branch  0 never executed
+branch  1 never executed
+    #####:   96:      return failure();
+    #####:   97:    auto forOp = dyn_cast<ForOp>(blockArg.getParentBlock()->getParentOp());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   98:    if (!forOp)
+branch  0 never executed
+branch  1 never executed
+    #####:   99:      return failure();
+    #####:  100:    if (!isShapePreserving(forOp, blockArg.getArgNumber() - 1))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  101:      return failure();
+        -:  102:
+    #####:  103:    Value initArg = forOp.getOpOperandForRegionIterArg(blockArg).get();
+call    0 never executed
+call    1 never executed
+    #####:  104:    rewriter.updateRootInPlace(
+call    0 never executed
+        -:  105:        dimOp, [&]() { dimOp.getSourceMutable().assign(initArg); });
+        -:  106:
+    #####:  107:    return success();
+        -:  108:  };
+------------------
+_ZNK12_GLOBAL__N_118DimOfIterArgFolderIN4mlir6memref5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_118DimOfIterArgFolderIN4mlir6memref5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   92:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:   93:                                PatternRewriter &rewriter) const override {
+    #####:   94:    auto blockArg = dimOp.getSource().template dyn_cast<BlockArgument>();
+call    0 never executed
+call    1 never executed
+    #####:   95:    if (!blockArg)
+branch  0 never executed
+branch  1 never executed
+    #####:   96:      return failure();
+    #####:   97:    auto forOp = dyn_cast<ForOp>(blockArg.getParentBlock()->getParentOp());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:   98:    if (!forOp)
+branch  0 never executed
+branch  1 never executed
+    #####:   99:      return failure();
+    #####:  100:    if (!isShapePreserving(forOp, blockArg.getArgNumber() - 1))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  101:      return failure();
+        -:  102:
+    #####:  103:    Value initArg = forOp.getOpOperandForRegionIterArg(blockArg).get();
+call    0 never executed
+call    1 never executed
+    #####:  104:    rewriter.updateRootInPlace(
+call    0 never executed
+        -:  105:        dimOp, [&]() { dimOp.getSourceMutable().assign(initArg); });
+        -:  106:
+    #####:  107:    return success();
+        -:  108:  };
+------------------
+        -:  109:};
+        -:  110:
+        -:  111:/// Fold dim ops of loop results to dim ops of their respective init args. E.g.:
+        -:  112:///
+        -:  113:/// ```
+        -:  114:/// %0 = ... : tensor<?x?xf32>
+        -:  115:/// %r = scf.for ... iter_args(%arg0 = %0) -> (tensor<?x?xf32>) {
+        -:  116:///   ...
+        -:  117:/// }
+        -:  118:/// %1 = tensor.dim %r, %c0 : tensor<?x?xf32>
+        -:  119:/// ```
+        -:  120:///
+        -:  121:/// is folded to:
+        -:  122:///
+        -:  123:/// ```
+        -:  124:/// %0 = ... : tensor<?x?xf32>
+        -:  125:/// %r = scf.for ... iter_args(%arg0 = %0) -> (tensor<?x?xf32>) {
+        -:  126:///   ...
+        -:  127:/// }
+        -:  128:/// %1 = tensor.dim %0, %c0 : tensor<?x?xf32>
+        -:  129:/// ```
+        -:  130:///
+        -:  131:/// Note: Dim ops are folded only if it can be proven that the runtime type of
+        -:  132:/// the iter arg does not change with loop iterations.
+        -:  133:template <typename OpTy>
+        -:  134:struct DimOfLoopResultFolder : public OpRewritePattern<OpTy> {
+        -:  135:  using OpRewritePattern<OpTy>::OpRewritePattern;
+        -:  136:
+    #####:  137:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:  138:                                PatternRewriter &rewriter) const override {
+    #####:  139:    auto forOp = dimOp.getSource().template getDefiningOp<scf::ForOp>();
+    #####:  140:    if (!forOp)
+    #####:  141:      return failure();
+    #####:  142:    auto opResult = dimOp.getSource().template cast<OpResult>();
+    #####:  143:    unsigned resultNumber = opResult.getResultNumber();
+    #####:  144:    if (!isShapePreserving(forOp, resultNumber))
+    #####:  145:      return failure();
+    #####:  146:    rewriter.updateRootInPlace(dimOp, [&]() {
+    #####:  147:      dimOp.getSourceMutable().assign(forOp.getIterOperands()[resultNumber]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+        -:  148:    });
+    #####:  149:    return success();
+        -:  150:  }
+------------------
+_ZNK12_GLOBAL__N_121DimOfLoopResultFolderIN4mlir6tensor5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_121DimOfLoopResultFolderIN4mlir6tensor5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  137:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:  138:                                PatternRewriter &rewriter) const override {
+    #####:  139:    auto forOp = dimOp.getSource().template getDefiningOp<scf::ForOp>();
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  140:    if (!forOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  141:      return failure();
+    #####:  142:    auto opResult = dimOp.getSource().template cast<OpResult>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  143:    unsigned resultNumber = opResult.getResultNumber();
+    #####:  144:    if (!isShapePreserving(forOp, resultNumber))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:      return failure();
+    #####:  146:    rewriter.updateRootInPlace(dimOp, [&]() {
+call    0 never executed
+        -:  147:      dimOp.getSourceMutable().assign(forOp.getIterOperands()[resultNumber]);
+        -:  148:    });
+    #####:  149:    return success();
+        -:  150:  }
+------------------
+_ZNK12_GLOBAL__N_121DimOfLoopResultFolderIN4mlir6memref5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_121DimOfLoopResultFolderIN4mlir6memref5DimOpEE15matchAndRewriteES3_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  137:  LogicalResult matchAndRewrite(OpTy dimOp,
+        -:  138:                                PatternRewriter &rewriter) const override {
+    #####:  139:    auto forOp = dimOp.getSource().template getDefiningOp<scf::ForOp>();
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  140:    if (!forOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  141:      return failure();
+    #####:  142:    auto opResult = dimOp.getSource().template cast<OpResult>();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  143:    unsigned resultNumber = opResult.getResultNumber();
+    #####:  144:    if (!isShapePreserving(forOp, resultNumber))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:      return failure();
+    #####:  146:    rewriter.updateRootInPlace(dimOp, [&]() {
+call    0 never executed
+        -:  147:      dimOp.getSourceMutable().assign(forOp.getIterOperands()[resultNumber]);
+        -:  148:    });
+    #####:  149:    return success();
+        -:  150:  }
+------------------
+        -:  151:};
+        -:  152:
+        -:  153:/// Canonicalize AffineMinOp/AffineMaxOp operations in the context of scf.for
+        -:  154:/// and scf.parallel loops with a known range.
+        -:  155:template <typename OpTy, bool IsMin>
+        -:  156:struct AffineOpSCFCanonicalizationPattern : public OpRewritePattern<OpTy> {
+        -:  157:  using OpRewritePattern<OpTy>::OpRewritePattern;
+        -:  158:
+    #####:  159:  LogicalResult matchAndRewrite(OpTy op,
+        -:  160:                                PatternRewriter &rewriter) const override {
+    #####:  161:    auto loopMatcher = [](Value iv, OpFoldResult &lb, OpFoldResult &ub,
+        -:  162:                          OpFoldResult &step) {
+    #####:  163:      if (scf::ForOp forOp = scf::getForInductionVarOwner(iv)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  164:        lb = forOp.getLowerBound();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  165:        ub = forOp.getUpperBound();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  166:        step = forOp.getStep();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  167:        return success();
+        -:  168:      }
+    #####:  169:      if (scf::ParallelOp parOp = scf::getParallelForInductionVarOwner(iv)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  170:        for (unsigned idx = 0; idx < parOp.getNumLoops(); ++idx) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  171:          if (parOp.getInductionVars()[idx] == iv) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  172:            lb = parOp.getLowerBound()[idx];
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  173:            ub = parOp.getUpperBound()[idx];
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  174:            step = parOp.getStep()[idx];
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+    #####:  175:            return success();
+        -:  176:          }
+        -:  177:        }
+    #####:  178:        return failure();
+        -:  179:      }
+    #####:  180:      if (scf::ForeachThreadOp foreachThreadOp =
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  181:              scf::getForeachThreadOpThreadIndexOwner(iv)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  182:        for (int64_t idx = 0; idx < foreachThreadOp.getRank(); ++idx) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  183:          if (foreachThreadOp.getThreadIndices()[idx] == iv) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  184:            lb = OpBuilder(iv.getContext()).getIndexAttr(0);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  185:            ub = foreachThreadOp.getNumThreads()[idx];
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+    #####:  186:            step = OpBuilder(iv.getContext()).getIndexAttr(1);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  187:            return success();
+        -:  188:          }
+        -:  189:        }
+    #####:  190:        return failure();
+        -:  191:      }
+    #####:  192:      return failure();
+        -:  193:    };
+        -:  194:
+    #####:  195:    return scf::canonicalizeMinMaxOpInLoop(rewriter, op, op.getAffineMap(),
+    #####:  196:                                           op.operands(), IsMin, loopMatcher);
+        -:  197:  }
+------------------
+_ZNK12_GLOBAL__N_134AffineOpSCFCanonicalizationPatternIN4mlir11AffineMinOpELb1EE15matchAndRewriteES2_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_134AffineOpSCFCanonicalizationPatternIN4mlir11AffineMinOpELb1EE15matchAndRewriteES2_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  159:  LogicalResult matchAndRewrite(OpTy op,
+        -:  160:                                PatternRewriter &rewriter) const override {
+        -:  161:    auto loopMatcher = [](Value iv, OpFoldResult &lb, OpFoldResult &ub,
+        -:  162:                          OpFoldResult &step) {
+        -:  163:      if (scf::ForOp forOp = scf::getForInductionVarOwner(iv)) {
+        -:  164:        lb = forOp.getLowerBound();
+        -:  165:        ub = forOp.getUpperBound();
+        -:  166:        step = forOp.getStep();
+        -:  167:        return success();
+        -:  168:      }
+        -:  169:      if (scf::ParallelOp parOp = scf::getParallelForInductionVarOwner(iv)) {
+        -:  170:        for (unsigned idx = 0; idx < parOp.getNumLoops(); ++idx) {
+        -:  171:          if (parOp.getInductionVars()[idx] == iv) {
+        -:  172:            lb = parOp.getLowerBound()[idx];
+        -:  173:            ub = parOp.getUpperBound()[idx];
+        -:  174:            step = parOp.getStep()[idx];
+        -:  175:            return success();
+        -:  176:          }
+        -:  177:        }
+        -:  178:        return failure();
+        -:  179:      }
+        -:  180:      if (scf::ForeachThreadOp foreachThreadOp =
+        -:  181:              scf::getForeachThreadOpThreadIndexOwner(iv)) {
+        -:  182:        for (int64_t idx = 0; idx < foreachThreadOp.getRank(); ++idx) {
+        -:  183:          if (foreachThreadOp.getThreadIndices()[idx] == iv) {
+        -:  184:            lb = OpBuilder(iv.getContext()).getIndexAttr(0);
+        -:  185:            ub = foreachThreadOp.getNumThreads()[idx];
+        -:  186:            step = OpBuilder(iv.getContext()).getIndexAttr(1);
+        -:  187:            return success();
+        -:  188:          }
+        -:  189:        }
+        -:  190:        return failure();
+        -:  191:      }
+        -:  192:      return failure();
+        -:  193:    };
+        -:  194:
+    #####:  195:    return scf::canonicalizeMinMaxOpInLoop(rewriter, op, op.getAffineMap(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  196:                                           op.operands(), IsMin, loopMatcher);
+        -:  197:  }
+------------------
+_ZNK12_GLOBAL__N_134AffineOpSCFCanonicalizationPatternIN4mlir11AffineMaxOpELb0EE15matchAndRewriteES2_RNS1_15PatternRewriterE:
+function _ZNK12_GLOBAL__N_134AffineOpSCFCanonicalizationPatternIN4mlir11AffineMaxOpELb0EE15matchAndRewriteES2_RNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  159:  LogicalResult matchAndRewrite(OpTy op,
+        -:  160:                                PatternRewriter &rewriter) const override {
+        -:  161:    auto loopMatcher = [](Value iv, OpFoldResult &lb, OpFoldResult &ub,
+        -:  162:                          OpFoldResult &step) {
+        -:  163:      if (scf::ForOp forOp = scf::getForInductionVarOwner(iv)) {
+        -:  164:        lb = forOp.getLowerBound();
+        -:  165:        ub = forOp.getUpperBound();
+        -:  166:        step = forOp.getStep();
+        -:  167:        return success();
+        -:  168:      }
+        -:  169:      if (scf::ParallelOp parOp = scf::getParallelForInductionVarOwner(iv)) {
+        -:  170:        for (unsigned idx = 0; idx < parOp.getNumLoops(); ++idx) {
+        -:  171:          if (parOp.getInductionVars()[idx] == iv) {
+        -:  172:            lb = parOp.getLowerBound()[idx];
+        -:  173:            ub = parOp.getUpperBound()[idx];
+        -:  174:            step = parOp.getStep()[idx];
+        -:  175:            return success();
+        -:  176:          }
+        -:  177:        }
+        -:  178:        return failure();
+        -:  179:      }
+        -:  180:      if (scf::ForeachThreadOp foreachThreadOp =
+        -:  181:              scf::getForeachThreadOpThreadIndexOwner(iv)) {
+        -:  182:        for (int64_t idx = 0; idx < foreachThreadOp.getRank(); ++idx) {
+        -:  183:          if (foreachThreadOp.getThreadIndices()[idx] == iv) {
+        -:  184:            lb = OpBuilder(iv.getContext()).getIndexAttr(0);
+        -:  185:            ub = foreachThreadOp.getNumThreads()[idx];
+        -:  186:            step = OpBuilder(iv.getContext()).getIndexAttr(1);
+        -:  187:            return success();
+        -:  188:          }
+        -:  189:        }
+        -:  190:        return failure();
+        -:  191:      }
+        -:  192:      return failure();
+        -:  193:    };
+        -:  194:
+    #####:  195:    return scf::canonicalizeMinMaxOpInLoop(rewriter, op, op.getAffineMap(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  196:                                           op.operands(), IsMin, loopMatcher);
+        -:  197:  }
+------------------
+        -:  198:};
+        -:  199:
+  326619*:  200:struct SCFForLoopCanonicalization
+call    0 never executed
+call    1 returned 100%
+        -:  201:    : public impl::SCFForLoopCanonicalizationBase<SCFForLoopCanonicalization> {
+function _ZN12_GLOBAL__N_126SCFForLoopCanonicalization14runOnOperationEv called 863 returned 100% blocks executed 83%
+      863:  202:  void runOnOperation() override {
+      863:  203:    auto *parentOp = getOperation();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+      863:  204:    MLIRContext *ctx = parentOp->getContext();
+call    0 returned 100%
+      863:  205:    RewritePatternSet patterns(ctx);
+call    0 returned 100%
+     1726:  206:    scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+      863:  207:    if (failed(applyPatternsAndFoldGreedily(parentOp, std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 0% (fallthrough)
+branch  4 taken 100%
+    #####:  208:      signalPassFailure();
+call    0 never executed
+      863:  209:  }
+        -:  210:};
+        -:  211:} // namespace
+        -:  212:
+function _ZN4mlir3scf42populateSCFForLoopCanonicalizationPatternsERNS_17RewritePatternSetE called 980 returned 100% blocks executed 100%
+     1843:  213:void mlir::scf::populateSCFForLoopCanonicalizationPatterns(
+        -:  214:    RewritePatternSet &patterns) {
+     1843:  215:  MLIRContext *ctx = patterns.getContext();
+call    0 returned 100%
+call    1 returned 100%
+     1843:  216:  patterns
+        -:  217:      .add<AffineOpSCFCanonicalizationPattern<AffineMinOp, /*IsMin=*/true>,
+        -:  218:           AffineOpSCFCanonicalizationPattern<AffineMaxOp, /*IsMin=*/false>,
+        -:  219:           DimOfIterArgFolder<tensor::DimOp>, DimOfIterArgFolder<memref::DimOp>,
+        -:  220:           DimOfLoopResultFolder<tensor::DimOp>,
+     1843:  221:           DimOfLoopResultFolder<memref::DimOp>>(ctx);
+call    0 returned 100%
+call    1 returned 100%
+      976:  222:}
+        -:  223:
+function _ZN4mlir36createSCFForLoopCanonicalizationPassEv called 326619 returned 100% blocks executed 100%
+   326619:  224:std::unique_ptr<Pass> mlir::createSCFForLoopCanonicalizationPass() {
+   326619:  225:  return std::make_unique<SCFForLoopCanonicalization>();
+call    0 returned 100%
+        -:  226:}

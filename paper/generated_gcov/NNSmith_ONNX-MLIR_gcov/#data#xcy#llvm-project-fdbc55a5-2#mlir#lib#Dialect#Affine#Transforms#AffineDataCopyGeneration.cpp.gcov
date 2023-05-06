@@ -1,0 +1,367 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Dialect/Affine/Transforms/AffineDataCopyGeneration.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/AffineDataCopyGeneration.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/AffineDataCopyGeneration.cpp.gcda
+        -:    0:Runs:128624
+        -:    1://===- AffineDataCopyGeneration.cpp - Explicit memref copying pass ------*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements a pass to automatically promote accessed memref regions
+        -:   10:// to buffers in a faster memory space that is explicitly managed, with the
+        -:   11:// necessary data movement operations performed through either regular
+        -:   12:// point-wise load/store's or DMAs. Such explicit copying (also referred to as
+        -:   13:// array packing/unpacking in the literature), when done on arrays that exhibit
+        -:   14:// reuse, results in near elimination of conflict misses, TLB misses, reduced
+        -:   15:// use of hardware prefetch streams, and reduced false sharing. It is also
+        -:   16:// necessary for hardware that explicitly managed levels in the memory
+        -:   17:// hierarchy, and where DMAs may have to be used. This optimization is often
+        -:   18:// performed on already tiled code.
+        -:   19://
+        -:   20://===----------------------------------------------------------------------===//
+        -:   21:
+        -:   22:#include "mlir/Dialect/Affine/Passes.h"
+        -:   23:
+        -:   24:#include "mlir/Dialect/Affine/Analysis/Utils.h"
+        -:   25:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   26:#include "mlir/Dialect/Affine/LoopUtils.h"
+        -:   27:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   28:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   29:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   30:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   31:#include "llvm/ADT/MapVector.h"
+        -:   32:#include "llvm/Support/CommandLine.h"
+        -:   33:#include "llvm/Support/Debug.h"
+        -:   34:#include <algorithm>
+        -:   35:
+        -:   36:namespace mlir {
+        -:   37:#define GEN_PASS_DEF_AFFINEDATACOPYGENERATION
+        -:   38:#include "mlir/Dialect/Affine/Passes.h.inc"
+        -:   39:} // namespace mlir
+        -:   40:
+        -:   41:#define DEBUG_TYPE "affine-data-copy-generate"
+        -:   42:
+        -:   43:using namespace mlir;
+        -:   44:
+        -:   45:namespace {
+        -:   46:
+        -:   47:/// Replaces all loads and stores on memref's living in 'slowMemorySpace' by
+        -:   48:/// introducing copy operations to transfer data into `fastMemorySpace` and
+        -:   49:/// rewriting the original load's/store's to instead load/store from the
+        -:   50:/// allocated fast memory buffers. Additional options specify the identifier
+        -:   51:/// corresponding to the fast memory space and the amount of fast memory space
+        -:   52:/// available. The pass traverses through the nesting structure, recursing to
+        -:   53:/// inner levels if necessary to determine at what depth copies need to be
+        -:   54:/// placed so that the allocated buffers fit within the memory capacity
+        -:   55:/// provided.
+        -:   56:// TODO: We currently can't generate copies correctly when stores
+        -:   57:// are strided. Check for strided stores.
+   159912:   58:struct AffineDataCopyGeneration
+call    0 returned 100%
+        -:   59:    : public impl::AffineDataCopyGenerationBase<AffineDataCopyGeneration> {
+   131226:   60:  AffineDataCopyGeneration() = default;
+call    0 returned 100%
+function _ZN12_GLOBAL__N_124AffineDataCopyGenerationC2Ejjjim called 0 returned 0% blocks executed 0%
+    #####:   61:  explicit AffineDataCopyGeneration(unsigned slowMemorySpace,
+        -:   62:                                    unsigned fastMemorySpace,
+        -:   63:                                    unsigned tagMemorySpace,
+        -:   64:                                    int minDmaTransferSize,
+    #####:   65:                                    uint64_t fastMemCapacityBytes) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   66:    this->slowMemorySpace = slowMemorySpace;
+branch  0 never executed
+branch  1 never executed
+    #####:   67:    this->fastMemorySpace = fastMemorySpace;
+branch  0 never executed
+branch  1 never executed
+    #####:   68:    this->tagMemorySpace = tagMemorySpace;
+branch  0 never executed
+branch  1 never executed
+    #####:   69:    this->minDmaTransferSize = minDmaTransferSize;
+branch  0 never executed
+branch  1 never executed
+    #####:   70:    this->fastMemoryCapacity = fastMemCapacityBytes / 1024;
+branch  0 never executed
+branch  1 never executed
+    #####:   71:  }
+        -:   72:
+        -:   73:  void runOnOperation() override;
+        -:   74:  void runOnBlock(Block *block, DenseSet<Operation *> &copyNests);
+        -:   75:
+        -:   76:  // Constant zero index to avoid too many duplicates.
+        -:   77:  Value zeroIndex = nullptr;
+        -:   78:};
+        -:   79:
+        -:   80:} // namespace
+        -:   81:
+        -:   82:/// Generates copies for memref's living in 'slowMemorySpace' into newly created
+        -:   83:/// buffers in 'fastMemorySpace', and replaces memory operations to the former
+        -:   84:/// by the latter. Only load op's handled for now.
+        -:   85:/// TODO: extend this to store op's.
+        -:   86:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir34createAffineDataCopyGenerationPassEjjjim called 0 returned 0% blocks executed 0%
+    #####:   87:mlir::createAffineDataCopyGenerationPass(unsigned slowMemorySpace,
+        -:   88:                                         unsigned fastMemorySpace,
+        -:   89:                                         unsigned tagMemorySpace,
+        -:   90:                                         int minDmaTransferSize,
+        -:   91:                                         uint64_t fastMemCapacityBytes) {
+    #####:   92:  return std::make_unique<AffineDataCopyGeneration>(
+call    0 never executed
+        -:   93:      slowMemorySpace, fastMemorySpace, tagMemorySpace, minDmaTransferSize,
+    #####:   94:      fastMemCapacityBytes);
+        -:   95:}
+        -:   96:std::unique_ptr<OperationPass<func::FuncOp>>
+function _ZN4mlir34createAffineDataCopyGenerationPassEv called 131226 returned 100% blocks executed 100%
+   131226:   97:mlir::createAffineDataCopyGenerationPass() {
+   131226:   98:  return std::make_unique<AffineDataCopyGeneration>();
+call    0 returned 100%
+        -:   99:}
+        -:  100:
+        -:  101:/// Generate copies for this block. The block is partitioned into separate
+        -:  102:/// ranges: each range is either a sequence of one or more operations starting
+        -:  103:/// and ending with an affine load or store op, or just an affine.forop (which
+        -:  104:/// could have other affine for op's nested within).
+function _ZN12_GLOBAL__N_124AffineDataCopyGeneration10runOnBlockEPN4mlir5BlockERN4llvm8DenseSetIPNS1_9OperationENS4_12DenseMapInfoIS7_vEEEE called 0 returned 0% blocks executed 0%
+    #####:  105:void AffineDataCopyGeneration::runOnBlock(Block *block,
+        -:  106:                                          DenseSet<Operation *> &copyNests) {
+    #####:  107:  if (block->empty())
+branch  0 never executed
+branch  1 never executed
+    #####:  108:    return;
+        -:  109:
+    #####:  110:  uint64_t fastMemCapacityBytes =
+    #####:  111:      fastMemoryCapacity != std::numeric_limits<uint64_t>::max()
+branch  0 never executed
+branch  1 never executed
+    #####:  112:          ? fastMemoryCapacity * 1024
+branch  0 never executed
+branch  1 never executed
+    #####:  113:          : fastMemoryCapacity;
+    #####:  114:  AffineCopyOptions copyOptions = {generateDma, slowMemorySpace,
+        -:  115:                                   fastMemorySpace, tagMemorySpace,
+    #####:  116:                                   fastMemCapacityBytes};
+call    0 never executed
+        -:  117:
+        -:  118:  // Every affine.for op in the block starts and ends a block range for copying;
+        -:  119:  // in addition, a contiguous sequence of operations starting with a
+        -:  120:  // load/store op but not including any copy nests themselves is also
+        -:  121:  // identified as a copy block range. Straightline code (a contiguous chunk of
+        -:  122:  // operations excluding AffineForOp's) are always assumed to not exhaust
+        -:  123:  // memory. As a result, this approach is conservative in some cases at the
+        -:  124:  // moment; we do a check later and report an error with location info.
+        -:  125:  // TODO: An 'affine.if' operation is being treated similar to an
+        -:  126:  // operation. 'affine.if''s could have 'affine.for's in them;
+        -:  127:  // treat them separately.
+        -:  128:
+        -:  129:  // Get to the first load, store, or for op (that is not a copy nest itself).
+    #####:  130:  auto curBegin =
+function _ZZN12_GLOBAL__N_124AffineDataCopyGeneration10runOnBlockEPN4mlir5BlockERN4llvm8DenseSetIPNS1_9OperationENS4_12DenseMapInfoIS7_vEEEEENKUlRS6_E_clESC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  131:      std::find_if(block->begin(), block->end(), [&](Operation &op) {
+    #####:  132:        return isa<AffineLoadOp, AffineStoreOp, AffineForOp>(op) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  133:               copyNests.count(&op) == 0;
+call    0 never executed
+    #####:  134:      });
+call    0 never executed
+        -:  135:
+        -:  136:  // Create [begin, end) ranges.
+    #####:  137:  auto it = curBegin;
+    #####:  138:  while (it != block->end()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  139:    AffineForOp forOp;
+call    0 never executed
+        -:  140:    // If you hit a non-copy for loop, we will split there.
+    #####:  141:    if ((forOp = dyn_cast<AffineForOp>(&*it)) && copyNests.count(forOp) == 0) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  142:      // Perform the copying up unti this 'for' op first.
+    #####:  143:      (void)affineDataCopyGenerate(/*begin=*/curBegin, /*end=*/it, copyOptions,
+call    0 never executed
+    #####:  144:                                   /*filterMemRef=*/llvm::None, copyNests);
+call    0 never executed
+        -:  145:
+        -:  146:      // Returns true if the footprint is known to exceed capacity.
+function _ZZN12_GLOBAL__N_124AffineDataCopyGeneration10runOnBlockEPN4mlir5BlockERN4llvm8DenseSetIPNS1_9OperationENS4_12DenseMapInfoIS7_vEEEEENKUlNS1_11AffineForOpEE0_clESC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  147:      auto exceedsCapacity = [&](AffineForOp forOp) {
+    #####:  148:        Optional<int64_t> footprint =
+        -:  149:            getMemoryFootprintBytes(forOp,
+    #####:  150:                                    /*memorySpace=*/0);
+call    0 never executed
+    #####:  151:        return (footprint.has_value() &&
+branch  0 never executed
+branch  1 never executed
+    #####:  152:                static_cast<uint64_t>(footprint.value()) >
+    #####:  153:                    fastMemCapacityBytes);
+branch  0 never executed
+branch  1 never executed
+    #####:  154:      };
+        -:  155:
+        -:  156:      // If the memory footprint of the 'affine.for' loop is higher than fast
+        -:  157:      // memory capacity (when provided), we recurse to copy at an inner level
+        -:  158:      // until we find a depth at which footprint fits in fast mem capacity. If
+        -:  159:      // the footprint can't be calculated, we assume for now it fits. Recurse
+        -:  160:      // inside if footprint for 'forOp' exceeds capacity, or when
+        -:  161:      // skipNonUnitStrideLoops is set and the step size is not one.
+    #####:  162:      bool recurseInner = skipNonUnitStrideLoops ? forOp.getStep() != 1
+call    0 never executed
+    #####:  163:                                                 : exceedsCapacity(forOp);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  164:      if (recurseInner) {
+branch  0 never executed
+branch  1 never executed
+        -:  165:        // We'll recurse and do the copies at an inner level for 'forInst'.
+        -:  166:        // Recurse onto the body of this loop.
+    #####:  167:        runOnBlock(forOp.getBody(), copyNests);
+call    0 never executed
+call    1 never executed
+        -:  168:      } else {
+        -:  169:        // We have enough capacity, i.e., copies will be computed for the
+        -:  170:        // portion of the block until 'it', and for 'it', which is 'forOp'. Note
+        -:  171:        // that for the latter, the copies are placed just before this loop (for
+        -:  172:        // incoming copies) and right after (for outgoing ones).
+        -:  173:
+        -:  174:        // Inner loop copies have their own scope - we don't thus update
+        -:  175:        // consumed capacity. The footprint check above guarantees this inner
+        -:  176:        // loop's footprint fits.
+    #####:  177:        (void)affineDataCopyGenerate(/*begin=*/it, /*end=*/std::next(it),
+        -:  178:                                     copyOptions,
+    #####:  179:                                     /*filterMemRef=*/llvm::None, copyNests);
+call    0 never executed
+        -:  180:      }
+        -:  181:      // Get to the next load or store op after 'forOp'.
+function _ZZN12_GLOBAL__N_124AffineDataCopyGeneration10runOnBlockEPN4mlir5BlockERN4llvm8DenseSetIPNS1_9OperationENS4_12DenseMapInfoIS7_vEEEEENKUlRS6_E1_clESC_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  182:      curBegin = std::find_if(std::next(it), block->end(), [&](Operation &op) {
+    #####:  183:        return isa<AffineLoadOp, AffineStoreOp, AffineForOp>(op) &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  184:               copyNests.count(&op) == 0;
+call    0 never executed
+    #####:  185:      });
+call    0 never executed
+    #####:  186:      it = curBegin;
+        -:  187:    } else {
+    #####:  188:      assert(copyNests.count(&*it) == 0 &&
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  189:             "all copy nests generated should have been skipped above");
+        -:  190:      // We simply include this op in the current range and continue for more.
+    #####:  191:      ++it;
+        -:  192:    }
+        -:  193:  }
+        -:  194:
+        -:  195:  // Generate the copy for the final block range.
+    #####:  196:  if (curBegin != block->end()) {
+branch  0 never executed
+branch  1 never executed
+        -:  197:    // Can't be a terminator because it would have been skipped above.
+    #####:  198:    assert(!curBegin->hasTrait<OpTrait::IsTerminator>() &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  199:           "can't be a terminator");
+        -:  200:    // Exclude the affine.yield - hence, the std::prev.
+    #####:  201:    (void)affineDataCopyGenerate(/*begin=*/curBegin,
+        -:  202:                                 /*end=*/std::prev(block->end()), copyOptions,
+    #####:  203:                                 /*filterMemRef=*/llvm::None, copyNests);
+call    0 never executed
+        -:  204:  }
+        -:  205:}
+        -:  206:
+function _ZN12_GLOBAL__N_124AffineDataCopyGeneration14runOnOperationEv called 0 returned 0% blocks executed 0%
+    #####:  207:void AffineDataCopyGeneration::runOnOperation() {
+    #####:  208:  func::FuncOp f = getOperation();
+call    0 never executed
+    #####:  209:  OpBuilder topBuilder(f.getBody());
+call    0 never executed
+call    1 never executed
+    #####:  210:  zeroIndex = topBuilder.create<arith::ConstantIndexOp>(f.getLoc(), 0);
+call    0 never executed
+call    1 never executed
+        -:  211:
+        -:  212:  // Nests that are copy-in's or copy-out's; the root AffineForOps of those
+        -:  213:  // nests are stored herein.
+    #####:  214:  DenseSet<Operation *> copyNests;
+call    0 never executed
+        -:  215:
+        -:  216:  // Clear recorded copy nests.
+    #####:  217:  copyNests.clear();
+call    0 never executed
+        -:  218:
+    #####:  219:  for (auto &block : f)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  220:    runOnBlock(&block, copyNests);
+call    0 never executed
+        -:  221:
+        -:  222:  // Promote any single iteration loops in the copy nests and collect
+        -:  223:  // load/stores to simplify.
+    #####:  224:  SmallVector<Operation *, 4> copyOps;
+call    0 never executed
+call    1 never executed
+    #####:  225:  for (Operation *nest : copyNests)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  226:    // With a post order walk, the erasure of loops does not affect
+        -:  227:    // continuation of the walk or the collection of load/store ops.
+function _ZZN12_GLOBAL__N_124AffineDataCopyGeneration14runOnOperationEvENKUlPN4mlir9OperationEE_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  228:    nest->walk([&](Operation *op) {
+call    0 never executed
+call    1 never executed
+    #####:  229:      if (auto forOp = dyn_cast<AffineForOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  230:        (void)promoteIfSingleIteration(forOp);
+call    0 never executed
+    #####:  231:      else if (isa<AffineLoadOp, AffineStoreOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  232:        copyOps.push_back(op);
+call    0 never executed
+    #####:  233:    });
+        -:  234:
+        -:  235:  // Promoting single iteration loops could lead to simplification of
+        -:  236:  // contained load's/store's, and the latter could anyway also be
+        -:  237:  // canonicalized.
+    #####:  238:  RewritePatternSet patterns(&getContext());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  239:  AffineLoadOp::getCanonicalizationPatterns(patterns, &getContext());
+call    0 never executed
+call    1 never executed
+    #####:  240:  AffineStoreOp::getCanonicalizationPatterns(patterns, &getContext());
+call    0 never executed
+call    1 never executed
+    #####:  241:  FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+call    0 never executed
+call    1 never executed
+    #####:  242:  (void)applyOpPatternsAndFold(copyOps, frozenPatterns, /*strict=*/true);
+call    0 never executed
+call    1 never executed
+    #####:  243:}

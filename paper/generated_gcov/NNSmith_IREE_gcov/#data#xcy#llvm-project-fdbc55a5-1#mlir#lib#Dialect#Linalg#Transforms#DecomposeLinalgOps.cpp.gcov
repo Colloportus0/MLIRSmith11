@@ -1,0 +1,553 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Linalg/Transforms/DecomposeLinalgOps.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/DecomposeLinalgOps.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/DecomposeLinalgOps.cpp.gcda
+        -:    0:Runs:325587
+        -:    1://===- DecomposeLinalgOps.cpp - Pattern to break up Linalg ops ------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   10:
+        -:   11:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   12:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   13:
+        -:   14:using namespace mlir;
+        -:   15:using namespace mlir::linalg;
+        -:   16:
+        -:   17:namespace {
+        -:   18:
+        -:   19:/// Pattern to decompose a GenericOp that has more than two statements
+        -:   20:/// into one GenericOp with the first statement (i.e. peeled operation), and
+        -:   21:/// a second GenericOp with the remaining statements (i.e. residual operations).
+        -:   22:
+        -:   23:/// - The result of the first GenericOp has the same shape as the iteration
+        -:   24:///   space of the GenericOp. The body of the op yields as many values as the
+        -:   25:///   original op plus all the results of the peeled operation.
+        -:   26:/// - The second GenericOp has as many operands as the original operation plus
+        -:   27:/// all the results of the first Generic Op. It has the same number of yields as
+        -:   28:/// the original op.
+        -:   29:/// - If the result of the peeled operation was yielded by the original
+        -:   30:///   GenericOp the uses of the corresponding results will be replaced with the
+        -:   31:///   result of the first GenericOp created.
+        -:   32:///
+        -:   33:///  Example
+        -:   34:///
+        -:   35:/// ```mlir
+        -:   36:///  %result:2 = linalg.generic ... ins(%arg0, %arg1, %arg2 : ...)
+        -:   37:///      outs(%init0, %init1 : ...) {
+        -:   38:///    ^bb0(%b0: ... , %b1: ... , %b2: ... , %b3: ..., %b4: ...):
+        -:   39:///      %0 = <s0> %b0, %b1 : ...
+        -:   40:///      %1 = <s1> %0, %b2 : ...
+        -:   41:///      linalg.yield %0, %1 : ...
+        -:   42:///  } -> (..., ...)
+        -:   43:///  return %result#0, %result#1
+        -:   44:/// ```
+        -:   45:///
+        -:   46:/// gets split into
+        -:   47:///
+        -:   48:/// ```mlir
+        -:   49:/// %init = tensor.empty ...
+        -:   50:/// %op0:3 = linalg.generic ... ins(%arg0, %arg1, %arg2 : ...)
+        -:   51:///      outs(%init0, %init1, %init : ...)
+        -:   52:///    ^bb0(%b0: ... , %b1: ... , %b2: ... , %b3: ..., %b4: ..., %b5: ...):
+        -:   53:///      %0 = <s0> %b0, %b1 : ...
+        -:   54:///      linalg.yield %0, %..., %0 : ...
+        -:   55:///  } -> (..., ..., ...)
+        -:   56:/// %op1:2 = linalg.generic ... ins(%arg0, %arg1, %arg2, %op0#2 : ...)
+        -:   57:///      outs(%init0, %init1 : ...) {
+        -:   58:///    ^bb0(%b0: ... , %b1: ... , %b2: ... , %b3: ..., %b4: ..., %b5: ...):
+        -:   59:///      %1 = <s1> %b3, %b2 : ...
+        -:   60:///      linalg.yield %..., %1 : ...
+        -:   61:///  } -> (..., ...)
+        -:   62:///  return %op0#0, %op1#1
+        -:   63:/// ```
+        -:   64:///
+        -:   65:/// After canonicalization this is expected to be
+        -:   66:///
+        -:   67:/// ```mlir
+        -:   68:/// %init = tensor.empty ...
+        -:   69:/// %op0 = linalg.generic ... ins(%arg0, %arg1, : ...)
+        -:   70:///      outs(%init : ...)
+        -:   71:///    ^bb0(%b0: ... , %b1: ... , %b2: ...):
+        -:   72:///      %0 = <s0> %b0, %b1 : ...
+        -:   73:///      linalg.yield %0 : ...
+        -:   74:///  } -> ...
+        -:   75:/// %op1 = linalg.generic ... ins(%arg2, %op0#2 : ...)
+        -:   76:///      outs(%init1 : ...) {
+        -:   77:///    ^bb0(%b0: ... , %b1: ... , %b2: ...):
+        -:   78:///      %1 = <s1> %b1, %b0 : ...
+        -:   79:///      linalg.yield %..., %1 : ...
+        -:   80:///  } -> ...
+        -:   81:///  return %op0, %op1
+        -:   82:/// ```
+        -:   83:struct DecomposeLinalgOp : public OpRewritePattern<GenericOp> {
+        -:   84:  using OpRewritePattern<GenericOp>::OpRewritePattern;
+        -:   85:
+        -:   86:  LogicalResult matchAndRewrite(GenericOp genericOp,
+        -:   87:                                PatternRewriter &rewriter) const override;
+        -:   88:
+        -:   89:private:
+        -:   90:  /// Helper method to create a generic op for the peeled scalar operation. The
+        -:   91:  /// created op has an empty region.
+        -:   92:  GenericOp createPeeledGenericOp(GenericOp genericOp,
+        -:   93:                                  PatternRewriter &rewriter) const;
+        -:   94:
+        -:   95:  /// Helper method to create a generic op for the residual scalar operation.
+        -:   96:  /// The created op has the same region as the original op.
+        -:   97:  GenericOp createResidualGenericOp(GenericOp genericOp,
+        -:   98:                                    GenericOp peeledGenericOp,
+        -:   99:                                    PatternRewriter &rewriter) const;
+        -:  100:};
+        -:  101:} // namespace
+        -:  102:
+        -:  103:/// Helper method to compute the range of a generic op.
+function _ZL21getGenericOpLoopRangeRN4mlir9OpBuilderENS_6linalg9GenericOpE called 0 returned 0% blocks executed 0%
+    #####:  104:static SmallVector<OpFoldResult> getGenericOpLoopRange(OpBuilder &b,
+        -:  105:                                                       GenericOp op) {
+    #####:  106:  OpBuilder::InsertionGuard g(b);
+call    0 never executed
+    #####:  107:  b.setInsertionPoint(op);
+call    0 never executed
+    #####:  108:  Location loc = op.getLoc();
+call    0 never executed
+    #####:  109:  auto allShapesSizes =
+    #####:  110:      cast<LinalgOp>(op.getOperation()).createFlatListOfOperandDims(b, loc);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  111:  AffineMap map = op.getShapesToLoopsMap();
+call    0 never executed
+    #####:  112:  IRRewriter rewriter(b);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  113:  return makeComposedFoldedMultiResultAffineApply(rewriter, loc, map,
+call    0 never executed
+    #####:  114:                                                  allShapesSizes);
+call    0 never executed
+call    1 never executed
+        -:  115:}
+        -:  116:
+        -:  117:/// Helper method to permute the list of `values` based on the `map`.
+function _Z13permuteValuesN4llvm8ArrayRefIN4mlir12OpFoldResultEEENS1_9AffineMapE called 0 returned 0% blocks executed 0%
+    #####:  118:SmallVector<OpFoldResult> permuteValues(ArrayRef<OpFoldResult> values,
+        -:  119:                                        AffineMap map) {
+    #####:  120:  assert(map.isPermutation());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  121:  SmallVector<OpFoldResult> permutedValues(values.size());
+call    0 never executed
+    #####:  122:  for (const auto &position :
+    #####:  123:       llvm::enumerate(llvm::map_range(map.getResults(), [](AffineExpr expr) {
+call    0 never executed
+        -:  124:         return expr.cast<AffineDimExpr>().getPosition();
+    #####:  125:       })))
+branch  0 never executed
+branch  1 never executed
+    #####:  126:    permutedValues[position.value()] = values[position.index()];
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  127:  return permutedValues;
+        -:  128:}
+        -:  129:
+        -:  130:/// Get zero value for an element type.
+function _ZL7getZeroRN4mlir9OpBuilderENS_8LocationENS_4TypeE called 0 returned 0% blocks executed 0%
+    #####:  131:static Value getZero(OpBuilder &b, Location loc, Type elementType) {
+    #####:  132:  assert(elementType.isIntOrIndexOrFloat() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  133:         "expected scalar type while computing zero value");
+    #####:  134:  if (elementType.isa<IntegerType>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  135:    return b.create<arith::ConstantIntOp>(loc, 0, elementType);
+call    0 never executed
+    #####:  136:  if (elementType.isIndex())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  137:    return b.create<arith::ConstantIndexOp>(loc, 0);
+call    0 never executed
+        -:  138:  // Assume float.
+    #####:  139:  auto floatType = elementType.cast<FloatType>();
+call    0 never executed
+    #####:  140:  return b.create<arith::ConstantFloatOp>(
+call    0 never executed
+    #####:  141:      loc, APFloat::getZero(floatType.getFloatSemantics()), floatType);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  142:}
+        -:  143:
+        -:  144:GenericOp
+        -:  145:DecomposeLinalgOp::createPeeledGenericOp(GenericOp genericOp,
+        -:  146:                                         PatternRewriter &rewriter) const {
+        -:  147:  Block *body = genericOp.getBody();
+        -:  148:  Operation *peeledScalarOperation = &(*body->begin());
+        -:  149:  SmallVector<AffineMap> peeledGenericOpIndexingMaps =
+        -:  150:      genericOp.getIndexingMapsArray();
+        -:  151:
+        -:  152:  /// Compute the loop ranges for operation. This is the shape of the result of
+        -:  153:  /// the generic op for the peeled operation.
+        -:  154:  Location loc = genericOp.getLoc();
+        -:  155:  SmallVector<OpFoldResult> domain = getGenericOpLoopRange(rewriter, genericOp);
+        -:  156:  SmallVector<Value> newInitValues;
+        -:  157:  SmallVector<Type> newResultTypes;
+        -:  158:
+        -:  159:  // Add as many new results as the number of results of the peeled scalar op.
+        -:  160:  for (auto scalarOpResult : peeledScalarOperation->getResults()) {
+        -:  161:    // If the result is yielded by the original op, use the operand, indexing
+        -:  162:    // map and result type that correspond to the yielded value.
+        -:  163:
+        -:  164:    Optional<unsigned> resultNumber;
+        -:  165:    for (auto *user : scalarOpResult.getUsers()) {
+        -:  166:      if (auto yieldOp = dyn_cast<YieldOp>(user)) {
+        -:  167:        // Find the first use of the `scalarOpResult` in the yield op.
+        -:  168:        for (OpOperand &yieldOperand : yieldOp->getOpOperands()) {
+        -:  169:          if (yieldOperand.get() == scalarOpResult) {
+        -:  170:            resultNumber = yieldOperand.getOperandNumber();
+        -:  171:            break;
+        -:  172:          }
+        -:  173:        }
+        -:  174:        assert(resultNumber && "unable to find use of a value in its user");
+        -:  175:        break;
+        -:  176:      }
+        -:  177:    }
+        -:  178:    if (resultNumber) {
+        -:  179:      newInitValues.push_back(
+        -:  180:          genericOp.getDpsInitOperand(*resultNumber)->get());
+        -:  181:      OpResult result = genericOp.getResult(*resultNumber).cast<OpResult>();
+        -:  182:      newResultTypes.push_back(result.getType());
+        -:  183:      peeledGenericOpIndexingMaps.push_back(
+        -:  184:          genericOp.getIndexingMapMatchingResult(result));
+        -:  185:      continue;
+        -:  186:    }
+        -:  187:
+        -:  188:    // Fall back path, use an `init_tensor` and identity indexing map.
+        -:  189:    AffineMap indexingMap = rewriter.getMultiDimIdentityMap(domain.size());
+        -:  190:    Value emptyTensor =
+        -:  191:        rewriter.create<tensor::EmptyOp>(loc, domain, scalarOpResult.getType());
+        -:  192:    newInitValues.push_back(emptyTensor);
+        -:  193:    newResultTypes.push_back(emptyTensor.getType());
+        -:  194:    peeledGenericOpIndexingMaps.push_back(indexingMap);
+        -:  195:  }
+        -:  196:
+        -:  197:  /// Create the peeled generic op with an empty body.
+        -:  198:  SmallVector<Value> outsOperands = genericOp.getOutputs();
+        -:  199:  outsOperands.append(newInitValues.begin(), newInitValues.end());
+        -:  200:  SmallVector<Type> resultTypes = llvm::to_vector(genericOp.getResultTypes());
+        -:  201:  resultTypes.append(newResultTypes.begin(), newResultTypes.end());
+        -:  202:  auto indexingMapAttr =
+        -:  203:      rewriter.getAffineMapArrayAttr(peeledGenericOpIndexingMaps);
+        -:  204:  return rewriter.create<GenericOp>(
+        -:  205:      loc, resultTypes, genericOp.getInputs(), outsOperands, indexingMapAttr,
+        -:  206:      genericOp.getIteratorTypes(), /*doc=*/nullptr, /*libraryCall=*/nullptr,
+    #####:  207:      [](OpBuilder, Location, ValueRange) {});
+        -:  208:}
+        -:  209:
+        -:  210:GenericOp
+        -:  211:DecomposeLinalgOp::createResidualGenericOp(GenericOp genericOp,
+        -:  212:                                           GenericOp peeledGenericOp,
+        -:  213:                                           PatternRewriter &rewriter) const {
+        -:  214:  /// Append all results from the peeledGenericOps as `ins` operand for the
+        -:  215:  /// residual generic op.
+        -:  216:  SmallVector<Value> residualGenericOpOperands = genericOp.getInputs();
+        -:  217:  unsigned origNumResults = genericOp.getNumResults();
+        -:  218:  unsigned peeledGenericOpNumResults = peeledGenericOp.getNumResults();
+        -:  219:  SmallVector<Value> extraIns;
+        -:  220:  for (auto resultNum :
+        -:  221:       llvm::seq<unsigned>(origNumResults, peeledGenericOpNumResults))
+        -:  222:    extraIns.push_back(peeledGenericOp->getResult(resultNum));
+        -:  223:  residualGenericOpOperands.append(extraIns);
+        -:  224:
+        -:  225:  /// Add indexing maps for the newly added operands. Use the same map
+        -:  226:  /// as those used for the new results of the peeledGenericOp.
+        -:  227:  auto indexingMaps = llvm::to_vector(
+        -:  228:      llvm::map_range(genericOp.getDpsInputOperands(), [&](OpOperand *operand) {
+        -:  229:        return genericOp.getMatchingIndexingMap(operand);
+        -:  230:      }));
+        -:  231:  for (auto resultNum :
+        -:  232:       llvm::seq<unsigned>(origNumResults, peeledGenericOpNumResults)) {
+        -:  233:    OpResult result = peeledGenericOp.getResult(resultNum).cast<OpResult>();
+        -:  234:    indexingMaps.push_back(
+        -:  235:        peeledGenericOp.getIndexingMapMatchingResult(result));
+        -:  236:  }
+        -:  237:  for (OpOperand *outOperand : genericOp.getDpsInitOperands())
+        -:  238:    indexingMaps.push_back(genericOp.getMatchingIndexingMap(outOperand));
+        -:  239:
+        -:  240:  auto indexingMapAttr = rewriter.getAffineMapArrayAttr(indexingMaps);
+        -:  241:  return rewriter.create<GenericOp>(
+        -:  242:      genericOp->getLoc(), genericOp->getResultTypes(),
+        -:  243:      residualGenericOpOperands, genericOp.getOutputs(), indexingMapAttr,
+        -:  244:      genericOp.getIteratorTypes(), /*doc=*/nullptr, /*libraryCall=*/nullptr,
+    #####:  245:      [](OpBuilder, Location, ValueRange) {});
+        -:  246:}
+        -:  247:
+        -:  248:LogicalResult
+function _ZNK12_GLOBAL__N_117DecomposeLinalgOp15matchAndRewriteEN4mlir6linalg9GenericOpERNS1_15PatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  249:DecomposeLinalgOp::matchAndRewrite(GenericOp genericOp,
+        -:  250:                                   PatternRewriter &rewriter) const {
+        -:  251:  /// For now only match on operations where the iterator types are all parallel
+    #####:  252:  if (genericOp.getNumParallelLoops() != genericOp.getNumLoops()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  253:    return rewriter.notifyMatchFailure(genericOp,
+        -:  254:                                       "unhandled decomposition of operation "
+    #####:  255:                                       "with non-parallel iterator types");
+call    0 never executed
+        -:  256:  }
+        -:  257:  // TODO: this could be generalized to handle `linalg.generic` with buffer
+        -:  258:  // operands too but requires allocation for intermediates. Punt on this for
+        -:  259:  // now.
+    #####:  260:  if (!genericOp.hasTensorSemantics()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  261:    return rewriter.notifyMatchFailure(
+    #####:  262:        genericOp, "only operations with tensor semantics are handled");
+call    0 never executed
+        -:  263:  }
+        -:  264:
+    #####:  265:  if (llvm::any_of(genericOp.getDpsInitOperands(), [&](OpOperand *outOperand) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  266:        return !genericOp.getMatchingIndexingMap(outOperand).isPermutation();
+        -:  267:      })) {
+    #####:  268:    return rewriter.notifyMatchFailure(
+        -:  269:        genericOp, "unhandled decomposition of generic op with out operand not "
+    #####:  270:                   "accessed using a permutation");
+call    0 never executed
+        -:  271:  }
+        -:  272:
+        -:  273:  /// If the op has only a single statement (apart from the yield), do nothing.
+    #####:  274:  Block *body = genericOp.getBody();
+call    0 never executed
+    #####:  275:  if (body->getOperations().size() <= 2) {
+branch  0 never executed
+branch  1 never executed
+    #####:  276:    return rewriter.notifyMatchFailure(genericOp,
+    #####:  277:                                       "operation has less than 3 statements");
+call    0 never executed
+        -:  278:  }
+        -:  279:
+        -:  280:  /// Check that the peeled statement has a scalar element type.
+    #####:  281:  if (llvm::any_of(body->getOperations().begin()->getResultTypes(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  282:                   [](Type t) { return !t.isIntOrIndexOrFloat(); })) {
+    #####:  283:    return rewriter.notifyMatchFailure(
+    #####:  284:        &(*body->getOperations().begin()),
+call    0 never executed
+    #####:  285:        "expected return type to be only int, index or float");
+call    0 never executed
+call    1 never executed
+        -:  286:  }
+        -:  287:
+    #####:  288:  GenericOp peeledGenericOp = createPeeledGenericOp(genericOp, rewriter);
+call    0 never executed
+    #####:  289:  GenericOp residualGenericOp =
+    #####:  290:      createResidualGenericOp(genericOp, peeledGenericOp, rewriter);
+call    0 never executed
+        -:  291:
+        -:  292:  /// Move the first statement of the original operation into the body of the
+        -:  293:  /// generic op for the peeled operation.
+    #####:  294:  Block *peeledGenericOpBody = peeledGenericOp.getBody();
+call    0 never executed
+    #####:  295:  Block *residualGenericOpBody = residualGenericOp.getBody();
+call    0 never executed
+    #####:  296:  assert(peeledGenericOpBody->empty() && residualGenericOpBody->empty() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  297:         "expected split generic ops to have empty region");
+    #####:  298:  peeledGenericOpBody->getOperations().splice(
+branch  0 never executed
+branch  1 never executed
+    #####:  299:      peeledGenericOpBody->begin(), body->getOperations(), body->begin());
+branch  0 never executed
+branch  1 never executed
+    #####:  300:  residualGenericOpBody->getOperations().splice(residualGenericOpBody->begin(),
+call    0 never executed
+    #####:  301:                                                body->getOperations());
+call    0 never executed
+        -:  302:
+    #####:  303:  Operation *peeledScalarOperation = &(*peeledGenericOpBody->begin());
+call    0 never executed
+    #####:  304:  auto *yieldOp = residualGenericOpBody->getTerminator();
+call    0 never executed
+    #####:  305:  {
+        -:  306:    // Yield all the result of the peeled scalar operation.
+    #####:  307:    OpBuilder::InsertionGuard g(rewriter);
+call    0 never executed
+    #####:  308:    rewriter.setInsertionPointToEnd(peeledGenericOpBody);
+call    0 never executed
+    #####:  309:    SmallVector<Value> yieldedVals;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  310:    for (auto origYield : yieldOp->getOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  311:      if (origYield.getDefiningOp() == peeledScalarOperation) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  312:        yieldedVals.push_back(origYield);
+call    0 never executed
+        -:  313:      } else {
+    #####:  314:        yieldedVals.push_back(
+call    0 never executed
+call    1 never executed
+        -:  315:            getZero(rewriter, genericOp.getLoc(), origYield.getType()));
+        -:  316:      }
+        -:  317:    }
+    #####:  318:    yieldedVals.append(llvm::to_vector(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  319:        llvm::map_range(peeledScalarOperation->getResults(),
+    #####:  320:                        [](OpResult opr) -> Value { return opr; })));
+call    0 never executed
+    #####:  321:    rewriter.create<YieldOp>(genericOp.getLoc(), yieldedVals);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  322:  }
+        -:  323:
+        -:  324:  /// In the split operations, replace block arguments uses that refer to
+        -:  325:  /// original operation to the block arguments of the newly created operation.
+    #####:  326:  unsigned origNumInputs = genericOp.getNumDpsInputs();
+call    0 never executed
+    #####:  327:  for (const auto &inputBlockArg :
+    #####:  328:       llvm::enumerate(genericOp.getBody()->getArguments())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  329:    Value residualOpReplacementArg =
+    #####:  330:        residualGenericOpBody->getArgument(inputBlockArg.index());
+call    0 never executed
+    #####:  331:    inputBlockArg.value().replaceUsesWithIf(
+call    0 never executed
+    #####:  332:        residualOpReplacementArg, [&](OpOperand &use) {
+    #####:  333:          return use.getOwner()->getBlock() == residualGenericOpBody;
+        -:  334:        });
+        -:  335:
+    #####:  336:    Value peeledOpReplacementArg =
+    #####:  337:        peeledGenericOpBody->getArgument(inputBlockArg.index());
+call    0 never executed
+    #####:  338:    inputBlockArg.value().replaceUsesWithIf(
+call    0 never executed
+call    1 never executed
+    #####:  339:        peeledOpReplacementArg, [&](OpOperand &use) {
+    #####:  340:          return use.getOwner()->getBlock() == peeledGenericOpBody;
+        -:  341:        });
+        -:  342:  }
+        -:  343:
+        -:  344:  /// Before fixing up the residual operation, track what values are yielded. If
+        -:  345:  /// any of those are from the peeled scalar operation, the uses of the
+        -:  346:  /// corresponding result have to be remapped to result of the generic op for
+        -:  347:  /// the peeled operation.
+    #####:  348:  SmallVector<Value> replacements;
+call    0 never executed
+    #####:  349:  for (const auto &yieldValue : llvm::enumerate(yieldOp->getOperands())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  350:    OpResult opr = yieldValue.value().dyn_cast<OpResult>();
+call    0 never executed
+    #####:  351:    if (!opr || opr.getOwner() != peeledScalarOperation)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  352:      replacements.push_back(residualGenericOp.getResult(yieldValue.index()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  353:    else
+    #####:  354:      replacements.push_back(peeledGenericOp->getResult(yieldValue.index()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  355:  }
+        -:  356:
+        -:  357:  /// Update all uses of the peeled scalar operation results in the residual op
+        -:  358:  /// to the newly added arguments.
+    #####:  359:  {
+    #####:  360:    SmallVector<Value> scalarReplacements;
+branch  0 never executed
+branch  1 never executed
+    #####:  361:    unsigned peeledScalarOpNumResults = peeledScalarOperation->getNumResults();
+branch  0 never executed
+branch  1 never executed
+    #####:  362:    scalarReplacements.reserve(peeledScalarOpNumResults);
+branch  0 never executed
+branch  1 never executed
+    #####:  363:    for (auto num : llvm::seq<unsigned>(0, peeledScalarOpNumResults))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  364:      scalarReplacements.push_back(
+    #####:  365:          residualGenericOpBody->getArgument(num + origNumInputs));
+call    0 never executed
+call    1 never executed
+    #####:  366:    bool allUsesReplaced = false;
+    #####:  367:    rewriter.replaceOpWithinBlock(peeledScalarOperation, scalarReplacements,
+call    0 never executed
+call    1 never executed
+        -:  368:                                  residualGenericOpBody, &allUsesReplaced);
+    #####:  369:    assert(!allUsesReplaced &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  370:           "peeled scalar operation is erased when it wasnt expected to be");
+        -:  371:  }
+        -:  372:
+        -:  373:  // Replace the original operation
+    #####:  374:  rewriter.replaceOp(genericOp, replacements);
+call    0 never executed
+call    1 never executed
+    #####:  375:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  376:}
+        -:  377:
+function _ZN4mlir6linalg33populateDecomposeLinalgOpsPatternERNS_17RewritePatternSetE called 884 returned 100% blocks executed 100%
+      884:  378:void mlir::linalg::populateDecomposeLinalgOpsPattern(
+        -:  379:    RewritePatternSet &patterns) {
+      884:  380:  patterns.insert<DecomposeLinalgOp>(patterns.getContext());
+call    0 returned 100%
+      884:  381:}

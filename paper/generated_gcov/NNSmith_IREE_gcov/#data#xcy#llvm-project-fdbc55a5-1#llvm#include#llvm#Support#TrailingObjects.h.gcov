@@ -1,0 +1,397 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/llvm/include/llvm/Support/TrailingObjects.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:325580
+        -:    1://===--- TrailingObjects.h - Variable-length classes ------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:///
+        -:    9:/// \file
+        -:   10:/// This header defines support for implementing classes that have
+        -:   11:/// some trailing object (or arrays of objects) appended to them. The
+        -:   12:/// main purpose is to make it obvious where this idiom is being used,
+        -:   13:/// and to make the usage more idiomatic and more difficult to get
+        -:   14:/// wrong.
+        -:   15:///
+        -:   16:/// The TrailingObject template abstracts away the reinterpret_cast,
+        -:   17:/// pointer arithmetic, and size calculations used for the allocation
+        -:   18:/// and access of appended arrays of objects, and takes care that they
+        -:   19:/// are all allocated at their required alignment. Additionally, it
+        -:   20:/// ensures that the base type is final -- deriving from a class that
+        -:   21:/// expects data appended immediately after it is typically not safe.
+        -:   22:///
+        -:   23:/// Users are expected to derive from this template, and provide
+        -:   24:/// numTrailingObjects implementations for each trailing type except
+        -:   25:/// the last, e.g. like this sample:
+        -:   26:///
+        -:   27:/// \code
+        -:   28:/// class VarLengthObj : private TrailingObjects<VarLengthObj, int, double> {
+        -:   29:///   friend TrailingObjects;
+        -:   30:///
+        -:   31:///   unsigned NumInts, NumDoubles;
+        -:   32:///   size_t numTrailingObjects(OverloadToken<int>) const { return NumInts; }
+        -:   33:///  };
+        -:   34:/// \endcode
+        -:   35:///
+        -:   36:/// You can access the appended arrays via 'getTrailingObjects', and
+        -:   37:/// determine the size needed for allocation via
+        -:   38:/// 'additionalSizeToAlloc' and 'totalSizeToAlloc'.
+        -:   39:///
+        -:   40:/// All the methods implemented by this class are are intended for use
+        -:   41:/// by the implementation of the class, not as part of its interface
+        -:   42:/// (thus, private inheritance is suggested).
+        -:   43:///
+        -:   44://===----------------------------------------------------------------------===//
+        -:   45:
+        -:   46:#ifndef LLVM_SUPPORT_TRAILINGOBJECTS_H
+        -:   47:#define LLVM_SUPPORT_TRAILINGOBJECTS_H
+        -:   48:
+        -:   49:#include "llvm/Support/AlignOf.h"
+        -:   50:#include "llvm/Support/Alignment.h"
+        -:   51:#include "llvm/Support/Compiler.h"
+        -:   52:#include "llvm/Support/MathExtras.h"
+        -:   53:#include "llvm/Support/type_traits.h"
+        -:   54:#include <new>
+        -:   55:#include <type_traits>
+        -:   56:
+        -:   57:namespace llvm {
+        -:   58:
+        -:   59:namespace trailing_objects_internal {
+        -:   60:/// Helper template to calculate the max alignment requirement for a set of
+        -:   61:/// objects.
+        -:   62:template <typename First, typename... Rest> class AlignmentCalcHelper {
+        -:   63:private:
+        -:   64:  enum {
+        -:   65:    FirstAlignment = alignof(First),
+        -:   66:    RestAlignment = AlignmentCalcHelper<Rest...>::Alignment,
+        -:   67:  };
+        -:   68:
+        -:   69:public:
+        -:   70:  enum {
+        -:   71:    Alignment = FirstAlignment > RestAlignment ? FirstAlignment : RestAlignment
+        -:   72:  };
+        -:   73:};
+        -:   74:
+        -:   75:template <typename First> class AlignmentCalcHelper<First> {
+        -:   76:public:
+        -:   77:  enum { Alignment = alignof(First) };
+        -:   78:};
+        -:   79:
+        -:   80:/// The base class for TrailingObjects* classes.
+        -:   81:class TrailingObjectsBase {
+        -:   82:protected:
+        -:   83:  /// OverloadToken's purpose is to allow specifying function overloads
+        -:   84:  /// for different types, without actually taking the types as
+        -:   85:  /// parameters. (Necessary because member function templates cannot
+        -:   86:  /// be specialized, so overloads must be used instead of
+        -:   87:  /// specialization.)
+        -:   88:  template <typename T> struct OverloadToken {};
+        -:   89:};
+        -:   90:
+        -:   91:// Just a little helper for transforming a type pack into the same
+        -:   92:// number of a different type. e.g.:
+        -:   93://   ExtractSecondType<Foo..., int>::type
+        -:   94:template <typename Ty1, typename Ty2> struct ExtractSecondType {
+        -:   95:  typedef Ty2 type;
+        -:   96:};
+        -:   97:
+        -:   98:// TrailingObjectsImpl is somewhat complicated, because it is a
+        -:   99:// recursively inheriting template, in order to handle the template
+        -:  100:// varargs. Each level of inheritance picks off a single trailing type
+        -:  101:// then recurses on the rest. The "Align", "BaseTy", and
+        -:  102:// "TopTrailingObj" arguments are passed through unchanged through the
+        -:  103:// recursion. "PrevTy" is, at each level, the type handled by the
+        -:  104:// level right above it.
+        -:  105:
+        -:  106:template <int Align, typename BaseTy, typename TopTrailingObj, typename PrevTy,
+        -:  107:          typename... MoreTys>
+        -:  108:class TrailingObjectsImpl {
+        -:  109:  // The main template definition is never used -- the two
+        -:  110:  // specializations cover all possibilities.
+        -:  111:};
+        -:  112:
+        -:  113:template <int Align, typename BaseTy, typename TopTrailingObj, typename PrevTy,
+        -:  114:          typename NextTy, typename... MoreTys>
+        -:  115:class TrailingObjectsImpl<Align, BaseTy, TopTrailingObj, PrevTy, NextTy,
+        -:  116:                          MoreTys...>
+        -:  117:    : public TrailingObjectsImpl<Align, BaseTy, TopTrailingObj, NextTy,
+        -:  118:                                 MoreTys...> {
+        -:  119:
+        -:  120:  typedef TrailingObjectsImpl<Align, BaseTy, TopTrailingObj, NextTy, MoreTys...>
+        -:  121:      ParentType;
+        -:  122:
+        -:  123:  struct RequiresRealignment {
+        -:  124:    static const bool value = alignof(PrevTy) < alignof(NextTy);
+        -:  125:  };
+        -:  126:
+        -:  127:  static constexpr bool requiresRealignment() {
+        -:  128:    return RequiresRealignment::value;
+        -:  129:  }
+        -:  130:
+        -:  131:protected:
+        -:  132:  // Ensure the inherited getTrailingObjectsImpl is not hidden.
+        -:  133:  using ParentType::getTrailingObjectsImpl;
+        -:  134:
+        -:  135:  // These two functions are helper functions for
+        -:  136:  // TrailingObjects::getTrailingObjects. They recurse to the left --
+        -:  137:  // the result for each type in the list of trailing types depends on
+        -:  138:  // the result of calling the function on the type to the
+        -:  139:  // left. However, the function for the type to the left is
+        -:  140:  // implemented by a *subclass* of this class, so we invoke it via
+        -:  141:  // the TopTrailingObj, which is, via the
+        -:  142:  // curiously-recurring-template-pattern, the most-derived type in
+        -:  143:  // this recursion, and thus, contains all the overloads.
+        -:  144:  static const NextTy *
+        -:  145:  getTrailingObjectsImpl(const BaseTy *Obj,
+        -:  146:                         TrailingObjectsBase::OverloadToken<NextTy>) {
+        -:  147:    auto *Ptr = TopTrailingObj::getTrailingObjectsImpl(
+        -:  148:                    Obj, TrailingObjectsBase::OverloadToken<PrevTy>()) +
+        -:  149:                TopTrailingObj::callNumTrailingObjects(
+        -:  150:                    Obj, TrailingObjectsBase::OverloadToken<PrevTy>());
+        -:  151:
+        -:  152:    if (requiresRealignment())
+        -:  153:      return reinterpret_cast<const NextTy *>(
+        -:  154:          alignAddr(Ptr, Align::Of<NextTy>()));
+        -:  155:    else
+        -:  156:      return reinterpret_cast<const NextTy *>(Ptr);
+        -:  157:  }
+        -:  158:
+        -:  159:  static NextTy *
+    #####:  160:  getTrailingObjectsImpl(BaseTy *Obj,
+        -:  161:                         TrailingObjectsBase::OverloadToken<NextTy>) {
+    #####:  162:    auto *Ptr = TopTrailingObj::getTrailingObjectsImpl(
+    #####:  163:                    Obj, TrailingObjectsBase::OverloadToken<PrevTy>()) +
+    #####:  164:                TopTrailingObj::callNumTrailingObjects(
+        -:  165:                    Obj, TrailingObjectsBase::OverloadToken<PrevTy>());
+        -:  166:
+        -:  167:    if (requiresRealignment())
+        -:  168:      return reinterpret_cast<NextTy *>(alignAddr(Ptr, Align::Of<NextTy>()));
+        -:  169:    else
+        -:  170:      return reinterpret_cast<NextTy *>(Ptr);
+        -:  171:  }
+        -:  172:
+        -:  173:  // Helper function for TrailingObjects::additionalSizeToAlloc: this
+        -:  174:  // function recurses to superclasses, each of which requires one
+        -:  175:  // fewer size_t argument, and adds its own size.
+        -:  176:  static constexpr size_t additionalSizeToAllocImpl(
+        -:  177:      size_t SizeSoFar, size_t Count1,
+        -:  178:      typename ExtractSecondType<MoreTys, size_t>::type... MoreCounts) {
+        -:  179:    return ParentType::additionalSizeToAllocImpl(
+        -:  180:        (requiresRealignment() ? llvm::alignTo<alignof(NextTy)>(SizeSoFar)
+        -:  181:                               : SizeSoFar) +
+        -:  182:            sizeof(NextTy) * Count1,
+        -:  183:        MoreCounts...);
+        -:  184:  }
+        -:  185:};
+        -:  186:
+        -:  187:// The base case of the TrailingObjectsImpl inheritance recursion,
+        -:  188:// when there's no more trailing types.
+        -:  189:template <int Align, typename BaseTy, typename TopTrailingObj, typename PrevTy>
+        -:  190:class alignas(Align) TrailingObjectsImpl<Align, BaseTy, TopTrailingObj, PrevTy>
+        -:  191:    : public TrailingObjectsBase {
+        -:  192:protected:
+        -:  193:  // This is a dummy method, only here so the "using" doesn't fail --
+        -:  194:  // it will never be called, because this function recurses backwards
+        -:  195:  // up the inheritance chain to subclasses.
+        -:  196:  static void getTrailingObjectsImpl();
+        -:  197:
+        -:  198:  static constexpr size_t additionalSizeToAllocImpl(size_t SizeSoFar) {
+        -:  199:    return SizeSoFar;
+        -:  200:  }
+        -:  201:
+        -:  202:  template <bool CheckAlignment> static void verifyTrailingObjectsAlignment() {}
+        -:  203:};
+        -:  204:
+        -:  205:} // end namespace trailing_objects_internal
+        -:  206:
+        -:  207:// Finally, the main type defined in this file, the one intended for users...
+        -:  208:
+        -:  209:/// See the file comment for details on the usage of the
+        -:  210:/// TrailingObjects type.
+        -:  211:template <typename BaseTy, typename... TrailingTys>
+        -:  212:class TrailingObjects : private trailing_objects_internal::TrailingObjectsImpl<
+        -:  213:                            trailing_objects_internal::AlignmentCalcHelper<
+        -:  214:                                TrailingTys...>::Alignment,
+        -:  215:                            BaseTy, TrailingObjects<BaseTy, TrailingTys...>,
+        -:  216:                            BaseTy, TrailingTys...> {
+        -:  217:
+        -:  218:  template <int A, typename B, typename T, typename P, typename... M>
+        -:  219:  friend class trailing_objects_internal::TrailingObjectsImpl;
+        -:  220:
+        -:  221:  template <typename... Tys> class Foo {};
+        -:  222:
+        -:  223:  typedef trailing_objects_internal::TrailingObjectsImpl<
+        -:  224:      trailing_objects_internal::AlignmentCalcHelper<TrailingTys...>::Alignment,
+        -:  225:      BaseTy, TrailingObjects<BaseTy, TrailingTys...>, BaseTy, TrailingTys...>
+        -:  226:      ParentType;
+        -:  227:  using TrailingObjectsBase = trailing_objects_internal::TrailingObjectsBase;
+        -:  228:
+        -:  229:  using ParentType::getTrailingObjectsImpl;
+        -:  230:
+        -:  231:  // This function contains only a static_assert BaseTy is final. The
+        -:  232:  // static_assert must be in a function, and not at class-level
+        -:  233:  // because BaseTy isn't complete at class instantiation time, but
+        -:  234:  // will be by the time this function is instantiated.
+    #####:  235:  static void verifyTrailingObjectsAssertions() {
+        -:  236:    static_assert(std::is_final<BaseTy>(), "BaseTy must be final.");
+        -:  237:  }
+        -:  238:
+        -:  239:  // These two methods are the base of the recursion for this method.
+        -:  240:  static const BaseTy *
+        -:  241:  getTrailingObjectsImpl(const BaseTy *Obj,
+        -:  242:                         TrailingObjectsBase::OverloadToken<BaseTy>) {
+        -:  243:    return Obj;
+        -:  244:  }
+        -:  245:
+        -:  246:  static BaseTy *
+    #####:  247:  getTrailingObjectsImpl(BaseTy *Obj,
+        -:  248:                         TrailingObjectsBase::OverloadToken<BaseTy>) {
+        -:  249:    return Obj;
+        -:  250:  }
+        -:  251:
+        -:  252:  // callNumTrailingObjects simply calls numTrailingObjects on the
+        -:  253:  // provided Obj -- except when the type being queried is BaseTy
+        -:  254:  // itself. There is always only one of the base object, so that case
+        -:  255:  // is handled here. (An additional benefit of indirecting through
+        -:  256:  // this function is that consumers only say "friend
+        -:  257:  // TrailingObjects", and thus, only this class itself can call the
+        -:  258:  // numTrailingObjects function.)
+        -:  259:  static size_t
+    #####:  260:  callNumTrailingObjects(const BaseTy *Obj,
+        -:  261:                         TrailingObjectsBase::OverloadToken<BaseTy>) {
+        -:  262:    return 1;
+        -:  263:  }
+        -:  264:
+        -:  265:  template <typename T>
+    #####:  266:  static size_t callNumTrailingObjects(const BaseTy *Obj,
+        -:  267:                                       TrailingObjectsBase::OverloadToken<T>) {
+    #####:  268:    return Obj->numTrailingObjects(TrailingObjectsBase::OverloadToken<T>());
+        -:  269:  }
+        -:  270:
+        -:  271:public:
+        -:  272:  // Make this (privately inherited) member public.
+        -:  273:#ifndef _MSC_VER
+        -:  274:  using ParentType::OverloadToken;
+        -:  275:#else
+        -:  276:  // An MSVC bug prevents the above from working, (last tested at CL version
+        -:  277:  // 19.28). "Class5" in TrailingObjectsTest.cpp tests the problematic case.
+        -:  278:  template <typename T>
+        -:  279:  using OverloadToken = typename ParentType::template OverloadToken<T>;
+        -:  280:#endif
+        -:  281:
+        -:  282:  /// Returns a pointer to the trailing object array of the given type
+        -:  283:  /// (which must be one of those specified in the class template). The
+        -:  284:  /// array may have zero or more elements in it.
+        -:  285:  template <typename T> const T *getTrailingObjects() const {
+        -:  286:    verifyTrailingObjectsAssertions();
+        -:  287:    // Forwards to an impl function with overloads, since member
+        -:  288:    // function templates can't be specialized.
+        -:  289:    return this->getTrailingObjectsImpl(
+        -:  290:        static_cast<const BaseTy *>(this),
+        -:  291:        TrailingObjectsBase::OverloadToken<T>());
+        -:  292:  }
+        -:  293:
+        -:  294:  /// Returns a pointer to the trailing object array of the given type
+        -:  295:  /// (which must be one of those specified in the class template). The
+        -:  296:  /// array may have zero or more elements in it.
+    #####:  297:  template <typename T> T *getTrailingObjects() {
+        -:  298:    verifyTrailingObjectsAssertions();
+        -:  299:    // Forwards to an impl function with overloads, since member
+        -:  300:    // function templates can't be specialized.
+        -:  301:    return this->getTrailingObjectsImpl(
+    #####:  302:        static_cast<BaseTy *>(this), TrailingObjectsBase::OverloadToken<T>());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+        -:  303:  }
+        -:  304:
+        -:  305:  /// Returns the size of the trailing data, if an object were
+        -:  306:  /// allocated with the given counts (The counts are in the same order
+        -:  307:  /// as the template arguments). This does not include the size of the
+        -:  308:  /// base object.  The template arguments must be the same as those
+        -:  309:  /// used in the class; they are supplied here redundantly only so
+        -:  310:  /// that it's clear what the counts are counting in callers.
+        -:  311:  template <typename... Tys>
+        -:  312:  static constexpr std::enable_if_t<
+        -:  313:      std::is_same<Foo<TrailingTys...>, Foo<Tys...>>::value, size_t>
+        -:  314:  additionalSizeToAlloc(typename trailing_objects_internal::ExtractSecondType<
+        -:  315:                        TrailingTys, size_t>::type... Counts) {
+        -:  316:    return ParentType::additionalSizeToAllocImpl(0, Counts...);
+        -:  317:  }
+        -:  318:
+        -:  319:  /// Returns the total size of an object if it were allocated with the
+        -:  320:  /// given trailing object counts. This is the same as
+        -:  321:  /// additionalSizeToAlloc, except it *does* include the size of the base
+        -:  322:  /// object.
+        -:  323:  template <typename... Tys>
+        -:  324:  static constexpr std::enable_if_t<
+        -:  325:      std::is_same<Foo<TrailingTys...>, Foo<Tys...>>::value, size_t>
+        -:  326:  totalSizeToAlloc(typename trailing_objects_internal::ExtractSecondType<
+        -:  327:                   TrailingTys, size_t>::type... Counts) {
+        -:  328:    return sizeof(BaseTy) + ParentType::additionalSizeToAllocImpl(0, Counts...);
+        -:  329:  }
+        -:  330:
+        -:  331:  TrailingObjects() = default;
+        -:  332:  TrailingObjects(const TrailingObjects &) = delete;
+        -:  333:  TrailingObjects(TrailingObjects &&) = delete;
+        -:  334:  TrailingObjects &operator=(const TrailingObjects &) = delete;
+        -:  335:  TrailingObjects &operator=(TrailingObjects &&) = delete;
+        -:  336:
+        -:  337:  /// A type where its ::with_counts template member has a ::type member
+        -:  338:  /// suitable for use as uninitialized storage for an object with the given
+        -:  339:  /// trailing object counts. The template arguments are similar to those
+        -:  340:  /// of additionalSizeToAlloc.
+        -:  341:  ///
+        -:  342:  /// Use with FixedSizeStorageOwner, e.g.:
+        -:  343:  ///
+        -:  344:  /// \code{.cpp}
+        -:  345:  ///
+        -:  346:  /// MyObj::FixedSizeStorage<void *>::with_counts<1u>::type myStackObjStorage;
+        -:  347:  /// MyObj::FixedSizeStorageOwner
+        -:  348:  ///     myStackObjOwner(new ((void *)&myStackObjStorage) MyObj);
+        -:  349:  /// MyObj *const myStackObjPtr = myStackObjOwner.get();
+        -:  350:  ///
+        -:  351:  /// \endcode
+        -:  352:  template <typename... Tys> struct FixedSizeStorage {
+        -:  353:    template <size_t... Counts> struct with_counts {
+        -:  354:      enum { Size = totalSizeToAlloc<Tys...>(Counts...) };
+        -:  355:      struct type {
+        -:  356:        alignas(BaseTy) char buffer[Size];
+        -:  357:      };
+        -:  358:    };
+        -:  359:  };
+        -:  360:
+        -:  361:  /// A type that acts as the owner for an object placed into fixed storage.
+        -:  362:  class FixedSizeStorageOwner {
+        -:  363:  public:
+        -:  364:    FixedSizeStorageOwner(BaseTy *p) : p(p) {}
+        -:  365:    ~FixedSizeStorageOwner() {
+        -:  366:      assert(p && "FixedSizeStorageOwner owns null?");
+        -:  367:      p->~BaseTy();
+        -:  368:    }
+        -:  369:
+        -:  370:    BaseTy *get() { return p; }
+        -:  371:    const BaseTy *get() const { return p; }
+        -:  372:
+        -:  373:  private:
+        -:  374:    FixedSizeStorageOwner(const FixedSizeStorageOwner &) = delete;
+        -:  375:    FixedSizeStorageOwner(FixedSizeStorageOwner &&) = delete;
+        -:  376:    FixedSizeStorageOwner &operator=(const FixedSizeStorageOwner &) = delete;
+        -:  377:    FixedSizeStorageOwner &operator=(FixedSizeStorageOwner &&) = delete;
+        -:  378:
+        -:  379:    BaseTy *const p;
+        -:  380:  };
+        -:  381:};
+        -:  382:
+        -:  383:} // end namespace llvm
+        -:  384:
+        -:  385:#endif

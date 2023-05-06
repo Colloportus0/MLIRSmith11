@@ -1,0 +1,2483 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/lib/Target/SPIRV/Serialization/Serializer.cpp
+        -:    0:Graph:../tools/mlir/lib/Target/SPIRV/Serialization/CMakeFiles/obj.MLIRSPIRVSerialization.dir/Serializer.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/SPIRV/Serialization/CMakeFiles/obj.MLIRSPIRVSerialization.dir/Serializer.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===- Serializer.cpp - MLIR SPIR-V Serializer ----------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines the MLIR SPIR-V module to SPIR-V binary serializer.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "Serializer.h"
+        -:   14:
+        -:   15:#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
+        -:   16:#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+        -:   17:#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
+        -:   18:#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
+        -:   19:#include "mlir/Support/LogicalResult.h"
+        -:   20:#include "mlir/Target/SPIRV/SPIRVBinaryUtils.h"
+        -:   21:#include "llvm/ADT/Sequence.h"
+        -:   22:#include "llvm/ADT/SmallPtrSet.h"
+        -:   23:#include "llvm/ADT/StringExtras.h"
+        -:   24:#include "llvm/ADT/TypeSwitch.h"
+        -:   25:#include "llvm/ADT/bit.h"
+        -:   26:#include "llvm/Support/Debug.h"
+        -:   27:#include <cstdint>
+        -:   28:
+        -:   29:#define DEBUG_TYPE "spirv-serialization"
+        -:   30:
+        -:   31:using namespace mlir;
+        -:   32:
+        -:   33:/// Returns the merge block if the given `op` is a structured control flow op.
+        -:   34:/// Otherwise returns nullptr.
+function _ZL36getStructuredControlFlowOpMergeBlockPN4mlir9OperationE called 0 returned 0% blocks executed 0%
+    #####:   35:static Block *getStructuredControlFlowOpMergeBlock(Operation *op) {
+    #####:   36:  if (auto selectionOp = dyn_cast<spirv::SelectionOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   37:    return selectionOp.getMergeBlock();
+call    0 never executed
+    #####:   38:  if (auto loopOp = dyn_cast<spirv::LoopOp>(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   39:    return loopOp.getMergeBlock();
+call    0 never executed
+    #####:   40:  return nullptr;
+        -:   41:}
+        -:   42:
+        -:   43:/// Given a predecessor `block` for a block with arguments, returns the block
+        -:   44:/// that should be used as the parent block for SPIR-V OpPhi instructions
+        -:   45:/// corresponding to the block arguments.
+function _ZL19getPhiIncomingBlockPN4mlir5BlockE called 0 returned 0% blocks executed 0%
+    #####:   46:static Block *getPhiIncomingBlock(Block *block) {
+        -:   47:  // If the predecessor block in question is the entry block for a
+        -:   48:  // spirv.mlir.loop, we jump to this spirv.mlir.loop from its enclosing block.
+    #####:   49:  if (block->isEntryBlock()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   50:    if (auto loopOp = dyn_cast<spirv::LoopOp>(block->getParentOp())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:   51:      // Then the incoming parent block for OpPhi should be the merge block of
+        -:   52:      // the structured control flow op before this loop.
+        -:   53:      Operation *op = loopOp.getOperation();
+    #####:   54:      while ((op = op->getPrevNode()) != nullptr)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   55:        if (Block *incomingBlock = getStructuredControlFlowOpMergeBlock(op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   56:          return incomingBlock;
+        -:   57:      // Or the enclosing block itself if no structured control flow ops
+        -:   58:      // exists before this loop.
+    #####:   59:      return loopOp->getBlock();
+        -:   60:    }
+        -:   61:  }
+        -:   62:
+        -:   63:  // Otherwise, we jump from the given predecessor block. Try to see if there is
+        -:   64:  // a structured control flow op inside it.
+    #####:   65:  for (Operation &op : llvm::reverse(block->getOperations())) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:   66:    if (Block *incomingBlock = getStructuredControlFlowOpMergeBlock(&op))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   67:      return incomingBlock;
+        -:   68:  }
+    #####:   69:  return block;
+        -:   70:}
+        -:   71:
+        -:   72:namespace mlir {
+        -:   73:namespace spirv {
+        -:   74:
+        -:   75:/// Encodes an SPIR-V instruction with the given `opcode` and `operands` into
+        -:   76:/// the given `binary` vector.
+function _ZN4mlir5spirv21encodeInstructionIntoERN4llvm15SmallVectorImplIjEENS0_6OpcodeENS1_8ArrayRefIjEE called 0 returned 0% blocks executed 0%
+    #####:   77:void encodeInstructionInto(SmallVectorImpl<uint32_t> &binary, spirv::Opcode op,
+        -:   78:                           ArrayRef<uint32_t> operands) {
+    #####:   79:  uint32_t wordCount = 1 + operands.size();
+call    0 never executed
+    #####:   80:  binary.push_back(spirv::getPrefixedOpcode(wordCount, op));
+call    0 never executed
+call    1 never executed
+    #####:   81:  binary.append(operands.begin(), operands.end());
+call    0 never executed
+    #####:   82:}
+        -:   83:
+function _ZN4mlir5spirv10SerializerC2ENS0_8ModuleOpERKNS0_20SerializationOptionsE called 0 returned 0% blocks executed 0%
+    #####:   84:Serializer::Serializer(spirv::ModuleOp module,
+    #####:   85:                       const SerializationOptions &options)
+    #####:   86:    : module(module), mlirBuilder(module.getContext()), options(options) {}
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:   87:
+function _ZN4mlir5spirv10Serializer9serializeEv called 0 returned 0% blocks executed 0%
+    #####:   88:LogicalResult Serializer::serialize() {
+    #####:   89:  LLVM_DEBUG(llvm::dbgs() << "+++ starting serialization +++\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:   90:
+    #####:   91:  if (failed(module.verifyInvariants()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   92:    return failure();
+        -:   93:
+        -:   94:  // TODO: handle the other sections
+    #####:   95:  processCapability();
+call    0 never executed
+    #####:   96:  processExtension();
+call    0 never executed
+    #####:   97:  processMemoryModel();
+call    0 never executed
+    #####:   98:  processDebugInfo();
+call    0 never executed
+        -:   99:
+        -:  100:  // Iterate over the module body to serialize it. Assumptions are that there is
+        -:  101:  // only one basic block in the moduleOp
+    #####:  102:  for (auto &op : *module.getBody()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  103:    if (failed(processOperation(&op))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  104:      return failure();
+        -:  105:    }
+        -:  106:  }
+        -:  107:
+    #####:  108:  LLVM_DEBUG(llvm::dbgs() << "+++ completed serialization +++\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  109:  return success();
+        -:  110:}
+        -:  111:
+function _ZN4mlir5spirv10Serializer7collectERN4llvm15SmallVectorImplIjEE called 0 returned 0% blocks executed 0%
+    #####:  112:void Serializer::collect(SmallVectorImpl<uint32_t> &binary) {
+    #####:  113:  auto moduleSize = spirv::kHeaderWordCount + capabilities.size() +
+branch  0 never executed
+branch  1 never executed
+    #####:  114:                    extensions.size() + extendedSets.size() +
+    #####:  115:                    memoryModel.size() + entryPoints.size() +
+    #####:  116:                    executionModes.size() + decorations.size() +
+    #####:  117:                    typesGlobalValues.size() + functions.size();
+        -:  118:
+    #####:  119:  binary.clear();
+branch  0 never executed
+branch  1 never executed
+    #####:  120:  binary.reserve(moduleSize);
+branch  0 never executed
+branch  1 never executed
+        -:  121:
+    #####:  122:  spirv::appendModuleHeader(binary, module.getVceTriple()->getVersion(),
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+        -:  123:                            nextID);
+    #####:  124:  binary.append(capabilities.begin(), capabilities.end());
+call    0 never executed
+    #####:  125:  binary.append(extensions.begin(), extensions.end());
+call    0 never executed
+    #####:  126:  binary.append(extendedSets.begin(), extendedSets.end());
+call    0 never executed
+    #####:  127:  binary.append(memoryModel.begin(), memoryModel.end());
+call    0 never executed
+    #####:  128:  binary.append(entryPoints.begin(), entryPoints.end());
+call    0 never executed
+    #####:  129:  binary.append(executionModes.begin(), executionModes.end());
+call    0 never executed
+    #####:  130:  binary.append(debug.begin(), debug.end());
+call    0 never executed
+    #####:  131:  binary.append(names.begin(), names.end());
+call    0 never executed
+    #####:  132:  binary.append(decorations.begin(), decorations.end());
+call    0 never executed
+    #####:  133:  binary.append(typesGlobalValues.begin(), typesGlobalValues.end());
+call    0 never executed
+    #####:  134:  binary.append(functions.begin(), functions.end());
+call    0 never executed
+    #####:  135:}
+        -:  136:
+        -:  137:#ifndef NDEBUG
+function _ZN4mlir5spirv10Serializer15printValueIDMapERN4llvm11raw_ostreamE called 0 returned 0% blocks executed 0%
+    #####:  138:void Serializer::printValueIDMap(raw_ostream &os) {
+    #####:  139:  os << "\n= Value <id> Map =\n\n";
+call    0 never executed
+    #####:  140:  for (auto valueIDPair : valueIDMap) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  141:    Value val = valueIDPair.first;
+    #####:  142:    os << "  " << val << " "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  143:       << "id = " << valueIDPair.second << ' ';
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  144:    if (auto *op = val.getDefiningOp()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  145:      os << "from op '" << op->getName() << "'";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  146:    } else if (auto arg = val.dyn_cast<BlockArgument>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  147:      Block *block = arg.getOwner();
+call    0 never executed
+    #####:  148:      os << "from argument of block " << block << ' ';
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  149:      os << " in op '" << block->getParentOp()->getName() << "'";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  150:    }
+    #####:  151:    os << '\n';
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  152:  }
+    #####:  153:}
+        -:  154:#endif
+        -:  155:
+        -:  156://===----------------------------------------------------------------------===//
+        -:  157:// Module structure
+        -:  158://===----------------------------------------------------------------------===//
+        -:  159:
+function _ZN4mlir5spirv10Serializer21getOrCreateFunctionIDEN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  160:uint32_t Serializer::getOrCreateFunctionID(StringRef fnName) {
+    #####:  161:  auto funcID = funcIDMap.lookup(fnName);
+call    0 never executed
+    #####:  162:  if (!funcID) {
+branch  0 never executed
+branch  1 never executed
+    #####:  163:    funcID = getNextID();
+call    0 never executed
+    #####:  164:    funcIDMap[fnName] = funcID;
+call    0 never executed
+        -:  165:  }
+    #####:  166:  return funcID;
+        -:  167:}
+        -:  168:
+function _ZN4mlir5spirv10Serializer17processCapabilityEv called 0 returned 0% blocks executed 0%
+    #####:  169:void Serializer::processCapability() {
+    #####:  170:  for (auto cap : module.getVceTriple()->getCapabilities())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  171:    encodeInstructionInto(capabilities, spirv::Opcode::OpCapability,
+call    0 never executed
+        -:  172:                          {static_cast<uint32_t>(cap)});
+    #####:  173:}
+        -:  174:
+function _ZN4mlir5spirv10Serializer16processDebugInfoEv called 0 returned 0% blocks executed 0%
+    #####:  175:void Serializer::processDebugInfo() {
+    #####:  176:  if (!options.emitDebugInfo)
+branch  0 never executed
+branch  1 never executed
+    #####:  177:    return;
+    #####:  178:  auto fileLoc = module.getLoc().dyn_cast<FileLineColLoc>();
+call    0 never executed
+    #####:  179:  auto fileName = fileLoc ? fileLoc.getFilename().strref() : "<unknown>";
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  180:  fileID = getNextID();
+call    0 never executed
+    #####:  181:  SmallVector<uint32_t, 16> operands;
+call    0 never executed
+    #####:  182:  operands.push_back(fileID);
+call    0 never executed
+    #####:  183:  spirv::encodeStringLiteralInto(operands, fileName);
+call    0 never executed
+    #####:  184:  encodeInstructionInto(debug, spirv::Opcode::OpString, operands);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  185:  // TODO: Encode more debug instructions.
+        -:  186:}
+        -:  187:
+function _ZN4mlir5spirv10Serializer16processExtensionEv called 0 returned 0% blocks executed 0%
+    #####:  188:void Serializer::processExtension() {
+    #####:  189:  llvm::SmallVector<uint32_t, 16> extName;
+call    0 never executed
+    #####:  190:  for (spirv::Extension ext : module.getVceTriple()->getExtensions()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  191:    extName.clear();
+call    0 never executed
+    #####:  192:    spirv::encodeStringLiteralInto(extName, spirv::stringifyExtension(ext));
+call    0 never executed
+call    1 never executed
+    #####:  193:    encodeInstructionInto(extensions, spirv::Opcode::OpExtension, extName);
+call    0 never executed
+        -:  194:  }
+    #####:  195:}
+        -:  196:
+function _ZN4mlir5spirv10Serializer18processMemoryModelEv called 0 returned 0% blocks executed 0%
+    #####:  197:void Serializer::processMemoryModel() {
+    #####:  198:  auto mm = static_cast<uint32_t>(
+    #####:  199:      module->getAttrOfType<spirv::MemoryModelAttr>("memory_model").getValue());
+call    0 never executed
+call    1 never executed
+    #####:  200:  auto am = static_cast<uint32_t>(
+    #####:  201:      module->getAttrOfType<spirv::AddressingModelAttr>("addressing_model")
+call    0 never executed
+    #####:  202:          .getValue());
+call    0 never executed
+        -:  203:
+    #####:  204:  encodeInstructionInto(memoryModel, spirv::Opcode::OpMemoryModel, {am, mm});
+call    0 never executed
+    #####:  205:}
+        -:  206:
+function _ZN4mlir5spirv10Serializer17processDecorationENS_8LocationEjNS_14NamedAttributeE called 0 returned 0% blocks executed 0%
+    #####:  207:LogicalResult Serializer::processDecoration(Location loc, uint32_t resultID,
+        -:  208:                                            NamedAttribute attr) {
+    #####:  209:  auto attrName = attr.getName().strref();
+call    0 never executed
+call    1 never executed
+    #####:  210:  auto decorationName = llvm::convertToCamelFromSnakeCase(attrName, true);
+call    0 never executed
+    #####:  211:  auto decoration = spirv::symbolizeDecoration(decorationName);
+call    0 never executed
+    #####:  212:  if (!decoration) {
+branch  0 never executed
+branch  1 never executed
+    #####:  213:    return emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  214:               loc, "non-argument attributes expected to have snake-case-ified "
+        -:  215:                    "decoration name, unhandled attribute with name : ")
+    #####:  216:           << attrName;
+call    0 never executed
+        -:  217:  }
+    #####:  218:  SmallVector<uint32_t, 1> args;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  219:  switch (*decoration) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  220:  case spirv::Decoration::Binding:
+    #####:  221:  case spirv::Decoration::DescriptorSet:
+    #####:  222:  case spirv::Decoration::Location:
+    #####:  223:    if (auto intAttr = attr.getValue().dyn_cast<IntegerAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  224:      args.push_back(intAttr.getValue().getZExtValue());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  225:      break;
+        -:  226:    }
+    #####:  227:    return emitError(loc, "expected integer attribute for ") << attrName;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  228:  case spirv::Decoration::BuiltIn:
+    #####:  229:    if (auto strAttr = attr.getValue().dyn_cast<StringAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  230:      auto enumVal = spirv::symbolizeBuiltIn(strAttr.getValue());
+call    0 never executed
+call    1 never executed
+    #####:  231:      if (enumVal) {
+branch  0 never executed
+branch  1 never executed
+    #####:  232:        args.push_back(static_cast<uint32_t>(*enumVal));
+call    0 never executed
+    #####:  233:        break;
+        -:  234:      }
+    #####:  235:      return emitError(loc, "invalid ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  236:             << attrName << " attribute " << strAttr.getValue();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  237:    }
+    #####:  238:    return emitError(loc, "expected string attribute for ") << attrName;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  239:  case spirv::Decoration::Aliased:
+    #####:  240:  case spirv::Decoration::Flat:
+    #####:  241:  case spirv::Decoration::NonReadable:
+    #####:  242:  case spirv::Decoration::NonWritable:
+    #####:  243:  case spirv::Decoration::NoPerspective:
+    #####:  244:  case spirv::Decoration::Restrict:
+    #####:  245:  case spirv::Decoration::RelaxedPrecision:
+        -:  246:    // For unit attributes, the args list has no values so we do nothing
+    #####:  247:    if (auto unitAttr = attr.getValue().dyn_cast<UnitAttr>())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  248:      break;
+    #####:  249:    return emitError(loc, "expected unit attribute for ") << attrName;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  250:  default:
+    #####:  251:    return emitError(loc, "unhandled decoration ") << decorationName;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  252:  }
+    #####:  253:  return emitDecoration(resultID, *decoration, args);
+call    0 never executed
+        -:  254:}
+        -:  255:
+function _ZN4mlir5spirv10Serializer11processNameEjN4llvm9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  256:LogicalResult Serializer::processName(uint32_t resultID, StringRef name) {
+    #####:  257:  assert(!name.empty() && "unexpected empty string for OpName");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  258:  if (!options.emitSymbolName)
+branch  0 never executed
+branch  1 never executed
+    #####:  259:    return success();
+        -:  260:
+    #####:  261:  SmallVector<uint32_t, 4> nameOperands;
+call    0 never executed
+    #####:  262:  nameOperands.push_back(resultID);
+call    0 never executed
+    #####:  263:  spirv::encodeStringLiteralInto(nameOperands, name);
+call    0 never executed
+    #####:  264:  encodeInstructionInto(names, spirv::Opcode::OpName, nameOperands);
+call    0 never executed
+    #####:  265:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  266:}
+        -:  267:
+        -:  268:template <>
+function _ZN4mlir5spirv10Serializer21processTypeDecorationINS0_9ArrayTypeEEENS_13LogicalResultENS_8LocationET_j called 0 returned 0% blocks executed 0%
+    #####:  269:LogicalResult Serializer::processTypeDecoration<spirv::ArrayType>(
+        -:  270:    Location loc, spirv::ArrayType type, uint32_t resultID) {
+    #####:  271:  if (unsigned stride = type.getArrayStride()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  272:    // OpDecorate %arrayTypeSSA ArrayStride strideLiteral
+    #####:  273:    return emitDecoration(resultID, spirv::Decoration::ArrayStride, {stride});
+call    0 never executed
+        -:  274:  }
+    #####:  275:  return success();
+        -:  276:}
+        -:  277:
+        -:  278:template <>
+function _ZN4mlir5spirv10Serializer21processTypeDecorationINS0_16RuntimeArrayTypeEEENS_13LogicalResultENS_8LocationET_j called 0 returned 0% blocks executed 0%
+    #####:  279:LogicalResult Serializer::processTypeDecoration<spirv::RuntimeArrayType>(
+        -:  280:    Location loc, spirv::RuntimeArrayType type, uint32_t resultID) {
+    #####:  281:  if (unsigned stride = type.getArrayStride()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  282:    // OpDecorate %arrayTypeSSA ArrayStride strideLiteral
+    #####:  283:    return emitDecoration(resultID, spirv::Decoration::ArrayStride, {stride});
+call    0 never executed
+        -:  284:  }
+    #####:  285:  return success();
+        -:  286:}
+        -:  287:
+function _ZN4mlir5spirv10Serializer23processMemberDecorationEjRKNS0_10StructType20MemberDecorationInfoE called 0 returned 0% blocks executed 0%
+    #####:  288:LogicalResult Serializer::processMemberDecoration(
+        -:  289:    uint32_t structID,
+        -:  290:    const spirv::StructType::MemberDecorationInfo &memberDecoration) {
+    #####:  291:  SmallVector<uint32_t, 4> args(
+    #####:  292:      {structID, memberDecoration.memberIndex,
+    #####:  293:       static_cast<uint32_t>(memberDecoration.decoration)});
+call    0 never executed
+    #####:  294:  if (memberDecoration.hasValue) {
+branch  0 never executed
+branch  1 never executed
+    #####:  295:    args.push_back(memberDecoration.decorationValue);
+call    0 never executed
+        -:  296:  }
+    #####:  297:  encodeInstructionInto(decorations, spirv::Opcode::OpMemberDecorate, args);
+call    0 never executed
+    #####:  298:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  299:}
+        -:  300:
+        -:  301://===----------------------------------------------------------------------===//
+        -:  302:// Type
+        -:  303://===----------------------------------------------------------------------===//
+        -:  304:
+        -:  305:// According to the SPIR-V spec "Validation Rules for Shader Capabilities":
+        -:  306:// "Composite objects in the StorageBuffer, PhysicalStorageBuffer, Uniform, and
+        -:  307:// PushConstant Storage Classes must be explicitly laid out."
+function _ZNK4mlir5spirv10Serializer24isInterfaceStructPtrTypeENS_4TypeE called 0 returned 0% blocks executed 0%
+    #####:  308:bool Serializer::isInterfaceStructPtrType(Type type) const {
+    #####:  309:  if (auto ptrType = type.dyn_cast<spirv::PointerType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  310:    switch (ptrType.getStorageClass()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  311:    case spirv::StorageClass::PhysicalStorageBuffer:
+    #####:  312:    case spirv::StorageClass::PushConstant:
+    #####:  313:    case spirv::StorageClass::StorageBuffer:
+    #####:  314:    case spirv::StorageClass::Uniform:
+    #####:  315:      return ptrType.getPointeeType().isa<spirv::StructType>();
+call    0 never executed
+call    1 never executed
+        -:  316:    default:
+        -:  317:      break;
+        -:  318:    }
+        -:  319:  }
+    #####:  320:  return false;
+        -:  321:}
+        -:  322:
+function _ZN4mlir5spirv10Serializer11processTypeENS_8LocationENS_4TypeERj called 0 returned 0% blocks executed 0%
+    #####:  323:LogicalResult Serializer::processType(Location loc, Type type,
+        -:  324:                                      uint32_t &typeID) {
+        -:  325:  // Maintains a set of names for nested identified struct types. This is used
+        -:  326:  // to properly serialize recursive references.
+    #####:  327:  SetVector<StringRef> serializationCtx;
+call    0 never executed
+call    1 never executed
+    #####:  328:  return processTypeImpl(loc, type, typeID, serializationCtx);
+call    0 never executed
+        -:  329:}
+        -:  330:
+        -:  331:LogicalResult
+function _ZN4mlir5spirv10Serializer15processTypeImplENS_8LocationENS_4TypeERjRN4llvm9SetVectorINS5_9StringRefESt6vectorIS7_SaIS7_EENS5_8DenseSetIS7_NS5_12DenseMapInfoIS7_vEEEEEE called 0 returned 0% blocks executed 0%
+    #####:  332:Serializer::processTypeImpl(Location loc, Type type, uint32_t &typeID,
+        -:  333:                            SetVector<StringRef> &serializationCtx) {
+    #####:  334:  typeID = getTypeID(type);
+call    0 never executed
+    #####:  335:  if (typeID)
+branch  0 never executed
+branch  1 never executed
+    #####:  336:    return success();
+        -:  337:
+    #####:  338:  typeID = getNextID();
+call    0 never executed
+    #####:  339:  SmallVector<uint32_t, 4> operands;
+call    0 never executed
+        -:  340:
+    #####:  341:  operands.push_back(typeID);
+call    0 never executed
+    #####:  342:  auto typeEnum = spirv::Opcode::OpTypeVoid;
+    #####:  343:  bool deferSerialization = false;
+        -:  344:
+    #####:  345:  if ((type.isa<FunctionType>() &&
+call    0 never executed
+    #####:  346:       succeeded(prepareFunctionType(loc, type.cast<FunctionType>(), typeEnum,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  347:                                     operands))) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  348:      succeeded(prepareBasicType(loc, type, typeID, typeEnum, operands,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  349:                                 deferSerialization, serializationCtx))) {
+    #####:  350:    if (deferSerialization)
+branch  0 never executed
+branch  1 never executed
+    #####:  351:      return success();
+        -:  352:
+    #####:  353:    typeIDMap[type] = typeID;
+call    0 never executed
+        -:  354:
+    #####:  355:    encodeInstructionInto(typesGlobalValues, typeEnum, operands);
+call    0 never executed
+        -:  356:
+    #####:  357:    if (recursiveStructInfos.count(type) != 0) {
+call    0 never executed
+        -:  358:      // This recursive struct type is emitted already, now the OpTypePointer
+        -:  359:      // instructions referring to recursive references are emitted as well.
+    #####:  360:      for (auto &ptrInfo : recursiveStructInfos[type]) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  361:        // TODO: This might not work if more than 1 recursive reference is
+        -:  362:        // present in the struct.
+    #####:  363:        SmallVector<uint32_t, 4> ptrOperands;
+call    0 never executed
+    #####:  364:        ptrOperands.push_back(ptrInfo.pointerTypeID);
+call    0 never executed
+    #####:  365:        ptrOperands.push_back(static_cast<uint32_t>(ptrInfo.storageClass));
+call    0 never executed
+    #####:  366:        ptrOperands.push_back(typeIDMap[type]);
+call    0 never executed
+call    1 never executed
+        -:  367:
+    #####:  368:        encodeInstructionInto(typesGlobalValues, spirv::Opcode::OpTypePointer,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  369:                              ptrOperands);
+        -:  370:      }
+        -:  371:
+    #####:  372:      recursiveStructInfos[type].clear();
+call    0 never executed
+        -:  373:    }
+        -:  374:
+    #####:  375:    return success();
+        -:  376:  }
+        -:  377:
+    #####:  378:  return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  379:}
+        -:  380:
+function _ZN4mlir5spirv10Serializer16prepareBasicTypeENS_8LocationENS_4TypeEjRNS0_6OpcodeERN4llvm15SmallVectorImplIjEERbRNS6_9SetVectorINS6_9StringRefESt6vectorISC_SaISC_EENS6_8DenseSetISC_NS6_12DenseMapInfoISC_vEEEEEE called 0 returned 0% blocks executed 0%
+    #####:  381:LogicalResult Serializer::prepareBasicType(
+        -:  382:    Location loc, Type type, uint32_t resultID, spirv::Opcode &typeEnum,
+        -:  383:    SmallVectorImpl<uint32_t> &operands, bool &deferSerialization,
+        -:  384:    SetVector<StringRef> &serializationCtx) {
+    #####:  385:  deferSerialization = false;
+        -:  386:
+    #####:  387:  if (isVoidType(type)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  388:    typeEnum = spirv::Opcode::OpTypeVoid;
+    #####:  389:    return success();
+        -:  390:  }
+        -:  391:
+    #####:  392:  if (auto intType = type.dyn_cast<IntegerType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  393:    if (intType.getWidth() == 1) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  394:      typeEnum = spirv::Opcode::OpTypeBool;
+    #####:  395:      return success();
+        -:  396:    }
+        -:  397:
+    #####:  398:    typeEnum = spirv::Opcode::OpTypeInt;
+    #####:  399:    operands.push_back(intType.getWidth());
+call    0 never executed
+call    1 never executed
+        -:  400:    // SPIR-V OpTypeInt "Signedness specifies whether there are signed semantics
+        -:  401:    // to preserve or validate.
+        -:  402:    // 0 indicates unsigned, or no signedness semantics
+        -:  403:    // 1 indicates signed semantics."
+    #####:  404:    operands.push_back(intType.isSigned() ? 1 : 0);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  405:    return success();
+        -:  406:  }
+        -:  407:
+    #####:  408:  if (auto floatType = type.dyn_cast<FloatType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  409:    typeEnum = spirv::Opcode::OpTypeFloat;
+    #####:  410:    operands.push_back(floatType.getWidth());
+call    0 never executed
+call    1 never executed
+    #####:  411:    return success();
+        -:  412:  }
+        -:  413:
+    #####:  414:  if (auto vectorType = type.dyn_cast<VectorType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  415:    uint32_t elementTypeID = 0;
+    #####:  416:    if (failed(processTypeImpl(loc, vectorType.getElementType(), elementTypeID,
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  417:                               serializationCtx))) {
+    #####:  418:      return failure();
+        -:  419:    }
+    #####:  420:    typeEnum = spirv::Opcode::OpTypeVector;
+    #####:  421:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  422:    operands.push_back(vectorType.getNumElements());
+call    0 never executed
+call    1 never executed
+    #####:  423:    return success();
+        -:  424:  }
+        -:  425:
+    #####:  426:  if (auto imageType = type.dyn_cast<spirv::ImageType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  427:    typeEnum = spirv::Opcode::OpTypeImage;
+    #####:  428:    uint32_t sampledTypeID = 0;
+    #####:  429:    if (failed(processType(loc, imageType.getElementType(), sampledTypeID)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  430:      return failure();
+        -:  431:
+    #####:  432:    operands.push_back(sampledTypeID);
+call    0 never executed
+    #####:  433:    operands.push_back(static_cast<uint32_t>(imageType.getDim()));
+call    0 never executed
+call    1 never executed
+    #####:  434:    operands.push_back(static_cast<uint32_t>(imageType.getDepthInfo()));
+call    0 never executed
+call    1 never executed
+    #####:  435:    operands.push_back(static_cast<uint32_t>(imageType.getArrayedInfo()));
+call    0 never executed
+call    1 never executed
+    #####:  436:    operands.push_back(static_cast<uint32_t>(imageType.getSamplingInfo()));
+call    0 never executed
+call    1 never executed
+    #####:  437:    operands.push_back(static_cast<uint32_t>(imageType.getSamplerUseInfo()));
+call    0 never executed
+call    1 never executed
+    #####:  438:    operands.push_back(static_cast<uint32_t>(imageType.getImageFormat()));
+call    0 never executed
+call    1 never executed
+    #####:  439:    return success();
+        -:  440:  }
+        -:  441:
+    #####:  442:  if (auto arrayType = type.dyn_cast<spirv::ArrayType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  443:    typeEnum = spirv::Opcode::OpTypeArray;
+    #####:  444:    uint32_t elementTypeID = 0;
+    #####:  445:    if (failed(processTypeImpl(loc, arrayType.getElementType(), elementTypeID,
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  446:                               serializationCtx))) {
+    #####:  447:      return failure();
+        -:  448:    }
+    #####:  449:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  450:    if (auto elementCountID = prepareConstantInt(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  451:            loc, mlirBuilder.getI32IntegerAttr(arrayType.getNumElements()))) {
+call    0 never executed
+    #####:  452:      operands.push_back(elementCountID);
+call    0 never executed
+        -:  453:    }
+    #####:  454:    return processTypeDecoration(loc, arrayType, resultID);
+call    0 never executed
+        -:  455:  }
+        -:  456:
+    #####:  457:  if (auto ptrType = type.dyn_cast<spirv::PointerType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  458:    uint32_t pointeeTypeID = 0;
+    #####:  459:    spirv::StructType pointeeStruct =
+    #####:  460:        ptrType.getPointeeType().dyn_cast<spirv::StructType>();
+call    0 never executed
+call    1 never executed
+        -:  461:
+    #####:  462:    if (pointeeStruct && pointeeStruct.isIdentified() &&
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  463:        serializationCtx.count(pointeeStruct.getIdentifier()) != 0) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  464:      // A recursive reference to an enclosing struct is found.
+        -:  465:      //
+        -:  466:      // 1. Prepare an OpTypeForwardPointer with resultID and the ptr storage
+        -:  467:      // class as operands.
+    #####:  468:      SmallVector<uint32_t, 2> forwardPtrOperands;
+call    0 never executed
+    #####:  469:      forwardPtrOperands.push_back(resultID);
+call    0 never executed
+    #####:  470:      forwardPtrOperands.push_back(
+call    0 never executed
+    #####:  471:          static_cast<uint32_t>(ptrType.getStorageClass()));
+call    0 never executed
+        -:  472:
+    #####:  473:      encodeInstructionInto(typesGlobalValues,
+call    0 never executed
+        -:  474:                            spirv::Opcode::OpTypeForwardPointer,
+        -:  475:                            forwardPtrOperands);
+        -:  476:
+        -:  477:      // 2. Find the pointee (enclosing) struct.
+    #####:  478:      auto structType = spirv::StructType::getIdentified(
+    #####:  479:          module.getContext(), pointeeStruct.getIdentifier());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  480:
+    #####:  481:      if (!structType)
+branch  0 never executed
+branch  1 never executed
+    #####:  482:        return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  483:
+        -:  484:      // 3. Mark the OpTypePointer that is supposed to be emitted by this call
+        -:  485:      // as deferred.
+    #####:  486:      deferSerialization = true;
+        -:  487:
+        -:  488:      // 4. Record the info needed to emit the deferred OpTypePointer
+        -:  489:      // instruction when the enclosing struct is completely serialized.
+    #####:  490:      recursiveStructInfos[structType].push_back(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  491:          {resultID, ptrType.getStorageClass()});
+call    0 never executed
+        -:  492:    } else {
+    #####:  493:      if (failed(processTypeImpl(loc, ptrType.getPointeeType(), pointeeTypeID,
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  494:                                 serializationCtx)))
+    #####:  495:        return failure();
+        -:  496:    }
+        -:  497:
+    #####:  498:    typeEnum = spirv::Opcode::OpTypePointer;
+    #####:  499:    operands.push_back(static_cast<uint32_t>(ptrType.getStorageClass()));
+call    0 never executed
+call    1 never executed
+    #####:  500:    operands.push_back(pointeeTypeID);
+call    0 never executed
+        -:  501:
+    #####:  502:    if (isInterfaceStructPtrType(ptrType)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  503:      if (failed(emitDecoration(getTypeID(pointeeStruct),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  504:                                spirv::Decoration::Block)))
+    #####:  505:        return emitError(loc, "cannot decorate ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  506:               << pointeeStruct << " with Block decoration";
+call    0 never executed
+call    1 never executed
+        -:  507:    }
+        -:  508:
+    #####:  509:    return success();
+        -:  510:  }
+        -:  511:
+    #####:  512:  if (auto runtimeArrayType = type.dyn_cast<spirv::RuntimeArrayType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  513:    uint32_t elementTypeID = 0;
+    #####:  514:    if (failed(processTypeImpl(loc, runtimeArrayType.getElementType(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  515:                               elementTypeID, serializationCtx))) {
+    #####:  516:      return failure();
+        -:  517:    }
+    #####:  518:    typeEnum = spirv::Opcode::OpTypeRuntimeArray;
+    #####:  519:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  520:    return processTypeDecoration(loc, runtimeArrayType, resultID);
+call    0 never executed
+        -:  521:  }
+        -:  522:
+    #####:  523:  if (auto sampledImageType = type.dyn_cast<spirv::SampledImageType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  524:    typeEnum = spirv::Opcode::OpTypeSampledImage;
+    #####:  525:    uint32_t imageTypeID = 0;
+    #####:  526:    if (failed(
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  527:            processType(loc, sampledImageType.getImageType(), imageTypeID))) {
+    #####:  528:      return failure();
+        -:  529:    }
+    #####:  530:    operands.push_back(imageTypeID);
+call    0 never executed
+    #####:  531:    return success();
+        -:  532:  }
+        -:  533:
+    #####:  534:  if (auto structType = type.dyn_cast<spirv::StructType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  535:    if (structType.isIdentified()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  536:      if (failed(processName(resultID, structType.getIdentifier())))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  537:        return failure();
+    #####:  538:      serializationCtx.insert(structType.getIdentifier());
+call    0 never executed
+call    1 never executed
+        -:  539:    }
+        -:  540:
+    #####:  541:    bool hasOffset = structType.hasOffset();
+call    0 never executed
+    #####:  542:    for (auto elementIndex :
+    #####:  543:         llvm::seq<uint32_t>(0, structType.getNumElements())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  544:      uint32_t elementTypeID = 0;
+    #####:  545:      if (failed(processTypeImpl(loc, structType.getElementType(elementIndex),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  546:                                 elementTypeID, serializationCtx))) {
+    #####:  547:        return failure();
+        -:  548:      }
+    #####:  549:      operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  550:      if (hasOffset) {
+branch  0 never executed
+branch  1 never executed
+        -:  551:        // Decorate each struct member with an offset
+    #####:  552:        spirv::StructType::MemberDecorationInfo offsetDecoration{
+        -:  553:            elementIndex, /*hasValue=*/1, spirv::Decoration::Offset,
+    #####:  554:            static_cast<uint32_t>(structType.getMemberOffset(elementIndex))};
+call    0 never executed
+call    1 never executed
+    #####:  555:        if (failed(processMemberDecoration(resultID, offsetDecoration))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  556:          return emitError(loc, "cannot decorate ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  557:                 << elementIndex << "-th member of " << structType
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  558:                 << " with its offset";
+call    0 never executed
+        -:  559:        }
+        -:  560:      }
+        -:  561:    }
+    #####:  562:    SmallVector<spirv::StructType::MemberDecorationInfo, 4> memberDecorations;
+call    0 never executed
+    #####:  563:    structType.getMemberDecorations(memberDecorations);
+call    0 never executed
+        -:  564:
+    #####:  565:    for (auto &memberDecoration : memberDecorations) {
+branch  0 never executed
+branch  1 never executed
+    #####:  566:      if (failed(processMemberDecoration(resultID, memberDecoration))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  567:        return emitError(loc, "cannot decorate ")
+call    0 never executed
+call    1 never executed
+    #####:  568:               << static_cast<uint32_t>(memberDecoration.memberIndex)
+call    0 never executed
+call    1 never executed
+    #####:  569:               << "-th member of " << structType << " with "
+call    0 never executed
+call    1 never executed
+    #####:  570:               << stringifyDecoration(memberDecoration.decoration);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  571:      }
+        -:  572:    }
+        -:  573:
+    #####:  574:    typeEnum = spirv::Opcode::OpTypeStruct;
+        -:  575:
+    #####:  576:    if (structType.isIdentified())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  577:      serializationCtx.remove(structType.getIdentifier());
+call    0 never executed
+call    1 never executed
+        -:  578:
+    #####:  579:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  580:  }
+        -:  581:
+    #####:  582:  if (auto cooperativeMatrixType =
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  583:          type.dyn_cast<spirv::CooperativeMatrixNVType>()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  584:    uint32_t elementTypeID = 0;
+    #####:  585:    if (failed(processTypeImpl(loc, cooperativeMatrixType.getElementType(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  586:                               elementTypeID, serializationCtx))) {
+    #####:  587:      return failure();
+        -:  588:    }
+    #####:  589:    typeEnum = spirv::Opcode::OpTypeCooperativeMatrixNV;
+function _ZZN4mlir5spirv10Serializer16prepareBasicTypeENS_8LocationENS_4TypeEjRNS0_6OpcodeERN4llvm15SmallVectorImplIjEERbRNS6_9SetVectorINS6_9StringRefESt6vectorISC_SaISC_EENS6_8DenseSetISC_NS6_12DenseMapInfoISC_vEEEEEEENKUljE_clEj called 0 returned 0% blocks executed 0%
+    #####:  590:    auto getConstantOp = [&](uint32_t id) {
+    #####:  591:      auto attr = IntegerAttr::get(IntegerType::get(type.getContext(), 32), id);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  592:      return prepareConstantInt(loc, attr);
+call    0 never executed
+    #####:  593:    };
+    #####:  594:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  595:    operands.push_back(
+call    0 never executed
+call    1 never executed
+    #####:  596:        getConstantOp(static_cast<uint32_t>(cooperativeMatrixType.getScope())));
+call    0 never executed
+    #####:  597:    operands.push_back(getConstantOp(cooperativeMatrixType.getRows()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  598:    operands.push_back(getConstantOp(cooperativeMatrixType.getColumns()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  599:    return success();
+        -:  600:  }
+        -:  601:
+    #####:  602:  if (auto jointMatrixType = type.dyn_cast<spirv::JointMatrixINTELType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  603:    uint32_t elementTypeID = 0;
+    #####:  604:    if (failed(processTypeImpl(loc, jointMatrixType.getElementType(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  605:                               elementTypeID, serializationCtx))) {
+    #####:  606:      return failure();
+        -:  607:    }
+    #####:  608:    typeEnum = spirv::Opcode::OpTypeJointMatrixINTEL;
+function _ZZN4mlir5spirv10Serializer16prepareBasicTypeENS_8LocationENS_4TypeEjRNS0_6OpcodeERN4llvm15SmallVectorImplIjEERbRNS6_9SetVectorINS6_9StringRefESt6vectorISC_SaISC_EENS6_8DenseSetISC_NS6_12DenseMapInfoISC_vEEEEEEENKUljE0_clEj called 0 returned 0% blocks executed 0%
+    #####:  609:    auto getConstantOp = [&](uint32_t id) {
+    #####:  610:      auto attr = IntegerAttr::get(IntegerType::get(type.getContext(), 32), id);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  611:      return prepareConstantInt(loc, attr);
+call    0 never executed
+    #####:  612:    };
+    #####:  613:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  614:    operands.push_back(getConstantOp(jointMatrixType.getRows()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  615:    operands.push_back(getConstantOp(jointMatrixType.getColumns()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  616:    operands.push_back(getConstantOp(
+call    0 never executed
+call    1 never executed
+    #####:  617:        static_cast<uint32_t>(jointMatrixType.getMatrixLayout())));
+call    0 never executed
+    #####:  618:    operands.push_back(
+call    0 never executed
+call    1 never executed
+    #####:  619:        getConstantOp(static_cast<uint32_t>(jointMatrixType.getScope())));
+call    0 never executed
+    #####:  620:    return success();
+        -:  621:  }
+        -:  622:
+    #####:  623:  if (auto matrixType = type.dyn_cast<spirv::MatrixType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  624:    uint32_t elementTypeID = 0;
+    #####:  625:    if (failed(processTypeImpl(loc, matrixType.getColumnType(), elementTypeID,
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  626:                               serializationCtx))) {
+    #####:  627:      return failure();
+        -:  628:    }
+    #####:  629:    typeEnum = spirv::Opcode::OpTypeMatrix;
+    #####:  630:    operands.push_back(elementTypeID);
+call    0 never executed
+    #####:  631:    operands.push_back(matrixType.getNumColumns());
+call    0 never executed
+call    1 never executed
+    #####:  632:    return success();
+        -:  633:  }
+        -:  634:
+        -:  635:  // TODO: Handle other types.
+    #####:  636:  return emitError(loc, "unhandled type in serialization: ") << type;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+        -:  637:}
+        -:  638:
+        -:  639:LogicalResult
+function _ZN4mlir5spirv10Serializer19prepareFunctionTypeENS_8LocationENS_12FunctionTypeERNS0_6OpcodeERN4llvm15SmallVectorImplIjEE called 0 returned 0% blocks executed 0%
+    #####:  640:Serializer::prepareFunctionType(Location loc, FunctionType type,
+        -:  641:                                spirv::Opcode &typeEnum,
+        -:  642:                                SmallVectorImpl<uint32_t> &operands) {
+    #####:  643:  typeEnum = spirv::Opcode::OpTypeFunction;
+    #####:  644:  assert(type.getNumResults() <= 1 &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  645:         "serialization supports only a single return value");
+    #####:  646:  uint32_t resultID = 0;
+    #####:  647:  if (failed(processType(
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  648:          loc, type.getNumResults() == 1 ? type.getResult(0) : getVoidType(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  649:          resultID))) {
+    #####:  650:    return failure();
+        -:  651:  }
+    #####:  652:  operands.push_back(resultID);
+call    0 never executed
+    #####:  653:  for (auto &res : type.getInputs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  654:    uint32_t argTypeID = 0;
+    #####:  655:    if (failed(processType(loc, res, argTypeID))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  656:      return failure();
+        -:  657:    }
+    #####:  658:    operands.push_back(argTypeID);
+call    0 never executed
+        -:  659:  }
+    #####:  660:  return success();
+        -:  661:}
+        -:  662:
+        -:  663://===----------------------------------------------------------------------===//
+        -:  664:// Constant
+        -:  665://===----------------------------------------------------------------------===//
+        -:  666:
+function _ZN4mlir5spirv10Serializer15prepareConstantENS_8LocationENS_4TypeENS_9AttributeE called 0 returned 0% blocks executed 0%
+    #####:  667:uint32_t Serializer::prepareConstant(Location loc, Type constType,
+        -:  668:                                     Attribute valueAttr) {
+    #####:  669:  if (auto id = prepareConstantScalar(loc, valueAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  670:    return id;
+        -:  671:  }
+        -:  672:
+        -:  673:  // This is a composite literal. We need to handle each component separately
+        -:  674:  // and then emit an OpConstantComposite for the whole.
+        -:  675:
+    #####:  676:  if (auto id = getConstantID(valueAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  677:    return id;
+        -:  678:  }
+        -:  679:
+    #####:  680:  uint32_t typeID = 0;
+    #####:  681:  if (failed(processType(loc, constType, typeID))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  682:    return 0;
+        -:  683:  }
+        -:  684:
+    #####:  685:  uint32_t resultID = 0;
+    #####:  686:  if (auto attr = valueAttr.dyn_cast<DenseElementsAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  687:    int rank = attr.getType().dyn_cast<ShapedType>().getRank();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  688:    SmallVector<uint64_t, 4> index(rank);
+call    0 never executed
+    #####:  689:    resultID = prepareDenseElementsConstant(loc, constType, attr,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  690:                                            /*dim=*/0, index);
+    #####:  691:  } else if (auto arrayAttr = valueAttr.dyn_cast<ArrayAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  692:    resultID = prepareArrayConstant(loc, constType, arrayAttr);
+call    0 never executed
+        -:  693:  }
+        -:  694:
+    #####:  695:  if (resultID == 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  696:    emitError(loc, "cannot serialize attribute: ") << valueAttr;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  697:    return 0;
+        -:  698:  }
+        -:  699:
+    #####:  700:  constIDMap[valueAttr] = resultID;
+call    0 never executed
+    #####:  701:  return resultID;
+        -:  702:}
+        -:  703:
+function _ZN4mlir5spirv10Serializer20prepareArrayConstantENS_8LocationENS_4TypeENS_9ArrayAttrE called 0 returned 0% blocks executed 0%
+    #####:  704:uint32_t Serializer::prepareArrayConstant(Location loc, Type constType,
+        -:  705:                                          ArrayAttr attr) {
+    #####:  706:  uint32_t typeID = 0;
+    #####:  707:  if (failed(processType(loc, constType, typeID))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  708:    return 0;
+        -:  709:  }
+        -:  710:
+    #####:  711:  uint32_t resultID = getNextID();
+call    0 never executed
+    #####:  712:  SmallVector<uint32_t, 4> operands = {typeID, resultID};
+call    0 never executed
+    #####:  713:  operands.reserve(attr.size() + 2);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  714:  auto elementType = constType.cast<spirv::ArrayType>().getElementType();
+call    0 never executed
+call    1 never executed
+    #####:  715:  for (Attribute elementAttr : attr) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  716:    if (auto elementID = prepareConstant(loc, elementType, elementAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  717:      operands.push_back(elementID);
+call    0 never executed
+        -:  718:    } else {
+    #####:  719:      return 0;
+        -:  720:    }
+        -:  721:  }
+    #####:  722:  spirv::Opcode opcode = spirv::Opcode::OpConstantComposite;
+    #####:  723:  encodeInstructionInto(typesGlobalValues, opcode, operands);
+call    0 never executed
+        -:  724:
+    #####:  725:  return resultID;
+        -:  726:}
+        -:  727:
+        -:  728:// TODO: Turn the below function into iterative function, instead of
+        -:  729:// recursive function.
+        -:  730:uint32_t
+function _ZN4mlir5spirv10Serializer28prepareDenseElementsConstantENS_8LocationENS_4TypeENS_17DenseElementsAttrEiN4llvm15MutableArrayRefImEE called 0 returned 0% blocks executed 0%
+    #####:  731:Serializer::prepareDenseElementsConstant(Location loc, Type constType,
+        -:  732:                                         DenseElementsAttr valueAttr, int dim,
+        -:  733:                                         MutableArrayRef<uint64_t> index) {
+    #####:  734:  auto shapedType = valueAttr.getType().dyn_cast<ShapedType>();
+call    0 never executed
+call    1 never executed
+    #####:  735:  assert(dim <= shapedType.getRank());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  736:  if (shapedType.getRank() == dim) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  737:    if (auto attr = valueAttr.dyn_cast<DenseIntElementsAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  738:      return attr.getType().getElementType().isInteger(1)
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  739:                 ? prepareConstantBool(loc, attr.getValues<BoolAttr>()[index])
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  740:                 : prepareConstantInt(loc,
+call    0 never executed
+    #####:  741:                                      attr.getValues<IntegerAttr>()[index]);
+call    0 never executed
+call    1 never executed
+        -:  742:    }
+    #####:  743:    if (auto attr = valueAttr.dyn_cast<DenseFPElementsAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  744:      return prepareConstantFp(loc, attr.getValues<FloatAttr>()[index]);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  745:    }
+    #####:  746:    return 0;
+        -:  747:  }
+        -:  748:
+    #####:  749:  uint32_t typeID = 0;
+    #####:  750:  if (failed(processType(loc, constType, typeID))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  751:    return 0;
+        -:  752:  }
+        -:  753:
+    #####:  754:  uint32_t resultID = getNextID();
+call    0 never executed
+    #####:  755:  SmallVector<uint32_t, 4> operands = {typeID, resultID};
+call    0 never executed
+    #####:  756:  operands.reserve(shapedType.getDimSize(dim) + 2);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  757:  auto elementType = constType.cast<spirv::CompositeType>().getElementType(0);
+call    0 never executed
+call    1 never executed
+    #####:  758:  for (int i = 0; i < shapedType.getDimSize(dim); ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  759:    index[dim] = i;
+branch  0 never executed
+branch  1 never executed
+    #####:  760:    if (auto elementID = prepareDenseElementsConstant(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  761:            loc, elementType, valueAttr, dim + 1, index)) {
+    #####:  762:      operands.push_back(elementID);
+call    0 never executed
+        -:  763:    } else {
+        -:  764:      return 0;
+        -:  765:    }
+        -:  766:  }
+    #####:  767:  spirv::Opcode opcode = spirv::Opcode::OpConstantComposite;
+    #####:  768:  encodeInstructionInto(typesGlobalValues, opcode, operands);
+call    0 never executed
+        -:  769:
+    #####:  770:  return resultID;
+        -:  771:}
+        -:  772:
+function _ZN4mlir5spirv10Serializer21prepareConstantScalarENS_8LocationENS_9AttributeEb called 0 returned 0% blocks executed 0%
+    #####:  773:uint32_t Serializer::prepareConstantScalar(Location loc, Attribute valueAttr,
+        -:  774:                                           bool isSpec) {
+    #####:  775:  if (auto floatAttr = valueAttr.dyn_cast<FloatAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  776:    return prepareConstantFp(loc, floatAttr, isSpec);
+call    0 never executed
+        -:  777:  }
+    #####:  778:  if (auto boolAttr = valueAttr.dyn_cast<BoolAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  779:    return prepareConstantBool(loc, boolAttr, isSpec);
+call    0 never executed
+        -:  780:  }
+    #####:  781:  if (auto intAttr = valueAttr.dyn_cast<IntegerAttr>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  782:    return prepareConstantInt(loc, intAttr, isSpec);
+call    0 never executed
+        -:  783:  }
+        -:  784:
+        -:  785:  return 0;
+        -:  786:}
+        -:  787:
+function _ZN4mlir5spirv10Serializer19prepareConstantBoolENS_8LocationENS_8BoolAttrEb called 0 returned 0% blocks executed 0%
+    #####:  788:uint32_t Serializer::prepareConstantBool(Location loc, BoolAttr boolAttr,
+        -:  789:                                         bool isSpec) {
+    #####:  790:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+        -:  791:    // We can de-duplicate normal constants, but not specialization constants.
+    #####:  792:    if (auto id = getConstantID(boolAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  793:      return id;
+        -:  794:    }
+        -:  795:  }
+        -:  796:
+        -:  797:  // Process the type for this bool literal
+    #####:  798:  uint32_t typeID = 0;
+    #####:  799:  if (failed(
+call    0 never executed
+call    1 never executed
+    #####:  800:          processType(loc, boolAttr.cast<IntegerAttr>().getType(), typeID))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  801:    return 0;
+        -:  802:  }
+        -:  803:
+    #####:  804:  auto resultID = getNextID();
+call    0 never executed
+    #####:  805:  auto opcode = boolAttr.getValue()
+call    0 never executed
+    #####:  806:                    ? (isSpec ? spirv::Opcode::OpSpecConstantTrue
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  807:                              : spirv::Opcode::OpConstantTrue)
+    #####:  808:                    : (isSpec ? spirv::Opcode::OpSpecConstantFalse
+branch  0 never executed
+branch  1 never executed
+    #####:  809:                              : spirv::Opcode::OpConstantFalse);
+    #####:  810:  encodeInstructionInto(typesGlobalValues, opcode, {typeID, resultID});
+call    0 never executed
+        -:  811:
+    #####:  812:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+    #####:  813:    constIDMap[boolAttr] = resultID;
+call    0 never executed
+        -:  814:  }
+        -:  815:  return resultID;
+        -:  816:}
+        -:  817:
+function _ZN4mlir5spirv10Serializer18prepareConstantIntENS_8LocationENS_11IntegerAttrEb called 0 returned 0% blocks executed 0%
+    #####:  818:uint32_t Serializer::prepareConstantInt(Location loc, IntegerAttr intAttr,
+        -:  819:                                        bool isSpec) {
+    #####:  820:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+        -:  821:    // We can de-duplicate normal constants, but not specialization constants.
+    #####:  822:    if (auto id = getConstantID(intAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  823:      return id;
+        -:  824:    }
+        -:  825:  }
+        -:  826:
+        -:  827:  // Process the type for this integer literal
+    #####:  828:  uint32_t typeID = 0;
+    #####:  829:  if (failed(processType(loc, intAttr.getType(), typeID))) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  830:    return 0;
+        -:  831:  }
+        -:  832:
+    #####:  833:  auto resultID = getNextID();
+call    0 never executed
+    #####:  834:  APInt value = intAttr.getValue();
+call    0 never executed
+    #####:  835:  unsigned bitwidth = value.getBitWidth();
+call    0 never executed
+    #####:  836:  bool isSigned = value.isSignedIntN(bitwidth);
+call    0 never executed
+        -:  837:
+    #####:  838:  auto opcode =
+    #####:  839:      isSpec ? spirv::Opcode::OpSpecConstant : spirv::Opcode::OpConstant;
+branch  0 never executed
+branch  1 never executed
+        -:  840:
+    #####:  841:  switch (bitwidth) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  842:    // According to SPIR-V spec, "When the type's bit width is less than
+        -:  843:    // 32-bits, the literal's value appears in the low-order bits of the word,
+        -:  844:    // and the high-order bits must be 0 for a floating-point type, or 0 for an
+        -:  845:    // integer type with Signedness of 0, or sign extended when Signedness
+        -:  846:    // is 1."
+    #####:  847:  case 32:
+    #####:  848:  case 16:
+    #####:  849:  case 8: {
+    #####:  850:    uint32_t word = 0;
+    #####:  851:    if (isSigned) {
+branch  0 never executed
+branch  1 never executed
+    #####:  852:      word = static_cast<int32_t>(value.getSExtValue());
+call    0 never executed
+        -:  853:    } else {
+    #####:  854:      word = static_cast<uint32_t>(value.getZExtValue());
+call    0 never executed
+        -:  855:    }
+    #####:  856:    encodeInstructionInto(typesGlobalValues, opcode, {typeID, resultID, word});
+call    0 never executed
+    #####:  857:  } break;
+        -:  858:    // According to SPIR-V spec: "When the type's bit width is larger than one
+        -:  859:    // word, the literal’s low-order words appear first."
+    #####:  860:  case 64: {
+    #####:  861:    struct DoubleWord {
+        -:  862:      uint32_t word1;
+        -:  863:      uint32_t word2;
+        -:  864:    } words;
+    #####:  865:    if (isSigned) {
+branch  0 never executed
+branch  1 never executed
+    #####:  866:      words = llvm::bit_cast<DoubleWord>(value.getSExtValue());
+call    0 never executed
+        -:  867:    } else {
+    #####:  868:      words = llvm::bit_cast<DoubleWord>(value.getZExtValue());
+call    0 never executed
+        -:  869:    }
+    #####:  870:    encodeInstructionInto(typesGlobalValues, opcode,
+call    0 never executed
+        -:  871:                          {typeID, resultID, words.word1, words.word2});
+    #####:  872:  } break;
+    #####:  873:  default: {
+    #####:  874:    std::string valueStr;
+call    0 never executed
+    #####:  875:    llvm::raw_string_ostream rss(valueStr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  876:    value.print(rss, /*isSigned=*/false);
+call    0 never executed
+        -:  877:
+    #####:  878:    emitError(loc, "cannot serialize ")
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  879:        << bitwidth << "-bit integer literal: " << rss.str();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  880:    return 0;
+call    0 never executed
+        -:  881:  }
+        -:  882:  }
+        -:  883:
+    #####:  884:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+    #####:  885:    constIDMap[intAttr] = resultID;
+call    0 never executed
+        -:  886:  }
+        -:  887:  return resultID;
+        -:  888:}
+        -:  889:
+function _ZN4mlir5spirv10Serializer17prepareConstantFpENS_8LocationENS_9FloatAttrEb called 0 returned 0% blocks executed 0%
+    #####:  890:uint32_t Serializer::prepareConstantFp(Location loc, FloatAttr floatAttr,
+        -:  891:                                       bool isSpec) {
+    #####:  892:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+        -:  893:    // We can de-duplicate normal constants, but not specialization constants.
+    #####:  894:    if (auto id = getConstantID(floatAttr)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  895:      return id;
+        -:  896:    }
+        -:  897:  }
+        -:  898:
+        -:  899:  // Process the type for this float literal
+    #####:  900:  uint32_t typeID = 0;
+    #####:  901:  if (failed(processType(loc, floatAttr.getType(), typeID))) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  902:    return 0;
+        -:  903:  }
+        -:  904:
+    #####:  905:  auto resultID = getNextID();
+call    0 never executed
+    #####:  906:  APFloat value = floatAttr.getValue();
+call    0 never executed
+    #####:  907:  APInt intValue = value.bitcastToAPInt();
+call    0 never executed
+call    1 never executed
+        -:  908:
+    #####:  909:  auto opcode =
+    #####:  910:      isSpec ? spirv::Opcode::OpSpecConstant : spirv::Opcode::OpConstant;
+branch  0 never executed
+branch  1 never executed
+        -:  911:
+    #####:  912:  if (&value.getSemantics() == &APFloat::IEEEsingle()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  913:    uint32_t word = llvm::bit_cast<uint32_t>(value.convertToFloat());
+call    0 never executed
+call    1 never executed
+    #####:  914:    encodeInstructionInto(typesGlobalValues, opcode, {typeID, resultID, word});
+call    0 never executed
+    #####:  915:  } else if (&value.getSemantics() == &APFloat::IEEEdouble()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  916:    struct DoubleWord {
+        -:  917:      uint32_t word1;
+        -:  918:      uint32_t word2;
+    #####:  919:    } words = llvm::bit_cast<DoubleWord>(value.convertToDouble());
+call    0 never executed
+call    1 never executed
+    #####:  920:    encodeInstructionInto(typesGlobalValues, opcode,
+call    0 never executed
+        -:  921:                          {typeID, resultID, words.word1, words.word2});
+    #####:  922:  } else if (&value.getSemantics() == &APFloat::IEEEhalf()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  923:    uint32_t word =
+    #####:  924:        static_cast<uint32_t>(value.bitcastToAPInt().getZExtValue());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  925:    encodeInstructionInto(typesGlobalValues, opcode, {typeID, resultID, word});
+call    0 never executed
+        -:  926:  } else {
+    #####:  927:    std::string valueStr;
+call    0 never executed
+    #####:  928:    llvm::raw_string_ostream rss(valueStr);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  929:    value.print(rss);
+call    0 never executed
+        -:  930:
+    #####:  931:    emitError(loc, "cannot serialize ")
+call    0 never executed
+call    1 never executed
+    #####:  932:        << floatAttr.getType() << "-typed float literal: " << rss.str();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  933:    return 0;
+call    0 never executed
+        -:  934:  }
+        -:  935:
+    #####:  936:  if (!isSpec) {
+branch  0 never executed
+branch  1 never executed
+    #####:  937:    constIDMap[floatAttr] = resultID;
+call    0 never executed
+        -:  938:  }
+        -:  939:  return resultID;
+        -:  940:}
+        -:  941:
+        -:  942://===----------------------------------------------------------------------===//
+        -:  943:// Control flow
+        -:  944://===----------------------------------------------------------------------===//
+        -:  945:
+function _ZN4mlir5spirv10Serializer18getOrCreateBlockIDEPNS_5BlockE called 0 returned 0% blocks executed 0%
+    #####:  946:uint32_t Serializer::getOrCreateBlockID(Block *block) {
+    #####:  947:  if (uint32_t id = getBlockID(block))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  948:    return id;
+    #####:  949:  return blockIDMap[block] = getNextID();
+call    0 never executed
+        -:  950:}
+        -:  951:
+        -:  952:#ifndef NDEBUG
+function _ZN4mlir5spirv10Serializer10printBlockEPNS_5BlockERN4llvm11raw_ostreamE called 0 returned 0% blocks executed 0%
+    #####:  953:void Serializer::printBlock(Block *block, raw_ostream &os) {
+    #####:  954:  os << "block " << block << " (id = ";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  955:  if (uint32_t id = getBlockID(block))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  956:    os << id;
+call    0 never executed
+        -:  957:  else
+    #####:  958:    os << "unknown";
+call    0 never executed
+    #####:  959:  os << ")\n";
+call    0 never executed
+    #####:  960:}
+        -:  961:#endif
+        -:  962:
+        -:  963:LogicalResult
+function _ZN4mlir5spirv10Serializer12processBlockEPNS_5BlockEbN4llvm12function_refIFNS_13LogicalResultEvEEE called 0 returned 0% blocks executed 0%
+    #####:  964:Serializer::processBlock(Block *block, bool omitLabel,
+        -:  965:                         function_ref<LogicalResult()> emitMerge) {
+    #####:  966:  LLVM_DEBUG(llvm::dbgs() << "processing block " << block << ":\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  967:  LLVM_DEBUG(block->print(llvm::dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  968:  LLVM_DEBUG(llvm::dbgs() << '\n');
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  969:  if (!omitLabel) {
+branch  0 never executed
+branch  1 never executed
+    #####:  970:    uint32_t blockID = getOrCreateBlockID(block);
+call    0 never executed
+    #####:  971:    LLVM_DEBUG(printBlock(block, llvm::dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -:  972:
+        -:  973:    // Emit OpLabel for this block.
+    #####:  974:    encodeInstructionInto(functionBody, spirv::Opcode::OpLabel, {blockID});
+call    0 never executed
+        -:  975:  }
+        -:  976:
+        -:  977:  // Emit OpPhi instructions for block arguments, if any.
+    #####:  978:  if (failed(emitPhiForBlockArguments(block)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  979:    return failure();
+        -:  980:
+        -:  981:  // If we need to emit merge instructions, it must happen in this block. Check
+        -:  982:  // whether we have other structured control flow ops, which will be expanded
+        -:  983:  // into multiple basic blocks. If that's the case, we need to emit the merge
+        -:  984:  // right now and then create new blocks for further serialization of the ops
+        -:  985:  // in this block.
+    #####:  986:  if (emitMerge && llvm::any_of(block->getOperations(), [](Operation &op) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  987:        return isa<spirv::LoopOp, spirv::SelectionOp>(op);
+    #####:  988:      })) {
+branch  0 never executed
+branch  1 never executed
+    #####:  989:    if (failed(emitMerge()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  990:      return failure();
+    #####:  991:    emitMerge = nullptr;
+call    0 never executed
+        -:  992:
+        -:  993:    // Start a new block for further serialization.
+    #####:  994:    uint32_t blockID = getNextID();
+call    0 never executed
+    #####:  995:    encodeInstructionInto(functionBody, spirv::Opcode::OpBranch, {blockID});
+call    0 never executed
+    #####:  996:    encodeInstructionInto(functionBody, spirv::Opcode::OpLabel, {blockID});
+call    0 never executed
+        -:  997:  }
+        -:  998:
+        -:  999:  // Process each op in this block except the terminator.
+    #####: 1000:  for (auto &op : llvm::make_range(block->begin(), std::prev(block->end()))) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1001:    if (failed(processOperation(&op)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1002:      return failure();
+        -: 1003:  }
+        -: 1004:
+        -: 1005:  // Process the terminator.
+    #####: 1006:  if (emitMerge)
+branch  0 never executed
+branch  1 never executed
+    #####: 1007:    if (failed(emitMerge()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1008:      return failure();
+    #####: 1009:  if (failed(processOperation(&block->back())))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1010:    return failure();
+        -: 1011:
+    #####: 1012:  return success();
+        -: 1013:}
+        -: 1014:
+function _ZN4mlir5spirv10Serializer24emitPhiForBlockArgumentsEPNS_5BlockE called 0 returned 0% blocks executed 0%
+    #####: 1015:LogicalResult Serializer::emitPhiForBlockArguments(Block *block) {
+        -: 1016:  // Nothing to do if this block has no arguments or it's the entry block, which
+        -: 1017:  // always has the same arguments as the function signature.
+    #####: 1018:  if (block->args_empty() || block->isEntryBlock())
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####: 1019:    return success();
+        -: 1020:
+    #####: 1021:  LLVM_DEBUG(llvm::dbgs() << "emitting phi instructions..\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+        -: 1022:
+        -: 1023:  // If the block has arguments, we need to create SPIR-V OpPhi instructions.
+        -: 1024:  // A SPIR-V OpPhi instruction is of the syntax:
+        -: 1025:  //   OpPhi | result type | result <id> | (value <id>, parent block <id>) pair
+        -: 1026:  // So we need to collect all predecessor blocks and the arguments they send
+        -: 1027:  // to this block.
+    #####: 1028:  SmallVector<std::pair<Block *, OperandRange>, 4> predecessors;
+    #####: 1029:  for (Block *mlirPredecessor : block->getPredecessors()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1030:    auto *terminator = mlirPredecessor->getTerminator();
+call    0 never executed
+    #####: 1031:    LLVM_DEBUG(llvm::dbgs() << "  mlir predecessor ");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1032:    LLVM_DEBUG(printBlock(mlirPredecessor, llvm::dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1033:    LLVM_DEBUG(llvm::dbgs() << "    terminator: " << *terminator << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1034:    // The predecessor here is the immediate one according to MLIR's IR
+        -: 1035:    // structure. It does not directly map to the incoming parent block for the
+        -: 1036:    // OpPhi instructions at SPIR-V binary level. This is because structured
+        -: 1037:    // control flow ops are serialized to multiple SPIR-V blocks. If there is a
+        -: 1038:    // spirv.mlir.selection/spirv.mlir.loop op in the MLIR predecessor block,
+        -: 1039:    // the branch op jumping to the OpPhi's block then resides in the previous
+        -: 1040:    // structured control flow op's merge block.
+    #####: 1041:    Block *spirvPredecessor = getPhiIncomingBlock(mlirPredecessor);
+call    0 never executed
+    #####: 1042:    LLVM_DEBUG(llvm::dbgs() << "  spirv predecessor ");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1043:    LLVM_DEBUG(printBlock(spirvPredecessor, llvm::dbgs()));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1044:    if (auto branchOp = dyn_cast<spirv::BranchOp>(terminator)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1045:      predecessors.emplace_back(spirvPredecessor, branchOp.getOperands());
+call    0 never executed
+call    1 never executed
+    #####: 1046:    } else if (auto branchCondOp =
+branch  0 never executed
+branch  1 never executed
+    #####: 1047:                   dyn_cast<spirv::BranchConditionalOp>(terminator)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1048:      Optional<OperandRange> blockOperands;
+    #####: 1049:      if (branchCondOp.getTrueTarget() == block) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1050:        blockOperands = branchCondOp.getTrueTargetOperands();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1051:      } else {
+    #####: 1052:        assert(branchCondOp.getFalseTarget() == block);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1053:        blockOperands = branchCondOp.getFalseTargetOperands();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1054:      }
+        -: 1055:
+    #####: 1056:      assert(!blockOperands->empty() &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -: 1057:             "expected non-empty block operand range");
+    #####: 1058:      predecessors.emplace_back(spirvPredecessor, *blockOperands);
+call    0 never executed
+        -: 1059:    } else {
+    #####: 1060:      return terminator->emitError("unimplemented terminator for Phi creation");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1061:    }
+    #####: 1062:    LLVM_DEBUG({
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+        -: 1063:      llvm::dbgs() << "    block arguments:\n";
+        -: 1064:      for (Value v : predecessors.back().second)
+        -: 1065:        llvm::dbgs() << "      " << v << "\n";
+        -: 1066:    });
+        -: 1067:  }
+        -: 1068:
+        -: 1069:  // Then create OpPhi instruction for each of the block argument.
+    #####: 1070:  for (auto argIndex : llvm::seq<unsigned>(0, block->getNumArguments())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1071:    BlockArgument arg = block->getArgument(argIndex);
+call    0 never executed
+        -: 1072:
+        -: 1073:    // Get the type <id> and result <id> for this OpPhi instruction.
+    #####: 1074:    uint32_t phiTypeID = 0;
+    #####: 1075:    if (failed(processType(arg.getLoc(), arg.getType(), phiTypeID)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1076:      return failure();
+    #####: 1077:    uint32_t phiID = getNextID();
+branch  0 never executed
+branch  1 never executed
+        -: 1078:
+    #####: 1079:    LLVM_DEBUG(llvm::dbgs() << "[phi] for block argument #" << argIndex << ' '
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+        -: 1080:                            << arg << " (id = " << phiID << ")\n");
+        -: 1081:
+        -: 1082:    // Prepare the (value <id>, parent block <id>) pairs.
+    #####: 1083:    SmallVector<uint32_t, 8> phiArgs;
+call    0 never executed
+call    1 never executed
+    #####: 1084:    phiArgs.push_back(phiTypeID);
+call    0 never executed
+    #####: 1085:    phiArgs.push_back(phiID);
+call    0 never executed
+        -: 1086:
+    #####: 1087:    for (auto predIndex : llvm::seq<unsigned>(0, predecessors.size())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1088:      Value value = predecessors[predIndex].second[argIndex];
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1089:      uint32_t predBlockId = getOrCreateBlockID(predecessors[predIndex].first);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1090:      LLVM_DEBUG(llvm::dbgs() << "[phi] use predecessor (id = " << predBlockId
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+branch 10 never executed
+branch 11 never executed
+        -: 1091:                              << ") value " << value << ' ');
+        -: 1092:      // Each pair is a value <id> ...
+    #####: 1093:      uint32_t valueId = getValueID(value);
+call    0 never executed
+    #####: 1094:      if (valueId == 0) {
+branch  0 never executed
+branch  1 never executed
+        -: 1095:        // The op generating this value hasn't been visited yet so we don't have
+        -: 1096:        // an <id> assigned yet. Record this to fix up later.
+    #####: 1097:        LLVM_DEBUG(llvm::dbgs() << "(need to fix)\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####: 1098:        deferredPhiValues[value].push_back(functionBody.size() + 1 +
+call    0 never executed
+call    1 never executed
+    #####: 1099:                                           phiArgs.size());
+call    0 never executed
+        -: 1100:      } else {
+    #####: 1101:        LLVM_DEBUG(llvm::dbgs() << "(id = " << valueId << ")\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1102:      }
+    #####: 1103:      phiArgs.push_back(valueId);
+call    0 never executed
+        -: 1104:      // ... and a parent block <id>.
+    #####: 1105:      phiArgs.push_back(predBlockId);
+call    0 never executed
+        -: 1106:    }
+        -: 1107:
+    #####: 1108:    encodeInstructionInto(functionBody, spirv::Opcode::OpPhi, phiArgs);
+call    0 never executed
+    #####: 1109:    valueIDMap[arg] = phiID;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1110:  }
+        -: 1111:
+    #####: 1112:  return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1113:}
+        -: 1114:
+        -: 1115://===----------------------------------------------------------------------===//
+        -: 1116:// Operation
+        -: 1117://===----------------------------------------------------------------------===//
+        -: 1118:
+function _ZN4mlir5spirv10Serializer26encodeExtensionInstructionEPNS_9OperationEN4llvm9StringRefEjNS4_8ArrayRefIjEE called 0 returned 0% blocks executed 0%
+    #####: 1119:LogicalResult Serializer::encodeExtensionInstruction(
+        -: 1120:    Operation *op, StringRef extensionSetName, uint32_t extensionOpcode,
+        -: 1121:    ArrayRef<uint32_t> operands) {
+        -: 1122:  // Check if the extension has been imported.
+    #####: 1123:  auto &setID = extendedInstSetIDMap[extensionSetName];
+call    0 never executed
+    #####: 1124:  if (!setID) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1125:    setID = getNextID();
+call    0 never executed
+    #####: 1126:    SmallVector<uint32_t, 16> importOperands;
+call    0 never executed
+    #####: 1127:    importOperands.push_back(setID);
+call    0 never executed
+    #####: 1128:    spirv::encodeStringLiteralInto(importOperands, extensionSetName);
+call    0 never executed
+    #####: 1129:    encodeInstructionInto(extendedSets, spirv::Opcode::OpExtInstImport,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -: 1130:                          importOperands);
+        -: 1131:  }
+        -: 1132:
+        -: 1133:  // The first two operands are the result type <id> and result <id>. The set
+        -: 1134:  // <id> and the opcode need to be insert after this.
+    #####: 1135:  if (operands.size() < 2) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1136:    return op->emitError("extended instructions must have a result encoding");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -: 1137:  }
+    #####: 1138:  SmallVector<uint32_t, 8> extInstOperands;
+branch  0 never executed
+branch  1 never executed
+    #####: 1139:  extInstOperands.reserve(operands.size() + 2);
+branch  0 never executed
+branch  1 never executed
+    #####: 1140:  extInstOperands.append(operands.begin(), std::next(operands.begin(), 2));
+call    0 never executed
+    #####: 1141:  extInstOperands.push_back(setID);
+call    0 never executed
+    #####: 1142:  extInstOperands.push_back(extensionOpcode);
+call    0 never executed
+    #####: 1143:  extInstOperands.append(std::next(operands.begin(), 2), operands.end());
+call    0 never executed
+    #####: 1144:  encodeInstructionInto(functionBody, spirv::Opcode::OpExtInst,
+call    0 never executed
+        -: 1145:                        extInstOperands);
+    #####: 1146:  return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1147:}
+        -: 1148:
+function _ZN4mlir5spirv10Serializer16processOperationEPNS_9OperationE called 0 returned 0% blocks executed 0%
+    #####: 1149:LogicalResult Serializer::processOperation(Operation *opInst) {
+    #####: 1150:  LLVM_DEBUG(llvm::dbgs() << "[op] '" << opInst->getName() << "'\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -: 1151:
+        -: 1152:  // First dispatch the ops that do not directly mirror an instruction from
+        -: 1153:  // the SPIR-V spec.
+    #####: 1154:  return TypeSwitch<Operation *, LogicalResult>(opInst)
+call    0 never executed
+    #####: 1155:      .Case([&](spirv::AddressOfOp op) { return processAddressOfOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1156:      .Case([&](spirv::BranchOp op) { return processBranchOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1157:      .Case([&](spirv::BranchConditionalOp op) {
+    #####: 1158:        return processBranchConditionalOp(op);
+call    0 never executed
+    #####: 1159:      })
+call    0 never executed
+    #####: 1160:      .Case([&](spirv::ConstantOp op) { return processConstantOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1161:      .Case([&](spirv::FuncOp op) { return processFuncOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1162:      .Case([&](spirv::GlobalVariableOp op) {
+    #####: 1163:        return processGlobalVariableOp(op);
+call    0 never executed
+    #####: 1164:      })
+call    0 never executed
+    #####: 1165:      .Case([&](spirv::LoopOp op) { return processLoopOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1166:      .Case([&](spirv::ReferenceOfOp op) { return processReferenceOfOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1167:      .Case([&](spirv::SelectionOp op) { return processSelectionOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1168:      .Case([&](spirv::SpecConstantOp op) { return processSpecConstantOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1169:      .Case([&](spirv::SpecConstantCompositeOp op) {
+    #####: 1170:        return processSpecConstantCompositeOp(op);
+call    0 never executed
+    #####: 1171:      })
+call    0 never executed
+    #####: 1172:      .Case([&](spirv::SpecConstantOperationOp op) {
+    #####: 1173:        return processSpecConstantOperationOp(op);
+call    0 never executed
+    #####: 1174:      })
+call    0 never executed
+    #####: 1175:      .Case([&](spirv::UndefOp op) { return processUndefOp(op); })
+call    0 never executed
+call    1 never executed
+    #####: 1176:      .Case([&](spirv::VariableOp op) { return processVariableOp(op); })
+call    0 never executed
+call    1 never executed
+        -: 1177:
+        -: 1178:      // Then handle all the ops that directly mirror SPIR-V instructions with
+        -: 1179:      // auto-generated methods.
+        -: 1180:      .Default(
+    #####: 1181:          [&](Operation *op) { return dispatchToAutogenSerialization(op); });
+call    0 never executed
+call    1 never executed
+        -: 1182:}
+        -: 1183:
+function _ZN4mlir5spirv10Serializer27processOpWithoutGrammarAttrEPNS_9OperationEN4llvm9StringRefEj called 0 returned 0% blocks executed 0%
+    #####: 1184:LogicalResult Serializer::processOpWithoutGrammarAttr(Operation *op,
+        -: 1185:                                                      StringRef extInstSet,
+        -: 1186:                                                      uint32_t opcode) {
+    #####: 1187:  SmallVector<uint32_t, 4> operands;
+branch  0 never executed
+branch  1 never executed
+    #####: 1188:  Location loc = op->getLoc();
+branch  0 never executed
+branch  1 never executed
+        -: 1189:
+    #####: 1190:  uint32_t resultID = 0;
+    #####: 1191:  if (op->getNumResults() != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1192:    uint32_t resultTypeID = 0;
+    #####: 1193:    if (failed(processType(loc, op->getResult(0).getType(), resultTypeID)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1194:      return failure();
+    #####: 1195:    operands.push_back(resultTypeID);
+call    0 never executed
+        -: 1196:
+    #####: 1197:    resultID = getNextID();
+call    0 never executed
+    #####: 1198:    operands.push_back(resultID);
+call    0 never executed
+    #####: 1199:    valueIDMap[op->getResult(0)] = resultID;
+call    0 never executed
+    #####: 1200:  };
+        -: 1201:
+    #####: 1202:  for (Value operand : op->getOperands())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####: 1203:    operands.push_back(getValueID(operand));
+call    0 never executed
+call    1 never executed
+        -: 1204:
+    #####: 1205:  if (failed(emitDebugLine(functionBody, loc)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1206:    return failure();
+        -: 1207:
+    #####: 1208:  if (extInstSet.empty()) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1209:    encodeInstructionInto(functionBody, static_cast<spirv::Opcode>(opcode),
+call    0 never executed
+        -: 1210:                          operands);
+        -: 1211:  } else {
+    #####: 1212:    if (failed(encodeExtensionInstruction(op, extInstSet, opcode, operands)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1213:      return failure();
+        -: 1214:  }
+        -: 1215:
+    #####: 1216:  if (op->getNumResults() != 0) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1217:    for (auto attr : op->getAttrs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1218:      if (failed(processDecoration(loc, resultID, attr)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####: 1219:        return failure();
+        -: 1220:    }
+        -: 1221:  }
+        -: 1222:
+    #####: 1223:  return success();
+branch  0 never executed
+branch  1 never executed
+        -: 1224:}
+        -: 1225:
+function _ZN4mlir5spirv10Serializer14emitDecorationEjNS0_10DecorationEN4llvm8ArrayRefIjEE called 0 returned 0% blocks executed 0%
+    #####: 1226:LogicalResult Serializer::emitDecoration(uint32_t target,
+        -: 1227:                                         spirv::Decoration decoration,
+        -: 1228:                                         ArrayRef<uint32_t> params) {
+    #####: 1229:  uint32_t wordCount = 3 + params.size();
+call    0 never executed
+    #####: 1230:  decorations.push_back(
+call    0 never executed
+call    1 never executed
+        -: 1231:      spirv::getPrefixedOpcode(wordCount, spirv::Opcode::OpDecorate));
+    #####: 1232:  decorations.push_back(target);
+call    0 never executed
+    #####: 1233:  decorations.push_back(static_cast<uint32_t>(decoration));
+call    0 never executed
+    #####: 1234:  decorations.append(params.begin(), params.end());
+call    0 never executed
+    #####: 1235:  return success();
+        -: 1236:}
+        -: 1237:
+function _ZN4mlir5spirv10Serializer13emitDebugLineERN4llvm15SmallVectorImplIjEENS_8LocationE called 0 returned 0% blocks executed 0%
+    #####: 1238:LogicalResult Serializer::emitDebugLine(SmallVectorImpl<uint32_t> &binary,
+        -: 1239:                                        Location loc) {
+    #####: 1240:  if (!options.emitDebugInfo)
+branch  0 never executed
+branch  1 never executed
+    #####: 1241:    return success();
+        -: 1242:
+    #####: 1243:  if (lastProcessedWasMergeInst) {
+branch  0 never executed
+branch  1 never executed
+    #####: 1244:    lastProcessedWasMergeInst = false;
+    #####: 1245:    return success();
+        -: 1246:  }
+        -: 1247:
+    #####: 1248:  auto fileLoc = loc.dyn_cast<FileLineColLoc>();
+call    0 never executed
+    #####: 1249:  if (fileLoc)
+branch  0 never executed
+branch  1 never executed
+    #####: 1250:    encodeInstructionInto(binary, spirv::Opcode::OpLine,
+call    0 never executed
+    #####: 1251:                          {fileID, fileLoc.getLine(), fileLoc.getColumn()});
+call    0 never executed
+call    1 never executed
+    #####: 1252:  return success();
+        -: 1253:}
+        -: 1254:} // namespace spirv
+        -: 1255:} // namespace mlir

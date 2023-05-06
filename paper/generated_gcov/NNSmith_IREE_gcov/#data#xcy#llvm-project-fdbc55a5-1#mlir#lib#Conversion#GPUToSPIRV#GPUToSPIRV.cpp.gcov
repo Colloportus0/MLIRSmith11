@@ -1,0 +1,848 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/GPUToSPIRV/CMakeFiles/obj.MLIRGPUToSPIRV.dir/GPUToSPIRV.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/GPUToSPIRV/CMakeFiles/obj.MLIRGPUToSPIRV.dir/GPUToSPIRV.cpp.gcda
+        -:    0:Runs:325556
+        -:    1://===- GPUToSPIRV.cpp - GPU to SPIR-V Patterns ----------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements patterns to convert GPU dialect to SPIR-V dialect.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Conversion/GPUToSPIRV/GPUToSPIRV.h"
+        -:   14:#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+        -:   15:#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
+        -:   16:#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+        -:   17:#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
+        -:   18:#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+        -:   19:#include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
+        -:   20:#include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
+        -:   21:#include "mlir/IR/BuiltinOps.h"
+        -:   22:#include "mlir/IR/Matchers.h"
+        -:   23:#include "mlir/Transforms/DialectConversion.h"
+        -:   24:
+        -:   25:using namespace mlir;
+        -:   26:
+        -:   27:static constexpr const char kSPIRVModule[] = "__spv__";
+        -:   28:
+        -:   29:namespace {
+        -:   30:/// Pattern lowering GPU block/thread size/id to loading SPIR-V invocation
+        -:   31:/// builtin variables.
+        -:   32:template <typename SourceOp, spirv::BuiltIn builtin>
+        -:   33:class LaunchConfigConversion : public OpConversionPattern<SourceOp> {
+        -:   34:public:
+        -:   35:  using OpConversionPattern<SourceOp>::OpConversionPattern;
+        -:   36:
+        -:   37:  LogicalResult
+        -:   38:  matchAndRewrite(SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:   39:                  ConversionPatternRewriter &rewriter) const override;
+        -:   40:};
+        -:   41:
+        -:   42:/// Pattern lowering subgroup size/id to loading SPIR-V invocation
+        -:   43:/// builtin variables.
+        -:   44:template <typename SourceOp, spirv::BuiltIn builtin>
+        -:   45:class SingleDimLaunchConfigConversion : public OpConversionPattern<SourceOp> {
+        -:   46:public:
+        -:   47:  using OpConversionPattern<SourceOp>::OpConversionPattern;
+        -:   48:
+        -:   49:  LogicalResult
+        -:   50:  matchAndRewrite(SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:   51:                  ConversionPatternRewriter &rewriter) const override;
+        -:   52:};
+        -:   53:
+        -:   54:/// This is separate because in Vulkan workgroup size is exposed to shaders via
+        -:   55:/// a constant with WorkgroupSize decoration. So here we cannot generate a
+        -:   56:/// builtin variable; instead the information in the `spirv.entry_point_abi`
+        -:   57:/// attribute on the surrounding FuncOp is used to replace the gpu::BlockDimOp.
+        -:   58:class WorkGroupSizeConversion : public OpConversionPattern<gpu::BlockDimOp> {
+        -:   59:public:
+function _ZN12_GLOBAL__N_123WorkGroupSizeConversionC2ERN4mlir13TypeConverterEPNS1_11MLIRContextE called 0 returned 0% blocks executed 0%
+    #####:   60:  WorkGroupSizeConversion(TypeConverter &typeConverter, MLIRContext *context)
+    #####:   61:      : OpConversionPattern(typeConverter, context, /*benefit*/ 10) {}
+call    0 never executed
+call    1 never executed
+        -:   62:
+        -:   63:  LogicalResult
+        -:   64:  matchAndRewrite(gpu::BlockDimOp op, OpAdaptor adaptor,
+        -:   65:                  ConversionPatternRewriter &rewriter) const override;
+        -:   66:};
+        -:   67:
+        -:   68:/// Pattern to convert a kernel function in GPU dialect within a spirv.module.
+        -:   69:class GPUFuncOpConversion final : public OpConversionPattern<gpu::GPUFuncOp> {
+        -:   70:public:
+        -:   71:  using OpConversionPattern<gpu::GPUFuncOp>::OpConversionPattern;
+        -:   72:
+        -:   73:  LogicalResult
+        -:   74:  matchAndRewrite(gpu::GPUFuncOp funcOp, OpAdaptor adaptor,
+        -:   75:                  ConversionPatternRewriter &rewriter) const override;
+        -:   76:
+        -:   77:private:
+        -:   78:  SmallVector<int32_t, 3> workGroupSizeAsInt32;
+        -:   79:};
+        -:   80:
+        -:   81:/// Pattern to convert a gpu.module to a spirv.module.
+        -:   82:class GPUModuleConversion final : public OpConversionPattern<gpu::GPUModuleOp> {
+        -:   83:public:
+        -:   84:  using OpConversionPattern<gpu::GPUModuleOp>::OpConversionPattern;
+        -:   85:
+        -:   86:  LogicalResult
+        -:   87:  matchAndRewrite(gpu::GPUModuleOp moduleOp, OpAdaptor adaptor,
+        -:   88:                  ConversionPatternRewriter &rewriter) const override;
+        -:   89:};
+        -:   90:
+        -:   91:class GPUModuleEndConversion final
+        -:   92:    : public OpConversionPattern<gpu::ModuleEndOp> {
+        -:   93:public:
+        -:   94:  using OpConversionPattern::OpConversionPattern;
+        -:   95:
+        -:   96:  LogicalResult
+function _ZNK12_GLOBAL__N_122GPUModuleEndConversion15matchAndRewriteEN4mlir3gpu11ModuleEndOpENS2_18ModuleEndOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:   97:  matchAndRewrite(gpu::ModuleEndOp endOp, OpAdaptor adaptor,
+        -:   98:                  ConversionPatternRewriter &rewriter) const override {
+    #####:   99:    rewriter.eraseOp(endOp);
+call    0 never executed
+    #####:  100:    return success();
+        -:  101:  }
+        -:  102:};
+        -:  103:
+        -:  104:/// Pattern to convert a gpu.return into a SPIR-V return.
+        -:  105:// TODO: This can go to DRR when GPU return has operands.
+        -:  106:class GPUReturnOpConversion final : public OpConversionPattern<gpu::ReturnOp> {
+        -:  107:public:
+        -:  108:  using OpConversionPattern<gpu::ReturnOp>::OpConversionPattern;
+        -:  109:
+        -:  110:  LogicalResult
+        -:  111:  matchAndRewrite(gpu::ReturnOp returnOp, OpAdaptor adaptor,
+        -:  112:                  ConversionPatternRewriter &rewriter) const override;
+        -:  113:};
+        -:  114:
+        -:  115:/// Pattern to convert a gpu.barrier op into a spirv.ControlBarrier op.
+        -:  116:class GPUBarrierConversion final : public OpConversionPattern<gpu::BarrierOp> {
+        -:  117:public:
+        -:  118:  using OpConversionPattern::OpConversionPattern;
+        -:  119:
+        -:  120:  LogicalResult
+        -:  121:  matchAndRewrite(gpu::BarrierOp barrierOp, OpAdaptor adaptor,
+        -:  122:                  ConversionPatternRewriter &rewriter) const override;
+        -:  123:};
+        -:  124:
+        -:  125:/// Pattern to convert a gpu.shuffle op into a spirv.GroupNonUniformShuffle op.
+        -:  126:class GPUShuffleConversion final : public OpConversionPattern<gpu::ShuffleOp> {
+        -:  127:public:
+        -:  128:  using OpConversionPattern::OpConversionPattern;
+        -:  129:
+        -:  130:  LogicalResult
+        -:  131:  matchAndRewrite(gpu::ShuffleOp shuffleOp, OpAdaptor adaptor,
+        -:  132:                  ConversionPatternRewriter &rewriter) const override;
+        -:  133:};
+        -:  134:
+        -:  135:} // namespace
+        -:  136:
+        -:  137://===----------------------------------------------------------------------===//
+        -:  138:// Builtins.
+        -:  139://===----------------------------------------------------------------------===//
+        -:  140:
+        -:  141:template <typename SourceOp, spirv::BuiltIn builtin>
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+    #####:  154:  return success();
+        -:  155:}
+------------------
+_ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu9BlockIdOpELNS1_5spirv7BuiltInE26EE15matchAndRewriteES3_NS2_16BlockIdOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu9BlockIdOpELNS1_5spirv7BuiltInE26EE15matchAndRewriteES3_NS2_16BlockIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+call    0 never executed
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+call    0 never executed
+call    1 never executed
+    #####:  154:  return success();
+        -:  155:}
+------------------
+_ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu9GridDimOpELNS1_5spirv7BuiltInE24EE15matchAndRewriteES3_NS2_16GridDimOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu9GridDimOpELNS1_5spirv7BuiltInE24EE15matchAndRewriteES3_NS2_16GridDimOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+call    0 never executed
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+call    0 never executed
+call    1 never executed
+    #####:  154:  return success();
+        -:  155:}
+------------------
+_ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10BlockDimOpELNS1_5spirv7BuiltInE25EE15matchAndRewriteES3_NS2_17BlockDimOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10BlockDimOpELNS1_5spirv7BuiltInE25EE15matchAndRewriteES3_NS2_17BlockDimOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+call    0 never executed
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+call    0 never executed
+call    1 never executed
+    #####:  154:  return success();
+        -:  155:}
+------------------
+_ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10ThreadIdOpELNS1_5spirv7BuiltInE27EE15matchAndRewriteES3_NS2_17ThreadIdOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10ThreadIdOpELNS1_5spirv7BuiltInE27EE15matchAndRewriteES3_NS2_17ThreadIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+call    0 never executed
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+call    0 never executed
+call    1 never executed
+    #####:  154:  return success();
+        -:  155:}
+------------------
+_ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10GlobalIdOpELNS1_5spirv7BuiltInE28EE15matchAndRewriteES3_NS2_17GlobalIdOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_122LaunchConfigConversionIN4mlir3gpu10GlobalIdOpELNS1_5spirv7BuiltInE28EE15matchAndRewriteES3_NS2_17GlobalIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  142:LogicalResult LaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  143:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  144:    ConversionPatternRewriter &rewriter) const {
+    #####:  145:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  146:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  147:
+        -:  148:  // SPIR-V invocation builtin variables are a vector of type <3xi32>
+        -:  149:  auto spirvBuiltin =
+    #####:  150:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+    #####:  151:  rewriter.replaceOpWithNewOp<spirv::CompositeExtractOp>(
+call    0 never executed
+        -:  152:      op, indexType, spirvBuiltin,
+    #####:  153:      rewriter.getI32ArrayAttr({static_cast<int32_t>(op.getDimension())}));
+call    0 never executed
+call    1 never executed
+    #####:  154:  return success();
+        -:  155:}
+------------------
+        -:  156:
+        -:  157:template <typename SourceOp, spirv::BuiltIn builtin>
+        -:  158:LogicalResult
+    #####:  159:SingleDimLaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  160:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  161:    ConversionPatternRewriter &rewriter) const {
+    #####:  162:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+    #####:  163:  auto indexType = typeConverter->getIndexType();
+        -:  164:
+        -:  165:  auto spirvBuiltin =
+    #####:  166:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+    #####:  167:  rewriter.replaceOp(op, spirvBuiltin);
+    #####:  168:  return success();
+        -:  169:}
+------------------
+_ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu12SubgroupIdOpELNS1_5spirv7BuiltInE40EE15matchAndRewriteES3_NS2_19SubgroupIdOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu12SubgroupIdOpELNS1_5spirv7BuiltInE40EE15matchAndRewriteES3_NS2_19SubgroupIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  159:SingleDimLaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  160:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  161:    ConversionPatternRewriter &rewriter) const {
+    #####:  162:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  163:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  164:
+        -:  165:  auto spirvBuiltin =
+    #####:  166:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  167:  rewriter.replaceOp(op, spirvBuiltin);
+call    0 never executed
+    #####:  168:  return success();
+        -:  169:}
+------------------
+_ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu14NumSubgroupsOpELNS1_5spirv7BuiltInE38EE15matchAndRewriteES3_NS2_21NumSubgroupsOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu14NumSubgroupsOpELNS1_5spirv7BuiltInE38EE15matchAndRewriteES3_NS2_21NumSubgroupsOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  159:SingleDimLaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  160:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  161:    ConversionPatternRewriter &rewriter) const {
+    #####:  162:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  163:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  164:
+        -:  165:  auto spirvBuiltin =
+    #####:  166:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  167:  rewriter.replaceOp(op, spirvBuiltin);
+call    0 never executed
+    #####:  168:  return success();
+        -:  169:}
+------------------
+_ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu14SubgroupSizeOpELNS1_5spirv7BuiltInE36EE15matchAndRewriteES3_NS2_21SubgroupSizeOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_131SingleDimLaunchConfigConversionIN4mlir3gpu14SubgroupSizeOpELNS1_5spirv7BuiltInE36EE15matchAndRewriteES3_NS2_21SubgroupSizeOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  159:SingleDimLaunchConfigConversion<SourceOp, builtin>::matchAndRewrite(
+        -:  160:    SourceOp op, typename SourceOp::Adaptor adaptor,
+        -:  161:    ConversionPatternRewriter &rewriter) const {
+    #####:  162:  auto *typeConverter = this->template getTypeConverter<SPIRVTypeConverter>();
+call    0 never executed
+    #####:  163:  auto indexType = typeConverter->getIndexType();
+call    0 never executed
+        -:  164:
+        -:  165:  auto spirvBuiltin =
+    #####:  166:      spirv::getBuiltinVariableValue(op, builtin, indexType, rewriter);
+call    0 never executed
+call    1 never executed
+    #####:  167:  rewriter.replaceOp(op, spirvBuiltin);
+call    0 never executed
+    #####:  168:  return success();
+        -:  169:}
+------------------
+        -:  170:
+function _ZNK12_GLOBAL__N_123WorkGroupSizeConversion15matchAndRewriteEN4mlir3gpu10BlockDimOpENS2_17BlockDimOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  171:LogicalResult WorkGroupSizeConversion::matchAndRewrite(
+        -:  172:    gpu::BlockDimOp op, OpAdaptor adaptor,
+        -:  173:    ConversionPatternRewriter &rewriter) const {
+    #####:  174:  auto workGroupSizeAttr = spirv::lookupLocalWorkGroupSize(op);
+call    0 never executed
+    #####:  175:  if (!workGroupSizeAttr)
+branch  0 never executed
+branch  1 never executed
+    #####:  176:    return failure();
+        -:  177:
+    #####:  178:  auto val = workGroupSizeAttr
+    #####:  179:                 .getValues<int32_t>()[static_cast<int32_t>(op.getDimension())];
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  180:  auto convertedType =
+    #####:  181:      getTypeConverter()->convertType(op.getResult().getType());
+call    0 never executed
+    #####:  182:  if (!convertedType)
+branch  0 never executed
+branch  1 never executed
+    #####:  183:    return failure();
+    #####:  184:  rewriter.replaceOpWithNewOp<spirv::ConstantOp>(
+    #####:  185:      op, convertedType, IntegerAttr::get(convertedType, val));
+call    0 never executed
+call    1 never executed
+    #####:  186:  return success();
+        -:  187:}
+        -:  188:
+        -:  189://===----------------------------------------------------------------------===//
+        -:  190:// GPUFuncOp
+        -:  191://===----------------------------------------------------------------------===//
+        -:  192:
+        -:  193:// Legalizes a GPU function as an entry SPIR-V function.
+        -:  194:static spirv::FuncOp
+function _ZL20lowerAsEntryFunctionN4mlir3gpu9GPUFuncOpERNS_13TypeConverterERNS_25ConversionPatternRewriterENS_5spirv17EntryPointABIAttrEN4llvm8ArrayRefINS6_19InterfaceVarABIAttrEEE called 0 returned 0% blocks executed 0%
+    #####:  195:lowerAsEntryFunction(gpu::GPUFuncOp funcOp, TypeConverter &typeConverter,
+        -:  196:                     ConversionPatternRewriter &rewriter,
+        -:  197:                     spirv::EntryPointABIAttr entryPointInfo,
+        -:  198:                     ArrayRef<spirv::InterfaceVarABIAttr> argABIInfo) {
+    #####:  199:  auto fnType = funcOp.getFunctionType();
+call    0 never executed
+    #####:  200:  if (fnType.getNumResults()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  201:    funcOp.emitError("SPIR-V lowering only supports entry functions"
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  202:                     "with no return values right now");
+    #####:  203:    return nullptr;
+        -:  204:  }
+    #####:  205:  if (!argABIInfo.empty() && fnType.getNumInputs() != argABIInfo.size()) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  206:    funcOp.emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  207:        "lowering as entry functions requires ABI info for all arguments "
+        -:  208:        "or none of them");
+    #####:  209:    return nullptr;
+        -:  210:  }
+        -:  211:  // Update the signature to valid SPIR-V types and add the ABI
+        -:  212:  // attributes. These will be "materialized" by using the
+        -:  213:  // LowerABIAttributesPass.
+    #####:  214:  TypeConverter::SignatureConversion signatureConverter(fnType.getNumInputs());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  215:  {
+    #####:  216:    for (const auto &argType :
+    #####:  217:         enumerate(funcOp.getFunctionType().getInputs())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  218:      auto convertedType = typeConverter.convertType(argType.value());
+call    0 never executed
+    #####:  219:      if (!convertedType)
+branch  0 never executed
+branch  1 never executed
+    #####:  220:        return nullptr;
+    #####:  221:      signatureConverter.addInputs(argType.index(), convertedType);
+call    0 never executed
+call    1 never executed
+        -:  222:    }
+        -:  223:  }
+    #####:  224:  auto newFuncOp = rewriter.create<spirv::FuncOp>(
+    #####:  225:      funcOp.getLoc(), funcOp.getName(),
+call    0 never executed
+    #####:  226:      rewriter.getFunctionType(signatureConverter.getConvertedTypes(),
+    #####:  227:                               llvm::None));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  228:  for (const auto &namedAttr : funcOp->getAttrs()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  229:    if (namedAttr.getName() == FunctionOpInterface::getTypeAttrName() ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  230:        namedAttr.getName() == SymbolTable::getSymbolAttrName())
+call    0 never executed
+call    1 never executed
+    #####:  231:      continue;
+    #####:  232:    newFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
+call    0 never executed
+call    1 never executed
+        -:  233:  }
+        -:  234:
+    #####:  235:  rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  236:                              newFuncOp.end());
+    #####:  237:  if (failed(rewriter.convertRegionTypes(&newFuncOp.getBody(), typeConverter,
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  238:                                         &signatureConverter)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  239:    return nullptr;
+    #####:  240:  rewriter.eraseOp(funcOp);
+call    0 never executed
+        -:  241:
+        -:  242:  // Set the attributes for argument and the function.
+    #####:  243:  StringRef argABIAttrName = spirv::getInterfaceVarABIAttrName();
+call    0 never executed
+    #####:  244:  for (auto argIndex : llvm::seq<unsigned>(0, argABIInfo.size())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  245:    newFuncOp.setArgAttr(argIndex, argABIAttrName, argABIInfo[argIndex]);
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  246:  }
+    #####:  247:  newFuncOp->setAttr(spirv::getEntryPointABIAttrName(), entryPointInfo);
+call    0 never executed
+call    1 never executed
+        -:  248:
+    #####:  249:  return newFuncOp;
+        -:  250:}
+        -:  251:
+        -:  252:/// Populates `argABI` with spirv.interface_var_abi attributes for lowering
+        -:  253:/// gpu.func to spirv.func if no arguments have the attributes set
+        -:  254:/// already. Returns failure if any argument has the ABI attribute set already.
+        -:  255:static LogicalResult
+function _ZL18getDefaultABIAttrsPN4mlir11MLIRContextENS_3gpu9GPUFuncOpERN4llvm15SmallVectorImplINS_5spirv19InterfaceVarABIAttrEEE called 0 returned 0% blocks executed 0%
+    #####:  256:getDefaultABIAttrs(MLIRContext *context, gpu::GPUFuncOp funcOp,
+        -:  257:                   SmallVectorImpl<spirv::InterfaceVarABIAttr> &argABI) {
+    #####:  258:  spirv::TargetEnvAttr targetEnv = spirv::lookupTargetEnvOrDefault(funcOp);
+call    0 never executed
+    #####:  259:  if (!spirv::needsInterfaceVarABIAttrs(targetEnv))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  260:    return success();
+        -:  261:
+    #####:  262:  for (auto argIndex : llvm::seq<unsigned>(0, funcOp.getNumArguments())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####:  263:    if (funcOp.getArgAttrOfType<spirv::InterfaceVarABIAttr>(
+branch  0 never executed
+branch  1 never executed
+    #####:  264:            argIndex, spirv::getInterfaceVarABIAttrName()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  265:      return failure();
+        -:  266:    // Vulkan's interface variable requirements needs scalars to be wrapped in a
+        -:  267:    // struct. The struct held in storage buffer.
+    #####:  268:    Optional<spirv::StorageClass> sc;
+    #####:  269:    if (funcOp.getArgument(argIndex).getType().isIntOrIndexOrFloat())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  270:      sc = spirv::StorageClass::StorageBuffer;
+    #####:  271:    argABI.push_back(spirv::getInterfaceVarABIAttr(0, argIndex, sc, context));
+call    0 never executed
+call    1 never executed
+        -:  272:  }
+    #####:  273:  return success();
+        -:  274:}
+        -:  275:
+function _ZNK12_GLOBAL__N_119GPUFuncOpConversion15matchAndRewriteEN4mlir3gpu9GPUFuncOpENS2_16GPUFuncOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  276:LogicalResult GPUFuncOpConversion::matchAndRewrite(
+        -:  277:    gpu::GPUFuncOp funcOp, OpAdaptor adaptor,
+        -:  278:    ConversionPatternRewriter &rewriter) const {
+    #####:  279:  if (!gpu::GPUDialect::isKernel(funcOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  280:    return failure();
+        -:  281:
+    #####:  282:  SmallVector<spirv::InterfaceVarABIAttr, 4> argABI;
+call    0 never executed
+    #####:  283:  if (failed(getDefaultABIAttrs(rewriter.getContext(), funcOp, argABI))) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  284:    argABI.clear();
+call    0 never executed
+    #####:  285:    for (auto argIndex : llvm::seq<unsigned>(0, funcOp.getNumArguments())) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  286:      // If the ABI is already specified, use it.
+    #####:  287:      auto abiAttr = funcOp.getArgAttrOfType<spirv::InterfaceVarABIAttr>(
+    #####:  288:          argIndex, spirv::getInterfaceVarABIAttrName());
+call    0 never executed
+call    1 never executed
+    #####:  289:      if (!abiAttr) {
+branch  0 never executed
+branch  1 never executed
+    #####:  290:        funcOp.emitRemark(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  291:            "match failure: missing 'spirv.interface_var_abi' attribute at "
+        -:  292:            "argument ")
+    #####:  293:            << argIndex;
+call    0 never executed
+    #####:  294:        return failure();
+        -:  295:      }
+    #####:  296:      argABI.push_back(abiAttr);
+call    0 never executed
+        -:  297:    }
+        -:  298:  }
+        -:  299:
+    #####:  300:  auto entryPointAttr = spirv::lookupEntryPointABI(funcOp);
+call    0 never executed
+    #####:  301:  if (!entryPointAttr) {
+branch  0 never executed
+branch  1 never executed
+    #####:  302:    funcOp.emitRemark(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  303:        "match failure: missing 'spirv.entry_point_abi' attribute");
+    #####:  304:    return failure();
+        -:  305:  }
+    #####:  306:  spirv::FuncOp newFuncOp = lowerAsEntryFunction(
+call    0 never executed
+    #####:  307:      funcOp, *getTypeConverter(), rewriter, entryPointAttr, argABI);
+call    0 never executed
+    #####:  308:  if (!newFuncOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  309:    return failure();
+    #####:  310:  newFuncOp->removeAttr(
+    #####:  311:      rewriter.getStringAttr(gpu::GPUDialect::getKernelFuncAttrName()));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  312:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  313:}
+        -:  314:
+        -:  315://===----------------------------------------------------------------------===//
+        -:  316:// ModuleOp with gpu.module.
+        -:  317://===----------------------------------------------------------------------===//
+        -:  318:
+function _ZNK12_GLOBAL__N_119GPUModuleConversion15matchAndRewriteEN4mlir3gpu11GPUModuleOpENS2_18GPUModuleOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  319:LogicalResult GPUModuleConversion::matchAndRewrite(
+        -:  320:    gpu::GPUModuleOp moduleOp, OpAdaptor adaptor,
+        -:  321:    ConversionPatternRewriter &rewriter) const {
+    #####:  322:  spirv::TargetEnvAttr targetEnv = spirv::lookupTargetEnvOrDefault(moduleOp);
+call    0 never executed
+    #####:  323:  spirv::AddressingModel addressingModel = spirv::getAddressingModel(targetEnv);
+call    0 never executed
+    #####:  324:  FailureOr<spirv::MemoryModel> memoryModel = spirv::getMemoryModel(targetEnv);
+call    0 never executed
+    #####:  325:  if (failed(memoryModel))
+branch  0 never executed
+branch  1 never executed
+    #####:  326:    return moduleOp.emitRemark("match failure: could not selected memory model "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  327:                               "based on 'spirv.target_env'");
+call    0 never executed
+        -:  328:
+        -:  329:  // Add a keyword to the module name to avoid symbolic conflict.
+    #####:  330:  std::string spvModuleName = (kSPIRVModule + moduleOp.getName()).str();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  331:  auto spvModule = rewriter.create<spirv::ModuleOp>(
+        -:  332:      moduleOp.getLoc(), addressingModel, *memoryModel, llvm::None,
+    #####:  333:      StringRef(spvModuleName));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  334:
+        -:  335:  // Move the region from the module op into the SPIR-V module.
+    #####:  336:  Region &spvModuleRegion = spvModule.getRegion();
+call    0 never executed
+    #####:  337:  rewriter.inlineRegionBefore(moduleOp.getBodyRegion(), spvModuleRegion,
+call    0 never executed
+call    1 never executed
+        -:  338:                              spvModuleRegion.begin());
+        -:  339:  // The spirv.module build method adds a block. Remove that.
+    #####:  340:  rewriter.eraseBlock(&spvModuleRegion.back());
+call    0 never executed
+call    1 never executed
+        -:  341:
+        -:  342:  // Some of the patterns call `lookupTargetEnv` during conversion and they
+        -:  343:  // will fail if called after GPUModuleConversion and we don't preserve
+        -:  344:  // `TargetEnv` attribute.
+        -:  345:  // Copy TargetEnvAttr only if it is attached directly to the GPUModuleOp.
+    #####:  346:  if (auto attr = moduleOp->getAttrOfType<spirv::TargetEnvAttr>(
+branch  0 never executed
+branch  1 never executed
+    #####:  347:          spirv::getTargetEnvAttrName()))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  348:    spvModule->setAttr(spirv::getTargetEnvAttrName(), attr);
+call    0 never executed
+call    1 never executed
+        -:  349:
+    #####:  350:  rewriter.eraseOp(moduleOp);
+call    0 never executed
+    #####:  351:  return success();
+branch  0 never executed
+branch  1 never executed
+        -:  352:}
+        -:  353:
+        -:  354://===----------------------------------------------------------------------===//
+        -:  355:// GPU return inside kernel functions to SPIR-V return.
+        -:  356://===----------------------------------------------------------------------===//
+        -:  357:
+function _ZNK12_GLOBAL__N_121GPUReturnOpConversion15matchAndRewriteEN4mlir3gpu8ReturnOpENS2_15ReturnOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  358:LogicalResult GPUReturnOpConversion::matchAndRewrite(
+        -:  359:    gpu::ReturnOp returnOp, OpAdaptor adaptor,
+        -:  360:    ConversionPatternRewriter &rewriter) const {
+    #####:  361:  if (!adaptor.getOperands().empty())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  362:    return failure();
+        -:  363:
+    #####:  364:  rewriter.replaceOpWithNewOp<spirv::ReturnOp>(returnOp);
+call    0 never executed
+    #####:  365:  return success();
+        -:  366:}
+        -:  367:
+        -:  368://===----------------------------------------------------------------------===//
+        -:  369:// Barrier.
+        -:  370://===----------------------------------------------------------------------===//
+        -:  371:
+function _ZNK12_GLOBAL__N_120GPUBarrierConversion15matchAndRewriteEN4mlir3gpu9BarrierOpENS2_16BarrierOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  372:LogicalResult GPUBarrierConversion::matchAndRewrite(
+        -:  373:    gpu::BarrierOp barrierOp, OpAdaptor adaptor,
+        -:  374:    ConversionPatternRewriter &rewriter) const {
+    #####:  375:  MLIRContext *context = getContext();
+call    0 never executed
+        -:  376:  // Both execution and memory scope should be workgroup.
+    #####:  377:  auto scope = spirv::ScopeAttr::get(context, spirv::Scope::Workgroup);
+call    0 never executed
+        -:  378:  // Require acquire and release memory semantics for workgroup memory.
+    #####:  379:  auto memorySemantics = spirv::MemorySemanticsAttr::get(
+        -:  380:      context, spirv::MemorySemantics::WorkgroupMemory |
+    #####:  381:                   spirv::MemorySemantics::AcquireRelease);
+call    0 never executed
+    #####:  382:  rewriter.replaceOpWithNewOp<spirv::ControlBarrierOp>(barrierOp, scope, scope,
+    #####:  383:                                                       memorySemantics);
+call    0 never executed
+    #####:  384:  return success();
+        -:  385:}
+        -:  386:
+        -:  387://===----------------------------------------------------------------------===//
+        -:  388:// Shuffle
+        -:  389://===----------------------------------------------------------------------===//
+        -:  390:
+function _ZNK12_GLOBAL__N_120GPUShuffleConversion15matchAndRewriteEN4mlir3gpu9ShuffleOpENS2_16ShuffleOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  391:LogicalResult GPUShuffleConversion::matchAndRewrite(
+        -:  392:    gpu::ShuffleOp shuffleOp, OpAdaptor adaptor,
+        -:  393:    ConversionPatternRewriter &rewriter) const {
+        -:  394:  // Require the shuffle width to be the same as the target's subgroup size,
+        -:  395:  // given that for SPIR-V non-uniform subgroup ops, we cannot select
+        -:  396:  // participating invocations.
+    #####:  397:  auto targetEnv = getTypeConverter<SPIRVTypeConverter>()->getTargetEnv();
+call    0 never executed
+    #####:  398:  unsigned subgroupSize =
+    #####:  399:      targetEnv.getAttr().getResourceLimits().getSubgroupSize();
+call    0 never executed
+call    1 never executed
+    #####:  400:  IntegerAttr widthAttr;
+    #####:  401:  if (!matchPattern(shuffleOp.getWidth(), m_Constant(&widthAttr)) ||
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  402:      widthAttr.getValue().getZExtValue() != subgroupSize)
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  403:    return rewriter.notifyMatchFailure(
+    #####:  404:        shuffleOp, "shuffle width and target subgroup size mismatch");
+call    0 never executed
+        -:  405:
+    #####:  406:  Location loc = shuffleOp.getLoc();
+call    0 never executed
+    #####:  407:  Value trueVal = spirv::ConstantOp::getOne(rewriter.getI1Type(),
+    #####:  408:                                            shuffleOp.getLoc(), rewriter);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  409:  auto scope = rewriter.getAttr<spirv::ScopeAttr>(spirv::Scope::Subgroup);
+call    0 never executed
+    #####:  410:  Value result;
+        -:  411:
+    #####:  412:  switch (shuffleOp.getMode()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  413:  case gpu::ShuffleMode::XOR:
+    #####:  414:    result = rewriter.create<spirv::GroupNonUniformShuffleXorOp>(
+    #####:  415:        loc, scope, adaptor.getValue(), adaptor.getOffset());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  416:    break;
+    #####:  417:  default:
+    #####:  418:    return rewriter.notifyMatchFailure(shuffleOp, "unimplemented shuffle mode");
+call    0 never executed
+        -:  419:  }
+        -:  420:
+    #####:  421:  rewriter.replaceOp(shuffleOp, {result, trueVal});
+call    0 never executed
+call    1 never executed
+    #####:  422:  return success();
+call    0 never executed
+        -:  423:}
+        -:  424:
+        -:  425://===----------------------------------------------------------------------===//
+        -:  426:// GPU To SPIRV Patterns.
+        -:  427://===----------------------------------------------------------------------===//
+        -:  428:
+function _ZN4mlir26populateGPUToSPIRVPatternsERNS_18SPIRVTypeConverterERNS_17RewritePatternSetE called 0 returned 0% blocks executed 0%
+    #####:  429:void mlir::populateGPUToSPIRVPatterns(SPIRVTypeConverter &typeConverter,
+        -:  430:                                      RewritePatternSet &patterns) {
+    #####:  431:  patterns.add<
+        -:  432:      GPUBarrierConversion, GPUFuncOpConversion, GPUModuleConversion,
+        -:  433:      GPUModuleEndConversion, GPUReturnOpConversion, GPUShuffleConversion,
+        -:  434:      LaunchConfigConversion<gpu::BlockIdOp, spirv::BuiltIn::WorkgroupId>,
+        -:  435:      LaunchConfigConversion<gpu::GridDimOp, spirv::BuiltIn::NumWorkgroups>,
+        -:  436:      LaunchConfigConversion<gpu::BlockDimOp, spirv::BuiltIn::WorkgroupSize>,
+        -:  437:      LaunchConfigConversion<gpu::ThreadIdOp,
+        -:  438:                             spirv::BuiltIn::LocalInvocationId>,
+        -:  439:      LaunchConfigConversion<gpu::GlobalIdOp,
+        -:  440:                             spirv::BuiltIn::GlobalInvocationId>,
+        -:  441:      SingleDimLaunchConfigConversion<gpu::SubgroupIdOp,
+        -:  442:                                      spirv::BuiltIn::SubgroupId>,
+        -:  443:      SingleDimLaunchConfigConversion<gpu::NumSubgroupsOp,
+        -:  444:                                      spirv::BuiltIn::NumSubgroups>,
+        -:  445:      SingleDimLaunchConfigConversion<gpu::SubgroupSizeOp,
+        -:  446:                                      spirv::BuiltIn::SubgroupSize>,
+    #####:  447:      WorkGroupSizeConversion>(typeConverter, patterns.getContext());
+call    0 never executed
+    #####:  448:}

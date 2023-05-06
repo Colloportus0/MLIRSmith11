@@ -1,0 +1,1169 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Bufferization/Transforms/BufferDeallocation.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/BufferDeallocation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/BufferDeallocation.cpp.gcda
+        -:    0:Runs:325545
+        -:    1://===- BufferDeallocation.cpp - the impl for buffer deallocation ----------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements logic for computing correct alloc and dealloc positions.
+        -:   10:// Furthermore, buffer deallocation also adds required new clone operations to
+        -:   11:// ensure that all buffers are deallocated. The main class is the
+        -:   12:// BufferDeallocationPass class that implements the underlying algorithm. In
+        -:   13:// order to put allocations and deallocations at safe positions, it is
+        -:   14:// significantly important to put them into the correct blocks. However, the
+        -:   15:// liveness analysis does not pay attention to aliases, which can occur due to
+        -:   16:// branches (and their associated block arguments) in general. For this purpose,
+        -:   17:// BufferDeallocation firstly finds all possible aliases for a single value
+        -:   18:// (using the BufferViewFlowAnalysis class). Consider the following example:
+        -:   19://
+        -:   20:// ^bb0(%arg0):
+        -:   21://   cf.cond_br %cond, ^bb1, ^bb2
+        -:   22:// ^bb1:
+        -:   23://   cf.br ^exit(%arg0)
+        -:   24:// ^bb2:
+        -:   25://   %new_value = ...
+        -:   26://   cf.br ^exit(%new_value)
+        -:   27:// ^exit(%arg1):
+        -:   28://   return %arg1;
+        -:   29://
+        -:   30:// We should place the dealloc for %new_value in exit. However, we have to free
+        -:   31:// the buffer in the same block, because it cannot be freed in the post
+        -:   32:// dominator. However, this requires a new clone buffer for %arg1 that will
+        -:   33:// contain the actual contents. Using the class BufferViewFlowAnalysis, we
+        -:   34:// will find out that %new_value has a potential alias %arg1. In order to find
+        -:   35:// the dealloc position we have to find all potential aliases, iterate over
+        -:   36:// their uses and find the common post-dominator block (note that additional
+        -:   37:// clones and buffers remove potential aliases and will influence the placement
+        -:   38:// of the deallocs). In all cases, the computed block can be safely used to free
+        -:   39:// the %new_value buffer (may be exit or bb2) as it will die and we can use
+        -:   40:// liveness information to determine the exact operation after which we have to
+        -:   41:// insert the dealloc. However, the algorithm supports introducing clone buffers
+        -:   42:// and placing deallocs in safe locations to ensure that all buffers will be
+        -:   43:// freed in the end.
+        -:   44://
+        -:   45:// TODO:
+        -:   46:// The current implementation does not support explicit-control-flow loops and
+        -:   47:// the resulting code will be invalid with respect to program semantics.
+        -:   48:// However, structured control-flow loops are fully supported. Furthermore, it
+        -:   49:// doesn't accept functions which return buffers already.
+        -:   50://
+        -:   51://===----------------------------------------------------------------------===//
+        -:   52:
+        -:   53:#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+        -:   54:
+        -:   55:#include "mlir/Dialect/Bufferization/IR/AllocationOpInterface.h"
+        -:   56:#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+        -:   57:#include "mlir/Dialect/Bufferization/Transforms/BufferUtils.h"
+        -:   58:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   59:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   60:#include "llvm/ADT/SetOperations.h"
+        -:   61:
+        -:   62:namespace mlir {
+        -:   63:namespace bufferization {
+        -:   64:#define GEN_PASS_DEF_BUFFERDEALLOCATION
+        -:   65:#include "mlir/Dialect/Bufferization/Transforms/Passes.h.inc"
+        -:   66:} // namespace bufferization
+        -:   67:} // namespace mlir
+        -:   68:
+        -:   69:using namespace mlir;
+        -:   70:using namespace mlir::bufferization;
+        -:   71:
+        -:   72:/// Walks over all immediate return-like terminators in the given region.
+        -:   73:static LogicalResult
+function _ZL20walkReturnOperationsPN4mlir6RegionEN4llvm12function_refIFNS_13LogicalResultEPNS_9OperationEEEE called 0 returned 0% blocks executed 0%
+    #####:   74:walkReturnOperations(Region *region,
+        -:   75:                     llvm::function_ref<LogicalResult(Operation *)> func) {
+    #####:   76:  for (Block &block : *region) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   77:    Operation *terminator = block.getTerminator();
+call    0 never executed
+        -:   78:    // Skip non region-return-like terminators.
+    #####:   79:    if (isRegionReturnLike(terminator)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   80:      if (failed(func(terminator)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   81:        return failure();
+        -:   82:    }
+        -:   83:  }
+    #####:   84:  return success();
+        -:   85:}
+        -:   86:
+        -:   87:/// Checks if all operations that have at least one attached region implement
+        -:   88:/// the RegionBranchOpInterface. This is not required in edge cases, where we
+        -:   89:/// have a single attached region and the parent operation has no results.
+      903:   90:static bool validateSupportedControlFlow(Operation *op) {
+function _ZZL28validateSupportedControlFlowPN4mlir9OperationEENKUlS1_E_clES1_.isra.0 called 10929 returned 100% blocks executed 56%
+    10929:   91:  WalkResult result = op->walk([&](Operation *operation) {
+        -:   92:    // Only check ops that are inside a function.
+    10929:   93:    if (!operation->getParentOfType<func::FuncOp>())
+call    0 returned 100%
+branch  1 taken 8% (fallthrough)
+branch  2 taken 92%
+      903:   94:      return WalkResult::advance();
+        -:   95:
+    10026:   96:    auto regions = operation->getRegions();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:   97:    // Walk over all operations in a region and check if the operation has at
+        -:   98:    // least one region and implements the RegionBranchOpInterface. If there
+        -:   99:    // is an operation that does not fulfill this condition, we cannot apply
+        -:  100:    // the deallocation steps. Furthermore, we accept cases, where we have a
+        -:  101:    // region that returns no results, since, in that case, the intra-region
+        -:  102:    // control flow does not affect the transformation.
+    10026:  103:    size_t size = regions.size();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   10026*:  104:    if (((size == 1 && !operation->getResults().empty()) || size > 1) &&
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 never executed
+branch  3 never executed
+branch  4 taken 0% (fallthrough)
+branch  5 taken 100%
+branch  6 never executed
+branch  7 never executed
+   10026*:  105:        !dyn_cast<RegionBranchOpInterface>(operation)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  106:      operation->emitError("All operations with attached regions need to "
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  107:                           "implement the RegionBranchOpInterface.");
+        -:  108:    }
+        -:  109:
+    10026:  110:    return WalkResult::advance();
+      903:  111:  });
+      903:  112:  return !result.wasSkipped();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  113:}
+        -:  114:
+        -:  115:namespace {
+        -:  116:
+        -:  117://===----------------------------------------------------------------------===//
+        -:  118:// Backedges analysis
+        -:  119://===----------------------------------------------------------------------===//
+        -:  120:
+        -:  121:/// A straight-forward program analysis which detects loop backedges induced by
+        -:  122:/// explicit control flow.
+        -:  123:class Backedges {
+        -:  124:public:
+        -:  125:  using BlockSetT = SmallPtrSet<Block *, 16>;
+        -:  126:  using BackedgeSetT = llvm::DenseSet<std::pair<Block *, Block *>>;
+        -:  127:
+        -:  128:public:
+        -:  129:  /// Constructs a new backedges analysis using the op provided.
+function _ZN12_GLOBAL__N_19BackedgesC2EPN4mlir9OperationE called 903 returned 100% blocks executed 100%
+      903:  130:  Backedges(Operation *op) { recurse(op); }
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  131:
+        -:  132:  /// Returns the number of backedges formed by explicit control flow.
+      903:  133:  size_t size() const { return edgeSet.size(); }
+        -:  134:
+        -:  135:  /// Returns the start iterator to loop over all backedges.
+        -:  136:  BackedgeSetT::const_iterator begin() const { return edgeSet.begin(); }
+        -:  137:
+        -:  138:  /// Returns the end iterator to loop over all backedges.
+        -:  139:  BackedgeSetT::const_iterator end() const { return edgeSet.end(); }
+        -:  140:
+        -:  141:private:
+        -:  142:  /// Enters the current block and inserts a backedge into the `edgeSet` if we
+        -:  143:  /// have already visited the current block. The inserted edge links the given
+        -:  144:  /// `predecessor` with the `current` block.
+function _ZN12_GLOBAL__N_19Backedges5enterERN4mlir5BlockEPS2_ called 903 returned 100% blocks executed 60%
+      903:  145:  bool enter(Block &current, Block *predecessor) {
+      903:  146:    bool inserted = visited.insert(&current).second;
+call    0 returned 100%
+      903:  147:    if (!inserted)
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  148:      edgeSet.insert(std::make_pair(predecessor, &current));
+call    0 never executed
+      903:  149:    return inserted;
+        -:  150:  }
+        -:  151:
+        -:  152:  /// Leaves the current block.
+      903:  153:  void exit(Block &current) { visited.erase(&current); }
+        -:  154:
+        -:  155:  /// Recurses into the given operation while taking all attached regions into
+        -:  156:  /// account.
+function _ZN12_GLOBAL__N_19Backedges7recurseEPN4mlir9OperationE called 10929 returned 100% blocks executed 69%
+    10929:  157:  void recurse(Operation *op) {
+    10929:  158:    Block *current = op->getBlock();
+call    0 returned 100%
+        -:  159:    // If the current op implements the `BranchOpInterface`, there can be
+        -:  160:    // cycles in the scope of all successor blocks.
+    10929:  161:    if (isa<BranchOpInterface>(op)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  162:      for (Block *succ : current->getSuccessors())
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  163:        recurse(*succ, current);
+call    0 never executed
+        -:  164:    }
+        -:  165:    // Recurse into all distinct regions and check for explicit control-flow
+        -:  166:    // loops.
+    15423:  167:    for (Region &region : op->getRegions()) {
+branch  0 taken 33% (fallthrough)
+branch  1 taken 67%
+branch  2 taken 8% (fallthrough)
+branch  3 taken 92%
+      903:  168:      if (!region.empty())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+      903:  169:        recurse(region.front(), current);
+call    0 returned 100%
+call    1 returned 100%
+        -:  170:    }
+    10929:  171:  }
+        -:  172:
+        -:  173:  /// Recurses into explicit control-flow structures that are given by
+        -:  174:  /// the successor relation defined on the block level.
+function _ZN12_GLOBAL__N_19Backedges7recurseERN4mlir5BlockEPS2_ called 903 returned 100% blocks executed 100%
+      903:  175:  void recurse(Block &block, Block *predecessor) {
+        -:  176:    // Try to enter the current block. If this is not possible, we are
+        -:  177:    // currently processing this block and can safely return here.
+      903:  178:    if (!enter(block, predecessor))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  179:      return;
+        -:  180:
+        -:  181:    // Recurse into all operations and successor blocks.
+    10929:  182:    for (Operation &op : block.getOperations())
+branch  0 taken 92% (fallthrough)
+branch  1 taken 8%
+call    2 returned 100%
+    10026:  183:      recurse(&op);
+call    0 returned 100%
+        -:  184:
+        -:  185:    // Leave the current block.
+      903:  186:    exit(block);
+call    0 returned 100%
+        -:  187:  }
+        -:  188:
+        -:  189:  /// Stores all blocks that are currently visited and on the processing stack.
+        -:  190:  BlockSetT visited;
+        -:  191:
+        -:  192:  /// Stores all backedges in the format (source, target).
+        -:  193:  BackedgeSetT edgeSet;
+        -:  194:};
+        -:  195:
+        -:  196://===----------------------------------------------------------------------===//
+        -:  197:// BufferDeallocation
+        -:  198://===----------------------------------------------------------------------===//
+        -:  199:
+        -:  200:/// The buffer deallocation transformation which ensures that all allocs in the
+        -:  201:/// program have a corresponding de-allocation. As a side-effect, it might also
+        -:  202:/// introduce clones that in turn leads to additional deallocations.
+        -:  203:class BufferDeallocation : public BufferPlacementTransformationBase {
+        -:  204:public:
+        -:  205:  using AliasAllocationMapT =
+        -:  206:      llvm::DenseMap<Value, bufferization::AllocationOpInterface>;
+        -:  207:
+function _ZN12_GLOBAL__N_118BufferDeallocationC2EPN4mlir9OperationE called 903 returned 100% blocks executed 100%
+      903:  208:  BufferDeallocation(Operation *op)
+      903:  209:      : BufferPlacementTransformationBase(op), dominators(op),
+      903:  210:        postDominators(op) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+        -:  211:
+        -:  212:  /// Checks if all allocation operations either provide an already existing
+        -:  213:  /// deallocation operation or implement the AllocationOpInterface. In
+        -:  214:  /// addition, this method initializes the internal alias to
+        -:  215:  /// AllocationOpInterface mapping in order to get compatible
+        -:  216:  /// AllocationOpInterface implementations for aliases.
+function _ZN12_GLOBAL__N_118BufferDeallocation7prepareEv called 903 returned 100% blocks executed 17%
+      903:  217:  LogicalResult prepare() {
+     903*:  218:    for (const BufferPlacementAllocs::AllocEntry &entry : allocs) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  219:      // Get the defining allocation operation.
+    #####:  220:      Value alloc = std::get<0>(entry);
+call    0 never executed
+    #####:  221:      auto allocationInterface =
+    #####:  222:          alloc.getDefiningOp<bufferization::AllocationOpInterface>();
+call    0 never executed
+        -:  223:      // If there is no existing deallocation operation and no implementation of
+        -:  224:      // the AllocationOpInterface, we cannot apply the BufferDeallocation pass.
+    #####:  225:      if (!std::get<1>(entry) && !allocationInterface) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  226:        return alloc.getDefiningOp()->emitError(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  227:            "Allocation is not deallocated explicitly nor does the operation "
+    #####:  228:            "implement the AllocationOpInterface.");
+call    0 never executed
+        -:  229:      }
+        -:  230:
+        -:  231:      // Register the current allocation interface implementation.
+    #####:  232:      aliasToAllocations[alloc] = allocationInterface;
+call    0 never executed
+        -:  233:
+        -:  234:      // Get the alias information for the current allocation node.
+    #####:  235:      for (Value alias : aliases.resolve(alloc)) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+        -:  236:        // TODO: check for incompatible implementations of the
+        -:  237:        // AllocationOpInterface. This could be realized by promoting the
+        -:  238:        // AllocationOpInterface to a DialectInterface.
+    #####:  239:        aliasToAllocations[alias] = allocationInterface;
+call    0 never executed
+call    1 never executed
+        -:  240:      }
+        -:  241:    }
+      903:  242:    return success();
+        -:  243:  }
+        -:  244:
+        -:  245:  /// Performs the actual placement/creation of all temporary clone and dealloc
+        -:  246:  /// nodes.
+function _ZN12_GLOBAL__N_118BufferDeallocation10deallocateEv called 903 returned 100% blocks executed 80%
+      903:  247:  LogicalResult deallocate() {
+        -:  248:    // Add additional clones that are required.
+      903:  249:    if (failed(introduceClones()))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  250:      return failure();
+        -:  251:
+        -:  252:    // Place deallocations for all allocation entries.
+      903:  253:    return placeDeallocs();
+call    0 returned 100%
+        -:  254:  }
+        -:  255:
+        -:  256:private:
+        -:  257:  /// Introduces required clone operations to avoid memory leaks.
+function _ZN12_GLOBAL__N_118BufferDeallocation15introduceClonesEv called 903 returned 100% blocks executed 44%
+      903:  258:  LogicalResult introduceClones() {
+        -:  259:    // Initialize the set of values that require a dedicated memory free
+        -:  260:    // operation since their operands cannot be safely deallocated in a post
+        -:  261:    // dominator.
+      903:  262:    SmallPtrSet<Value, 8> valuesToFree;
+call    0 returned 100%
+     1806:  263:    llvm::SmallDenseSet<std::tuple<Value, Block *>> visitedValues;
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+     1806:  264:    SmallVector<std::tuple<Value, Block *>, 8> toProcess;
+call    0 returned 100%
+        -:  265:
+        -:  266:    // Check dominance relation for proper dominance properties. If the given
+        -:  267:    // value node does not dominate an alias, we will have to create a clone in
+        -:  268:    // order to free all buffers that can potentially leak into a post
+        -:  269:    // dominator.
+function _ZZN12_GLOBAL__N_118BufferDeallocation15introduceClonesEvENKUlN4mlir5ValueEPNS1_5BlockEE_clES2_S4_ called 0 returned 0% blocks executed 0%
+     903*:  270:    auto findUnsafeValues = [&](Value source, Block *definingBlock) {
+    #####:  271:      auto it = aliases.find(source);
+call    0 never executed
+    #####:  272:      if (it == aliases.end())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  273:        return;
+    #####:  274:      for (Value value : it->second) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  275:        if (valuesToFree.count(value) > 0)
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  276:          continue;
+    #####:  277:        Block *parentBlock = value.getParentBlock();
+call    0 never executed
+        -:  278:        // Check whether we have to free this particular block argument or
+        -:  279:        // generic value. We have to free the current alias if it is either
+        -:  280:        // defined in a non-dominated block or it is defined in the same block
+        -:  281:        // but the current value is not dominated by the source value.
+    #####:  282:        if (!dominators.dominates(definingBlock, parentBlock) ||
+branch  0 never executed
+branch  1 never executed
+    #####:  283:            (definingBlock == parentBlock && value.isa<BlockArgument>())) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  284:          toProcess.emplace_back(value, parentBlock);
+call    0 never executed
+    #####:  285:          valuesToFree.insert(value);
+call    0 never executed
+    #####:  286:        } else if (visitedValues.insert(std::make_tuple(value, definingBlock))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  287:                       .second)
+    #####:  288:          toProcess.emplace_back(value, definingBlock);
+call    0 never executed
+        -:  289:      }
+      903:  290:    };
+        -:  291:
+        -:  292:    // Detect possibly unsafe aliases starting from all allocations.
+     903*:  293:    for (BufferPlacementAllocs::AllocEntry &entry : allocs) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  294:      Value allocValue = std::get<0>(entry);
+call    0 never executed
+    #####:  295:      findUnsafeValues(allocValue, allocValue.getDefiningOp()->getBlock());
+call    0 never executed
+call    1 never executed
+        -:  296:    }
+        -:  297:    // Try to find block arguments that require an explicit free operation
+        -:  298:    // until we reach a fix point.
+      903:  299:    while (!toProcess.empty()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  300:      auto current = toProcess.pop_back_val();
+call    0 never executed
+    #####:  301:      findUnsafeValues(std::get<0>(current), std::get<1>(current));
+call    0 never executed
+        -:  302:    }
+        -:  303:
+        -:  304:    // Update buffer aliases to ensure that we free all buffers and block
+        -:  305:    // arguments at the correct locations.
+      903:  306:    aliases.remove(valuesToFree);
+call    0 returned 100%
+        -:  307:
+        -:  308:    // Add new allocs and additional clone operations.
+     903*:  309:    for (Value value : valuesToFree) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+call    4 never executed
+    #####:  310:      if (failed(value.isa<BlockArgument>()
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  311:                     ? introduceBlockArgCopy(value.cast<BlockArgument>())
+call    0 never executed
+    #####:  312:                     : introduceValueCopyForRegionResult(value)))
+call    0 never executed
+    #####:  313:        return failure();
+        -:  314:
+        -:  315:      // Register the value to require a final dealloc. Note that we do not have
+        -:  316:      // to assign a block here since we do not want to move the allocation node
+        -:  317:      // to another location.
+    #####:  318:      allocs.registerAlloc(std::make_tuple(value, nullptr));
+call    0 never executed
+call    1 never executed
+        -:  319:    }
+      903:  320:    return success();
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  321:  }
+        -:  322:
+        -:  323:  /// Introduces temporary clones in all predecessors and copies the source
+        -:  324:  /// values into the newly allocated buffers.
+function _ZN12_GLOBAL__N_118BufferDeallocation21introduceBlockArgCopyEN4mlir13BlockArgumentE called 0 returned 0% blocks executed 0%
+    #####:  325:  LogicalResult introduceBlockArgCopy(BlockArgument blockArg) {
+        -:  326:    // Allocate a buffer for the current block argument in the block of
+        -:  327:    // the associated value (which will be a predecessor block by
+        -:  328:    // definition).
+    #####:  329:    Block *block = blockArg.getOwner();
+    #####:  330:    for (auto it = block->pred_begin(), e = block->pred_end(); it != e; ++it) {
+branch  0 never executed
+branch  1 never executed
+        -:  331:      // Get the terminator and the value that will be passed to our
+        -:  332:      // argument.
+    #####:  333:      Operation *terminator = (*it)->getTerminator();
+call    0 never executed
+call    1 never executed
+    #####:  334:      auto branchInterface = cast<BranchOpInterface>(terminator);
+call    0 never executed
+    #####:  335:      SuccessorOperands operands =
+    #####:  336:          branchInterface.getSuccessorOperands(it.getSuccessorIndex());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  337:
+        -:  338:      // Query the associated source value.
+    #####:  339:      Value sourceValue = operands[blockArg.getArgNumber()];
+call    0 never executed
+    #####:  340:      if (!sourceValue) {
+branch  0 never executed
+branch  1 never executed
+    #####:  341:        return failure();
+        -:  342:      }
+        -:  343:      // Wire new clone and successor operand.
+        -:  344:      // Create a new clone at the current location of the terminator.
+    #####:  345:      auto clone = introduceCloneBuffers(sourceValue, terminator);
+call    0 never executed
+    #####:  346:      if (failed(clone))
+branch  0 never executed
+branch  1 never executed
+    #####:  347:        return failure();
+branch  0 never executed
+branch  1 never executed
+    #####:  348:      operands.slice(blockArg.getArgNumber(), 1).assign(*clone);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  349:    }
+        -:  350:
+        -:  351:    // Check whether the block argument has implicitly defined predecessors via
+        -:  352:    // the RegionBranchOpInterface. This can be the case if the current block
+        -:  353:    // argument belongs to the first block in a region and the parent operation
+        -:  354:    // implements the RegionBranchOpInterface.
+    #####:  355:    Region *argRegion = block->getParent();
+call    0 never executed
+    #####:  356:    Operation *parentOp = argRegion->getParentOp();
+call    0 never executed
+    #####:  357:    RegionBranchOpInterface regionInterface;
+call    0 never executed
+    #####:  358:    if (&argRegion->front() != block ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  359:        !(regionInterface = dyn_cast<RegionBranchOpInterface>(parentOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  360:      return success();
+        -:  361:
+    #####:  362:    if (failed(introduceClonesForRegionSuccessors(
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  363:            regionInterface, argRegion->getParentOp()->getRegions(), blockArg,
+        -:  364:            [&](RegionSuccessor &successorRegion) {
+        -:  365:              // Find a predecessor of our argRegion.
+        -:  366:              return successorRegion.getSuccessor() == argRegion;
+        -:  367:            })))
+    #####:  368:      return failure();
+        -:  369:
+        -:  370:    // Check whether the block argument belongs to an entry region of the
+        -:  371:    // parent operation. In this case, we have to introduce an additional clone
+        -:  372:    // for buffer that is passed to the argument.
+    #####:  373:    SmallVector<RegionSuccessor, 2> successorRegions;
+call    0 never executed
+    #####:  374:    regionInterface.getSuccessorRegions(/*index=*/llvm::None, successorRegions);
+call    0 never executed
+    #####:  375:    auto *it =
+    #####:  376:        llvm::find_if(successorRegions, [&](RegionSuccessor &successorRegion) {
+branch  0 never executed
+branch  1 never executed
+        -:  377:          return successorRegion.getSuccessor() == argRegion;
+        -:  378:        });
+    #####:  379:    if (it == successorRegions.end())
+branch  0 never executed
+branch  1 never executed
+    #####:  380:      return success();
+        -:  381:
+        -:  382:    // Determine the actual operand to introduce a clone for and rewire the
+        -:  383:    // operand to point to the clone instead.
+    #####:  384:    auto operands =
+    #####:  385:        regionInterface.getSuccessorEntryOperands(argRegion->getRegionNumber());
+call    0 never executed
+call    1 never executed
+    #####:  386:    size_t operandIndex =
+    #####:  387:        llvm::find(it->getSuccessorInputs(), blockArg).getIndex() +
+call    0 never executed
+call    1 never executed
+    #####:  388:        operands.getBeginOperandIndex();
+call    0 never executed
+    #####:  389:    Value operand = parentOp->getOperand(operandIndex);
+call    0 never executed
+    #####:  390:    assert(operand ==
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+        -:  391:               operands[operandIndex - operands.getBeginOperandIndex()] &&
+        -:  392:           "region interface operands don't match parentOp operands");
+    #####:  393:    auto clone = introduceCloneBuffers(operand, parentOp);
+call    0 never executed
+    #####:  394:    if (failed(clone))
+branch  0 never executed
+branch  1 never executed
+    #####:  395:      return failure();
+        -:  396:
+    #####:  397:    parentOp->setOperand(operandIndex, *clone);
+call    0 never executed
+    #####:  398:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  399:  }
+        -:  400:
+        -:  401:  /// Introduces temporary clones in front of all associated nested-region
+        -:  402:  /// terminators and copies the source values into the newly allocated buffers.
+function _ZN12_GLOBAL__N_118BufferDeallocation33introduceValueCopyForRegionResultEN4mlir5ValueE called 0 returned 0% blocks executed 0%
+    #####:  403:  LogicalResult introduceValueCopyForRegionResult(Value value) {
+        -:  404:    // Get the actual result index in the scope of the parent terminator.
+    #####:  405:    Operation *operation = value.getDefiningOp();
+call    0 never executed
+    #####:  406:    auto regionInterface = cast<RegionBranchOpInterface>(operation);
+call    0 never executed
+        -:  407:    // Filter successors that return to the parent operation.
+    #####:  408:    auto regionPredicate = [&](RegionSuccessor &successorRegion) {
+        -:  409:      // If the RegionSuccessor has no associated successor, it will return to
+        -:  410:      // its parent operation.
+        -:  411:      return !successorRegion.getSuccessor();
+        -:  412:    };
+        -:  413:    // Introduce a clone for all region "results" that are returned to the
+        -:  414:    // parent operation. This is required since the parent's result value has
+        -:  415:    // been considered critical. Therefore, the algorithm assumes that a clone
+        -:  416:    // of a previously allocated buffer is returned by the operation (like in
+        -:  417:    // the case of a block argument).
+    #####:  418:    return introduceClonesForRegionSuccessors(
+branch  0 never executed
+branch  1 never executed
+    #####:  419:        regionInterface, operation->getRegions(), value, regionPredicate);
+call    0 never executed
+        -:  420:  }
+        -:  421:
+        -:  422:  /// Introduces buffer clones for all terminators in the given regions. The
+        -:  423:  /// regionPredicate is applied to every successor region in order to restrict
+        -:  424:  /// the clones to specific regions.
+        -:  425:  template <typename TPredicate>
+function _ZN12_GLOBAL__N_118BufferDeallocation34introduceClonesForRegionSuccessorsIZNS0_21introduceBlockArgCopyEN4mlir13BlockArgumentEEUlRNS2_15RegionSuccessorEE_EENS2_13LogicalResultENS2_23RegionBranchOpInterfaceEN4llvm15MutableArrayRefINS2_6RegionEEENS2_5ValueERKT_ called 0 returned 0% blocks executed 0%
+    #####:  426:  LogicalResult introduceClonesForRegionSuccessors(
+        -:  427:      RegionBranchOpInterface regionInterface, MutableArrayRef<Region> regions,
+        -:  428:      Value argValue, const TPredicate &regionPredicate) {
+    #####:  429:    for (Region &region : regions) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  430:      // Query the regionInterface to get all successor regions of the current
+        -:  431:      // one.
+    #####:  432:      SmallVector<RegionSuccessor, 2> successorRegions;
+    #####:  433:      regionInterface.getSuccessorRegions(region.getRegionNumber(),
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  434:                                          successorRegions);
+        -:  435:      // Try to find a matching region successor.
+        -:  436:      RegionSuccessor *regionSuccessor =
+    #####:  437:          llvm::find_if(successorRegions, regionPredicate);
+    #####:  438:      if (regionSuccessor == successorRegions.end())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  439:        continue;
+        -:  440:      // Get the operand index in the context of the current successor input
+        -:  441:      // bindings.
+    #####:  442:      size_t operandIndex =
+    #####:  443:          llvm::find(regionSuccessor->getSuccessorInputs(), argValue)
+call    0 never executed
+    #####:  444:              .getIndex();
+call    0 never executed
+        -:  445:
+        -:  446:      // Iterate over all immediate terminator operations to introduce
+        -:  447:      // new buffer allocations. Thereby, the appropriate terminator operand
+        -:  448:      // will be adjusted to point to the newly allocated buffer instead.
+    #####:  449:      if (failed(walkReturnOperations(&region, [&](Operation *terminator) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+------------------
+_ZZN12_GLOBAL__N_118BufferDeallocation34introduceClonesForRegionSuccessorsIZNS0_33introduceValueCopyForRegionResultEN4mlir5ValueEEUlRNS2_15RegionSuccessorEE_EENS2_13LogicalResultENS2_23RegionBranchOpInterfaceEN4llvm15MutableArrayRefINS2_6RegionEEES3_RKT_ENKUlPNS2_9OperationEE_clESH_:
+function _ZZN12_GLOBAL__N_118BufferDeallocation34introduceClonesForRegionSuccessorsIZNS0_33introduceValueCopyForRegionResultEN4mlir5ValueEEUlRNS2_15RegionSuccessorEE_EENS2_13LogicalResultENS2_23RegionBranchOpInterfaceEN4llvm15MutableArrayRefINS2_6RegionEEES3_RKT_ENKUlPNS2_9OperationEE_clESH_ called 0 returned 0% blocks executed 0%
+    #####:  449:      if (failed(walkReturnOperations(&region, [&](Operation *terminator) {
+------------------
+_ZZN12_GLOBAL__N_118BufferDeallocation34introduceClonesForRegionSuccessorsIZNS0_21introduceBlockArgCopyEN4mlir13BlockArgumentEEUlRNS2_15RegionSuccessorEE_EENS2_13LogicalResultENS2_23RegionBranchOpInterfaceEN4llvm15MutableArrayRefINS2_6RegionEEENS2_5ValueERKT_ENKUlPNS2_9OperationEE_clESI_:
+function _ZZN12_GLOBAL__N_118BufferDeallocation34introduceClonesForRegionSuccessorsIZNS0_21introduceBlockArgCopyEN4mlir13BlockArgumentEEUlRNS2_15RegionSuccessorEE_EENS2_13LogicalResultENS2_23RegionBranchOpInterfaceEN4llvm15MutableArrayRefINS2_6RegionEEENS2_5ValueERKT_ENKUlPNS2_9OperationEE_clESI_ called 0 returned 0% blocks executed 0%
+    #####:  449:      if (failed(walkReturnOperations(&region, [&](Operation *terminator) {
+------------------
+        -:  450:            // Get the actual mutable operands for this terminator op.
+    #####:  451:            auto terminatorOperands = *getMutableRegionBranchSuccessorOperands(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+call    7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+branch 12 never executed
+branch 13 never executed
+    #####:  452:                terminator, region.getRegionNumber());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  453:            // Extract the source value from the current terminator.
+        -:  454:            // This conversion needs to exist on a separate line due to a bug in
+        -:  455:            // GCC conversion analysis.
+    #####:  456:            OperandRange immutableTerminatorOperands = terminatorOperands;
+call    0 never executed
+call    1 never executed
+    #####:  457:            Value sourceValue = immutableTerminatorOperands[operandIndex];
+call    0 never executed
+call    1 never executed
+        -:  458:            // Create a new clone at the current location of the terminator.
+    #####:  459:            auto clone = introduceCloneBuffers(sourceValue, terminator);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  460:            if (failed(clone))
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  461:              return failure();
+        -:  462:            // Wire clone and terminator operand.
+    #####:  463:            terminatorOperands.slice(operandIndex, 1).assign(*clone);
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  464:            return success();
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  465:          })))
+    #####:  466:        return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  467:    }
+    #####:  468:    return success();
+        -:  469:  }
+        -:  470:
+        -:  471:  /// Creates a new memory allocation for the given source value and clones
+        -:  472:  /// its content into the newly allocated buffer. The terminator operation is
+        -:  473:  /// used to insert the clone operation at the right place.
+function _ZN12_GLOBAL__N_118BufferDeallocation21introduceCloneBuffersEN4mlir5ValueEPNS1_9OperationE called 0 returned 0% blocks executed 0%
+    #####:  474:  FailureOr<Value> introduceCloneBuffers(Value sourceValue,
+        -:  475:                                         Operation *terminator) {
+        -:  476:    // Avoid multiple clones of the same source value. This can happen in the
+        -:  477:    // presence of loops when a branch acts as a backedge while also having
+        -:  478:    // another successor that returns to its parent operation. Note: that
+        -:  479:    // copying copied buffers can introduce memory leaks since the invariant of
+        -:  480:    // BufferDeallocation assumes that a buffer will be only cloned once into a
+        -:  481:    // temporary buffer. Hence, the construction of clone chains introduces
+        -:  482:    // additional allocations that are not tracked automatically by the
+        -:  483:    // algorithm.
+    #####:  484:    if (clonedValues.contains(sourceValue))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  485:      return sourceValue;
+        -:  486:    // Create a new clone operation that copies the contents of the old
+        -:  487:    // buffer to the new one.
+    #####:  488:    auto clone = buildClone(terminator, sourceValue);
+call    0 never executed
+    #####:  489:    if (succeeded(clone)) {
+branch  0 never executed
+branch  1 never executed
+        -:  490:      // Remember the clone of original source value.
+    #####:  491:      clonedValues.insert(*clone);
+call    0 never executed
+        -:  492:    }
+    #####:  493:    return clone;
+        -:  494:  }
+        -:  495:
+        -:  496:  /// Finds correct dealloc positions according to the algorithm described at
+        -:  497:  /// the top of the file for all alloc nodes and block arguments that can be
+        -:  498:  /// handled by this analysis.
+function _ZN12_GLOBAL__N_118BufferDeallocation13placeDeallocsEv called 903 returned 100% blocks executed 9%
+      903:  499:  LogicalResult placeDeallocs() {
+        -:  500:    // Move or insert deallocs using the previously computed information.
+        -:  501:    // These deallocations will be linked to their associated allocation nodes
+        -:  502:    // since they don't have any aliases that can (potentially) increase their
+        -:  503:    // liveness.
+     903*:  504:    for (const BufferPlacementAllocs::AllocEntry &entry : allocs) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  505:      Value alloc = std::get<0>(entry);
+call    0 never executed
+    #####:  506:      auto aliasesSet = aliases.resolve(alloc);
+call    0 never executed
+    #####:  507:      assert(!aliasesSet.empty() && "must contain at least one alias");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  508:
+        -:  509:      // Determine the actual block to place the dealloc and get liveness
+        -:  510:      // information.
+    #####:  511:      Block *placementBlock =
+    #####:  512:          findCommonDominator(alloc, aliasesSet, postDominators);
+call    0 never executed
+    #####:  513:      const LivenessBlockInfo *livenessInfo =
+    #####:  514:          liveness.getLiveness(placementBlock);
+call    0 never executed
+        -:  515:
+        -:  516:      // We have to ensure that the dealloc will be after the last use of all
+        -:  517:      // aliases of the given value. We first assume that there are no uses in
+        -:  518:      // the placementBlock and that we can safely place the dealloc at the
+        -:  519:      // beginning.
+    #####:  520:      Operation *endOperation = &placementBlock->front();
+call    0 never executed
+        -:  521:
+        -:  522:      // Iterate over all aliases and ensure that the endOperation will point
+        -:  523:      // to the last operation of all potential aliases in the placementBlock.
+    #####:  524:      for (Value alias : aliasesSet) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+        -:  525:        // Ensure that the start operation is at least the defining operation of
+        -:  526:        // the current alias to avoid invalid placement of deallocs for aliases
+        -:  527:        // without any uses.
+    #####:  528:        Operation *beforeOp = endOperation;
+    #####:  529:        if (alias.getDefiningOp() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  530:            !(beforeOp = placementBlock->findAncestorOpInBlock(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  531:                  *alias.getDefiningOp())))
+call    0 never executed
+    #####:  532:          continue;
+        -:  533:
+    #####:  534:        Operation *aliasEndOperation =
+    #####:  535:            livenessInfo->getEndOperation(alias, beforeOp);
+call    0 never executed
+        -:  536:        // Check whether the aliasEndOperation lies in the desired block and
+        -:  537:        // whether it is behind the current endOperation. If yes, this will be
+        -:  538:        // the new endOperation.
+    #####:  539:        if (aliasEndOperation->getBlock() == placementBlock &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  540:            endOperation->isBeforeInBlock(aliasEndOperation))
+call    0 never executed
+        -:  541:          endOperation = aliasEndOperation;
+        -:  542:      }
+        -:  543:      // endOperation is the last operation behind which we can safely store
+        -:  544:      // the dealloc taking all potential aliases into account.
+        -:  545:
+        -:  546:      // If there is an existing dealloc, move it to the right place.
+    #####:  547:      Operation *deallocOperation = std::get<1>(entry);
+branch  0 never executed
+branch  1 never executed
+    #####:  548:      if (deallocOperation) {
+branch  0 never executed
+branch  1 never executed
+    #####:  549:        deallocOperation->moveAfter(endOperation);
+call    0 never executed
+        -:  550:      } else {
+        -:  551:        // If the Dealloc position is at the terminator operation of the
+        -:  552:        // block, then the value should escape from a deallocation.
+    #####:  553:        Operation *nextOp = endOperation->getNextNode();
+branch  0 never executed
+branch  1 never executed
+    #####:  554:        if (!nextOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  555:          continue;
+branch  0 never executed
+branch  1 never executed
+        -:  556:        // If there is no dealloc node, insert one in the right place.
+    #####:  557:        if (failed(buildDealloc(nextOp, alloc)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  558:          return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  559:      }
+        -:  560:    }
+      903:  561:    return success();
+        -:  562:  }
+        -:  563:
+        -:  564:  /// Builds a deallocation operation compatible with the given allocation
+        -:  565:  /// value. If there is no registered AllocationOpInterface implementation for
+        -:  566:  /// the given value (e.g. in the case of a function parameter), this method
+        -:  567:  /// builds a memref::DeallocOp.
+function _ZN12_GLOBAL__N_118BufferDeallocation12buildDeallocEPN4mlir9OperationENS1_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  568:  LogicalResult buildDealloc(Operation *op, Value alloc) {
+    #####:  569:    OpBuilder builder(op);
+call    0 never executed
+    #####:  570:    auto it = aliasToAllocations.find(alloc);
+call    0 never executed
+    #####:  571:    if (it != aliasToAllocations.end()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  572:      // Call the allocation op interface to build a supported and
+        -:  573:      // compatible deallocation operation.
+    #####:  574:      auto dealloc = it->second.buildDealloc(builder, alloc);
+call    0 never executed
+call    1 never executed
+    #####:  575:      if (!dealloc)
+branch  0 never executed
+branch  1 never executed
+    #####:  576:        return op->emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  577:               << "allocations without compatible deallocations are "
+    #####:  578:                  "not supported";
+call    0 never executed
+        -:  579:    } else {
+        -:  580:      // Build a "default" DeallocOp for unknown allocation sources.
+    #####:  581:      builder.create<memref::DeallocOp>(alloc.getLoc(), alloc);
+call    0 never executed
+call    1 never executed
+        -:  582:    }
+    #####:  583:    return success();
+        -:  584:  }
+        -:  585:
+        -:  586:  /// Builds a clone operation compatible with the given allocation value. If
+        -:  587:  /// there is no registered AllocationOpInterface implementation for the given
+        -:  588:  /// value (e.g. in the case of a function parameter), this method builds a
+        -:  589:  /// bufferization::CloneOp.
+function _ZN12_GLOBAL__N_118BufferDeallocation10buildCloneEPN4mlir9OperationENS1_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  590:  FailureOr<Value> buildClone(Operation *op, Value alloc) {
+    #####:  591:    OpBuilder builder(op);
+call    0 never executed
+    #####:  592:    auto it = aliasToAllocations.find(alloc);
+call    0 never executed
+    #####:  593:    if (it != aliasToAllocations.end()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  594:      // Call the allocation op interface to build a supported and
+        -:  595:      // compatible clone operation.
+    #####:  596:      auto clone = it->second.buildClone(builder, alloc);
+call    0 never executed
+call    1 never executed
+    #####:  597:      if (clone)
+branch  0 never executed
+branch  1 never executed
+    #####:  598:        return *clone;
+    #####:  599:      return (LogicalResult)(op->emitError()
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  600:                             << "allocations without compatible clone ops "
+    #####:  601:                                "are not supported");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  602:    }
+        -:  603:    // Build a "default" CloneOp for unknown allocation sources.
+    #####:  604:    return builder.create<bufferization::CloneOp>(alloc.getLoc(), alloc)
+call    0 never executed
+call    1 never executed
+    #####:  605:        .getResult();
+        -:  606:  }
+        -:  607:
+        -:  608:  /// The dominator info to find the appropriate start operation to move the
+        -:  609:  /// allocs.
+        -:  610:  DominanceInfo dominators;
+        -:  611:
+        -:  612:  /// The post dominator info to move the dependent allocs in the right
+        -:  613:  /// position.
+        -:  614:  PostDominanceInfo postDominators;
+        -:  615:
+        -:  616:  /// Stores already cloned buffers to avoid additional clones of clones.
+        -:  617:  ValueSetT clonedValues;
+        -:  618:
+        -:  619:  /// Maps aliases to their source allocation interfaces (inverse mapping).
+        -:  620:  AliasAllocationMapT aliasToAllocations;
+        -:  621:};
+        -:  622:
+        -:  623://===----------------------------------------------------------------------===//
+        -:  624:// BufferDeallocationPass
+        -:  625://===----------------------------------------------------------------------===//
+        -:  626:
+     2195:  627:struct DefaultAllocationInterface
+call    0 returned 100%
+        -:  628:    : public bufferization::AllocationOpInterface::ExternalModel<
+        -:  629:          DefaultAllocationInterface, memref::AllocOp> {
+function _ZN12_GLOBAL__N_126DefaultAllocationInterface12buildDeallocERN4mlir9OpBuilderENS1_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  630:  static Optional<Operation *> buildDealloc(OpBuilder &builder, Value alloc) {
+    #####:  631:    return builder.create<memref::DeallocOp>(alloc.getLoc(), alloc)
+call    0 never executed
+call    1 never executed
+    #####:  632:        .getOperation();
+        -:  633:  }
+function _ZN12_GLOBAL__N_126DefaultAllocationInterface10buildCloneERN4mlir9OpBuilderENS1_5ValueE called 0 returned 0% blocks executed 0%
+    #####:  634:  static Optional<Value> buildClone(OpBuilder &builder, Value alloc) {
+    #####:  635:    return builder.create<bufferization::CloneOp>(alloc.getLoc(), alloc)
+call    0 never executed
+call    1 never executed
+    #####:  636:        .getResult();
+        -:  637:  }
+        -:  638:};
+        -:  639:
+        -:  640:/// The actual buffer deallocation pass that inserts and moves dealloc nodes
+        -:  641:/// into the right positions. Furthermore, it inserts additional clones if
+        -:  642:/// necessary. It uses the algorithm described at the top of the file.
+   390728:  643:struct BufferDeallocationPass
+call    0 returned 100%
+call    1 returned 100%
+        -:  644:    : public bufferization::impl::BufferDeallocationBase<
+        -:  645:          BufferDeallocationPass> {
+function _ZNK12_GLOBAL__N_122BufferDeallocationPass20getDependentDialectsERN4mlir15DialectRegistryE called 1103 returned 100% blocks executed 100%
+     1103:  646:  void getDependentDialects(DialectRegistry &registry) const override {
+     1103:  647:    registry.insert<bufferization::BufferizationDialect>();
+call    0 returned 100%
+     1103:  648:    registry.insert<memref::MemRefDialect>();
+call    0 returned 100%
+     2206:  649:    registerAllocationOpInterfaceExternalModels(registry);
+     1103:  650:  }
+        -:  651:
+function _ZN12_GLOBAL__N_122BufferDeallocationPass14runOnOperationEv called 945 returned 100% blocks executed 86%
+      945:  652:  void runOnOperation() override {
+      945:  653:    func::FuncOp func = getOperation();
+call    0 returned 100%
+      946:  654:    if (func.isExternal())
+call    0 returned 100%
+branch  1 taken 96% (fallthrough)
+branch  2 taken 4%
+      945:  655:      return;
+        -:  656:
+      903:  657:    if (failed(deallocateBuffers(func)))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  658:      signalPassFailure();
+call    0 never executed
+        -:  659:  }
+        -:  660:};
+        -:  661:
+        -:  662:} // namespace
+        -:  663:
+function _ZN4mlir13bufferization17deallocateBuffersEPNS_9OperationE called 903 returned 100% blocks executed 62%
+      903:  664:LogicalResult bufferization::deallocateBuffers(Operation *op) {
+      903:  665:  if (isa<ModuleOp>(op)) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  666:    WalkResult result = op->walk([&](func::FuncOp funcOp) {
+    #####:  667:      if (failed(deallocateBuffers(funcOp)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  668:        return WalkResult::interrupt();
+    #####:  669:      return WalkResult::advance();
+    #####:  670:    });
+call    0 never executed
+    #####:  671:    return success(!result.wasInterrupted());
+        -:  672:  }
+        -:  673:
+        -:  674:  // Ensure that there are supported loops only.
+      903:  675:  Backedges backedges(op);
+call    0 returned 100%
+      903:  676:  if (backedges.size()) {
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  677:    op->emitError("Only structured control-flow loops are supported.");
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  678:    return failure();
+        -:  679:  }
+        -:  680:
+        -:  681:  // Check that the control flow structures are supported.
+      903:  682:  if (!validateSupportedControlFlow(op))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+     903*:  683:    return failure();
+call    0 returned 100%
+        -:  684:
+        -:  685:  // Gather all required allocation nodes and prepare the deallocation phase.
+      903:  686:  BufferDeallocation deallocation(op);
+call    0 returned 100%
+        -:  687:
+        -:  688:  // Check for supported AllocationOpInterface implementations and prepare the
+        -:  689:  // internal deallocation pass.
+      903:  690:  if (failed(deallocation.prepare()))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  691:    return failure();
+        -:  692:
+        -:  693:  // Place all required temporary clone and dealloc nodes.
+      903:  694:  if (failed(deallocation.deallocate()))
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  695:    return failure();
+        -:  696:
+      903:  697:  return success();
+call    0 returned 100%
+        -:  698:}
+        -:  699:
+function _ZN4mlir13bufferization43registerAllocationOpInterfaceExternalModelsERNS_15DialectRegistryE called 1092 returned 100% blocks executed 100%
+     2195:  700:void bufferization::registerAllocationOpInterfaceExternalModels(
+        -:  701:    DialectRegistry &registry) {
+     2195:  702:  registry.addExtension(+[](MLIRContext *ctx, memref::MemRefDialect *dialect) {
+call    0 returned 100%
+call    1 returned 100%
+        -:  703:    memref::AllocOp::attachInterface<DefaultAllocationInterface>(*ctx);
+        -:  704:  });
+     1092:  705:}
+        -:  706:
+        -:  707://===----------------------------------------------------------------------===//
+        -:  708:// BufferDeallocationPass construction
+        -:  709://===----------------------------------------------------------------------===//
+        -:  710:
+function _ZN4mlir13bufferization28createBufferDeallocationPassEv called 326648 returned 100% blocks executed 100%
+   326648:  711:std::unique_ptr<Pass> mlir::bufferization::createBufferDeallocationPass() {
+   326648:  712:  return std::make_unique<BufferDeallocationPass>();
+call    0 returned 100%
+        -:  713:}

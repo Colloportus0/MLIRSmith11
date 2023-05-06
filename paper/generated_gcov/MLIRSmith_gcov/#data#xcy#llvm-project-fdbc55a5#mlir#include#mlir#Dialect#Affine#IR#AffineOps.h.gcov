@@ -1,0 +1,610 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/include/mlir/Dialect/Affine/IR/AffineOps.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/PipelineDataTransfer.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Affine/Transforms/CMakeFiles/obj.MLIRAffineTransforms.dir/PipelineDataTransfer.cpp.gcda
+        -:    0:Runs:116157
+        -:    1://===- AffineOps.h - MLIR Affine Operations -------------------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines convenience types for working with Affine operations
+        -:   10:// in the MLIR operation set.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef MLIR_DIALECT_AFFINE_IR_AFFINEOPS_H
+        -:   15:#define MLIR_DIALECT_AFFINE_IR_AFFINEOPS_H
+        -:   16:
+        -:   17:#include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
+        -:   18:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   19:#include "mlir/IR/AffineMap.h"
+        -:   20:#include "mlir/IR/Builders.h"
+        -:   21:#include "mlir/Interfaces/ControlFlowInterfaces.h"
+        -:   22:#include "mlir/Interfaces/LoopLikeInterface.h"
+        -:   23:
+        -:   24:namespace mlir {
+        -:   25:class AffineApplyOp;
+        -:   26:class AffineBound;
+        -:   27:class AffineValueMap;
+        -:   28:
+        -:   29:/// TODO: These should be renamed if they are on the mlir namespace.
+        -:   30:///       Ideally, they should go in a mlir::affine:: namespace.
+        -:   31:
+        -:   32:/// A utility function to check if a value is defined at the top level of an
+        -:   33:/// op with trait `AffineScope` or is a region argument for such an op. A value
+        -:   34:/// of index type defined at the top level is always a valid symbol for all its
+        -:   35:/// uses.
+        -:   36:bool isTopLevelValue(Value value);
+        -:   37:
+        -:   38:/// A utility function to check if a value is defined at the top level of
+        -:   39:/// `region` or is an argument of `region`. A value of index type defined at the
+        -:   40:/// top level of a `AffineScope` region is always a valid symbol for all
+        -:   41:/// uses in that region.
+        -:   42:bool isTopLevelValue(Value value, Region *region);
+        -:   43:
+        -:   44:/// Returns the closest region enclosing `op` that is held by an operation with
+        -:   45:/// trait `AffineScope`; `nullptr` if there is no such region.
+        -:   46:Region *getAffineScope(Operation *op);
+        -:   47:
+        -:   48:/// AffineDmaStartOp starts a non-blocking DMA operation that transfers data
+        -:   49:/// from a source memref to a destination memref. The source and destination
+        -:   50:/// memref need not be of the same dimensionality, but need to have the same
+        -:   51:/// elemental type. The operands include the source and destination memref's
+        -:   52:/// each followed by its indices, size of the data transfer in terms of the
+        -:   53:/// number of elements (of the elemental type of the memref), a tag memref with
+        -:   54:/// its indices, and optionally at the end, a stride and a
+        -:   55:/// number_of_elements_per_stride arguments. The tag location is used by an
+        -:   56:/// AffineDmaWaitOp to check for completion. The indices of the source memref,
+        -:   57:/// destination memref, and the tag memref have the same restrictions as any
+        -:   58:/// affine.load/store. In particular, index for each memref dimension must be an
+        -:   59:/// affine expression of loop induction variables and symbols.
+        -:   60:/// The optional stride arguments should be of 'index' type, and specify a
+        -:   61:/// stride for the slower memory space (memory space with a lower memory space
+        -:   62:/// id), transferring chunks of number_of_elements_per_stride every stride until
+        -:   63:/// %num_elements are transferred. Either both or no stride arguments should be
+        -:   64:/// specified. The value of 'num_elements' must be a multiple of
+        -:   65:/// 'number_of_elements_per_stride'. If the source and destination locations
+        -:   66:/// overlap the behavior of this operation is not defined.
+        -:   67://
+        -:   68:// For example, an AffineDmaStartOp operation that transfers 256 elements of a
+        -:   69:// memref '%src' in memory space 0 at indices [%i + 3, %j] to memref '%dst' in
+        -:   70:// memory space 1 at indices [%k + 7, %l], would be specified as follows:
+        -:   71://
+        -:   72://   %num_elements = arith.constant 256
+        -:   73://   %idx = arith.constant 0 : index
+        -:   74://   %tag = memref.alloc() : memref<1xi32, 4>
+        -:   75://   affine.dma_start %src[%i + 3, %j], %dst[%k + 7, %l], %tag[%idx],
+        -:   76://     %num_elements :
+        -:   77://       memref<40x128xf32, 0>, memref<2x1024xf32, 1>, memref<1xi32, 2>
+        -:   78://
+        -:   79://   If %stride and %num_elt_per_stride are specified, the DMA is expected to
+        -:   80://   transfer %num_elt_per_stride elements every %stride elements apart from
+        -:   81://   memory space 0 until %num_elements are transferred.
+        -:   82://
+        -:   83://   affine.dma_start %src[%i, %j], %dst[%k, %l], %tag[%idx], %num_elements,
+        -:   84://     %stride, %num_elt_per_stride : ...
+        -:   85://
+        -:   86:// TODO: add additional operands to allow source and destination striding, and
+        -:   87:// multiple stride levels (possibly using AffineMaps to specify multiple levels
+        -:   88:// of striding).
+        -:   89:class AffineDmaStartOp
+        -:   90:    : public Op<AffineDmaStartOp, OpTrait::MemRefsNormalizable,
+        -:   91:                OpTrait::VariadicOperands, OpTrait::ZeroResults,
+        -:   92:                OpTrait::OpInvariants, AffineMapAccessInterface::Trait> {
+        -:   93:public:
+    4336*:   94:  using Op::Op;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 never executed
+branch  5 never executed
+        -:   95:  static ArrayRef<StringRef> getAttributeNames() { return {}; }
+        -:   96:
+        -:   97:  static void build(OpBuilder &builder, OperationState &result, Value srcMemRef,
+        -:   98:                    AffineMap srcMap, ValueRange srcIndices, Value destMemRef,
+        -:   99:                    AffineMap dstMap, ValueRange destIndices, Value tagMemRef,
+        -:  100:                    AffineMap tagMap, ValueRange tagIndices, Value numElements,
+        -:  101:                    Value stride = nullptr, Value elementsPerStride = nullptr);
+        -:  102:
+        -:  103:  /// Returns the operand index of the source memref.
+    #####:  104:  unsigned getSrcMemRefOperandIndex() { return 0; }
+        -:  105:
+        -:  106:  /// Returns the source MemRefType for this DMA operation.
+    #####:  107:  Value getSrcMemRef() { return getOperand(getSrcMemRefOperandIndex()); }
+call    0 never executed
+call    1 never executed
+        -:  108:  MemRefType getSrcMemRefType() {
+        -:  109:    return getSrcMemRef().getType().cast<MemRefType>();
+        -:  110:  }
+        -:  111:
+        -:  112:  /// Returns the rank (number of indices) of the source MemRefType.
+        -:  113:  unsigned getSrcMemRefRank() { return getSrcMemRefType().getRank(); }
+        -:  114:
+        -:  115:  /// Returns the affine map used to access the source memref.
+    #####:  116:  AffineMap getSrcMap() { return getSrcMapAttr().getValue(); }
+call    0 never executed
+function _ZN4mlir16AffineDmaStartOp13getSrcMapAttrEv called 0 returned 0% blocks executed 0%
+    #####:  117:  AffineMapAttr getSrcMapAttr() {
+    #####:  118:    return (*this)->getAttr(getSrcMapAttrStrName()).cast<AffineMapAttr>();
+call    0 never executed
+call    1 never executed
+        -:  119:  }
+        -:  120:
+        -:  121:  /// Returns the source memref affine map indices for this DMA operation.
+        -:  122:  operand_range getSrcIndices() {
+        -:  123:    return {operand_begin() + getSrcMemRefOperandIndex() + 1,
+        -:  124:            operand_begin() + getSrcMemRefOperandIndex() + 1 +
+        -:  125:                getSrcMap().getNumInputs()};
+        -:  126:  }
+        -:  127:
+        -:  128:  /// Returns the memory space of the source memref.
+function _ZN4mlir16AffineDmaStartOp17getSrcMemorySpaceEv called 0 returned 0% blocks executed 0%
+    #####:  129:  unsigned getSrcMemorySpace() {
+    #####:  130:    return getSrcMemRef().getType().cast<MemRefType>().getMemorySpaceAsInt();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  131:  }
+        -:  132:
+        -:  133:  /// Returns the operand index of the destination memref.
+function _ZN4mlir16AffineDmaStartOp24getDstMemRefOperandIndexEv called 0 returned 0% blocks executed 0%
+    #####:  134:  unsigned getDstMemRefOperandIndex() {
+    #####:  135:    return getSrcMemRefOperandIndex() + 1 + getSrcMap().getNumInputs();
+call    0 never executed
+call    1 never executed
+        -:  136:  }
+        -:  137:
+        -:  138:  /// Returns the destination MemRefType for this DMA operation.
+function _ZN4mlir16AffineDmaStartOp12getDstMemRefEv called 0 returned 0% blocks executed 0%
+    #####:  139:  Value getDstMemRef() { return getOperand(getDstMemRefOperandIndex()); }
+call    0 never executed
+call    1 never executed
+        -:  140:  MemRefType getDstMemRefType() {
+        -:  141:    return getDstMemRef().getType().cast<MemRefType>();
+        -:  142:  }
+        -:  143:
+        -:  144:  /// Returns the rank (number of indices) of the destination MemRefType.
+        -:  145:  unsigned getDstMemRefRank() {
+        -:  146:    return getDstMemRef().getType().cast<MemRefType>().getRank();
+        -:  147:  }
+        -:  148:
+        -:  149:  /// Returns the memory space of the source memref.
+function _ZN4mlir16AffineDmaStartOp17getDstMemorySpaceEv called 0 returned 0% blocks executed 0%
+    #####:  150:  unsigned getDstMemorySpace() {
+    #####:  151:    return getDstMemRef().getType().cast<MemRefType>().getMemorySpaceAsInt();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  152:  }
+        -:  153:
+        -:  154:  /// Returns the affine map used to access the destination memref.
+    #####:  155:  AffineMap getDstMap() { return getDstMapAttr().getValue(); }
+call    0 never executed
+function _ZN4mlir16AffineDmaStartOp13getDstMapAttrEv called 0 returned 0% blocks executed 0%
+    #####:  156:  AffineMapAttr getDstMapAttr() {
+    #####:  157:    return (*this)->getAttr(getDstMapAttrStrName()).cast<AffineMapAttr>();
+call    0 never executed
+call    1 never executed
+        -:  158:  }
+        -:  159:
+        -:  160:  /// Returns the destination memref indices for this DMA operation.
+        -:  161:  operand_range getDstIndices() {
+        -:  162:    return {operand_begin() + getDstMemRefOperandIndex() + 1,
+        -:  163:            operand_begin() + getDstMemRefOperandIndex() + 1 +
+        -:  164:                getDstMap().getNumInputs()};
+        -:  165:  }
+        -:  166:
+        -:  167:  /// Returns the operand index of the tag memref.
+function _ZN4mlir16AffineDmaStartOp24getTagMemRefOperandIndexEv called 0 returned 0% blocks executed 0%
+    #####:  168:  unsigned getTagMemRefOperandIndex() {
+    #####:  169:    return getDstMemRefOperandIndex() + 1 + getDstMap().getNumInputs();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  170:  }
+        -:  171:
+        -:  172:  /// Returns the Tag MemRef for this DMA operation.
+function _ZN4mlir16AffineDmaStartOp12getTagMemRefEv called 0 returned 0% blocks executed 0%
+    #####:  173:  Value getTagMemRef() { return getOperand(getTagMemRefOperandIndex()); }
+call    0 never executed
+call    1 never executed
+        -:  174:  MemRefType getTagMemRefType() {
+        -:  175:    return getTagMemRef().getType().cast<MemRefType>();
+        -:  176:  }
+        -:  177:
+        -:  178:  /// Returns the rank (number of indices) of the tag MemRefType.
+        -:  179:  unsigned getTagMemRefRank() {
+        -:  180:    return getTagMemRef().getType().cast<MemRefType>().getRank();
+        -:  181:  }
+        -:  182:
+        -:  183:  /// Returns the affine map used to access the tag memref.
+    #####:  184:  AffineMap getTagMap() { return getTagMapAttr().getValue(); }
+call    0 never executed
+function _ZN4mlir16AffineDmaStartOp13getTagMapAttrEv called 0 returned 0% blocks executed 0%
+    #####:  185:  AffineMapAttr getTagMapAttr() {
+    #####:  186:    return (*this)->getAttr(getTagMapAttrStrName()).cast<AffineMapAttr>();
+call    0 never executed
+call    1 never executed
+        -:  187:  }
+        -:  188:
+        -:  189:  /// Returns the tag memref indices for this DMA operation.
+function _ZN4mlir16AffineDmaStartOp13getTagIndicesEv called 0 returned 0% blocks executed 0%
+    #####:  190:  operand_range getTagIndices() {
+    #####:  191:    return {operand_begin() + getTagMemRefOperandIndex() + 1,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  192:            operand_begin() + getTagMemRefOperandIndex() + 1 +
+call    0 never executed
+    #####:  193:                getTagMap().getNumInputs()};
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  194:  }
+        -:  195:
+        -:  196:  /// Returns the number of elements being transferred by this DMA operation.
+        -:  197:  Value getNumElements() {
+        -:  198:    return getOperand(getTagMemRefOperandIndex() + 1 +
+        -:  199:                      getTagMap().getNumInputs());
+        -:  200:  }
+        -:  201:
+        -:  202:  /// Impelements the AffineMapAccessInterface.
+        -:  203:  /// Returns the AffineMapAttr associated with 'memref'.
+        -:  204:  NamedAttribute getAffineMapAttrForMemRef(Value memref) {
+        -:  205:    if (memref == getSrcMemRef())
+        -:  206:      return {StringAttr::get(getContext(), getSrcMapAttrStrName()),
+        -:  207:              getSrcMapAttr()};
+        -:  208:    if (memref == getDstMemRef())
+        -:  209:      return {StringAttr::get(getContext(), getDstMapAttrStrName()),
+        -:  210:              getDstMapAttr()};
+        -:  211:    assert(memref == getTagMemRef() &&
+        -:  212:           "DmaStartOp expected source, destination or tag memref");
+        -:  213:    return {StringAttr::get(getContext(), getTagMapAttrStrName()),
+        -:  214:            getTagMapAttr()};
+        -:  215:  }
+        -:  216:
+        -:  217:  /// Returns true if this is a DMA from a faster memory space to a slower one.
+    #####:  218:  bool isDestMemorySpaceFaster() {
+    #####:  219:    return (getSrcMemorySpace() < getDstMemorySpace());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  220:  }
+        -:  221:
+        -:  222:  /// Returns true if this is a DMA from a slower memory space to a faster one.
+    #####:  223:  bool isSrcMemorySpaceFaster() {
+        -:  224:    // Assumes that a lower number is for a slower memory space.
+    #####:  225:    return (getDstMemorySpace() < getSrcMemorySpace());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  226:  }
+        -:  227:
+        -:  228:  /// Given a DMA start operation, returns the operand position of either the
+        -:  229:  /// source or destination memref depending on the one that is at the higher
+        -:  230:  /// level of the memory hierarchy. Asserts failure if neither is true.
+function _ZN4mlir16AffineDmaStartOp15getFasterMemPosEv called 0 returned 0% blocks executed 0%
+    #####:  231:  unsigned getFasterMemPos() {
+    #####:  232:    assert(isSrcMemorySpaceFaster() || isDestMemorySpaceFaster());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+    #####:  233:    return isSrcMemorySpaceFaster() ? 0 : getDstMemRefOperandIndex();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  234:  }
+        -:  235:
+    #####:  236:  static StringRef getSrcMapAttrStrName() { return "src_map"; }
+call    0 never executed
+    #####:  237:  static StringRef getDstMapAttrStrName() { return "dst_map"; }
+call    0 never executed
+    #####:  238:  static StringRef getTagMapAttrStrName() { return "tag_map"; }
+call    0 never executed
+        -:  239:
+    #####:  240:  static StringRef getOperationName() { return "affine.dma_start"; }
+call    0 never executed
+call    1 never executed
+        -:  241:  static ParseResult parse(OpAsmParser &parser, OperationState &result);
+        -:  242:  void print(OpAsmPrinter &p);
+        -:  243:  LogicalResult verifyInvariantsImpl();
+        -:  244:  LogicalResult verifyInvariants() { return verifyInvariantsImpl(); }
+        -:  245:  LogicalResult fold(ArrayRef<Attribute> cstOperands,
+        -:  246:                     SmallVectorImpl<OpFoldResult> &results);
+        -:  247:
+        -:  248:  /// Returns true if this DMA operation is strided, returns false otherwise.
+        -:  249:  bool isStrided() {
+        -:  250:    return getNumOperands() !=
+        -:  251:           getTagMemRefOperandIndex() + 1 + getTagMap().getNumInputs() + 1;
+        -:  252:  }
+        -:  253:
+        -:  254:  /// Returns the stride value for this DMA operation.
+        -:  255:  Value getStride() {
+        -:  256:    if (!isStrided())
+        -:  257:      return nullptr;
+        -:  258:    return getOperand(getNumOperands() - 1 - 1);
+        -:  259:  }
+        -:  260:
+        -:  261:  /// Returns the number of elements to transfer per stride for this DMA op.
+        -:  262:  Value getNumElementsPerStride() {
+        -:  263:    if (!isStrided())
+        -:  264:      return nullptr;
+        -:  265:    return getOperand(getNumOperands() - 1);
+        -:  266:  }
+        -:  267:};
+        -:  268:
+        -:  269:/// AffineDmaWaitOp blocks until the completion of a DMA operation associated
+        -:  270:/// with the tag element '%tag[%index]'. %tag is a memref, and %index has to be
+        -:  271:/// an index with the same restrictions as any load/store index. In particular,
+        -:  272:/// index for each memref dimension must be an affine expression of loop
+        -:  273:/// induction variables and symbols. %num_elements is the number of elements
+        -:  274:/// associated with the DMA operation. For example:
+        -:  275://
+        -:  276://   affine.dma_start %src[%i, %j], %dst[%k, %l], %tag[%index], %num_elements :
+        -:  277://     memref<2048xf32, 0>, memref<256xf32, 1>, memref<1xi32, 2>
+        -:  278://   ...
+        -:  279://   ...
+        -:  280://   affine.dma_wait %tag[%index], %num_elements : memref<1xi32, 2>
+        -:  281://
+        -:  282:class AffineDmaWaitOp
+        -:  283:    : public Op<AffineDmaWaitOp, OpTrait::MemRefsNormalizable,
+        -:  284:                OpTrait::VariadicOperands, OpTrait::ZeroResults,
+        -:  285:                OpTrait::OpInvariants, AffineMapAccessInterface::Trait> {
+        -:  286:public:
+    #####:  287:  using Op::Op;
+        -:  288:  static ArrayRef<StringRef> getAttributeNames() { return {}; }
+        -:  289:
+        -:  290:  static void build(OpBuilder &builder, OperationState &result, Value tagMemRef,
+        -:  291:                    AffineMap tagMap, ValueRange tagIndices, Value numElements);
+        -:  292:
+    #####:  293:  static StringRef getOperationName() { return "affine.dma_wait"; }
+call    0 never executed
+call    1 never executed
+        -:  294:
+        -:  295:  /// Returns the Tag MemRef associated with the DMA operation being waited on.
+    #####:  296:  Value getTagMemRef() { return getOperand(0); }
+call    0 never executed
+call    1 never executed
+        -:  297:  MemRefType getTagMemRefType() {
+        -:  298:    return getTagMemRef().getType().cast<MemRefType>();
+        -:  299:  }
+        -:  300:
+        -:  301:  /// Returns the affine map used to access the tag memref.
+    #####:  302:  AffineMap getTagMap() { return getTagMapAttr().getValue(); }
+call    0 never executed
+function _ZN4mlir15AffineDmaWaitOp13getTagMapAttrEv called 0 returned 0% blocks executed 0%
+    #####:  303:  AffineMapAttr getTagMapAttr() {
+    #####:  304:    return (*this)->getAttr(getTagMapAttrStrName()).cast<AffineMapAttr>();
+call    0 never executed
+call    1 never executed
+        -:  305:  }
+        -:  306:
+        -:  307:  /// Returns the tag memref index for this DMA operation.
+function _ZN4mlir15AffineDmaWaitOp13getTagIndicesEv called 0 returned 0% blocks executed 0%
+    #####:  308:  operand_range getTagIndices() {
+    #####:  309:    return {operand_begin() + 1,
+call    0 never executed
+call    1 never executed
+    #####:  310:            operand_begin() + 1 + getTagMap().getNumInputs()};
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  311:  }
+        -:  312:
+        -:  313:  /// Returns the rank (number of indices) of the tag memref.
+        -:  314:  unsigned getTagMemRefRank() {
+        -:  315:    return getTagMemRef().getType().cast<MemRefType>().getRank();
+        -:  316:  }
+        -:  317:
+        -:  318:  /// Impelements the AffineMapAccessInterface. Returns the AffineMapAttr
+        -:  319:  /// associated with 'memref'.
+        -:  320:  NamedAttribute getAffineMapAttrForMemRef(Value memref) {
+        -:  321:    assert(memref == getTagMemRef());
+        -:  322:    return {StringAttr::get(getContext(), getTagMapAttrStrName()),
+        -:  323:            getTagMapAttr()};
+        -:  324:  }
+        -:  325:
+        -:  326:  /// Returns the number of elements transferred by the associated DMA op.
+        -:  327:  Value getNumElements() { return getOperand(1 + getTagMap().getNumInputs()); }
+        -:  328:
+    #####:  329:  static StringRef getTagMapAttrStrName() { return "tag_map"; }
+call    0 never executed
+        -:  330:  static ParseResult parse(OpAsmParser &parser, OperationState &result);
+        -:  331:  void print(OpAsmPrinter &p);
+        -:  332:  LogicalResult verifyInvariantsImpl();
+        -:  333:  LogicalResult verifyInvariants() { return verifyInvariantsImpl(); }
+        -:  334:  LogicalResult fold(ArrayRef<Attribute> cstOperands,
+        -:  335:                     SmallVectorImpl<OpFoldResult> &results);
+        -:  336:};
+        -:  337:
+        -:  338:/// Returns true if the given Value can be used as a dimension id in the region
+        -:  339:/// of the closest surrounding op that has the trait `AffineScope`.
+        -:  340:bool isValidDim(Value value);
+        -:  341:
+        -:  342:/// Returns true if the given Value can be used as a dimension id in `region`,
+        -:  343:/// i.e., for all its uses in `region`.
+        -:  344:bool isValidDim(Value value, Region *region);
+        -:  345:
+        -:  346:/// Returns true if the given value can be used as a symbol in the region of the
+        -:  347:/// closest surrounding op that has the trait `AffineScope`.
+        -:  348:bool isValidSymbol(Value value);
+        -:  349:
+        -:  350:/// Returns true if the given Value can be used as a symbol for `region`, i.e.,
+        -:  351:/// for all its uses in `region`.
+        -:  352:bool isValidSymbol(Value value, Region *region);
+        -:  353:
+        -:  354:/// Parses dimension and symbol list. `numDims` is set to the number of
+        -:  355:/// dimensions in the list parsed.
+        -:  356:ParseResult parseDimAndSymbolList(OpAsmParser &parser,
+        -:  357:                                  SmallVectorImpl<Value> &operands,
+        -:  358:                                  unsigned &numDims);
+        -:  359:
+        -:  360:/// Modifies both `map` and `operands` in-place so as to:
+        -:  361:/// 1. drop duplicate operands
+        -:  362:/// 2. drop unused dims and symbols from map
+        -:  363:/// 3. promote valid symbols to symbolic operands in case they appeared as
+        -:  364:///    dimensional operands
+        -:  365:/// 4. propagate constant operands and drop them
+        -:  366:void canonicalizeMapAndOperands(AffineMap *map,
+        -:  367:                                SmallVectorImpl<Value> *operands);
+        -:  368:
+        -:  369:/// Canonicalizes an integer set the same way canonicalizeMapAndOperands does
+        -:  370:/// for affine maps.
+        -:  371:void canonicalizeSetAndOperands(IntegerSet *set,
+        -:  372:                                SmallVectorImpl<Value> *operands);
+        -:  373:
+        -:  374:/// Returns a composed AffineApplyOp by composing `map` and `operands` with
+        -:  375:/// other AffineApplyOps supplying those operands. The operands of the resulting
+        -:  376:/// AffineApplyOp do not change the length of  AffineApplyOp chains.
+        -:  377:AffineApplyOp makeComposedAffineApply(OpBuilder &b, Location loc, AffineMap map,
+        -:  378:                                      ValueRange operands);
+        -:  379:/// Variant of `makeComposedAffineApply` which infers the AffineMap from `e`.
+        -:  380:AffineApplyOp makeComposedAffineApply(OpBuilder &b, Location loc, AffineExpr e,
+        -:  381:                                      ValueRange values);
+        -:  382:
+        -:  383:/// Constructs an AffineApplyOp that applies `map` to `operands` after composing
+        -:  384:/// the map with the maps of any other AffineApplyOp supplying the operands,
+        -:  385:/// then immediately attempts to fold it. If folding results in a constant
+        -:  386:/// value, no ops are actually created. The `map` must be a single-result affine
+        -:  387:/// map.
+        -:  388:OpFoldResult makeComposedFoldedAffineApply(OpBuilder &b, Location loc,
+        -:  389:                                           AffineMap map,
+        -:  390:                                           ArrayRef<OpFoldResult> operands);
+        -:  391:/// Variant of `makeComposedFoldedAffineApply` that applies to an expression.
+        -:  392:OpFoldResult makeComposedFoldedAffineApply(OpBuilder &b, Location loc,
+        -:  393:                                           AffineExpr expr,
+        -:  394:                                           ArrayRef<OpFoldResult> operands);
+        -:  395:/// Variant of `makeComposedFoldedAffineApply` suitable for multi-result maps.
+        -:  396:/// Note that this may create as many affine.apply operations as the map has
+        -:  397:/// results given that affine.apply must be single-result.
+        -:  398:SmallVector<OpFoldResult> makeComposedFoldedMultiResultAffineApply(
+        -:  399:    OpBuilder &b, Location loc, AffineMap map, ArrayRef<OpFoldResult> operands);
+        -:  400:
+        -:  401:/// Returns an AffineMinOp obtained by composing `map` and `operands` with
+        -:  402:/// AffineApplyOps supplying those operands.
+        -:  403:Value makeComposedAffineMin(OpBuilder &b, Location loc, AffineMap map,
+        -:  404:                            ValueRange operands);
+        -:  405:
+        -:  406:/// Constructs an AffineMinOp that computes a minimum across the results of
+        -:  407:/// applying `map` to `operands`, then immediately attempts to fold it. If
+        -:  408:/// folding results in a constant value, no ops are actually created.
+        -:  409:OpFoldResult makeComposedFoldedAffineMin(OpBuilder &b, Location loc,
+        -:  410:                                         AffineMap map,
+        -:  411:                                         ArrayRef<OpFoldResult> operands);
+        -:  412:
+        -:  413:/// Constructs an AffineMinOp that computes a maximum across the results of
+        -:  414:/// applying `map` to `operands`, then immediately attempts to fold it. If
+        -:  415:/// folding results in a constant value, no ops are actually created.
+        -:  416:OpFoldResult makeComposedFoldedAffineMax(OpBuilder &b, Location loc,
+        -:  417:                                         AffineMap map,
+        -:  418:                                         ArrayRef<OpFoldResult> operands);
+        -:  419:
+        -:  420:/// Returns the values obtained by applying `map` to the list of values.
+        -:  421:SmallVector<Value, 4> applyMapToValues(OpBuilder &b, Location loc,
+        -:  422:                                       AffineMap map, ValueRange values);
+        -:  423:
+        -:  424:/// Given an affine map `map` and its input `operands`, this method composes
+        -:  425:/// into `map`, maps of AffineApplyOps whose results are the values in
+        -:  426:/// `operands`, iteratively until no more of `operands` are the result of an
+        -:  427:/// AffineApplyOp. When this function returns, `map` becomes the composed affine
+        -:  428:/// map, and each Value in `operands` is guaranteed to be either a loop IV or a
+        -:  429:/// terminal symbol, i.e., a symbol defined at the top level or a block/function
+        -:  430:/// argument.
+        -:  431:void fullyComposeAffineMapAndOperands(AffineMap *map,
+        -:  432:                                      SmallVectorImpl<Value> *operands);
+        -:  433:} // namespace mlir
+        -:  434:#include "mlir/Dialect/Affine/IR/AffineOpsDialect.h.inc"
+        -:  435:
+        -:  436:#define GET_OP_CLASSES
+        -:  437:#include "mlir/Dialect/Affine/IR/AffineOps.h.inc"
+        -:  438:
+        -:  439:namespace mlir {
+        -:  440:/// Returns true if the provided value is the induction variable of a
+        -:  441:/// AffineForOp.
+        -:  442:bool isForInductionVar(Value val);
+        -:  443:
+        -:  444:/// Returns the loop parent of an induction variable. If the provided value is
+        -:  445:/// not an induction variable, then return nullptr.
+        -:  446:AffineForOp getForInductionVarOwner(Value val);
+        -:  447:
+        -:  448:/// Extracts the induction variables from a list of AffineForOps and places them
+        -:  449:/// in the output argument `ivs`.
+        -:  450:void extractForInductionVars(ArrayRef<AffineForOp> forInsts,
+        -:  451:                             SmallVectorImpl<Value> *ivs);
+        -:  452:
+        -:  453:/// Builds a perfect nest of affine.for loops, i.e., each loop except the
+        -:  454:/// innermost one contains only another loop and a terminator. The loops iterate
+        -:  455:/// from "lbs" to "ubs" with "steps". The body of the innermost loop is
+        -:  456:/// populated by calling "bodyBuilderFn" and providing it with an OpBuilder, a
+        -:  457:/// Location and a list of loop induction variables.
+        -:  458:void buildAffineLoopNest(OpBuilder &builder, Location loc,
+        -:  459:                         ArrayRef<int64_t> lbs, ArrayRef<int64_t> ubs,
+        -:  460:                         ArrayRef<int64_t> steps,
+        -:  461:                         function_ref<void(OpBuilder &, Location, ValueRange)>
+        -:  462:                             bodyBuilderFn = nullptr);
+        -:  463:void buildAffineLoopNest(OpBuilder &builder, Location loc, ValueRange lbs,
+        -:  464:                         ValueRange ubs, ArrayRef<int64_t> steps,
+        -:  465:                         function_ref<void(OpBuilder &, Location, ValueRange)>
+        -:  466:                             bodyBuilderFn = nullptr);
+        -:  467:
+        -:  468:/// Replace `loop` with a new loop where `newIterOperands` are appended with
+        -:  469:/// new initialization values and `newYieldedValues` are added as new yielded
+        -:  470:/// values. The returned ForOp has `newYieldedValues.size()` new result values.
+        -:  471:/// Additionally, if `replaceLoopResults` is true, all uses of
+        -:  472:/// `loop.getResults()` are replaced with the first `loop.getNumResults()`
+        -:  473:/// return values  of the original loop respectively. The original loop is
+        -:  474:/// deleted and the new loop returned.
+        -:  475:/// Prerequisite: `newIterOperands.size() == newYieldedValues.size()`.
+        -:  476:AffineForOp replaceForOpWithNewYields(OpBuilder &b, AffineForOp loop,
+        -:  477:                                      ValueRange newIterOperands,
+        -:  478:                                      ValueRange newYieldedValues,
+        -:  479:                                      ValueRange newIterArgs,
+        -:  480:                                      bool replaceLoopResults = true);
+        -:  481:
+        -:  482:/// AffineBound represents a lower or upper bound in the for operation.
+        -:  483:/// This class does not own the underlying operands. Instead, it refers
+        -:  484:/// to the operands stored in the AffineForOp. Its life span should not exceed
+        -:  485:/// that of the for operation it refers to.
+        -:  486:class AffineBound {
+        -:  487:public:
+        -:  488:  AffineForOp getAffineForOp() { return op; }
+        -:  489:  AffineMap getMap() { return map; }
+        -:  490:
+        -:  491:  unsigned getNumOperands() { return opEnd - opStart; }
+        -:  492:  Value getOperand(unsigned idx) { return op.getOperand(opStart + idx); }
+        -:  493:
+        -:  494:  using operand_iterator = AffineForOp::operand_iterator;
+        -:  495:  using operand_range = AffineForOp::operand_range;
+        -:  496:
+        -:  497:  operand_iterator operandBegin() { return op.operand_begin() + opStart; }
+        -:  498:  operand_iterator operandEnd() { return op.operand_begin() + opEnd; }
+        -:  499:  operand_range getOperands() { return {operandBegin(), operandEnd()}; }
+        -:  500:
+        -:  501:private:
+        -:  502:  // 'affine.for' operation that contains this bound.
+        -:  503:  AffineForOp op;
+        -:  504:  // Start and end positions of this affine bound operands in the list of
+        -:  505:  // the containing 'affine.for' operation operands.
+        -:  506:  unsigned opStart, opEnd;
+        -:  507:  // Affine map for this bound.
+        -:  508:  AffineMap map;
+        -:  509:
+        -:  510:  AffineBound(AffineForOp op, unsigned opStart, unsigned opEnd, AffineMap map)
+        -:  511:      : op(op), opStart(opStart), opEnd(opEnd), map(map) {}
+        -:  512:
+        -:  513:  friend class AffineForOp;
+        -:  514:};
+        -:  515:
+        -:  516:} // namespace mlir
+        -:  517:
+        -:  518:#endif

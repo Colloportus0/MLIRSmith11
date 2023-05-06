@@ -1,0 +1,259 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/Support/Threading.h
+        -:    0:Graph:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/MLIRContext.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/IR/CMakeFiles/obj.MLIRIR.dir/MLIRContext.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===-- llvm/Support/Threading.h - Control multithreading mode --*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file declares helper functions for running LLVM in a multi-threaded
+        -:   10:// environment.
+        -:   11://
+        -:   12://===----------------------------------------------------------------------===//
+        -:   13:
+        -:   14:#ifndef LLVM_SUPPORT_THREADING_H
+        -:   15:#define LLVM_SUPPORT_THREADING_H
+        -:   16:
+        -:   17:#include "llvm/ADT/BitVector.h"
+        -:   18:#include "llvm/ADT/StringRef.h"
+        -:   19:#include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
+        -:   20:#include "llvm/Support/Compiler.h"
+        -:   21:#include <ciso646> // So we can check the C++ standard lib macros.
+        -:   22:
+        -:   23:#if defined(_MSC_VER)
+        -:   24:// MSVC's call_once implementation worked since VS 2015, which is the minimum
+        -:   25:// supported version as of this writing.
+        -:   26:#define LLVM_THREADING_USE_STD_CALL_ONCE 1
+        -:   27:#elif defined(LLVM_ON_UNIX) &&                                                 \
+        -:   28:    (defined(_LIBCPP_VERSION) ||                                               \
+        -:   29:     !(defined(__NetBSD__) || defined(__OpenBSD__) ||                          \
+        -:   30:       (defined(__ppc__) || defined(__PPC__))))
+        -:   31:// std::call_once from libc++ is used on all Unix platforms. Other
+        -:   32:// implementations like libstdc++ are known to have problems on NetBSD,
+        -:   33:// OpenBSD and PowerPC.
+        -:   34:#define LLVM_THREADING_USE_STD_CALL_ONCE 1
+        -:   35:#elif defined(LLVM_ON_UNIX) &&                                                 \
+        -:   36:    ((defined(__ppc__) || defined(__PPC__)) && defined(__LITTLE_ENDIAN__))
+        -:   37:#define LLVM_THREADING_USE_STD_CALL_ONCE 1
+        -:   38:#else
+        -:   39:#define LLVM_THREADING_USE_STD_CALL_ONCE 0
+        -:   40:#endif
+        -:   41:
+        -:   42:#if LLVM_THREADING_USE_STD_CALL_ONCE
+        -:   43:#include <mutex>
+        -:   44:#else
+        -:   45:#include "llvm/Support/Atomic.h"
+        -:   46:#endif
+        -:   47:
+        -:   48:namespace llvm {
+        -:   49:class Twine;
+        -:   50:
+        -:   51:/// Returns true if LLVM is compiled with support for multi-threading, and
+        -:   52:/// false otherwise.
+        -:   53:constexpr bool llvm_is_multithreaded() { return LLVM_ENABLE_THREADS; }
+        -:   54:
+        -:   55:#if LLVM_THREADING_USE_STD_CALL_ONCE
+        -:   56:
+        -:   57:  typedef std::once_flag once_flag;
+        -:   58:
+        -:   59:#else
+        -:   60:
+        -:   61:  enum InitStatus { Uninitialized = 0, Wait = 1, Done = 2 };
+        -:   62:
+        -:   63:  /// The llvm::once_flag structure
+        -:   64:  ///
+        -:   65:  /// This type is modeled after std::once_flag to use with llvm::call_once.
+        -:   66:  /// This structure must be used as an opaque object. It is a struct to force
+        -:   67:  /// autoinitialization and behave like std::once_flag.
+        -:   68:  struct once_flag {
+        -:   69:    volatile sys::cas_flag status = Uninitialized;
+        -:   70:  };
+        -:   71:
+        -:   72:#endif
+        -:   73:
+        -:   74:  /// Execute the function specified as a parameter once.
+        -:   75:  ///
+        -:   76:  /// Typical usage:
+        -:   77:  /// \code
+        -:   78:  ///   void foo() {...};
+        -:   79:  ///   ...
+        -:   80:  ///   static once_flag flag;
+        -:   81:  ///   call_once(flag, foo);
+        -:   82:  /// \endcode
+        -:   83:  ///
+        -:   84:  /// \param flag Flag used for tracking whether or not this has run.
+        -:   85:  /// \param F Function to call once.
+        -:   86:  template <typename Function, typename... Args>
+        -:   87:  void call_once(once_flag &flag, Function &&F, Args &&... ArgList) {
+        -:   88:#if LLVM_THREADING_USE_STD_CALL_ONCE
+        -:   89:    std::call_once(flag, std::forward<Function>(F),
+        -:   90:                   std::forward<Args>(ArgList)...);
+        -:   91:#else
+        -:   92:    // For other platforms we use a generic (if brittle) version based on our
+        -:   93:    // atomics.
+        -:   94:    sys::cas_flag old_val = sys::CompareAndSwap(&flag.status, Wait, Uninitialized);
+        -:   95:    if (old_val == Uninitialized) {
+        -:   96:      std::forward<Function>(F)(std::forward<Args>(ArgList)...);
+        -:   97:      sys::MemoryFence();
+        -:   98:      TsanIgnoreWritesBegin();
+        -:   99:      TsanHappensBefore(&flag.status);
+        -:  100:      flag.status = Done;
+        -:  101:      TsanIgnoreWritesEnd();
+        -:  102:    } else {
+        -:  103:      // Wait until any thread doing the call has finished.
+        -:  104:      sys::cas_flag tmp = flag.status;
+        -:  105:      sys::MemoryFence();
+        -:  106:      while (tmp != Done) {
+        -:  107:        tmp = flag.status;
+        -:  108:        sys::MemoryFence();
+        -:  109:      }
+        -:  110:    }
+        -:  111:    TsanHappensAfter(&flag.status);
+        -:  112:#endif
+        -:  113:  }
+        -:  114:
+        -:  115:  /// This tells how a thread pool will be used
+        -:  116:  class ThreadPoolStrategy {
+        -:  117:  public:
+        -:  118:    // The default value (0) means all available threads should be used,
+        -:  119:    // taking the affinity mask into account. If set, this value only represents
+        -:  120:    // a suggested high bound, the runtime might choose a lower value (not
+        -:  121:    // higher).
+        -:  122:    unsigned ThreadsRequested = 0;
+        -:  123:
+        -:  124:    // If SMT is active, use hyper threads. If false, there will be only one
+        -:  125:    // std::thread per core.
+        -:  126:    bool UseHyperThreads = true;
+        -:  127:
+        -:  128:    // If set, will constrain 'ThreadsRequested' to the number of hardware
+        -:  129:    // threads, or hardware cores.
+        -:  130:    bool Limit = false;
+        -:  131:
+        -:  132:    /// Retrieves the max available threads for the current strategy. This
+        -:  133:    /// accounts for affinity masks and takes advantage of all CPU sockets.
+        -:  134:    unsigned compute_thread_count() const;
+        -:  135:
+        -:  136:    /// Assign the current thread to an ideal hardware CPU or NUMA node. In a
+        -:  137:    /// multi-socket system, this ensures threads are assigned to all CPU
+        -:  138:    /// sockets. \p ThreadPoolNum represents a number bounded by [0,
+        -:  139:    /// compute_thread_count()).
+        -:  140:    void apply_thread_strategy(unsigned ThreadPoolNum) const;
+        -:  141:
+        -:  142:    /// Finds the CPU socket where a thread should go. Returns 'None' if the
+        -:  143:    /// thread shall remain on the actual CPU socket.
+        -:  144:    Optional<unsigned> compute_cpu_socket(unsigned ThreadPoolNum) const;
+        -:  145:  };
+        -:  146:
+        -:  147:  /// Build a strategy from a number of threads as a string provided in \p Num.
+        -:  148:  /// When Num is above the max number of threads specified by the \p Default
+        -:  149:  /// strategy, we attempt to equally allocate the threads on all CPU sockets.
+        -:  150:  /// "0" or an empty string will return the \p Default strategy.
+        -:  151:  /// "all" for using all hardware threads.
+        -:  152:  Optional<ThreadPoolStrategy>
+        -:  153:  get_threadpool_strategy(StringRef Num, ThreadPoolStrategy Default = {});
+        -:  154:
+        -:  155:  /// Returns a thread strategy for tasks requiring significant memory or other
+        -:  156:  /// resources. To be used for workloads where hardware_concurrency() proves to
+        -:  157:  /// be less efficient. Avoid this strategy if doing lots of I/O. Currently
+        -:  158:  /// based on physical cores, if available for the host system, otherwise falls
+        -:  159:  /// back to hardware_concurrency(). Returns 1 when LLVM is configured with
+        -:  160:  /// LLVM_ENABLE_THREADS = OFF.
+        -:  161:  inline ThreadPoolStrategy
+        -:  162:  heavyweight_hardware_concurrency(unsigned ThreadCount = 0) {
+        -:  163:    ThreadPoolStrategy S;
+        -:  164:    S.UseHyperThreads = false;
+        -:  165:    S.ThreadsRequested = ThreadCount;
+        -:  166:    return S;
+        -:  167:  }
+        -:  168:
+        -:  169:  /// Like heavyweight_hardware_concurrency() above, but builds a strategy
+        -:  170:  /// based on the rules described for get_threadpool_strategy().
+        -:  171:  /// If \p Num is invalid, returns a default strategy where one thread per
+        -:  172:  /// hardware core is used.
+        -:  173:  inline ThreadPoolStrategy heavyweight_hardware_concurrency(StringRef Num) {
+        -:  174:    Optional<ThreadPoolStrategy> S =
+        -:  175:        get_threadpool_strategy(Num, heavyweight_hardware_concurrency());
+        -:  176:    if (S)
+        -:  177:      return *S;
+        -:  178:    return heavyweight_hardware_concurrency();
+        -:  179:  }
+        -:  180:
+        -:  181:  /// Returns a default thread strategy where all available hardware resources
+        -:  182:  /// are to be used, except for those initially excluded by an affinity mask.
+        -:  183:  /// This function takes affinity into consideration. Returns 1 when LLVM is
+        -:  184:  /// configured with LLVM_ENABLE_THREADS=OFF.
+   103011:  185:  inline ThreadPoolStrategy hardware_concurrency(unsigned ThreadCount = 0) {
+   103011:  186:    ThreadPoolStrategy S;
+   103011:  187:    S.ThreadsRequested = ThreadCount;
+   103011:  188:    return S;
+call    0 returned 100%
+        -:  189:  }
+        -:  190:
+        -:  191:  /// Returns an optimal thread strategy to execute specified amount of tasks.
+        -:  192:  /// This strategy should prevent us from creating too many threads if we
+        -:  193:  /// occasionaly have an unexpectedly small amount of tasks.
+        -:  194:  inline ThreadPoolStrategy optimal_concurrency(unsigned TaskCount = 0) {
+        -:  195:    ThreadPoolStrategy S;
+        -:  196:    S.Limit = true;
+        -:  197:    S.ThreadsRequested = TaskCount;
+        -:  198:    return S;
+        -:  199:  }
+        -:  200:
+        -:  201:  /// Return the current thread id, as used in various OS system calls.
+        -:  202:  /// Note that not all platforms guarantee that the value returned will be
+        -:  203:  /// unique across the entire system, so portable code should not assume
+        -:  204:  /// this.
+        -:  205:  uint64_t get_threadid();
+        -:  206:
+        -:  207:  /// Get the maximum length of a thread name on this platform.
+        -:  208:  /// A value of 0 means there is no limit.
+        -:  209:  uint32_t get_max_thread_name_length();
+        -:  210:
+        -:  211:  /// Set the name of the current thread.  Setting a thread's name can
+        -:  212:  /// be helpful for enabling useful diagnostics under a debugger or when
+        -:  213:  /// logging.  The level of support for setting a thread's name varies
+        -:  214:  /// wildly across operating systems, and we only make a best effort to
+        -:  215:  /// perform the operation on supported platforms.  No indication of success
+        -:  216:  /// or failure is returned.
+        -:  217:  void set_thread_name(const Twine &Name);
+        -:  218:
+        -:  219:  /// Get the name of the current thread.  The level of support for
+        -:  220:  /// getting a thread's name varies wildly across operating systems, and it
+        -:  221:  /// is not even guaranteed that if you can successfully set a thread's name
+        -:  222:  /// that you can later get it back.  This function is intended for diagnostic
+        -:  223:  /// purposes, and as with setting a thread's name no indication of whether
+        -:  224:  /// the operation succeeded or failed is returned.
+        -:  225:  void get_thread_name(SmallVectorImpl<char> &Name);
+        -:  226:
+        -:  227:  /// Returns a mask that represents on which hardware thread, core, CPU, NUMA
+        -:  228:  /// group, the calling thread can be executed. On Windows, threads cannot
+        -:  229:  /// cross CPU sockets boundaries.
+        -:  230:  llvm::BitVector get_thread_affinity_mask();
+        -:  231:
+        -:  232:  /// Returns how many physical CPUs or NUMA groups the system has.
+        -:  233:  unsigned get_cpus();
+        -:  234:
+        -:  235:  enum class ThreadPriority {
+        -:  236:    /// Lower the current thread's priority as much as possible. Can be used
+        -:  237:    /// for long-running tasks that are not time critical; more energy-
+        -:  238:    /// efficient than Low.
+        -:  239:    Background = 0,
+        -:  240:
+        -:  241:    /// Lower the current thread's priority such that it does not affect
+        -:  242:    /// foreground tasks significantly. This is a good default for long-
+        -:  243:    /// running, latency-insensitive tasks to make sure cpu is not hogged
+        -:  244:    /// by this task.
+        -:  245:    Low = 1,
+        -:  246:
+        -:  247:    /// Restore the current thread's priority to default scheduling priority.
+        -:  248:    Default = 2,
+        -:  249:  };
+        -:  250:  enum class SetThreadPriorityResult { FAILURE, SUCCESS };
+        -:  251:  SetThreadPriorityResult set_thread_priority(ThreadPriority Priority);
+        -:  252:}
+        -:  253:
+        -:  254:#endif

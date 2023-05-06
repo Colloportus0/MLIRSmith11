@@ -1,0 +1,761 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/llvm/include/llvm/Support/raw_ostream.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:116169
+        -:    1://===--- raw_ostream.h - Raw output stream ----------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9://  This file defines the raw_ostream class.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef LLVM_SUPPORT_RAW_OSTREAM_H
+        -:   14:#define LLVM_SUPPORT_RAW_OSTREAM_H
+        -:   15:
+        -:   16:#include "llvm/ADT/SmallVector.h"
+        -:   17:#include "llvm/ADT/StringRef.h"
+        -:   18:#include "llvm/ADT/Optional.h"
+        -:   19:#include "llvm/Support/DataTypes.h"
+        -:   20:#include <cassert>
+        -:   21:#include <cstddef>
+        -:   22:#include <cstdint>
+        -:   23:#include <cstring>
+        -:   24:#include <string>
+        -:   25:#include <string_view>
+        -:   26:#include <system_error>
+        -:   27:#include <type_traits>
+        -:   28:
+        -:   29:namespace llvm {
+        -:   30:
+        -:   31:class Duration;
+        -:   32:class formatv_object_base;
+        -:   33:class format_object_base;
+        -:   34:class FormattedString;
+        -:   35:class FormattedNumber;
+        -:   36:class FormattedBytes;
+        -:   37:template <class T> class [[nodiscard]] Expected;
+        -:   38:
+        -:   39:namespace sys {
+        -:   40:namespace fs {
+        -:   41:enum FileAccess : unsigned;
+        -:   42:enum OpenFlags : unsigned;
+        -:   43:enum CreationDisposition : unsigned;
+        -:   44:class FileLocker;
+        -:   45:} // end namespace fs
+        -:   46:} // end namespace sys
+        -:   47:
+        -:   48:/// This class implements an extremely fast bulk output stream that can *only*
+        -:   49:/// output to a stream.  It does not support seeking, reopening, rewinding, line
+        -:   50:/// buffered disciplines etc. It is a simple buffer that outputs
+        -:   51:/// a chunk at a time.
+        -:   52:class raw_ostream {
+        -:   53:public:
+        -:   54:  // Class kinds to support LLVM-style RTTI.
+        -:   55:  enum class OStreamKind {
+        -:   56:    OK_OStream,
+        -:   57:    OK_FDStream,
+        -:   58:  };
+        -:   59:
+        -:   60:private:
+        -:   61:  OStreamKind Kind;
+        -:   62:
+        -:   63:  /// The buffer is handled in such a way that the buffer is
+        -:   64:  /// uninitialized, unbuffered, or out of space when OutBufCur >=
+        -:   65:  /// OutBufEnd. Thus a single comparison suffices to determine if we
+        -:   66:  /// need to take the slow path to write a single character.
+        -:   67:  ///
+        -:   68:  /// The buffer is in one of three states:
+        -:   69:  ///  1. Unbuffered (BufferMode == Unbuffered)
+        -:   70:  ///  1. Uninitialized (BufferMode != Unbuffered && OutBufStart == 0).
+        -:   71:  ///  2. Buffered (BufferMode != Unbuffered && OutBufStart != 0 &&
+        -:   72:  ///               OutBufEnd - OutBufStart >= 1).
+        -:   73:  ///
+        -:   74:  /// If buffered, then the raw_ostream owns the buffer if (BufferMode ==
+        -:   75:  /// InternalBuffer); otherwise the buffer has been set via SetBuffer and is
+        -:   76:  /// managed by the subclass.
+        -:   77:  ///
+        -:   78:  /// If a subclass installs an external buffer using SetBuffer then it can wait
+        -:   79:  /// for a \see write_impl() call to handle the data which has been put into
+        -:   80:  /// this buffer.
+        -:   81:  char *OutBufStart, *OutBufEnd, *OutBufCur;
+        -:   82:  bool ColorEnabled = false;
+        -:   83:
+        -:   84:  /// Optional stream this stream is tied to. If this stream is written to, the
+        -:   85:  /// tied-to stream will be flushed first.
+        -:   86:  raw_ostream *TiedStream = nullptr;
+        -:   87:
+        -:   88:  enum class BufferKind {
+        -:   89:    Unbuffered = 0,
+        -:   90:    InternalBuffer,
+        -:   91:    ExternalBuffer
+        -:   92:  } BufferMode;
+        -:   93:
+        -:   94:public:
+        -:   95:  // color order matches ANSI escape sequence, don't change
+        -:   96:  enum class Colors {
+        -:   97:    BLACK = 0,
+        -:   98:    RED,
+        -:   99:    GREEN,
+        -:  100:    YELLOW,
+        -:  101:    BLUE,
+        -:  102:    MAGENTA,
+        -:  103:    CYAN,
+        -:  104:    WHITE,
+        -:  105:    SAVEDCOLOR,
+        -:  106:    RESET,
+        -:  107:  };
+        -:  108:
+        -:  109:  static constexpr Colors BLACK = Colors::BLACK;
+        -:  110:  static constexpr Colors RED = Colors::RED;
+        -:  111:  static constexpr Colors GREEN = Colors::GREEN;
+        -:  112:  static constexpr Colors YELLOW = Colors::YELLOW;
+        -:  113:  static constexpr Colors BLUE = Colors::BLUE;
+        -:  114:  static constexpr Colors MAGENTA = Colors::MAGENTA;
+        -:  115:  static constexpr Colors CYAN = Colors::CYAN;
+        -:  116:  static constexpr Colors WHITE = Colors::WHITE;
+        -:  117:  static constexpr Colors SAVEDCOLOR = Colors::SAVEDCOLOR;
+        -:  118:  static constexpr Colors RESET = Colors::RESET;
+        -:  119:
+        -:  120:  explicit raw_ostream(bool unbuffered = false,
+        -:  121:                       OStreamKind K = OStreamKind::OK_OStream)
+        -:  122:      : Kind(K), BufferMode(unbuffered ? BufferKind::Unbuffered
+        -:  123:                                       : BufferKind::InternalBuffer) {
+        -:  124:    // Start out ready to flush.
+        -:  125:    OutBufStart = OutBufEnd = OutBufCur = nullptr;
+        -:  126:  }
+        -:  127:
+        -:  128:  raw_ostream(const raw_ostream &) = delete;
+        -:  129:  void operator=(const raw_ostream &) = delete;
+        -:  130:
+        -:  131:  virtual ~raw_ostream();
+        -:  132:
+        -:  133:  /// tell - Return the current offset with the file.
+        -:  134:  uint64_t tell() const { return current_pos() + GetNumBytesInBuffer(); }
+        -:  135:
+        -:  136:  OStreamKind get_kind() const { return Kind; }
+        -:  137:
+        -:  138:  //===--------------------------------------------------------------------===//
+        -:  139:  // Configuration Interface
+        -:  140:  //===--------------------------------------------------------------------===//
+        -:  141:
+        -:  142:  /// If possible, pre-allocate \p ExtraSize bytes for stream data.
+        -:  143:  /// i.e. it extends internal buffers to keep additional ExtraSize bytes.
+        -:  144:  /// So that the stream could keep at least tell() + ExtraSize bytes
+        -:  145:  /// without re-allocations. reserveExtraSpace() does not change
+        -:  146:  /// the size/data of the stream.
+        -:  147:  virtual void reserveExtraSpace(uint64_t ExtraSize) {}
+        -:  148:
+        -:  149:  /// Set the stream to be buffered, with an automatically determined buffer
+        -:  150:  /// size.
+        -:  151:  void SetBuffered();
+        -:  152:
+        -:  153:  /// Set the stream to be buffered, using the specified buffer size.
+        -:  154:  void SetBufferSize(size_t Size) {
+        -:  155:    flush();
+        -:  156:    SetBufferAndMode(new char[Size], Size, BufferKind::InternalBuffer);
+        -:  157:  }
+        -:  158:
+        -:  159:  size_t GetBufferSize() const {
+        -:  160:    // If we're supposed to be buffered but haven't actually gotten around
+        -:  161:    // to allocating the buffer yet, return the value that would be used.
+        -:  162:    if (BufferMode != BufferKind::Unbuffered && OutBufStart == nullptr)
+        -:  163:      return preferred_buffer_size();
+        -:  164:
+        -:  165:    // Otherwise just return the size of the allocated buffer.
+        -:  166:    return OutBufEnd - OutBufStart;
+        -:  167:  }
+        -:  168:
+        -:  169:  /// Set the stream to be unbuffered. When unbuffered, the stream will flush
+        -:  170:  /// after every write. This routine will also flush the buffer immediately
+        -:  171:  /// when the stream is being set to unbuffered.
+        -:  172:  void SetUnbuffered() {
+        -:  173:    flush();
+        -:  174:    SetBufferAndMode(nullptr, 0, BufferKind::Unbuffered);
+        -:  175:  }
+        -:  176:
+        -:  177:  size_t GetNumBytesInBuffer() const {
+        -:  178:    return OutBufCur - OutBufStart;
+        -:  179:  }
+        -:  180:
+        -:  181:  //===--------------------------------------------------------------------===//
+        -:  182:  // Data Output Interface
+        -:  183:  //===--------------------------------------------------------------------===//
+        -:  184:
+        -:  185:  void flush() {
+        -:  186:    if (OutBufCur != OutBufStart)
+        -:  187:      flush_nonempty();
+        -:  188:  }
+        -:  189:
+        -:  190:  raw_ostream &operator<<(char C) {
+        -:  191:    if (OutBufCur >= OutBufEnd)
+        -:  192:      return write(C);
+        -:  193:    *OutBufCur++ = C;
+        -:  194:    return *this;
+        -:  195:  }
+        -:  196:
+        -:  197:  raw_ostream &operator<<(unsigned char C) {
+        -:  198:    if (OutBufCur >= OutBufEnd)
+        -:  199:      return write(C);
+        -:  200:    *OutBufCur++ = C;
+        -:  201:    return *this;
+        -:  202:  }
+        -:  203:
+        -:  204:  raw_ostream &operator<<(signed char C) {
+        -:  205:    if (OutBufCur >= OutBufEnd)
+        -:  206:      return write(C);
+        -:  207:    *OutBufCur++ = C;
+        -:  208:    return *this;
+        -:  209:  }
+        -:  210:
+function _ZN4llvm11raw_ostreamlsENS_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  211:  raw_ostream &operator<<(StringRef Str) {
+        -:  212:    // Inline fast path, particularly for strings with a known length.
+    #####:  213:    size_t Size = Str.size();
+branch  0 never executed
+branch  1 never executed
+        -:  214:
+        -:  215:    // Make sure we can use the fast path.
+    #####:  216:    if (Size > (size_t)(OutBufEnd - OutBufCur))
+branch  0 never executed
+branch  1 never executed
+    #####:  217:      return write(Str.data(), Size);
+call    0 never executed
+        -:  218:
+    #####:  219:    if (Size) {
+branch  0 never executed
+branch  1 never executed
+    #####:  220:      memcpy(OutBufCur, Str.data(), Size);
+    #####:  221:      OutBufCur += Size;
+        -:  222:    }
+        -:  223:    return *this;
+        -:  224:  }
+        -:  225:
+function _ZN4llvm11raw_ostreamlsEPKc called 0 returned 0% blocks executed 0%
+    #####:  226:  raw_ostream &operator<<(const char *Str) {
+        -:  227:    // Inline fast path, particularly for constant strings where a sufficiently
+        -:  228:    // smart compiler will simplify strlen.
+        -:  229:
+    #####:  230:    return this->operator<<(StringRef(Str));
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  231:  }
+        -:  232:
+        -:  233:  raw_ostream &operator<<(const std::string &Str) {
+        -:  234:    // Avoid the fast path, it would only increase code size for a marginal win.
+        -:  235:    return write(Str.data(), Str.length());
+        -:  236:  }
+        -:  237:
+        -:  238:  raw_ostream &operator<<(const std::string_view &Str) {
+        -:  239:    return write(Str.data(), Str.length());
+        -:  240:  }
+        -:  241:
+        -:  242:  raw_ostream &operator<<(const SmallVectorImpl<char> &Str) {
+        -:  243:    return write(Str.data(), Str.size());
+        -:  244:  }
+        -:  245:
+        -:  246:  raw_ostream &operator<<(unsigned long N);
+        -:  247:  raw_ostream &operator<<(long N);
+        -:  248:  raw_ostream &operator<<(unsigned long long N);
+        -:  249:  raw_ostream &operator<<(long long N);
+        -:  250:  raw_ostream &operator<<(const void *P);
+        -:  251:
+        -:  252:  raw_ostream &operator<<(unsigned int N) {
+        -:  253:    return this->operator<<(static_cast<unsigned long>(N));
+        -:  254:  }
+        -:  255:
+        -:  256:  raw_ostream &operator<<(int N) {
+        -:  257:    return this->operator<<(static_cast<long>(N));
+        -:  258:  }
+        -:  259:
+        -:  260:  raw_ostream &operator<<(double N);
+        -:  261:
+        -:  262:  /// Output \p N in hexadecimal, without any prefix or padding.
+        -:  263:  raw_ostream &write_hex(unsigned long long N);
+        -:  264:
+        -:  265:  // Change the foreground color of text.
+        -:  266:  raw_ostream &operator<<(Colors C);
+        -:  267:
+        -:  268:  /// Output a formatted UUID with dash separators.
+        -:  269:  using uuid_t = uint8_t[16];
+        -:  270:  raw_ostream &write_uuid(const uuid_t UUID);
+        -:  271:
+        -:  272:  /// Output \p Str, turning '\\', '\t', '\n', '"', and anything that doesn't
+        -:  273:  /// satisfy llvm::isPrint into an escape sequence.
+        -:  274:  raw_ostream &write_escaped(StringRef Str, bool UseHexEscapes = false);
+        -:  275:
+        -:  276:  raw_ostream &write(unsigned char C);
+        -:  277:  raw_ostream &write(const char *Ptr, size_t Size);
+        -:  278:
+        -:  279:  // Formatted output, see the format() function in Support/Format.h.
+        -:  280:  raw_ostream &operator<<(const format_object_base &Fmt);
+        -:  281:
+        -:  282:  // Formatted output, see the leftJustify() function in Support/Format.h.
+        -:  283:  raw_ostream &operator<<(const FormattedString &);
+        -:  284:
+        -:  285:  // Formatted output, see the formatHex() function in Support/Format.h.
+        -:  286:  raw_ostream &operator<<(const FormattedNumber &);
+        -:  287:
+        -:  288:  // Formatted output, see the formatv() function in Support/FormatVariadic.h.
+        -:  289:  raw_ostream &operator<<(const formatv_object_base &);
+        -:  290:
+        -:  291:  // Formatted output, see the format_bytes() function in Support/Format.h.
+        -:  292:  raw_ostream &operator<<(const FormattedBytes &);
+        -:  293:
+        -:  294:  /// indent - Insert 'NumSpaces' spaces.
+        -:  295:  raw_ostream &indent(unsigned NumSpaces);
+        -:  296:
+        -:  297:  /// write_zeros - Insert 'NumZeros' nulls.
+        -:  298:  raw_ostream &write_zeros(unsigned NumZeros);
+        -:  299:
+        -:  300:  /// Changes the foreground color of text that will be output from this point
+        -:  301:  /// forward.
+        -:  302:  /// @param Color ANSI color to use, the special SAVEDCOLOR can be used to
+        -:  303:  /// change only the bold attribute, and keep colors untouched
+        -:  304:  /// @param Bold bold/brighter text, default false
+        -:  305:  /// @param BG if true change the background, default: change foreground
+        -:  306:  /// @returns itself so it can be used within << invocations
+        -:  307:  virtual raw_ostream &changeColor(enum Colors Color, bool Bold = false,
+        -:  308:                                   bool BG = false);
+        -:  309:
+        -:  310:  /// Resets the colors to terminal defaults. Call this when you are done
+        -:  311:  /// outputting colored text, or before program exit.
+        -:  312:  virtual raw_ostream &resetColor();
+        -:  313:
+        -:  314:  /// Reverses the foreground and background colors.
+        -:  315:  virtual raw_ostream &reverseColor();
+        -:  316:
+        -:  317:  /// This function determines if this stream is connected to a "tty" or
+        -:  318:  /// "console" window. That is, the output would be displayed to the user
+        -:  319:  /// rather than being put on a pipe or stored in a file.
+        -:  320:  virtual bool is_displayed() const { return false; }
+        -:  321:
+        -:  322:  /// This function determines if this stream is displayed and supports colors.
+        -:  323:  /// The result is unaffected by calls to enable_color().
+        -:  324:  virtual bool has_colors() const { return is_displayed(); }
+        -:  325:
+        -:  326:  // Enable or disable colors. Once enable_colors(false) is called,
+        -:  327:  // changeColor() has no effect until enable_colors(true) is called.
+        -:  328:  virtual void enable_colors(bool enable) { ColorEnabled = enable; }
+        -:  329:
+        -:  330:  bool colors_enabled() const { return ColorEnabled; }
+        -:  331:
+        -:  332:  /// Tie this stream to the specified stream. Replaces any existing tied-to
+        -:  333:  /// stream. Specifying a nullptr unties the stream.
+        -:  334:  void tie(raw_ostream *TieTo) { TiedStream = TieTo; }
+        -:  335:
+        -:  336:  //===--------------------------------------------------------------------===//
+        -:  337:  // Subclass Interface
+        -:  338:  //===--------------------------------------------------------------------===//
+        -:  339:
+        -:  340:private:
+        -:  341:  /// The is the piece of the class that is implemented by subclasses.  This
+        -:  342:  /// writes the \p Size bytes starting at
+        -:  343:  /// \p Ptr to the underlying stream.
+        -:  344:  ///
+        -:  345:  /// This function is guaranteed to only be called at a point at which it is
+        -:  346:  /// safe for the subclass to install a new buffer via SetBuffer.
+        -:  347:  ///
+        -:  348:  /// \param Ptr The start of the data to be written. For buffered streams this
+        -:  349:  /// is guaranteed to be the start of the buffer.
+        -:  350:  ///
+        -:  351:  /// \param Size The number of bytes to be written.
+        -:  352:  ///
+        -:  353:  /// \invariant { Size > 0 }
+        -:  354:  virtual void write_impl(const char *Ptr, size_t Size) = 0;
+        -:  355:
+        -:  356:  /// Return the current position within the stream, not counting the bytes
+        -:  357:  /// currently in the buffer.
+        -:  358:  virtual uint64_t current_pos() const = 0;
+        -:  359:
+        -:  360:protected:
+        -:  361:  /// Use the provided buffer as the raw_ostream buffer. This is intended for
+        -:  362:  /// use only by subclasses which can arrange for the output to go directly
+        -:  363:  /// into the desired output buffer, instead of being copied on each flush.
+        -:  364:  void SetBuffer(char *BufferStart, size_t Size) {
+        -:  365:    SetBufferAndMode(BufferStart, Size, BufferKind::ExternalBuffer);
+        -:  366:  }
+        -:  367:
+        -:  368:  /// Return an efficient buffer size for the underlying output mechanism.
+        -:  369:  virtual size_t preferred_buffer_size() const;
+        -:  370:
+        -:  371:  /// Return the beginning of the current stream buffer, or 0 if the stream is
+        -:  372:  /// unbuffered.
+        -:  373:  const char *getBufferStart() const { return OutBufStart; }
+        -:  374:
+        -:  375:  //===--------------------------------------------------------------------===//
+        -:  376:  // Private Interface
+        -:  377:  //===--------------------------------------------------------------------===//
+        -:  378:private:
+        -:  379:  /// Install the given buffer and mode.
+        -:  380:  void SetBufferAndMode(char *BufferStart, size_t Size, BufferKind Mode);
+        -:  381:
+        -:  382:  /// Flush the current buffer, which is known to be non-empty. This outputs the
+        -:  383:  /// currently buffered data and resets the buffer to empty.
+        -:  384:  void flush_nonempty();
+        -:  385:
+        -:  386:  /// Copy data into the buffer. Size must not be greater than the number of
+        -:  387:  /// unused bytes in the buffer.
+        -:  388:  void copy_to_buffer(const char *Ptr, size_t Size);
+        -:  389:
+        -:  390:  /// Compute whether colors should be used and do the necessary work such as
+        -:  391:  /// flushing. The result is affected by calls to enable_color().
+        -:  392:  bool prepare_colors();
+        -:  393:
+        -:  394:  /// Flush the tied-to stream (if present) and then write the required data.
+        -:  395:  void flush_tied_then_write(const char *Ptr, size_t Size);
+        -:  396:
+        -:  397:  virtual void anchor();
+        -:  398:};
+        -:  399:
+        -:  400:/// Call the appropriate insertion operator, given an rvalue reference to a
+        -:  401:/// raw_ostream object and return a stream of the same type as the argument.
+        -:  402:template <typename OStream, typename T>
+        -:  403:std::enable_if_t<!std::is_reference<OStream>::value &&
+        -:  404:                     std::is_base_of<raw_ostream, OStream>::value,
+        -:  405:                 OStream &&>
+        -:  406:operator<<(OStream &&OS, const T &Value) {
+        -:  407:  OS << Value;
+        -:  408:  return std::move(OS);
+        -:  409:}
+        -:  410:
+        -:  411:/// An abstract base class for streams implementations that also support a
+        -:  412:/// pwrite operation. This is useful for code that can mostly stream out data,
+        -:  413:/// but needs to patch in a header that needs to know the output size.
+        -:  414:class raw_pwrite_stream : public raw_ostream {
+        -:  415:  virtual void pwrite_impl(const char *Ptr, size_t Size, uint64_t Offset) = 0;
+        -:  416:  void anchor() override;
+        -:  417:
+        -:  418:public:
+        -:  419:  explicit raw_pwrite_stream(bool Unbuffered = false,
+        -:  420:                             OStreamKind K = OStreamKind::OK_OStream)
+        -:  421:      : raw_ostream(Unbuffered, K) {}
+        -:  422:  void pwrite(const char *Ptr, size_t Size, uint64_t Offset) {
+        -:  423:#ifndef NDEBUG
+        -:  424:    uint64_t Pos = tell();
+        -:  425:    // /dev/null always reports a pos of 0, so we cannot perform this check
+        -:  426:    // in that case.
+        -:  427:    if (Pos)
+        -:  428:      assert(Size + Offset <= Pos && "We don't support extending the stream");
+        -:  429:#endif
+        -:  430:    pwrite_impl(Ptr, Size, Offset);
+        -:  431:  }
+        -:  432:};
+        -:  433:
+        -:  434://===----------------------------------------------------------------------===//
+        -:  435:// File Output Streams
+        -:  436://===----------------------------------------------------------------------===//
+        -:  437:
+        -:  438:/// A raw_ostream that writes to a file descriptor.
+        -:  439:///
+        -:  440:class raw_fd_ostream : public raw_pwrite_stream {
+        -:  441:  int FD;
+        -:  442:  bool ShouldClose;
+        -:  443:  bool SupportsSeeking = false;
+        -:  444:  bool IsRegularFile = false;
+        -:  445:  mutable Optional<bool> HasColors;
+        -:  446:
+        -:  447:#ifdef _WIN32
+        -:  448:  /// True if this fd refers to a Windows console device. Mintty and other
+        -:  449:  /// terminal emulators are TTYs, but they are not consoles.
+        -:  450:  bool IsWindowsConsole = false;
+        -:  451:#endif
+        -:  452:
+        -:  453:  std::error_code EC;
+        -:  454:
+        -:  455:  uint64_t pos = 0;
+        -:  456:
+        -:  457:  /// See raw_ostream::write_impl.
+        -:  458:  void write_impl(const char *Ptr, size_t Size) override;
+        -:  459:
+        -:  460:  void pwrite_impl(const char *Ptr, size_t Size, uint64_t Offset) override;
+        -:  461:
+        -:  462:  /// Return the current position within the stream, not counting the bytes
+        -:  463:  /// currently in the buffer.
+        -:  464:  uint64_t current_pos() const override { return pos; }
+        -:  465:
+        -:  466:  /// Determine an efficient buffer size.
+        -:  467:  size_t preferred_buffer_size() const override;
+        -:  468:
+        -:  469:  void anchor() override;
+        -:  470:
+        -:  471:protected:
+        -:  472:  /// Set the flag indicating that an output error has been encountered.
+        -:  473:  void error_detected(std::error_code EC) { this->EC = EC; }
+        -:  474:
+        -:  475:  /// Return the file descriptor.
+        -:  476:  int get_fd() const { return FD; }
+        -:  477:
+        -:  478:  // Update the file position by increasing \p Delta.
+        -:  479:  void inc_pos(uint64_t Delta) { pos += Delta; }
+        -:  480:
+        -:  481:public:
+        -:  482:  /// Open the specified file for writing. If an error occurs, information
+        -:  483:  /// about the error is put into EC, and the stream should be immediately
+        -:  484:  /// destroyed;
+        -:  485:  /// \p Flags allows optional flags to control how the file will be opened.
+        -:  486:  ///
+        -:  487:  /// As a special case, if Filename is "-", then the stream will use
+        -:  488:  /// STDOUT_FILENO instead of opening a file. This will not close the stdout
+        -:  489:  /// descriptor.
+        -:  490:  raw_fd_ostream(StringRef Filename, std::error_code &EC);
+        -:  491:  raw_fd_ostream(StringRef Filename, std::error_code &EC,
+        -:  492:                 sys::fs::CreationDisposition Disp);
+        -:  493:  raw_fd_ostream(StringRef Filename, std::error_code &EC,
+        -:  494:                 sys::fs::FileAccess Access);
+        -:  495:  raw_fd_ostream(StringRef Filename, std::error_code &EC,
+        -:  496:                 sys::fs::OpenFlags Flags);
+        -:  497:  raw_fd_ostream(StringRef Filename, std::error_code &EC,
+        -:  498:                 sys::fs::CreationDisposition Disp, sys::fs::FileAccess Access,
+        -:  499:                 sys::fs::OpenFlags Flags);
+        -:  500:
+        -:  501:  /// FD is the file descriptor that this writes to.  If ShouldClose is true,
+        -:  502:  /// this closes the file when the stream is destroyed. If FD is for stdout or
+        -:  503:  /// stderr, it will not be closed.
+        -:  504:  raw_fd_ostream(int fd, bool shouldClose, bool unbuffered = false,
+        -:  505:                 OStreamKind K = OStreamKind::OK_OStream);
+        -:  506:
+        -:  507:  ~raw_fd_ostream() override;
+        -:  508:
+        -:  509:  /// Manually flush the stream and close the file. Note that this does not call
+        -:  510:  /// fsync.
+        -:  511:  void close();
+        -:  512:
+        -:  513:  bool supportsSeeking() const { return SupportsSeeking; }
+        -:  514:
+        -:  515:  bool isRegularFile() const { return IsRegularFile; }
+        -:  516:
+        -:  517:  /// Flushes the stream and repositions the underlying file descriptor position
+        -:  518:  /// to the offset specified from the beginning of the file.
+        -:  519:  uint64_t seek(uint64_t off);
+        -:  520:
+        -:  521:  bool is_displayed() const override;
+        -:  522:
+        -:  523:  bool has_colors() const override;
+        -:  524:
+        -:  525:  std::error_code error() const { return EC; }
+        -:  526:
+        -:  527:  /// Return the value of the flag in this raw_fd_ostream indicating whether an
+        -:  528:  /// output error has been encountered.
+        -:  529:  /// This doesn't implicitly flush any pending output.  Also, it doesn't
+        -:  530:  /// guarantee to detect all errors unless the stream has been closed.
+        -:  531:  bool has_error() const { return bool(EC); }
+        -:  532:
+        -:  533:  /// Set the flag read by has_error() to false. If the error flag is set at the
+        -:  534:  /// time when this raw_ostream's destructor is called, report_fatal_error is
+        -:  535:  /// called to report the error. Use clear_error() after handling the error to
+        -:  536:  /// avoid this behavior.
+        -:  537:  ///
+        -:  538:  ///   "Errors should never pass silently.
+        -:  539:  ///    Unless explicitly silenced."
+        -:  540:  ///      - from The Zen of Python, by Tim Peters
+        -:  541:  ///
+        -:  542:  void clear_error() { EC = std::error_code(); }
+        -:  543:
+        -:  544:  /// Locks the underlying file.
+        -:  545:  ///
+        -:  546:  /// @returns RAII object that releases the lock upon leaving the scope, if the
+        -:  547:  ///          locking was successful. Otherwise returns corresponding
+        -:  548:  ///          error code.
+        -:  549:  ///
+        -:  550:  /// The function blocks the current thread until the lock become available or
+        -:  551:  /// error occurs.
+        -:  552:  ///
+        -:  553:  /// Possible use of this function may be as follows:
+        -:  554:  ///
+        -:  555:  ///   @code{.cpp}
+        -:  556:  ///   if (auto L = stream.lock()) {
+        -:  557:  ///     // ... do action that require file to be locked.
+        -:  558:  ///   } else {
+        -:  559:  ///     handleAllErrors(std::move(L.takeError()), [&](ErrorInfoBase &EIB) {
+        -:  560:  ///       // ... handle lock error.
+        -:  561:  ///     });
+        -:  562:  ///   }
+        -:  563:  ///   @endcode
+        -:  564:  [[nodiscard]] Expected<sys::fs::FileLocker> lock();
+        -:  565:
+        -:  566:  /// Tries to lock the underlying file within the specified period.
+        -:  567:  ///
+        -:  568:  /// @returns RAII object that releases the lock upon leaving the scope, if the
+        -:  569:  ///          locking was successful. Otherwise returns corresponding
+        -:  570:  ///          error code.
+        -:  571:  ///
+        -:  572:  /// It is used as @ref lock.
+        -:  573:  [[nodiscard]] Expected<sys::fs::FileLocker>
+        -:  574:  tryLockFor(Duration const &Timeout);
+        -:  575:};
+        -:  576:
+        -:  577:/// This returns a reference to a raw_fd_ostream for standard output. Use it
+        -:  578:/// like: outs() << "foo" << "bar";
+        -:  579:raw_fd_ostream &outs();
+        -:  580:
+        -:  581:/// This returns a reference to a raw_ostream for standard error.
+        -:  582:/// Use it like: errs() << "foo" << "bar";
+        -:  583:/// By default, the stream is tied to stdout to ensure stdout is flushed before
+        -:  584:/// stderr is written, to ensure the error messages are written in their
+        -:  585:/// expected place.
+        -:  586:raw_fd_ostream &errs();
+        -:  587:
+        -:  588:/// This returns a reference to a raw_ostream which simply discards output.
+        -:  589:raw_ostream &nulls();
+        -:  590:
+        -:  591://===----------------------------------------------------------------------===//
+        -:  592:// File Streams
+        -:  593://===----------------------------------------------------------------------===//
+        -:  594:
+        -:  595:/// A raw_ostream of a file for reading/writing/seeking.
+        -:  596:///
+        -:  597:class raw_fd_stream : public raw_fd_ostream {
+        -:  598:public:
+        -:  599:  /// Open the specified file for reading/writing/seeking. If an error occurs,
+        -:  600:  /// information about the error is put into EC, and the stream should be
+        -:  601:  /// immediately destroyed.
+        -:  602:  raw_fd_stream(StringRef Filename, std::error_code &EC);
+        -:  603:
+        -:  604:  /// This reads the \p Size bytes into a buffer pointed by \p Ptr.
+        -:  605:  ///
+        -:  606:  /// \param Ptr The start of the buffer to hold data to be read.
+        -:  607:  ///
+        -:  608:  /// \param Size The number of bytes to be read.
+        -:  609:  ///
+        -:  610:  /// On success, the number of bytes read is returned, and the file position is
+        -:  611:  /// advanced by this number. On error, -1 is returned, use error() to get the
+        -:  612:  /// error code.
+        -:  613:  ssize_t read(char *Ptr, size_t Size);
+        -:  614:
+        -:  615:  /// Check if \p OS is a pointer of type raw_fd_stream*.
+        -:  616:  static bool classof(const raw_ostream *OS);
+        -:  617:};
+        -:  618:
+        -:  619://===----------------------------------------------------------------------===//
+        -:  620:// Output Stream Adaptors
+        -:  621://===----------------------------------------------------------------------===//
+        -:  622:
+        -:  623:/// A raw_ostream that writes to an std::string.  This is a simple adaptor
+        -:  624:/// class. This class does not encounter output errors.
+        -:  625:/// raw_string_ostream operates without a buffer, delegating all memory
+        -:  626:/// management to the std::string. Thus the std::string is always up-to-date,
+        -:  627:/// may be used directly and there is no need to call flush().
+        -:  628:class raw_string_ostream : public raw_ostream {
+        -:  629:  std::string &OS;
+        -:  630:
+        -:  631:  /// See raw_ostream::write_impl.
+        -:  632:  void write_impl(const char *Ptr, size_t Size) override;
+        -:  633:
+        -:  634:  /// Return the current position within the stream, not counting the bytes
+        -:  635:  /// currently in the buffer.
+        -:  636:  uint64_t current_pos() const override { return OS.size(); }
+        -:  637:
+        -:  638:public:
+        -:  639:  explicit raw_string_ostream(std::string &O) : OS(O) {
+        -:  640:    SetUnbuffered();
+        -:  641:  }
+        -:  642:
+        -:  643:  /// Returns the string's reference. In most cases it is better to simply use
+        -:  644:  /// the underlying std::string directly.
+        -:  645:  /// TODO: Consider removing this API.
+        -:  646:  std::string &str() { return OS; }
+        -:  647:
+        -:  648:  void reserveExtraSpace(uint64_t ExtraSize) override {
+        -:  649:    OS.reserve(tell() + ExtraSize);
+        -:  650:  }
+        -:  651:};
+        -:  652:
+        -:  653:/// A raw_ostream that writes to an SmallVector or SmallString.  This is a
+        -:  654:/// simple adaptor class. This class does not encounter output errors.
+        -:  655:/// raw_svector_ostream operates without a buffer, delegating all memory
+        -:  656:/// management to the SmallString. Thus the SmallString is always up-to-date,
+        -:  657:/// may be used directly and there is no need to call flush().
+        -:  658:class raw_svector_ostream : public raw_pwrite_stream {
+        -:  659:  SmallVectorImpl<char> &OS;
+        -:  660:
+        -:  661:  /// See raw_ostream::write_impl.
+        -:  662:  void write_impl(const char *Ptr, size_t Size) override;
+        -:  663:
+        -:  664:  void pwrite_impl(const char *Ptr, size_t Size, uint64_t Offset) override;
+        -:  665:
+        -:  666:  /// Return the current position within the stream.
+        -:  667:  uint64_t current_pos() const override;
+        -:  668:
+        -:  669:public:
+        -:  670:  /// Construct a new raw_svector_ostream.
+        -:  671:  ///
+        -:  672:  /// \param O The vector to write to; this should generally have at least 128
+        -:  673:  /// bytes free to avoid any extraneous memory overhead.
+        -:  674:  explicit raw_svector_ostream(SmallVectorImpl<char> &O) : OS(O) {
+        -:  675:    SetUnbuffered();
+        -:  676:  }
+        -:  677:
+        -:  678:  ~raw_svector_ostream() override = default;
+        -:  679:
+        -:  680:  void flush() = delete;
+        -:  681:
+        -:  682:  /// Return a StringRef for the vector contents.
+        -:  683:  StringRef str() const { return StringRef(OS.data(), OS.size()); }
+        -:  684:
+        -:  685:  void reserveExtraSpace(uint64_t ExtraSize) override {
+        -:  686:    OS.reserve(tell() + ExtraSize);
+        -:  687:  }
+        -:  688:};
+        -:  689:
+        -:  690:/// A raw_ostream that discards all output.
+        -:  691:class raw_null_ostream : public raw_pwrite_stream {
+        -:  692:  /// See raw_ostream::write_impl.
+        -:  693:  void write_impl(const char *Ptr, size_t size) override;
+        -:  694:  void pwrite_impl(const char *Ptr, size_t Size, uint64_t Offset) override;
+        -:  695:
+        -:  696:  /// Return the current position within the stream, not counting the bytes
+        -:  697:  /// currently in the buffer.
+        -:  698:  uint64_t current_pos() const override;
+        -:  699:
+        -:  700:public:
+        -:  701:  explicit raw_null_ostream() = default;
+        -:  702:  ~raw_null_ostream() override;
+        -:  703:};
+        -:  704:
+        -:  705:class buffer_ostream : public raw_svector_ostream {
+        -:  706:  raw_ostream &OS;
+        -:  707:  SmallVector<char, 0> Buffer;
+        -:  708:
+        -:  709:  void anchor() override;
+        -:  710:
+        -:  711:public:
+        -:  712:  buffer_ostream(raw_ostream &OS) : raw_svector_ostream(Buffer), OS(OS) {}
+        -:  713:  ~buffer_ostream() override { OS << str(); }
+        -:  714:};
+        -:  715:
+        -:  716:class buffer_unique_ostream : public raw_svector_ostream {
+        -:  717:  std::unique_ptr<raw_ostream> OS;
+        -:  718:  SmallVector<char, 0> Buffer;
+        -:  719:
+        -:  720:  void anchor() override;
+        -:  721:
+        -:  722:public:
+        -:  723:  buffer_unique_ostream(std::unique_ptr<raw_ostream> OS)
+        -:  724:      : raw_svector_ostream(Buffer), OS(std::move(OS)) {
+        -:  725:    // Turn off buffering on OS, which we now own, to avoid allocating a buffer
+        -:  726:    // when the destructor writes only to be immediately flushed again.
+        -:  727:    this->OS->SetUnbuffered();
+        -:  728:  }
+        -:  729:  ~buffer_unique_ostream() override { *OS << str(); }
+        -:  730:};
+        -:  731:
+        -:  732:class Error;
+        -:  733:
+        -:  734:/// This helper creates an output stream and then passes it to \p Write.
+        -:  735:/// The stream created is based on the specified \p OutputFileName:
+        -:  736:/// llvm::outs for "-", raw_null_ostream for "/dev/null", and raw_fd_ostream
+        -:  737:/// for other names. For raw_fd_ostream instances, the stream writes to
+        -:  738:/// a temporary file. The final output file is atomically replaced with the
+        -:  739:/// temporary file after the \p Write function is finished.
+        -:  740:Error writeToOutput(StringRef OutputFileName,
+        -:  741:                    std::function<Error(raw_ostream &)> Write);
+        -:  742:
+        -:  743:} // end namespace llvm
+        -:  744:
+        -:  745:#endif // LLVM_SUPPORT_RAW_OSTREAM_H

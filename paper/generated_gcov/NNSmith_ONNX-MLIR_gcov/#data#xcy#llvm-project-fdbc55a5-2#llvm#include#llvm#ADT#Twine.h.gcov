@@ -1,0 +1,614 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/llvm/include/llvm/ADT/Twine.h
+        -:    0:Graph:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Parser/CMakeFiles/obj.MLIRParser.dir/Parser.cpp.gcda
+        -:    0:Runs:128638
+        -:    1://===- Twine.h - Fast Temporary String Concatenation ------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#ifndef LLVM_ADT_TWINE_H
+        -:   10:#define LLVM_ADT_TWINE_H
+        -:   11:
+        -:   12:#include "llvm/ADT/SmallVector.h"
+        -:   13:#include "llvm/ADT/StringRef.h"
+        -:   14:#include "llvm/Support/ErrorHandling.h"
+        -:   15:#include <cassert>
+        -:   16:#include <cstdint>
+        -:   17:#include <string>
+        -:   18:#include <string_view>
+        -:   19:
+        -:   20:namespace llvm {
+        -:   21:
+        -:   22:  class formatv_object_base;
+        -:   23:  class raw_ostream;
+        -:   24:
+        -:   25:  /// Twine - A lightweight data structure for efficiently representing the
+        -:   26:  /// concatenation of temporary values as strings.
+        -:   27:  ///
+        -:   28:  /// A Twine is a kind of rope, it represents a concatenated string using a
+        -:   29:  /// binary-tree, where the string is the preorder of the nodes. Since the
+        -:   30:  /// Twine can be efficiently rendered into a buffer when its result is used,
+        -:   31:  /// it avoids the cost of generating temporary values for intermediate string
+        -:   32:  /// results -- particularly in cases when the Twine result is never
+        -:   33:  /// required. By explicitly tracking the type of leaf nodes, we can also avoid
+        -:   34:  /// the creation of temporary strings for conversions operations (such as
+        -:   35:  /// appending an integer to a string).
+        -:   36:  ///
+        -:   37:  /// A Twine is not intended for use directly and should not be stored, its
+        -:   38:  /// implementation relies on the ability to store pointers to temporary stack
+        -:   39:  /// objects which may be deallocated at the end of a statement. Twines should
+        -:   40:  /// only be used accepted as const references in arguments, when an API wishes
+        -:   41:  /// to accept possibly-concatenated strings.
+        -:   42:  ///
+        -:   43:  /// Twines support a special 'null' value, which always concatenates to form
+        -:   44:  /// itself, and renders as an empty string. This can be returned from APIs to
+        -:   45:  /// effectively nullify any concatenations performed on the result.
+        -:   46:  ///
+        -:   47:  /// \b Implementation
+        -:   48:  ///
+        -:   49:  /// Given the nature of a Twine, it is not possible for the Twine's
+        -:   50:  /// concatenation method to construct interior nodes; the result must be
+        -:   51:  /// represented inside the returned value. For this reason a Twine object
+        -:   52:  /// actually holds two values, the left- and right-hand sides of a
+        -:   53:  /// concatenation. We also have nullary Twine objects, which are effectively
+        -:   54:  /// sentinel values that represent empty strings.
+        -:   55:  ///
+        -:   56:  /// Thus, a Twine can effectively have zero, one, or two children. The \see
+        -:   57:  /// isNullary(), \see isUnary(), and \see isBinary() predicates exist for
+        -:   58:  /// testing the number of children.
+        -:   59:  ///
+        -:   60:  /// We maintain a number of invariants on Twine objects (FIXME: Why):
+        -:   61:  ///  - Nullary twines are always represented with their Kind on the left-hand
+        -:   62:  ///    side, and the Empty kind on the right-hand side.
+        -:   63:  ///  - Unary twines are always represented with the value on the left-hand
+        -:   64:  ///    side, and the Empty kind on the right-hand side.
+        -:   65:  ///  - If a Twine has another Twine as a child, that child should always be
+        -:   66:  ///    binary (otherwise it could have been folded into the parent).
+        -:   67:  ///
+        -:   68:  /// These invariants are check by \see isValid().
+        -:   69:  ///
+        -:   70:  /// \b Efficiency Considerations
+        -:   71:  ///
+        -:   72:  /// The Twine is designed to yield efficient and small code for common
+        -:   73:  /// situations. For this reason, the concat() method is inlined so that
+        -:   74:  /// concatenations of leaf nodes can be optimized into stores directly into a
+        -:   75:  /// single stack allocated object.
+        -:   76:  ///
+        -:   77:  /// In practice, not all compilers can be trusted to optimize concat() fully,
+        -:   78:  /// so we provide two additional methods (and accompanying operator+
+        -:   79:  /// overloads) to guarantee that particularly important cases (cstring plus
+        -:   80:  /// StringRef) codegen as desired.
+        -:   81:  class Twine {
+        -:   82:    /// NodeKind - Represent the type of an argument.
+        -:   83:    enum NodeKind : unsigned char {
+        -:   84:      /// An empty string; the result of concatenating anything with it is also
+        -:   85:      /// empty.
+        -:   86:      NullKind,
+        -:   87:
+        -:   88:      /// The empty string.
+        -:   89:      EmptyKind,
+        -:   90:
+        -:   91:      /// A pointer to a Twine instance.
+        -:   92:      TwineKind,
+        -:   93:
+        -:   94:      /// A pointer to a C string instance.
+        -:   95:      CStringKind,
+        -:   96:
+        -:   97:      /// A pointer to an std::string instance.
+        -:   98:      StdStringKind,
+        -:   99:
+        -:  100:      /// A Pointer and Length representation. Used for std::string_view,
+        -:  101:      /// StringRef, and SmallString.  Can't use a StringRef here
+        -:  102:      /// because they are not trivally constructible.
+        -:  103:      PtrAndLengthKind,
+        -:  104:
+        -:  105:      /// A pointer to a formatv_object_base instance.
+        -:  106:      FormatvObjectKind,
+        -:  107:
+        -:  108:      /// A char value, to render as a character.
+        -:  109:      CharKind,
+        -:  110:
+        -:  111:      /// An unsigned int value, to render as an unsigned decimal integer.
+        -:  112:      DecUIKind,
+        -:  113:
+        -:  114:      /// An int value, to render as a signed decimal integer.
+        -:  115:      DecIKind,
+        -:  116:
+        -:  117:      /// A pointer to an unsigned long value, to render as an unsigned decimal
+        -:  118:      /// integer.
+        -:  119:      DecULKind,
+        -:  120:
+        -:  121:      /// A pointer to a long value, to render as a signed decimal integer.
+        -:  122:      DecLKind,
+        -:  123:
+        -:  124:      /// A pointer to an unsigned long long value, to render as an unsigned
+        -:  125:      /// decimal integer.
+        -:  126:      DecULLKind,
+        -:  127:
+        -:  128:      /// A pointer to a long long value, to render as a signed decimal integer.
+        -:  129:      DecLLKind,
+        -:  130:
+        -:  131:      /// A pointer to a uint64_t value, to render as an unsigned hexadecimal
+        -:  132:      /// integer.
+        -:  133:      UHexKind
+        -:  134:    };
+        -:  135:
+        -:  136:    union Child
+        -:  137:    {
+        -:  138:      const Twine *twine;
+        -:  139:      const char *cString;
+        -:  140:      const std::string *stdString;
+        -:  141:      struct {
+        -:  142:        const char *ptr;
+        -:  143:        size_t length;
+        -:  144:      } ptrAndLength;
+        -:  145:      const formatv_object_base *formatvObject;
+        -:  146:      char character;
+        -:  147:      unsigned int decUI;
+        -:  148:      int decI;
+        -:  149:      const unsigned long *decUL;
+        -:  150:      const long *decL;
+        -:  151:      const unsigned long long *decULL;
+        -:  152:      const long long *decLL;
+        -:  153:      const uint64_t *uHex;
+        -:  154:    };
+        -:  155:
+        -:  156:    /// LHS - The prefix in the concatenation, which may be uninitialized for
+        -:  157:    /// Null or Empty kinds.
+        -:  158:    Child LHS;
+        -:  159:
+        -:  160:    /// RHS - The suffix in the concatenation, which may be uninitialized for
+        -:  161:    /// Null or Empty kinds.
+        -:  162:    Child RHS;
+        -:  163:
+        -:  164:    /// LHSKind - The NodeKind of the left hand side, \see getLHSKind().
+        -:  165:    NodeKind LHSKind = EmptyKind;
+        -:  166:
+        -:  167:    /// RHSKind - The NodeKind of the right hand side, \see getRHSKind().
+        -:  168:    NodeKind RHSKind = EmptyKind;
+        -:  169:
+        -:  170:    /// Construct a nullary twine; the kind must be NullKind or EmptyKind.
+        -:  171:    explicit Twine(NodeKind Kind) : LHSKind(Kind) {
+        -:  172:      assert(isNullary() && "Invalid kind!");
+        -:  173:    }
+        -:  174:
+        -:  175:    /// Construct a binary twine.
+        -:  176:    explicit Twine(const Twine &LHS, const Twine &RHS)
+        -:  177:        : LHSKind(TwineKind), RHSKind(TwineKind) {
+        -:  178:      this->LHS.twine = &LHS;
+        -:  179:      this->RHS.twine = &RHS;
+        -:  180:      assert(isValid() && "Invalid twine!");
+        -:  181:    }
+        -:  182:
+        -:  183:    /// Construct a twine from explicit values.
+        -:  184:    explicit Twine(Child LHS, NodeKind LHSKind, Child RHS, NodeKind RHSKind)
+        -:  185:        : LHS(LHS), RHS(RHS), LHSKind(LHSKind), RHSKind(RHSKind) {
+        -:  186:      assert(isValid() && "Invalid twine!");
+        -:  187:    }
+        -:  188:
+        -:  189:    /// Check for the null twine.
+    #####:  190:    bool isNull() const {
+    #####:  191:      return getLHSKind() == NullKind;
+        -:  192:    }
+        -:  193:
+        -:  194:    /// Check for the empty twine.
+    #####:  195:    bool isEmpty() const {
+    #####:  196:      return getLHSKind() == EmptyKind;
+        -:  197:    }
+        -:  198:
+        -:  199:    /// Check if this is a nullary twine (null or empty).
+    #####:  200:    bool isNullary() const {
+    #####:  201:      return isNull() || isEmpty();
+        -:  202:    }
+        -:  203:
+        -:  204:    /// Check if this is a unary twine.
+        -:  205:    bool isUnary() const {
+        -:  206:      return getRHSKind() == EmptyKind && !isNullary();
+        -:  207:    }
+        -:  208:
+        -:  209:    /// Check if this is a binary twine.
+    #####:  210:    bool isBinary() const {
+    #####:  211:      return getLHSKind() != NullKind && getRHSKind() != EmptyKind;
+        -:  212:    }
+        -:  213:
+        -:  214:    /// Check if this is a valid twine (satisfying the invariants on
+        -:  215:    /// order and number of arguments).
+function _ZNK4llvm5Twine7isValidEv called 0 returned 0% blocks executed 0%
+    #####:  216:    bool isValid() const {
+        -:  217:      // Nullary twines always have Empty on the RHS.
+    #####:  218:      if (isNullary() && getRHSKind() != EmptyKind)
+        -:  219:        return false;
+        -:  220:
+        -:  221:      // Null should never appear on the RHS.
+    #####:  222:      if (getRHSKind() == NullKind)
+        -:  223:        return false;
+        -:  224:
+        -:  225:      // The RHS cannot be non-empty if the LHS is empty.
+    #####:  226:      if (getRHSKind() != EmptyKind && getLHSKind() == EmptyKind)
+        -:  227:        return false;
+        -:  228:
+        -:  229:      // A twine child should always be binary.
+    #####:  230:      if (getLHSKind() == TwineKind &&
+    #####:  231:          !LHS.twine->isBinary())
+        -:  232:        return false;
+    #####:  233:      if (getRHSKind() == TwineKind &&
+    #####:  234:          !RHS.twine->isBinary())
+    #####:  235:        return false;
+        -:  236:
+        -:  237:      return true;
+        -:  238:    }
+        -:  239:
+        -:  240:    /// Get the NodeKind of the left-hand side.
+    #####:  241:    NodeKind getLHSKind() const { return LHSKind; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+        -:  242:
+        -:  243:    /// Get the NodeKind of the right-hand side.
+    #####:  244:    NodeKind getRHSKind() const { return RHSKind; }
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+branch  8 never executed
+branch  9 never executed
+branch 10 never executed
+branch 11 never executed
+        -:  245:
+        -:  246:    /// Print one child from a twine.
+        -:  247:    void printOneChild(raw_ostream &OS, Child Ptr, NodeKind Kind) const;
+        -:  248:
+        -:  249:    /// Print the representation of one child from a twine.
+        -:  250:    void printOneChildRepr(raw_ostream &OS, Child Ptr,
+        -:  251:                           NodeKind Kind) const;
+        -:  252:
+        -:  253:  public:
+        -:  254:    /// @name Constructors
+        -:  255:    /// @{
+        -:  256:
+        -:  257:    /// Construct from an empty string.
+        -:  258:    /*implicit*/ Twine() {
+        -:  259:      assert(isValid() && "Invalid twine!");
+        -:  260:    }
+        -:  261:
+        -:  262:    Twine(const Twine &) = default;
+        -:  263:
+        -:  264:    /// Construct from a C string.
+        -:  265:    ///
+        -:  266:    /// We take care here to optimize "" into the empty twine -- this will be
+        -:  267:    /// optimized out for string constants. This allows Twine arguments have
+        -:  268:    /// default "" values, without introducing unnecessary string constants.
+function _ZN4llvm5TwineC2EPKc called 0 returned 0% blocks executed 0%
+    #####:  269:    /*implicit*/ Twine(const char *Str) {
+    #####:  270:      if (Str[0] != '\0') {
+branch  0 never executed
+branch  1 never executed
+    #####:  271:        LHS.cString = Str;
+    #####:  272:        LHSKind = CStringKind;
+        -:  273:      } else
+        -:  274:        LHSKind = EmptyKind;
+        -:  275:
+    #####:  276:      assert(isValid() && "Invalid twine!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  277:    }
+        -:  278:    /// Delete the implicit conversion from nullptr as Twine(const char *)
+        -:  279:    /// cannot take nullptr.
+        -:  280:    /*implicit*/ Twine(std::nullptr_t) = delete;
+        -:  281:
+        -:  282:    /// Construct from an std::string.
+        -:  283:    /*implicit*/ Twine(const std::string &Str) : LHSKind(StdStringKind) {
+        -:  284:      LHS.stdString = &Str;
+        -:  285:      assert(isValid() && "Invalid twine!");
+        -:  286:    }
+        -:  287:
+        -:  288:    /// Construct from an std::string_view by converting it to a pointer and
+        -:  289:    /// length.  This handles string_views on a pure API basis, and avoids
+        -:  290:    /// storing one (or a pointer to one) inside a Twine, which avoids problems
+        -:  291:    /// when mixing code compiled under various C++ standards.
+        -:  292:    /*implicit*/ Twine(const std::string_view &Str)
+        -:  293:        : LHSKind(PtrAndLengthKind) {
+        -:  294:      LHS.ptrAndLength.ptr = Str.data();
+        -:  295:      LHS.ptrAndLength.length = Str.length();
+        -:  296:      assert(isValid() && "Invalid twine!");
+        -:  297:    }
+        -:  298:
+        -:  299:    /// Construct from a StringRef.
+function _ZN4llvm5TwineC2ERKNS_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  300:    /*implicit*/ Twine(const StringRef &Str) : LHSKind(PtrAndLengthKind) {
+    #####:  301:      LHS.ptrAndLength.ptr = Str.data();
+branch  0 never executed
+branch  1 never executed
+    #####:  302:      LHS.ptrAndLength.length = Str.size();
+branch  0 never executed
+branch  1 never executed
+    #####:  303:      assert(isValid() && "Invalid twine!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  304:    }
+        -:  305:
+        -:  306:    /// Construct from a SmallString.
+        -:  307:    /*implicit*/ Twine(const SmallVectorImpl<char> &Str)
+        -:  308:        : LHSKind(PtrAndLengthKind) {
+        -:  309:      LHS.ptrAndLength.ptr = Str.data();
+        -:  310:      LHS.ptrAndLength.length = Str.size();
+        -:  311:      assert(isValid() && "Invalid twine!");
+        -:  312:    }
+        -:  313:
+        -:  314:    /// Construct from a formatv_object_base.
+        -:  315:    /*implicit*/ Twine(const formatv_object_base &Fmt)
+        -:  316:        : LHSKind(FormatvObjectKind) {
+        -:  317:      LHS.formatvObject = &Fmt;
+        -:  318:      assert(isValid() && "Invalid twine!");
+        -:  319:    }
+        -:  320:
+        -:  321:    /// Construct from a char.
+        -:  322:    explicit Twine(char Val) : LHSKind(CharKind) {
+        -:  323:      LHS.character = Val;
+        -:  324:    }
+        -:  325:
+        -:  326:    /// Construct from a signed char.
+        -:  327:    explicit Twine(signed char Val) : LHSKind(CharKind) {
+        -:  328:      LHS.character = static_cast<char>(Val);
+        -:  329:    }
+        -:  330:
+        -:  331:    /// Construct from an unsigned char.
+        -:  332:    explicit Twine(unsigned char Val) : LHSKind(CharKind) {
+        -:  333:      LHS.character = static_cast<char>(Val);
+        -:  334:    }
+        -:  335:
+        -:  336:    /// Construct a twine to print \p Val as an unsigned decimal integer.
+        -:  337:    explicit Twine(unsigned Val) : LHSKind(DecUIKind) {
+        -:  338:      LHS.decUI = Val;
+        -:  339:    }
+        -:  340:
+        -:  341:    /// Construct a twine to print \p Val as a signed decimal integer.
+        -:  342:    explicit Twine(int Val) : LHSKind(DecIKind) {
+        -:  343:      LHS.decI = Val;
+        -:  344:    }
+        -:  345:
+        -:  346:    /// Construct a twine to print \p Val as an unsigned decimal integer.
+        -:  347:    explicit Twine(const unsigned long &Val) : LHSKind(DecULKind) {
+        -:  348:      LHS.decUL = &Val;
+        -:  349:    }
+        -:  350:
+        -:  351:    /// Construct a twine to print \p Val as a signed decimal integer.
+        -:  352:    explicit Twine(const long &Val) : LHSKind(DecLKind) {
+        -:  353:      LHS.decL = &Val;
+        -:  354:    }
+        -:  355:
+        -:  356:    /// Construct a twine to print \p Val as an unsigned decimal integer.
+        -:  357:    explicit Twine(const unsigned long long &Val) : LHSKind(DecULLKind) {
+        -:  358:      LHS.decULL = &Val;
+        -:  359:    }
+        -:  360:
+        -:  361:    /// Construct a twine to print \p Val as a signed decimal integer.
+        -:  362:    explicit Twine(const long long &Val) : LHSKind(DecLLKind) {
+        -:  363:      LHS.decLL = &Val;
+        -:  364:    }
+        -:  365:
+        -:  366:    // FIXME: Unfortunately, to make sure this is as efficient as possible we
+        -:  367:    // need extra binary constructors from particular types. We can't rely on
+        -:  368:    // the compiler to be smart enough to fold operator+()/concat() down to the
+        -:  369:    // right thing. Yet.
+        -:  370:
+        -:  371:    /// Construct as the concatenation of a C string and a StringRef.
+function _ZN4llvm5TwineC2EPKcRKNS_9StringRefE called 0 returned 0% blocks executed 0%
+    #####:  372:    /*implicit*/ Twine(const char *LHS, const StringRef &RHS)
+    #####:  373:        : LHSKind(CStringKind), RHSKind(PtrAndLengthKind) {
+    #####:  374:      this->LHS.cString = LHS;
+    #####:  375:      this->RHS.ptrAndLength.ptr = RHS.data();
+branch  0 never executed
+branch  1 never executed
+    #####:  376:      this->RHS.ptrAndLength.length = RHS.size();
+branch  0 never executed
+branch  1 never executed
+    #####:  377:      assert(isValid() && "Invalid twine!");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  378:    }
+        -:  379:
+        -:  380:    /// Construct as the concatenation of a StringRef and a C string.
+        -:  381:    /*implicit*/ Twine(const StringRef &LHS, const char *RHS)
+        -:  382:        : LHSKind(PtrAndLengthKind), RHSKind(CStringKind) {
+        -:  383:      this->LHS.ptrAndLength.ptr = LHS.data();
+        -:  384:      this->LHS.ptrAndLength.length = LHS.size();
+        -:  385:      this->RHS.cString = RHS;
+        -:  386:      assert(isValid() && "Invalid twine!");
+        -:  387:    }
+        -:  388:
+        -:  389:    /// Since the intended use of twines is as temporary objects, assignments
+        -:  390:    /// when concatenating might cause undefined behavior or stack corruptions
+        -:  391:    Twine &operator=(const Twine &) = delete;
+        -:  392:
+        -:  393:    /// Create a 'null' string, which is an empty string that always
+        -:  394:    /// concatenates to form another empty string.
+        -:  395:    static Twine createNull() {
+        -:  396:      return Twine(NullKind);
+        -:  397:    }
+        -:  398:
+        -:  399:    /// @}
+        -:  400:    /// @name Numeric Conversions
+        -:  401:    /// @{
+        -:  402:
+        -:  403:    // Construct a twine to print \p Val as an unsigned hexadecimal integer.
+        -:  404:    static Twine utohexstr(const uint64_t &Val) {
+        -:  405:      Child LHS, RHS;
+        -:  406:      LHS.uHex = &Val;
+        -:  407:      RHS.twine = nullptr;
+        -:  408:      return Twine(LHS, UHexKind, RHS, EmptyKind);
+        -:  409:    }
+        -:  410:
+        -:  411:    /// @}
+        -:  412:    /// @name Predicate Operations
+        -:  413:    /// @{
+        -:  414:
+        -:  415:    /// Check if this twine is trivially empty; a false return value does not
+        -:  416:    /// necessarily mean the twine is empty.
+        -:  417:    bool isTriviallyEmpty() const {
+        -:  418:      return isNullary();
+        -:  419:    }
+        -:  420:
+        -:  421:    /// Return true if this twine can be dynamically accessed as a single
+        -:  422:    /// StringRef value with getSingleStringRef().
+        -:  423:    bool isSingleStringRef() const {
+        -:  424:      if (getRHSKind() != EmptyKind) return false;
+        -:  425:
+        -:  426:      switch (getLHSKind()) {
+        -:  427:      case EmptyKind:
+        -:  428:      case CStringKind:
+        -:  429:      case StdStringKind:
+        -:  430:      case PtrAndLengthKind:
+        -:  431:        return true;
+        -:  432:      default:
+        -:  433:        return false;
+        -:  434:      }
+        -:  435:    }
+        -:  436:
+        -:  437:    /// @}
+        -:  438:    /// @name String Operations
+        -:  439:    /// @{
+        -:  440:
+        -:  441:    Twine concat(const Twine &Suffix) const;
+        -:  442:
+        -:  443:    /// @}
+        -:  444:    /// @name Output & Conversion.
+        -:  445:    /// @{
+        -:  446:
+        -:  447:    /// Return the twine contents as a std::string.
+        -:  448:    std::string str() const;
+        -:  449:
+        -:  450:    /// Append the concatenated string into the given SmallString or SmallVector.
+        -:  451:    void toVector(SmallVectorImpl<char> &Out) const;
+        -:  452:
+        -:  453:    /// This returns the twine as a single StringRef.  This method is only valid
+        -:  454:    /// if isSingleStringRef() is true.
+        -:  455:    StringRef getSingleStringRef() const {
+        -:  456:      assert(isSingleStringRef() &&"This cannot be had as a single stringref!");
+        -:  457:      switch (getLHSKind()) {
+        -:  458:      default: llvm_unreachable("Out of sync with isSingleStringRef");
+        -:  459:      case EmptyKind:
+        -:  460:        return StringRef();
+        -:  461:      case CStringKind:
+        -:  462:        return StringRef(LHS.cString);
+        -:  463:      case StdStringKind:
+        -:  464:        return StringRef(*LHS.stdString);
+        -:  465:      case PtrAndLengthKind:
+        -:  466:        return StringRef(LHS.ptrAndLength.ptr, LHS.ptrAndLength.length);
+        -:  467:      }
+        -:  468:    }
+        -:  469:
+        -:  470:    /// This returns the twine as a single StringRef if it can be
+        -:  471:    /// represented as such. Otherwise the twine is written into the given
+        -:  472:    /// SmallVector and a StringRef to the SmallVector's data is returned.
+        -:  473:    StringRef toStringRef(SmallVectorImpl<char> &Out) const {
+        -:  474:      if (isSingleStringRef())
+        -:  475:        return getSingleStringRef();
+        -:  476:      toVector(Out);
+        -:  477:      return StringRef(Out.data(), Out.size());
+        -:  478:    }
+        -:  479:
+        -:  480:    /// This returns the twine as a single null terminated StringRef if it
+        -:  481:    /// can be represented as such. Otherwise the twine is written into the
+        -:  482:    /// given SmallVector and a StringRef to the SmallVector's data is returned.
+        -:  483:    ///
+        -:  484:    /// The returned StringRef's size does not include the null terminator.
+        -:  485:    StringRef toNullTerminatedStringRef(SmallVectorImpl<char> &Out) const;
+        -:  486:
+        -:  487:    /// Write the concatenated string represented by this twine to the
+        -:  488:    /// stream \p OS.
+        -:  489:    void print(raw_ostream &OS) const;
+        -:  490:
+        -:  491:    /// Dump the concatenated string represented by this twine to stderr.
+        -:  492:    void dump() const;
+        -:  493:
+        -:  494:    /// Write the representation of this twine to the stream \p OS.
+        -:  495:    void printRepr(raw_ostream &OS) const;
+        -:  496:
+        -:  497:    /// Dump the representation of this twine to stderr.
+        -:  498:    void dumpRepr() const;
+        -:  499:
+        -:  500:    /// @}
+        -:  501:  };
+        -:  502:
+        -:  503:  /// @name Twine Inline Implementations
+        -:  504:  /// @{
+        -:  505:
+        -:  506:  inline Twine Twine::concat(const Twine &Suffix) const {
+        -:  507:    // Concatenation with null is null.
+        -:  508:    if (isNull() || Suffix.isNull())
+        -:  509:      return Twine(NullKind);
+        -:  510:
+        -:  511:    // Concatenation with empty yields the other side.
+        -:  512:    if (isEmpty())
+        -:  513:      return Suffix;
+        -:  514:    if (Suffix.isEmpty())
+        -:  515:      return *this;
+        -:  516:
+        -:  517:    // Otherwise we need to create a new node, taking care to fold in unary
+        -:  518:    // twines.
+        -:  519:    Child NewLHS, NewRHS;
+        -:  520:    NewLHS.twine = this;
+        -:  521:    NewRHS.twine = &Suffix;
+        -:  522:    NodeKind NewLHSKind = TwineKind, NewRHSKind = TwineKind;
+        -:  523:    if (isUnary()) {
+        -:  524:      NewLHS = LHS;
+        -:  525:      NewLHSKind = getLHSKind();
+        -:  526:    }
+        -:  527:    if (Suffix.isUnary()) {
+        -:  528:      NewRHS = Suffix.LHS;
+        -:  529:      NewRHSKind = Suffix.getLHSKind();
+        -:  530:    }
+        -:  531:
+        -:  532:    return Twine(NewLHS, NewLHSKind, NewRHS, NewRHSKind);
+        -:  533:  }
+        -:  534:
+        -:  535:  inline Twine operator+(const Twine &LHS, const Twine &RHS) {
+        -:  536:    return LHS.concat(RHS);
+        -:  537:  }
+        -:  538:
+        -:  539:  /// Additional overload to guarantee simplified codegen; this is equivalent to
+        -:  540:  /// concat().
+        -:  541:
+    #####:  542:  inline Twine operator+(const char *LHS, const StringRef &RHS) {
+    #####:  543:    return Twine(LHS, RHS);
+call    0 never executed
+        -:  544:  }
+        -:  545:
+        -:  546:  /// Additional overload to guarantee simplified codegen; this is equivalent to
+        -:  547:  /// concat().
+        -:  548:
+        -:  549:  inline Twine operator+(const StringRef &LHS, const char *RHS) {
+        -:  550:    return Twine(LHS, RHS);
+        -:  551:  }
+        -:  552:
+        -:  553:  inline raw_ostream &operator<<(raw_ostream &OS, const Twine &RHS) {
+        -:  554:    RHS.print(OS);
+        -:  555:    return OS;
+        -:  556:  }
+        -:  557:
+        -:  558:  /// @}
+        -:  559:
+        -:  560:} // end namespace llvm
+        -:  561:
+        -:  562:#endif // LLVM_ADT_TWINE_H

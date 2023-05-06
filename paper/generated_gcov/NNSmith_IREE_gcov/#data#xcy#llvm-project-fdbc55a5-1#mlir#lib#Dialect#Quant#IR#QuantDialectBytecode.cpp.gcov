@@ -1,0 +1,368 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/mlir/lib/Dialect/Quant/IR/QuantDialectBytecode.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Quant/IR/CMakeFiles/obj.MLIRQuantDialect.dir/QuantDialectBytecode.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Quant/IR/CMakeFiles/obj.MLIRQuantDialect.dir/QuantDialectBytecode.cpp.gcda
+        -:    0:Runs:325550
+        -:    1://===- QuantDialectBytecode.cpp - Quant Bytecode Implementation
+        -:    2://------------===//
+        -:    3://
+        -:    4:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    5:// See https://llvm.org/LICENSE.txt for license information.
+        -:    6:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    7://
+        -:    8://===----------------------------------------------------------------------===//
+        -:    9:
+        -:   10:#include "QuantDialectBytecode.h"
+        -:   11:#include "mlir/Bytecode/BytecodeImplementation.h"
+        -:   12:#include "mlir/Dialect/Quant/QuantOps.h"
+        -:   13:#include "mlir/Dialect/Quant/QuantTypes.h"
+        -:   14:#include "mlir/IR/Diagnostics.h"
+        -:   15:#include "mlir/Support/LogicalResult.h"
+        -:   16:#include "llvm/ADT/APFloat.h"
+        -:   17:#include "llvm/ADT/SmallVector.h"
+        -:   18:#include "llvm/ADT/TypeSwitch.h"
+        -:   19:
+        -:   20:using namespace mlir;
+        -:   21:using namespace mlir::quant;
+        -:   22:
+        -:   23://===----------------------------------------------------------------------===//
+        -:   24:// Encoding
+        -:   25://===----------------------------------------------------------------------===//
+        -:   26:
+        -:   27:namespace {
+        -:   28:namespace quant_encoding {
+        -:   29:/// This enum contains marker codes used to indicate which type is currently
+        -:   30:/// being decoded, and how it should be decoded. The order of these codes should
+        -:   31:/// generally be unchanged, as any changes will inevitably break compatibility
+        -:   32:/// with older bytecode.
+        -:   33:enum TypeCode {
+        -:   34:  ///   AnyQuantizedType {
+        -:   35:  ///     flags: varint
+        -:   36:  ///     storageType: Type
+        -:   37:  ///     storageTypeMin: svarint
+        -:   38:  ///     storageTypeMax: svarint
+        -:   39:  ///   }
+        -:   40:  ///
+        -:   41:  kAnyQuantizedType = 1,
+        -:   42:
+        -:   43:  ///   AnyQuantizedType {
+        -:   44:  ///     flags: varint
+        -:   45:  ///     storageType: Type
+        -:   46:  ///     expressedType: Type
+        -:   47:  ///     storageTypeMin: svarint
+        -:   48:  ///     storageTypeMax: svarint
+        -:   49:  ///   }
+        -:   50:  ///
+        -:   51:  kAnyQuantizedTypeWithExpressedType = 2,
+        -:   52:
+        -:   53:  ///   CalibratedQuantizedType {
+        -:   54:  ///     expressedType: Type
+        -:   55:  ///     min: APFloat
+        -:   56:  ///     max: APFloat
+        -:   57:  ///   }
+        -:   58:  ///
+        -:   59:  kCalibratedQuantizedType = 3,
+        -:   60:
+        -:   61:  ///   UniformQuantizedType {
+        -:   62:  ///     flags: varint
+        -:   63:  ///     storageType: Type
+        -:   64:  ///     expressedType: Type
+        -:   65:  ///     scale: APFloat
+        -:   66:  ///     zeroPoint: svarint
+        -:   67:  ///     storageTypeMin: svarint
+        -:   68:  ///     storageTypeMax: svarint
+        -:   69:  ///   }
+        -:   70:  ///
+        -:   71:  kUniformQuantizedType = 4,
+        -:   72:
+        -:   73:  ///   UniformQuantizedPerAxisType {
+        -:   74:  ///     flags: varint
+        -:   75:  ///     storageType: Type
+        -:   76:  ///     expressedType: Type
+        -:   77:  ///     quantizedDimension: varint
+        -:   78:  ///     storageTypeMin: svarint
+        -:   79:  ///     storageTypeMax: svarint
+        -:   80:  ///     scale: APFloat[]
+        -:   81:  ///     zeroPoint: svarint[]
+        -:   82:  ///   }
+        -:   83:  ///
+        -:   84:  kUniformQuantizedPerAxisType = 5,
+        -:   85:};
+        -:   86:
+        -:   87:} // namespace quant_encoding
+        -:   88:} // namespace
+        -:   89:
+        -:   90://===----------------------------------------------------------------------===//
+        -:   91:// QuantDialectBytecodeInterface
+        -:   92://===----------------------------------------------------------------------===//
+        -:   93:
+        -:   94:namespace {
+        -:   95:/// This class implements the bytecode interface for the Quant dialect.
+        -:   96:struct QuantDialectBytecodeInterface : public BytecodeDialectInterface {
+        -:   97:  QuantDialectBytecodeInterface(Dialect *dialect)
+        -:   98:      : BytecodeDialectInterface(dialect) {}
+        -:   99:
+        -:  100:  //===--------------------------------------------------------------------===//
+        -:  101:  // Types
+        -:  102:
+        -:  103:  Type readType(DialectBytecodeReader &reader) const override;
+        -:  104:  LogicalResult writeType(Type type,
+        -:  105:                          DialectBytecodeWriter &writer) const override;
+        -:  106:
+        -:  107:  AnyQuantizedType readAnyQuantizedType(bool withExpressedType,
+        -:  108:                                        DialectBytecodeReader &reader) const;
+        -:  109:  void write(AnyQuantizedType type, DialectBytecodeWriter &writer) const;
+        -:  110:
+        -:  111:  CalibratedQuantizedType
+        -:  112:  readCalibratedQuantizedType(DialectBytecodeReader &reader) const;
+        -:  113:  void write(CalibratedQuantizedType type, DialectBytecodeWriter &writer) const;
+        -:  114:
+        -:  115:  UniformQuantizedType
+        -:  116:  readUniformQuantizedType(DialectBytecodeReader &reader) const;
+        -:  117:  void write(UniformQuantizedType type, DialectBytecodeWriter &writer) const;
+        -:  118:
+        -:  119:  UniformQuantizedPerAxisType
+        -:  120:  readUniformQuantizedPerAxisType(DialectBytecodeReader &reader) const;
+        -:  121:  void write(UniformQuantizedPerAxisType type,
+        -:  122:             DialectBytecodeWriter &writer) const;
+        -:  123:};
+        -:  124:} // namespace
+        -:  125:
+function _ZN4mlir5quant6detail20addBytecodeInterfaceEPNS0_19QuantizationDialectE called 0 returned 0% blocks executed 0%
+    #####:  126:void quant::detail::addBytecodeInterface(QuantizationDialect *dialect) {
+    #####:  127:  dialect->addInterfaces<QuantDialectBytecodeInterface>();
+call    0 never executed
+    #####:  128:}
+        -:  129:
+        -:  130://===----------------------------------------------------------------------===//
+        -:  131:// Types
+        -:  132://===----------------------------------------------------------------------===//
+        -:  133:
+function _ZNK12_GLOBAL__N_129QuantDialectBytecodeInterface8readTypeERN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  134:Type QuantDialectBytecodeInterface::readType(
+        -:  135:    DialectBytecodeReader &reader) const {
+    #####:  136:  uint64_t code;
+    #####:  137:  if (failed(reader.readVarInt(code)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  138:    return Type();
+        -:  139:
+    #####:  140:  switch (code) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+    #####:  141:  case quant_encoding::kAnyQuantizedType:
+    #####:  142:    return readAnyQuantizedType(/*withExpressedType=*/false, reader);
+call    0 never executed
+    #####:  143:  case quant_encoding::kAnyQuantizedTypeWithExpressedType:
+    #####:  144:    return readAnyQuantizedType(/*withExpressedType=*/true, reader);
+call    0 never executed
+    #####:  145:  case quant_encoding::kCalibratedQuantizedType:
+    #####:  146:    return readCalibratedQuantizedType(reader);
+call    0 never executed
+    #####:  147:  case quant_encoding::kUniformQuantizedType:
+    #####:  148:    return readUniformQuantizedType(reader);
+call    0 never executed
+    #####:  149:  case quant_encoding::kUniformQuantizedPerAxisType:
+    #####:  150:    return readUniformQuantizedPerAxisType(reader);
+call    0 never executed
+        -:  151:
+    #####:  152:  default:
+    #####:  153:    reader.emitError() << "unknown builtin type code: " << code;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  154:    return Type();
+        -:  155:  }
+        -:  156:}
+        -:  157:
+        -:  158:LogicalResult
+function _ZNK12_GLOBAL__N_129QuantDialectBytecodeInterface9writeTypeEN4mlir4TypeERNS1_21DialectBytecodeWriterE called 0 returned 0% blocks executed 0%
+    #####:  159:QuantDialectBytecodeInterface::writeType(Type type,
+        -:  160:                                         DialectBytecodeWriter &writer) const {
+    #####:  161:  return TypeSwitch<Type, LogicalResult>(type)
+call    0 never executed
+        -:  162:      .Case<AnyQuantizedType, CalibratedQuantizedType, UniformQuantizedType>(
+    #####:  163:          [&](auto attr) { return write(attr, writer), success(); })
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+call    9 never executed
+    #####:  164:      .Default([&](Type) { return failure(); });
+branch  0 never executed
+branch  1 never executed
+        -:  165:}
+        -:  166:
+function _ZNK12_GLOBAL__N_129QuantDialectBytecodeInterface20readAnyQuantizedTypeEbRN4mlir21DialectBytecodeReaderE called 0 returned 0% blocks executed 0%
+    #####:  167:AnyQuantizedType QuantDialectBytecodeInterface::readAnyQuantizedType(
+        -:  168:    bool withExpressedType, DialectBytecodeReader &reader) const {
+    #####:  169:  uint64_t flags;
+    #####:  170:  Type storageType, expressedType;
+    #####:  171:  int64_t storageTypeMin, storageTypeMax;
+    #####:  172:  if (failed(reader.readVarInt(flags)) ||
+call    0 never executed
+    #####:  173:      failed(reader.readType(storageType)) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  174:      (withExpressedType && failed(reader.readType(expressedType))) ||
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  175:      failed(reader.readSignedVarInt(storageTypeMin)) ||
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  176:      failed(reader.readSignedVarInt(storageTypeMax)))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  177:    return reader.emitError("invalid AnyQuantizedType"), AnyQuantizedType();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  178:  return AnyQuantizedType::get(flags, storageType, expressedType,
+    #####:  179:                               storageTypeMin, storageTypeMax);
+call    0 never executed
+        -:  180:}
+        -:  181:void QuantDialectBytecodeInterface::write(AnyQuantizedType type,
+        -:  182:                                          DialectBytecodeWriter &writer) const {
+        -:  183:  if (type.getExpressedType())
+        -:  184:    writer.writeVarInt(quant_encoding::kAnyQuantizedTypeWithExpressedType);
+        -:  185:  else
+        -:  186:    writer.writeVarInt(quant_encoding::kAnyQuantizedType);
+        -:  187:
+        -:  188:  writer.writeVarInt(type.getFlags());
+        -:  189:  writer.writeType(type.getStorageType());
+        -:  190:  if (type.getExpressedType())
+        -:  191:    writer.writeType(type.getExpressedType());
+        -:  192:  writer.writeSignedVarInt(type.getStorageTypeMin());
+        -:  193:  writer.writeSignedVarInt(type.getStorageTypeMax());
+        -:  194:}
+        -:  195:
+        -:  196:CalibratedQuantizedType
+        -:  197:QuantDialectBytecodeInterface::readCalibratedQuantizedType(
+        -:  198:    DialectBytecodeReader &reader) const {
+        -:  199:  Type expressedType;
+        -:  200:  FailureOr<APFloat> min, max;
+        -:  201:  if (failed(reader.readType(expressedType)) ||
+        -:  202:      failed(min = reader.readAPFloatWithKnownSemantics(
+        -:  203:                 llvm::APFloat::IEEEdouble())) ||
+        -:  204:      failed(max = reader.readAPFloatWithKnownSemantics(
+        -:  205:                 llvm::APFloat::IEEEdouble())))
+        -:  206:    return reader.emitError("invalid CalibratedQuantizedType"),
+        -:  207:           CalibratedQuantizedType();
+        -:  208:  return CalibratedQuantizedType::get(expressedType,
+        -:  209:                                      min.value().convertToDouble(),
+        -:  210:                                      max.value().convertToDouble());
+        -:  211:}
+        -:  212:void QuantDialectBytecodeInterface::write(CalibratedQuantizedType type,
+        -:  213:                                          DialectBytecodeWriter &writer) const {
+        -:  214:  writer.writeVarInt(quant_encoding::kCalibratedQuantizedType);
+        -:  215:  writer.writeType(type.getExpressedType());
+        -:  216:  writer.writeAPFloatWithKnownSemantics(APFloat(type.getMin()));
+        -:  217:  writer.writeAPFloatWithKnownSemantics(APFloat(type.getMax()));
+        -:  218:}
+        -:  219:
+        -:  220:UniformQuantizedType QuantDialectBytecodeInterface::readUniformQuantizedType(
+        -:  221:    DialectBytecodeReader &reader) const {
+        -:  222:  uint64_t flags;
+        -:  223:  Type storageType, expressedType;
+        -:  224:  FailureOr<APFloat> scale;
+        -:  225:  int64_t zeroPoint, storageTypeMin, storageTypeMax;
+        -:  226:  if (failed(reader.readVarInt(flags)) ||
+        -:  227:      failed(reader.readType(storageType)) ||
+        -:  228:      failed(reader.readType(expressedType)) ||
+        -:  229:      failed(scale = reader.readAPFloatWithKnownSemantics(
+        -:  230:                 llvm::APFloat::IEEEdouble())) ||
+        -:  231:      failed(reader.readSignedVarInt(zeroPoint)) ||
+        -:  232:      failed(reader.readSignedVarInt(storageTypeMin)) ||
+        -:  233:      failed(reader.readSignedVarInt(storageTypeMax)))
+        -:  234:    return reader.emitError("invalid UniformQuantizedType"),
+        -:  235:           UniformQuantizedType();
+        -:  236:  return UniformQuantizedType::get(flags, storageType, expressedType,
+        -:  237:                                   scale.value().convertToDouble(), zeroPoint,
+        -:  238:                                   storageTypeMin, storageTypeMax);
+        -:  239:}
+        -:  240:void QuantDialectBytecodeInterface::write(UniformQuantizedType type,
+        -:  241:                                          DialectBytecodeWriter &writer) const {
+        -:  242:  writer.writeVarInt(quant_encoding::kUniformQuantizedType);
+        -:  243:  writer.writeVarInt(type.getFlags());
+        -:  244:  writer.writeType(type.getStorageType());
+        -:  245:  writer.writeType(type.getExpressedType());
+        -:  246:  writer.writeAPFloatWithKnownSemantics(APFloat(type.getScale()));
+        -:  247:  writer.writeSignedVarInt(type.getZeroPoint());
+        -:  248:  writer.writeSignedVarInt(type.getStorageTypeMin());
+        -:  249:  writer.writeSignedVarInt(type.getStorageTypeMax());
+        -:  250:}
+        -:  251:
+        -:  252:UniformQuantizedPerAxisType
+        -:  253:QuantDialectBytecodeInterface::readUniformQuantizedPerAxisType(
+        -:  254:    DialectBytecodeReader &reader) const {
+        -:  255:  uint64_t flags;
+        -:  256:  Type storageType, expressedType;
+        -:  257:  SmallVector<double> scales;
+        -:  258:  SmallVector<int64_t> zeroPoints;
+        -:  259:  uint64_t quantizedDimension;
+        -:  260:  int64_t storageTypeMin, storageTypeMax;
+        -:  261:
+function _ZZNK12_GLOBAL__N_129QuantDialectBytecodeInterface31readUniformQuantizedPerAxisTypeERN4mlir21DialectBytecodeReaderEENKUlRdE_clES4_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  262:  auto scalesRead = [&](double &val) -> LogicalResult {
+    #####:  263:    FailureOr<APFloat> fl =
+    #####:  264:        reader.readAPFloatWithKnownSemantics(APFloat::IEEEdouble());
+call    0 never executed
+    #####:  265:    if (succeeded(fl)) {
+branch  0 never executed
+branch  1 never executed
+    #####:  266:      val = fl.value().convertToDouble();
+call    0 never executed
+    #####:  267:      return success();
+        -:  268:    }
+    #####:  269:    return failure();
+branch  0 never executed
+branch  1 never executed
+        -:  270:  };
+        -:  271:
+        -:  272:  if (failed(reader.readVarInt(flags)) ||
+        -:  273:      failed(reader.readType(storageType)) ||
+        -:  274:      failed(reader.readType(expressedType)) ||
+        -:  275:      failed(reader.readList(scales, scalesRead)) ||
+        -:  276:      failed(reader.readSignedVarInts(zeroPoints)) ||
+        -:  277:      failed(reader.readVarInt(quantizedDimension)) ||
+        -:  278:      failed(reader.readSignedVarInt(storageTypeMin)) ||
+        -:  279:      failed(reader.readSignedVarInt(storageTypeMax)))
+        -:  280:    return reader.emitError("invalid UniformQuantizedPerAxisType"),
+        -:  281:           UniformQuantizedPerAxisType();
+        -:  282:  return UniformQuantizedPerAxisType::get(
+        -:  283:      flags, storageType, expressedType, scales, zeroPoints,
+        -:  284:      (int32_t)quantizedDimension, storageTypeMin, storageTypeMax);
+        -:  285:}
+        -:  286:void QuantDialectBytecodeInterface::write(UniformQuantizedPerAxisType type,
+        -:  287:                                          DialectBytecodeWriter &writer) const {
+        -:  288:  writer.writeVarInt(quant_encoding::kUniformQuantizedType);
+        -:  289:  writer.writeVarInt(type.getFlags());
+        -:  290:  writer.writeType(type.getStorageType());
+        -:  291:  writer.writeType(type.getExpressedType());
+        -:  292:  writer.writeList(type.getScales(), [&](double val) {
+        -:  293:    writer.writeAPFloatWithKnownSemantics(APFloat(val));
+        -:  294:  });
+        -:  295:  writer.writeSignedVarInts(type.getZeroPoints());
+        -:  296:  writer.writeVarInt(type.getQuantizedDimension());
+        -:  297:  writer.writeSignedVarInt(type.getStorageTypeMin());
+        -:  298:  writer.writeSignedVarInt(type.getStorageTypeMax());
+        -:  299:}

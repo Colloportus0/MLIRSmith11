@@ -1,0 +1,1791 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Conversion/AsyncToLLVM/AsyncToLLVM.cpp
+        -:    0:Graph:../tools/mlir/lib/Conversion/AsyncToLLVM/CMakeFiles/obj.MLIRAsyncToLLVM.dir/AsyncToLLVM.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Conversion/AsyncToLLVM/CMakeFiles/obj.MLIRAsyncToLLVM.dir/AsyncToLLVM.cpp.gcda
+        -:    0:Runs:116161
+        -:    1://===- AsyncToLLVM.cpp - Convert Async to LLVM dialect --------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8:
+        -:    9:#include "mlir/Conversion/AsyncToLLVM/AsyncToLLVM.h"
+        -:   10:
+        -:   11:#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+        -:   12:#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+        -:   13:#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+        -:   14:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   15:#include "mlir/Dialect/Async/IR/Async.h"
+        -:   16:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   17:#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+        -:   18:#include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
+        -:   19:#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+        -:   20:#include "mlir/IR/ImplicitLocOpBuilder.h"
+        -:   21:#include "mlir/IR/TypeUtilities.h"
+        -:   22:#include "mlir/Pass/Pass.h"
+        -:   23:#include "mlir/Transforms/DialectConversion.h"
+        -:   24:#include "llvm/ADT/TypeSwitch.h"
+        -:   25:
+        -:   26:namespace mlir {
+        -:   27:#define GEN_PASS_DEF_CONVERTASYNCTOLLVM
+        -:   28:#include "mlir/Conversion/Passes.h.inc"
+        -:   29:} // namespace mlir
+        -:   30:
+        -:   31:#define DEBUG_TYPE "convert-async-to-llvm"
+        -:   32:
+        -:   33:using namespace mlir;
+        -:   34:using namespace mlir::async;
+        -:   35:
+        -:   36://===----------------------------------------------------------------------===//
+        -:   37:// Async Runtime C API declaration.
+        -:   38://===----------------------------------------------------------------------===//
+        -:   39:
+        -:   40:static constexpr const char *kAddRef = "mlirAsyncRuntimeAddRef";
+        -:   41:static constexpr const char *kDropRef = "mlirAsyncRuntimeDropRef";
+        -:   42:static constexpr const char *kCreateToken = "mlirAsyncRuntimeCreateToken";
+        -:   43:static constexpr const char *kCreateValue = "mlirAsyncRuntimeCreateValue";
+        -:   44:static constexpr const char *kCreateGroup = "mlirAsyncRuntimeCreateGroup";
+        -:   45:static constexpr const char *kEmplaceToken = "mlirAsyncRuntimeEmplaceToken";
+        -:   46:static constexpr const char *kEmplaceValue = "mlirAsyncRuntimeEmplaceValue";
+        -:   47:static constexpr const char *kSetTokenError = "mlirAsyncRuntimeSetTokenError";
+        -:   48:static constexpr const char *kSetValueError = "mlirAsyncRuntimeSetValueError";
+        -:   49:static constexpr const char *kIsTokenError = "mlirAsyncRuntimeIsTokenError";
+        -:   50:static constexpr const char *kIsValueError = "mlirAsyncRuntimeIsValueError";
+        -:   51:static constexpr const char *kIsGroupError = "mlirAsyncRuntimeIsGroupError";
+        -:   52:static constexpr const char *kAwaitToken = "mlirAsyncRuntimeAwaitToken";
+        -:   53:static constexpr const char *kAwaitValue = "mlirAsyncRuntimeAwaitValue";
+        -:   54:static constexpr const char *kAwaitGroup = "mlirAsyncRuntimeAwaitAllInGroup";
+        -:   55:static constexpr const char *kExecute = "mlirAsyncRuntimeExecute";
+        -:   56:static constexpr const char *kGetValueStorage =
+        -:   57:    "mlirAsyncRuntimeGetValueStorage";
+        -:   58:static constexpr const char *kAddTokenToGroup =
+        -:   59:    "mlirAsyncRuntimeAddTokenToGroup";
+        -:   60:static constexpr const char *kAwaitTokenAndExecute =
+        -:   61:    "mlirAsyncRuntimeAwaitTokenAndExecute";
+        -:   62:static constexpr const char *kAwaitValueAndExecute =
+        -:   63:    "mlirAsyncRuntimeAwaitValueAndExecute";
+        -:   64:static constexpr const char *kAwaitAllAndExecute =
+        -:   65:    "mlirAsyncRuntimeAwaitAllInGroupAndExecute";
+        -:   66:static constexpr const char *kGetNumWorkerThreads =
+        -:   67:    "mlirAsyncRuntimGetNumWorkerThreads";
+        -:   68:
+        -:   69:namespace {
+        -:   70:/// Async Runtime API function types.
+        -:   71:///
+        -:   72:/// Because we can't create API function signature for type parametrized
+        -:   73:/// async.getValue type, we use opaque pointers (!llvm.ptr<i8>) instead. After
+        -:   74:/// lowering all async data types become opaque pointers at runtime.
+        -:   75:struct AsyncAPI {
+        -:   76:  // All async types are lowered to opaque i8* LLVM pointers at runtime.
+function _ZN12_GLOBAL__N_18AsyncAPI17opaquePointerTypeEPN4mlir11MLIRContextE called 8380 returned 100% blocks executed 100%
+     8380:   77:  static LLVM::LLVMPointerType opaquePointerType(MLIRContext *ctx) {
+     8380:   78:    return LLVM::LLVMPointerType::get(IntegerType::get(ctx, 8));
+call    0 returned 100%
+call    1 returned 100%
+        -:   79:  }
+        -:   80:
+    #####:   81:  static LLVM::LLVMTokenType tokenType(MLIRContext *ctx) {
+    #####:   82:    return LLVM::LLVMTokenType::get(ctx);
+        -:   83:  }
+        -:   84:
+function _ZN12_GLOBAL__N_18AsyncAPI24addOrDropRefFunctionTypeEPN4mlir11MLIRContextE called 838 returned 100% blocks executed 100%
+      838:   85:  static FunctionType addOrDropRefFunctionType(MLIRContext *ctx) {
+      838:   86:    auto ref = opaquePointerType(ctx);
+call    0 returned 100%
+      838:   87:    auto count = IntegerType::get(ctx, 64);
+call    0 returned 100%
+      838:   88:    return FunctionType::get(ctx, {ref, count}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:   89:  }
+        -:   90:
+function _ZN12_GLOBAL__N_18AsyncAPI23createTokenFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:   91:  static FunctionType createTokenFunctionType(MLIRContext *ctx) {
+      419:   92:    return FunctionType::get(ctx, {}, {TokenType::get(ctx)});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:   93:  }
+        -:   94:
+function _ZN12_GLOBAL__N_18AsyncAPI23createValueFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:   95:  static FunctionType createValueFunctionType(MLIRContext *ctx) {
+      419:   96:    auto i64 = IntegerType::get(ctx, 64);
+call    0 returned 100%
+      419:   97:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:   98:    return FunctionType::get(ctx, {i64}, {value});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:   99:  }
+        -:  100:
+function _ZN12_GLOBAL__N_18AsyncAPI23createGroupFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  101:  static FunctionType createGroupFunctionType(MLIRContext *ctx) {
+      419:  102:    auto i64 = IntegerType::get(ctx, 64);
+call    0 returned 100%
+      419:  103:    return FunctionType::get(ctx, {i64}, {GroupType::get(ctx)});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  104:  }
+        -:  105:
+function _ZN12_GLOBAL__N_18AsyncAPI27getValueStorageFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  106:  static FunctionType getValueStorageFunctionType(MLIRContext *ctx) {
+      419:  107:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  108:    auto storage = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  109:    return FunctionType::get(ctx, {value}, {storage});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  110:  }
+        -:  111:
+function _ZN12_GLOBAL__N_18AsyncAPI24emplaceTokenFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  112:  static FunctionType emplaceTokenFunctionType(MLIRContext *ctx) {
+      419:  113:    return FunctionType::get(ctx, {TokenType::get(ctx)}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  114:  }
+        -:  115:
+function _ZN12_GLOBAL__N_18AsyncAPI24emplaceValueFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  116:  static FunctionType emplaceValueFunctionType(MLIRContext *ctx) {
+      419:  117:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  118:    return FunctionType::get(ctx, {value}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  119:  }
+        -:  120:
+function _ZN12_GLOBAL__N_18AsyncAPI25setTokenErrorFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  121:  static FunctionType setTokenErrorFunctionType(MLIRContext *ctx) {
+      419:  122:    return FunctionType::get(ctx, {TokenType::get(ctx)}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  123:  }
+        -:  124:
+function _ZN12_GLOBAL__N_18AsyncAPI25setValueErrorFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  125:  static FunctionType setValueErrorFunctionType(MLIRContext *ctx) {
+      419:  126:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  127:    return FunctionType::get(ctx, {value}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  128:  }
+        -:  129:
+function _ZN12_GLOBAL__N_18AsyncAPI24isTokenErrorFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  130:  static FunctionType isTokenErrorFunctionType(MLIRContext *ctx) {
+      419:  131:    auto i1 = IntegerType::get(ctx, 1);
+call    0 returned 100%
+      419:  132:    return FunctionType::get(ctx, {TokenType::get(ctx)}, {i1});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  133:  }
+        -:  134:
+function _ZN12_GLOBAL__N_18AsyncAPI24isValueErrorFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  135:  static FunctionType isValueErrorFunctionType(MLIRContext *ctx) {
+      419:  136:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  137:    auto i1 = IntegerType::get(ctx, 1);
+call    0 returned 100%
+      419:  138:    return FunctionType::get(ctx, {value}, {i1});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  139:  }
+        -:  140:
+function _ZN12_GLOBAL__N_18AsyncAPI24isGroupErrorFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  141:  static FunctionType isGroupErrorFunctionType(MLIRContext *ctx) {
+      419:  142:    auto i1 = IntegerType::get(ctx, 1);
+call    0 returned 100%
+      419:  143:    return FunctionType::get(ctx, {GroupType::get(ctx)}, {i1});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  144:  }
+        -:  145:
+function _ZN12_GLOBAL__N_18AsyncAPI22awaitTokenFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  146:  static FunctionType awaitTokenFunctionType(MLIRContext *ctx) {
+      419:  147:    return FunctionType::get(ctx, {TokenType::get(ctx)}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  148:  }
+        -:  149:
+function _ZN12_GLOBAL__N_18AsyncAPI22awaitValueFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  150:  static FunctionType awaitValueFunctionType(MLIRContext *ctx) {
+      419:  151:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  152:    return FunctionType::get(ctx, {value}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  153:  }
+        -:  154:
+function _ZN12_GLOBAL__N_18AsyncAPI22awaitGroupFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  155:  static FunctionType awaitGroupFunctionType(MLIRContext *ctx) {
+      419:  156:    return FunctionType::get(ctx, {GroupType::get(ctx)}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  157:  }
+        -:  158:
+function _ZN12_GLOBAL__N_18AsyncAPI19executeFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  159:  static FunctionType executeFunctionType(MLIRContext *ctx) {
+      419:  160:    auto hdl = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  161:    auto resume = LLVM::LLVMPointerType::get(resumeFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  162:    return FunctionType::get(ctx, {hdl, resume}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  163:  }
+        -:  164:
+function _ZN12_GLOBAL__N_18AsyncAPI27addTokenToGroupFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  165:  static FunctionType addTokenToGroupFunctionType(MLIRContext *ctx) {
+      419:  166:    auto i64 = IntegerType::get(ctx, 64);
+call    0 returned 100%
+     1676:  167:    return FunctionType::get(ctx, {TokenType::get(ctx), GroupType::get(ctx)},
+      419:  168:                             {i64});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+call    4 returned 100%
+        -:  169:  }
+        -:  170:
+function _ZN12_GLOBAL__N_18AsyncAPI32awaitTokenAndExecuteFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  171:  static FunctionType awaitTokenAndExecuteFunctionType(MLIRContext *ctx) {
+      419:  172:    auto hdl = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  173:    auto resume = LLVM::LLVMPointerType::get(resumeFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  174:    return FunctionType::get(ctx, {TokenType::get(ctx), hdl, resume}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  175:  }
+        -:  176:
+function _ZN12_GLOBAL__N_18AsyncAPI32awaitValueAndExecuteFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  177:  static FunctionType awaitValueAndExecuteFunctionType(MLIRContext *ctx) {
+      419:  178:    auto value = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  179:    auto hdl = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  180:    auto resume = LLVM::LLVMPointerType::get(resumeFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  181:    return FunctionType::get(ctx, {value, hdl, resume}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:  182:  }
+        -:  183:
+function _ZN12_GLOBAL__N_18AsyncAPI30awaitAllAndExecuteFunctionTypeEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  184:  static FunctionType awaitAllAndExecuteFunctionType(MLIRContext *ctx) {
+      419:  185:    auto hdl = opaquePointerType(ctx);
+call    0 returned 100%
+      419:  186:    auto resume = LLVM::LLVMPointerType::get(resumeFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  187:    return FunctionType::get(ctx, {GroupType::get(ctx), hdl, resume}, {});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  188:  }
+        -:  189:
+function _ZN12_GLOBAL__N_18AsyncAPI19getNumWorkerThreadsEPN4mlir11MLIRContextE called 419 returned 100% blocks executed 100%
+      419:  190:  static FunctionType getNumWorkerThreads(MLIRContext *ctx) {
+      419:  191:    return FunctionType::get(ctx, {}, {IndexType::get(ctx)});
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  192:  }
+        -:  193:
+        -:  194:  // Auxiliary coroutine resume intrinsic wrapper.
+function _ZN12_GLOBAL__N_18AsyncAPI18resumeFunctionTypeEPN4mlir11MLIRContextE called 1676 returned 100% blocks executed 100%
+     1676:  195:  static Type resumeFunctionType(MLIRContext *ctx) {
+     1676:  196:    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+call    0 returned 100%
+     1676:  197:    auto i8Ptr = opaquePointerType(ctx);
+call    0 returned 100%
+     1676:  198:    return LLVM::LLVMFunctionType::get(voidTy, {i8Ptr}, false);
+call    0 returned 100%
+        -:  199:  }
+        -:  200:};
+        -:  201:} // namespace
+        -:  202:
+        -:  203:/// Adds Async Runtime C API declarations to the module.
+function _ZL30addAsyncRuntimeApiDeclarationsN4mlir8ModuleOpE called 419 returned 100% blocks executed 100%
+      419:  204:static void addAsyncRuntimeApiDeclarations(ModuleOp module) {
+      419:  205:  auto builder =
+      419:  206:      ImplicitLocOpBuilder::atBlockEnd(module.getLoc(), module.getBody());
+call    0 returned 100%
+call    1 returned 100%
+        -:  207:
+function _ZZL30addAsyncRuntimeApiDeclarationsN4mlir8ModuleOpEENKUlN4llvm9StringRefENS_12FunctionTypeEE_clES2_S3_.isra.0 called 9218 returned 100% blocks executed 100%
+     9637:  208:  auto addFuncDecl = [&](StringRef name, FunctionType type) {
+     9218:  209:    if (module.lookupSymbol(name))
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        -:  210:      return;
+     9218:  211:    builder.create<func::FuncOp>(name, type).setPrivate();
+call    0 returned 100%
+call    1 returned 100%
+      419:  212:  };
+        -:  213:
+      419:  214:  MLIRContext *ctx = module.getContext();
+call    0 returned 100%
+      419:  215:  addFuncDecl(kAddRef, AsyncAPI::addOrDropRefFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  216:  addFuncDecl(kDropRef, AsyncAPI::addOrDropRefFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  217:  addFuncDecl(kCreateToken, AsyncAPI::createTokenFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  218:  addFuncDecl(kCreateValue, AsyncAPI::createValueFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  219:  addFuncDecl(kCreateGroup, AsyncAPI::createGroupFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  220:  addFuncDecl(kEmplaceToken, AsyncAPI::emplaceTokenFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  221:  addFuncDecl(kEmplaceValue, AsyncAPI::emplaceValueFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  222:  addFuncDecl(kSetTokenError, AsyncAPI::setTokenErrorFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  223:  addFuncDecl(kSetValueError, AsyncAPI::setValueErrorFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  224:  addFuncDecl(kIsTokenError, AsyncAPI::isTokenErrorFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  225:  addFuncDecl(kIsValueError, AsyncAPI::isValueErrorFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  226:  addFuncDecl(kIsGroupError, AsyncAPI::isGroupErrorFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  227:  addFuncDecl(kAwaitToken, AsyncAPI::awaitTokenFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  228:  addFuncDecl(kAwaitValue, AsyncAPI::awaitValueFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  229:  addFuncDecl(kAwaitGroup, AsyncAPI::awaitGroupFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  230:  addFuncDecl(kExecute, AsyncAPI::executeFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  231:  addFuncDecl(kGetValueStorage, AsyncAPI::getValueStorageFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  232:  addFuncDecl(kAddTokenToGroup, AsyncAPI::addTokenToGroupFunctionType(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  233:  addFuncDecl(kAwaitTokenAndExecute,
+call    0 returned 100%
+call    1 returned 100%
+        -:  234:              AsyncAPI::awaitTokenAndExecuteFunctionType(ctx));
+      419:  235:  addFuncDecl(kAwaitValueAndExecute,
+call    0 returned 100%
+call    1 returned 100%
+        -:  236:              AsyncAPI::awaitValueAndExecuteFunctionType(ctx));
+      419:  237:  addFuncDecl(kAwaitAllAndExecute,
+call    0 returned 100%
+call    1 returned 100%
+        -:  238:              AsyncAPI::awaitAllAndExecuteFunctionType(ctx));
+      419:  239:  addFuncDecl(kGetNumWorkerThreads, AsyncAPI::getNumWorkerThreads(ctx));
+call    0 returned 100%
+call    1 returned 100%
+      419:  240:}
+        -:  241:
+        -:  242://===----------------------------------------------------------------------===//
+        -:  243:// Coroutine resume function wrapper.
+        -:  244://===----------------------------------------------------------------------===//
+        -:  245:
+        -:  246:static constexpr const char *kResume = "__resume";
+        -:  247:
+        -:  248:/// A function that takes a coroutine handle and calls a `llvm.coro.resume`
+        -:  249:/// intrinsics. We need this function to be able to pass it to the async
+        -:  250:/// runtime execute API.
+function _ZL17addResumeFunctionN4mlir8ModuleOpE called 0 returned 0% blocks executed 0%
+    #####:  251:static void addResumeFunction(ModuleOp module) {
+    #####:  252:  if (module.lookupSymbol(kResume))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  253:    return;
+        -:  254:
+    #####:  255:  MLIRContext *ctx = module.getContext();
+call    0 never executed
+    #####:  256:  auto loc = module.getLoc();
+call    0 never executed
+    #####:  257:  auto moduleBuilder = ImplicitLocOpBuilder::atBlockEnd(loc, module.getBody());
+call    0 never executed
+        -:  258:
+    #####:  259:  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+call    0 never executed
+    #####:  260:  auto i8Ptr = LLVM::LLVMPointerType::get(IntegerType::get(ctx, 8));
+call    0 never executed
+call    1 never executed
+        -:  261:
+    #####:  262:  auto resumeOp = moduleBuilder.create<LLVM::LLVMFuncOp>(
+    #####:  263:      kResume, LLVM::LLVMFunctionType::get(voidTy, {i8Ptr}));
+call    0 never executed
+call    1 never executed
+    #####:  264:  resumeOp.setPrivate();
+call    0 never executed
+        -:  265:
+    #####:  266:  auto *block = resumeOp.addEntryBlock();
+call    0 never executed
+    #####:  267:  auto blockBuilder = ImplicitLocOpBuilder::atBlockEnd(loc, block);
+call    0 never executed
+        -:  268:
+    #####:  269:  blockBuilder.create<LLVM::CoroResumeOp>(resumeOp.getArgument(0));
+call    0 never executed
+call    1 never executed
+    #####:  270:  blockBuilder.create<LLVM::ReturnOp>(ValueRange());
+call    0 never executed
+call    1 never executed
+        -:  271:}
+        -:  272:
+        -:  273://===----------------------------------------------------------------------===//
+        -:  274:// Convert Async dialect types to LLVM types.
+        -:  275://===----------------------------------------------------------------------===//
+        -:  276:
+        -:  277:namespace {
+        -:  278:/// AsyncRuntimeTypeConverter only converts types from the Async dialect to
+        -:  279:/// their runtime type (opaque pointers) and does not convert any other types.
+      419:  280:class AsyncRuntimeTypeConverter : public TypeConverter {
+        -:  281:public:
+function _ZN12_GLOBAL__N_125AsyncRuntimeTypeConverterC2Ev called 419 returned 100% blocks executed 100%
+      419:  282:  AsyncRuntimeTypeConverter() {
+call    0 returned 100%
+     3202:  283:    addConversion([](Type type) { return type; });
+call    0 returned 100%
+call    1 returned 100%
+      419:  284:    addConversion(convertAsyncTypes);
+call    0 returned 100%
+        -:  285:
+        -:  286:    // Use UnrealizedConversionCast as the bridge so that we don't need to pull
+        -:  287:    // in patterns for other dialects.
+     419*:  288:    auto addUnrealizedCast = [](OpBuilder &builder, Type type,
+        -:  289:                                ValueRange inputs, Location loc) {
+    #####:  290:      auto cast = builder.create<UnrealizedConversionCastOp>(loc, type, inputs);
+call    0 never executed
+    #####:  291:      return Optional<Value>(cast.getResult(0));
+        -:  292:    };
+        -:  293:
+      419:  294:    addSourceMaterialization(addUnrealizedCast);
+call    0 returned 100%
+      419:  295:    addTargetMaterialization(addUnrealizedCast);
+call    0 returned 100%
+      419:  296:  }
+        -:  297:
+function _ZN12_GLOBAL__N_125AsyncRuntimeTypeConverter17convertAsyncTypesEN4mlir4TypeE called 3621 returned 100% blocks executed 65%
+     3621:  298:  static Optional<Type> convertAsyncTypes(Type type) {
+     3621:  299:    if (type.isa<TokenType, GroupType, ValueType>())
+call    0 returned 100%
+branch  1 taken 23% (fallthrough)
+branch  2 taken 77%
+      838:  300:      return AsyncAPI::opaquePointerType(type.getContext());
+call    0 returned 100%
+call    1 returned 100%
+        -:  301:
+     2783:  302:    if (type.isa<CoroIdType, CoroStateType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  303:      return AsyncAPI::tokenType(type.getContext());
+call    0 never executed
+call    1 never executed
+     2783:  304:    if (type.isa<CoroHandleType>())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  305:      return AsyncAPI::opaquePointerType(type.getContext());
+call    0 never executed
+call    1 never executed
+        -:  306:
+     2783:  307:    return llvm::None;
+        -:  308:  }
+        -:  309:};
+        -:  310:} // namespace
+        -:  311:
+        -:  312://===----------------------------------------------------------------------===//
+        -:  313:// Convert async.coro.id to @llvm.coro.id intrinsic.
+        -:  314://===----------------------------------------------------------------------===//
+        -:  315:
+        -:  316:namespace {
+        -:  317:class CoroIdOpConversion : public OpConversionPattern<CoroIdOp> {
+        -:  318:public:
+        -:  319:  using OpConversionPattern::OpConversionPattern;
+        -:  320:
+        -:  321:  LogicalResult
+function _ZNK12_GLOBAL__N_118CoroIdOpConversion15matchAndRewriteEN4mlir5async8CoroIdOpENS2_15CoroIdOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  322:  matchAndRewrite(CoroIdOp op, OpAdaptor adaptor,
+        -:  323:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  324:    auto token = AsyncAPI::tokenType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  325:    auto i8Ptr = AsyncAPI::opaquePointerType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  326:    auto loc = op->getLoc();
+call    0 never executed
+        -:  327:
+        -:  328:    // Constants for initializing coroutine frame.
+    #####:  329:    auto constZero =
+    #####:  330:        rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(), 0);
+call    0 never executed
+call    1 never executed
+    #####:  331:    auto nullPtr = rewriter.create<LLVM::NullOp>(loc, i8Ptr);
+call    0 never executed
+        -:  332:
+        -:  333:    // Get coroutine id: @llvm.coro.id.
+    #####:  334:    rewriter.replaceOpWithNewOp<LLVM::CoroIdOp>(
+    #####:  335:        op, token, ValueRange({constZero, nullPtr, nullPtr, nullPtr}));
+call    0 never executed
+call    1 never executed
+        -:  336:
+    #####:  337:    return success();
+        -:  338:  }
+        -:  339:};
+        -:  340:} // namespace
+        -:  341:
+        -:  342://===----------------------------------------------------------------------===//
+        -:  343:// Convert async.coro.begin to @llvm.coro.begin intrinsic.
+        -:  344://===----------------------------------------------------------------------===//
+        -:  345:
+        -:  346:namespace {
+        -:  347:class CoroBeginOpConversion : public OpConversionPattern<CoroBeginOp> {
+        -:  348:public:
+        -:  349:  using OpConversionPattern::OpConversionPattern;
+        -:  350:
+        -:  351:  LogicalResult
+function _ZNK12_GLOBAL__N_121CoroBeginOpConversion15matchAndRewriteEN4mlir5async11CoroBeginOpENS2_18CoroBeginOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  352:  matchAndRewrite(CoroBeginOp op, OpAdaptor adaptor,
+        -:  353:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  354:    auto i8Ptr = AsyncAPI::opaquePointerType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  355:    auto loc = op->getLoc();
+call    0 never executed
+        -:  356:
+        -:  357:    // Get coroutine frame size: @llvm.coro.size.i64.
+    #####:  358:    Value coroSize =
+    #####:  359:        rewriter.create<LLVM::CoroSizeOp>(loc, rewriter.getI64Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  360:    // Get coroutine frame alignment: @llvm.coro.align.i64.
+    #####:  361:    Value coroAlign =
+    #####:  362:        rewriter.create<LLVM::CoroAlignOp>(loc, rewriter.getI64Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  363:
+        -:  364:    // Round up the size to be multiple of the alignment. Since aligned_alloc
+        -:  365:    // requires the size parameter be an integral multiple of the alignment
+        -:  366:    // parameter.
+function _ZZNK12_GLOBAL__N_121CoroBeginOpConversion15matchAndRewriteEN4mlir5async11CoroBeginOpENS2_18CoroBeginOpAdaptorERNS1_25ConversionPatternRewriterEENKUlmE_clEm.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  367:    auto makeConstant = [&](uint64_t c) {
+    #####:  368:      return rewriter.create<LLVM::ConstantOp>(op->getLoc(),
+    #####:  369:                                               rewriter.getI64Type(), c);
+call    0 never executed
+call    1 never executed
+    #####:  370:    };
+    #####:  371:    coroSize = rewriter.create<LLVM::AddOp>(op->getLoc(), coroSize, coroAlign);
+call    0 never executed
+call    1 never executed
+    #####:  372:    coroSize =
+    #####:  373:        rewriter.create<LLVM::SubOp>(op->getLoc(), coroSize, makeConstant(1));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  374:    Value negCoroAlign =
+    #####:  375:        rewriter.create<LLVM::SubOp>(op->getLoc(), makeConstant(0), coroAlign);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  376:    coroSize =
+    #####:  377:        rewriter.create<LLVM::AndOp>(op->getLoc(), coroSize, negCoroAlign);
+call    0 never executed
+call    1 never executed
+        -:  378:
+        -:  379:    // Allocate memory for the coroutine frame.
+    #####:  380:    auto allocFuncOp = LLVM::lookupOrCreateAlignedAllocFn(
+    #####:  381:        op->getParentOfType<ModuleOp>(), rewriter.getI64Type());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  382:    auto coroAlloc = rewriter.create<LLVM::CallOp>(
+    #####:  383:        loc, allocFuncOp, ValueRange{coroAlign, coroSize});
+call    0 never executed
+call    1 never executed
+        -:  384:
+        -:  385:    // Begin a coroutine: @llvm.coro.begin.
+    #####:  386:    auto coroId = CoroBeginOpAdaptor(adaptor.getOperands()).getId();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  387:    rewriter.replaceOpWithNewOp<LLVM::CoroBeginOp>(
+    #####:  388:        op, i8Ptr, ValueRange({coroId, coroAlloc.getResult()}));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  389:
+    #####:  390:    return success();
+        -:  391:  }
+        -:  392:};
+        -:  393:} // namespace
+        -:  394:
+        -:  395://===----------------------------------------------------------------------===//
+        -:  396:// Convert async.coro.free to @llvm.coro.free intrinsic.
+        -:  397://===----------------------------------------------------------------------===//
+        -:  398:
+        -:  399:namespace {
+        -:  400:class CoroFreeOpConversion : public OpConversionPattern<CoroFreeOp> {
+        -:  401:public:
+        -:  402:  using OpConversionPattern::OpConversionPattern;
+        -:  403:
+        -:  404:  LogicalResult
+function _ZNK12_GLOBAL__N_120CoroFreeOpConversion15matchAndRewriteEN4mlir5async10CoroFreeOpENS2_17CoroFreeOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  405:  matchAndRewrite(CoroFreeOp op, OpAdaptor adaptor,
+        -:  406:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  407:    auto i8Ptr = AsyncAPI::opaquePointerType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  408:    auto loc = op->getLoc();
+call    0 never executed
+        -:  409:
+        -:  410:    // Get a pointer to the coroutine frame memory: @llvm.coro.free.
+    #####:  411:    auto coroMem =
+    #####:  412:        rewriter.create<LLVM::CoroFreeOp>(loc, i8Ptr, adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+        -:  413:
+        -:  414:    // Free the memory.
+    #####:  415:    auto freeFuncOp =
+    #####:  416:        LLVM::lookupOrCreateFreeFn(op->getParentOfType<ModuleOp>());
+call    0 never executed
+call    1 never executed
+    #####:  417:    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, freeFuncOp,
+    #####:  418:                                              ValueRange(coroMem.getResult()));
+call    0 never executed
+call    1 never executed
+        -:  419:
+    #####:  420:    return success();
+        -:  421:  }
+        -:  422:};
+        -:  423:} // namespace
+        -:  424:
+        -:  425://===----------------------------------------------------------------------===//
+        -:  426:// Convert async.coro.end to @llvm.coro.end intrinsic.
+        -:  427://===----------------------------------------------------------------------===//
+        -:  428:
+        -:  429:namespace {
+        -:  430:class CoroEndOpConversion : public OpConversionPattern<CoroEndOp> {
+        -:  431:public:
+        -:  432:  using OpConversionPattern::OpConversionPattern;
+        -:  433:
+        -:  434:  LogicalResult
+function _ZNK12_GLOBAL__N_119CoroEndOpConversion15matchAndRewriteEN4mlir5async9CoroEndOpENS2_16CoroEndOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  435:  matchAndRewrite(CoroEndOp op, OpAdaptor adaptor,
+        -:  436:                  ConversionPatternRewriter &rewriter) const override {
+        -:  437:    // We are not in the block that is part of the unwind sequence.
+    #####:  438:    auto constFalse = rewriter.create<LLVM::ConstantOp>(
+    #####:  439:        op->getLoc(), rewriter.getI1Type(), rewriter.getBoolAttr(false));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  440:
+        -:  441:    // Mark the end of a coroutine: @llvm.coro.end.
+    #####:  442:    auto coroHdl = adaptor.getHandle();
+call    0 never executed
+    #####:  443:    rewriter.create<LLVM::CoroEndOp>(op->getLoc(), rewriter.getI1Type(),
+    #####:  444:                                     ValueRange({coroHdl, constFalse}));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  445:    rewriter.eraseOp(op);
+call    0 never executed
+        -:  446:
+    #####:  447:    return success();
+        -:  448:  }
+        -:  449:};
+        -:  450:} // namespace
+        -:  451:
+        -:  452://===----------------------------------------------------------------------===//
+        -:  453:// Convert async.coro.save to @llvm.coro.save intrinsic.
+        -:  454://===----------------------------------------------------------------------===//
+        -:  455:
+        -:  456:namespace {
+        -:  457:class CoroSaveOpConversion : public OpConversionPattern<CoroSaveOp> {
+        -:  458:public:
+        -:  459:  using OpConversionPattern::OpConversionPattern;
+        -:  460:
+        -:  461:  LogicalResult
+function _ZNK12_GLOBAL__N_120CoroSaveOpConversion15matchAndRewriteEN4mlir5async10CoroSaveOpENS2_17CoroSaveOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  462:  matchAndRewrite(CoroSaveOp op, OpAdaptor adaptor,
+        -:  463:                  ConversionPatternRewriter &rewriter) const override {
+        -:  464:    // Save the coroutine state: @llvm.coro.save
+    #####:  465:    rewriter.replaceOpWithNewOp<LLVM::CoroSaveOp>(
+    #####:  466:        op, AsyncAPI::tokenType(op->getContext()), adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  467:
+    #####:  468:    return success();
+        -:  469:  }
+        -:  470:};
+        -:  471:} // namespace
+        -:  472:
+        -:  473://===----------------------------------------------------------------------===//
+        -:  474:// Convert async.coro.suspend to @llvm.coro.suspend intrinsic.
+        -:  475://===----------------------------------------------------------------------===//
+        -:  476:
+        -:  477:namespace {
+        -:  478:
+        -:  479:/// Convert async.coro.suspend to the @llvm.coro.suspend intrinsic call, and
+        -:  480:/// branch to the appropriate block based on the return code.
+        -:  481:///
+        -:  482:/// Before:
+        -:  483:///
+        -:  484:///   ^suspended:
+        -:  485:///     "opBefore"(...)
+        -:  486:///     async.coro.suspend %state, ^suspend, ^resume, ^cleanup
+        -:  487:///   ^resume:
+        -:  488:///     "op"(...)
+        -:  489:///   ^cleanup: ...
+        -:  490:///   ^suspend: ...
+        -:  491:///
+        -:  492:/// After:
+        -:  493:///
+        -:  494:///   ^suspended:
+        -:  495:///     "opBefore"(...)
+        -:  496:///     %suspend = llmv.intr.coro.suspend ...
+        -:  497:///     switch %suspend [-1: ^suspend, 0: ^resume, 1: ^cleanup]
+        -:  498:///   ^resume:
+        -:  499:///     "op"(...)
+        -:  500:///   ^cleanup: ...
+        -:  501:///   ^suspend: ...
+        -:  502:///
+        -:  503:class CoroSuspendOpConversion : public OpConversionPattern<CoroSuspendOp> {
+        -:  504:public:
+        -:  505:  using OpConversionPattern::OpConversionPattern;
+        -:  506:
+        -:  507:  LogicalResult
+function _ZNK12_GLOBAL__N_123CoroSuspendOpConversion15matchAndRewriteEN4mlir5async13CoroSuspendOpENS2_20CoroSuspendOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  508:  matchAndRewrite(CoroSuspendOp op, OpAdaptor adaptor,
+        -:  509:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  510:    auto i8 = rewriter.getIntegerType(8);
+call    0 never executed
+    #####:  511:    auto i32 = rewriter.getI32Type();
+call    0 never executed
+    #####:  512:    auto loc = op->getLoc();
+call    0 never executed
+        -:  513:
+        -:  514:    // This is not a final suspension point.
+    #####:  515:    auto constFalse = rewriter.create<LLVM::ConstantOp>(
+    #####:  516:        loc, rewriter.getI1Type(), rewriter.getBoolAttr(false));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  517:
+        -:  518:    // Suspend a coroutine: @llvm.coro.suspend
+    #####:  519:    auto coroState = adaptor.getState();
+call    0 never executed
+    #####:  520:    auto coroSuspend = rewriter.create<LLVM::CoroSuspendOp>(
+    #####:  521:        loc, i8, ValueRange({coroState, constFalse}));
+call    0 never executed
+call    1 never executed
+        -:  522:
+        -:  523:    // Cast return code to i32.
+        -:  524:
+        -:  525:    // After a suspension point decide if we should branch into resume, cleanup
+        -:  526:    // or suspend block of the coroutine (see @llvm.coro.suspend return code
+        -:  527:    // documentation).
+    #####:  528:    llvm::SmallVector<int32_t, 2> caseValues = {0, 1};
+call    0 never executed
+    #####:  529:    llvm::SmallVector<Block *, 2> caseDest = {op.getResumeDest(),
+call    0 never executed
+    #####:  530:                                              op.getCleanupDest()};
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  531:    rewriter.replaceOpWithNewOp<LLVM::SwitchOp>(
+    #####:  532:        op, rewriter.create<LLVM::SExtOp>(loc, i32, coroSuspend.getResult()),
+    #####:  533:        /*defaultDestination=*/op.getSuspendDest(),
+call    0 never executed
+call    1 never executed
+    #####:  534:        /*defaultOperands=*/ValueRange(),
+call    0 never executed
+        -:  535:        /*caseValues=*/caseValues,
+        -:  536:        /*caseDestinations=*/caseDest,
+    #####:  537:        /*caseOperands=*/ArrayRef<ValueRange>({ValueRange(), ValueRange()}),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  538:        /*branchWeights=*/ArrayRef<int32_t>());
+call    0 never executed
+call    1 never executed
+        -:  539:
+    #####:  540:    return success();
+branch  0 never executed
+branch  1 never executed
+        -:  541:  }
+        -:  542:};
+        -:  543:} // namespace
+        -:  544:
+        -:  545://===----------------------------------------------------------------------===//
+        -:  546:// Convert async.runtime.create to the corresponding runtime API call.
+        -:  547://
+        -:  548:// To allocate storage for the async values we use getelementptr trick:
+        -:  549:// http://nondot.org/sabre/LLVMNotes/SizeOf-OffsetOf-VariableSizedStructs.txt
+        -:  550://===----------------------------------------------------------------------===//
+        -:  551:
+        -:  552:namespace {
+        -:  553:class RuntimeCreateOpLowering : public OpConversionPattern<RuntimeCreateOp> {
+        -:  554:public:
+        -:  555:  using OpConversionPattern::OpConversionPattern;
+        -:  556:
+        -:  557:  LogicalResult
+function _ZNK12_GLOBAL__N_123RuntimeCreateOpLowering15matchAndRewriteEN4mlir5async15RuntimeCreateOpENS2_22RuntimeCreateOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  558:  matchAndRewrite(RuntimeCreateOp op, OpAdaptor adaptor,
+        -:  559:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  560:    TypeConverter *converter = getTypeConverter();
+branch  0 never executed
+branch  1 never executed
+    #####:  561:    Type resultType = op->getResultTypes()[0];
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  562:
+        -:  563:    // Tokens creation maps to a simple function call.
+    #####:  564:    if (resultType.isa<TokenType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  565:      rewriter.replaceOpWithNewOp<func::CallOp>(
+    #####:  566:          op, kCreateToken, converter->convertType(resultType));
+call    0 never executed
+call    1 never executed
+    #####:  567:      return success();
+        -:  568:    }
+        -:  569:
+        -:  570:    // To create a value we need to compute the storage requirement.
+    #####:  571:    if (auto value = resultType.dyn_cast<ValueType>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  572:      // Returns the size requirements for the async value storage.
+function _ZZNK12_GLOBAL__N_123RuntimeCreateOpLowering15matchAndRewriteEN4mlir5async15RuntimeCreateOpENS2_22RuntimeCreateOpAdaptorERNS1_25ConversionPatternRewriterEENKUlNS2_9ValueTypeEE_clES7_ called 0 returned 0% blocks executed 0%
+    #####:  573:      auto sizeOf = [&](ValueType valueType) -> Value {
+    #####:  574:        auto loc = op->getLoc();
+call    0 never executed
+    #####:  575:        auto i64 = rewriter.getI64Type();
+call    0 never executed
+        -:  576:
+    #####:  577:        auto storedType = converter->convertType(valueType.getValueType());
+call    0 never executed
+call    1 never executed
+    #####:  578:        auto storagePtrType = LLVM::LLVMPointerType::get(storedType);
+call    0 never executed
+        -:  579:
+        -:  580:        // %Size = getelementptr %T* null, int 1
+        -:  581:        // %SizeI = ptrtoint %T* %Size to i64
+    #####:  582:        auto nullPtr = rewriter.create<LLVM::NullOp>(loc, storagePtrType);
+call    0 never executed
+    #####:  583:        auto gep = rewriter.create<LLVM::GEPOp>(loc, storagePtrType, nullPtr,
+    #####:  584:                                                ArrayRef<LLVM::GEPArg>{1});
+call    0 never executed
+call    1 never executed
+    #####:  585:        return rewriter.create<LLVM::PtrToIntOp>(loc, i64, gep);
+call    0 never executed
+    #####:  586:      };
+        -:  587:
+    #####:  588:      rewriter.replaceOpWithNewOp<func::CallOp>(op, kCreateValue, resultType,
+    #####:  589:                                                sizeOf(value));
+call    0 never executed
+call    1 never executed
+        -:  590:
+    #####:  591:      return success();
+        -:  592:    }
+        -:  593:
+    #####:  594:    return rewriter.notifyMatchFailure(op, "unsupported async type");
+call    0 never executed
+        -:  595:  }
+        -:  596:};
+        -:  597:} // namespace
+        -:  598:
+        -:  599://===----------------------------------------------------------------------===//
+        -:  600:// Convert async.runtime.create_group to the corresponding runtime API call.
+        -:  601://===----------------------------------------------------------------------===//
+        -:  602:
+        -:  603:namespace {
+        -:  604:class RuntimeCreateGroupOpLowering
+        -:  605:    : public OpConversionPattern<RuntimeCreateGroupOp> {
+        -:  606:public:
+        -:  607:  using OpConversionPattern::OpConversionPattern;
+        -:  608:
+        -:  609:  LogicalResult
+function _ZNK12_GLOBAL__N_128RuntimeCreateGroupOpLowering15matchAndRewriteEN4mlir5async20RuntimeCreateGroupOpENS2_27RuntimeCreateGroupOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  610:  matchAndRewrite(RuntimeCreateGroupOp op, OpAdaptor adaptor,
+        -:  611:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  612:    TypeConverter *converter = getTypeConverter();
+call    0 never executed
+    #####:  613:    Type resultType = op.getResult().getType();
+call    0 never executed
+call    1 never executed
+        -:  614:
+    #####:  615:    rewriter.replaceOpWithNewOp<func::CallOp>(
+    #####:  616:        op, kCreateGroup, converter->convertType(resultType),
+call    0 never executed
+    #####:  617:        adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####:  618:    return success();
+        -:  619:  }
+        -:  620:};
+        -:  621:} // namespace
+        -:  622:
+        -:  623://===----------------------------------------------------------------------===//
+        -:  624:// Convert async.runtime.set_available to the corresponding runtime API call.
+        -:  625://===----------------------------------------------------------------------===//
+        -:  626:
+        -:  627:namespace {
+        -:  628:class RuntimeSetAvailableOpLowering
+        -:  629:    : public OpConversionPattern<RuntimeSetAvailableOp> {
+        -:  630:public:
+        -:  631:  using OpConversionPattern::OpConversionPattern;
+        -:  632:
+        -:  633:  LogicalResult
+function _ZNK12_GLOBAL__N_129RuntimeSetAvailableOpLowering15matchAndRewriteEN4mlir5async21RuntimeSetAvailableOpENS2_28RuntimeSetAvailableOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  634:  matchAndRewrite(RuntimeSetAvailableOp op, OpAdaptor adaptor,
+        -:  635:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  636:    StringRef apiFuncName =
+    #####:  637:        TypeSwitch<Type, StringRef>(op.getOperand().getType())
+call    0 never executed
+call    1 never executed
+    #####:  638:            .Case<TokenType>([](Type) { return kEmplaceToken; })
+call    0 never executed
+    #####:  639:            .Case<ValueType>([](Type) { return kEmplaceValue; });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  640:
+    #####:  641:    rewriter.replaceOpWithNewOp<func::CallOp>(op, apiFuncName, TypeRange(),
+call    0 never executed
+    #####:  642:                                              adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  643:
+    #####:  644:    return success();
+        -:  645:  }
+        -:  646:};
+        -:  647:} // namespace
+        -:  648:
+        -:  649://===----------------------------------------------------------------------===//
+        -:  650:// Convert async.runtime.set_error to the corresponding runtime API call.
+        -:  651://===----------------------------------------------------------------------===//
+        -:  652:
+        -:  653:namespace {
+        -:  654:class RuntimeSetErrorOpLowering
+        -:  655:    : public OpConversionPattern<RuntimeSetErrorOp> {
+        -:  656:public:
+        -:  657:  using OpConversionPattern::OpConversionPattern;
+        -:  658:
+        -:  659:  LogicalResult
+function _ZNK12_GLOBAL__N_125RuntimeSetErrorOpLowering15matchAndRewriteEN4mlir5async17RuntimeSetErrorOpENS2_24RuntimeSetErrorOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  660:  matchAndRewrite(RuntimeSetErrorOp op, OpAdaptor adaptor,
+        -:  661:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  662:    StringRef apiFuncName =
+    #####:  663:        TypeSwitch<Type, StringRef>(op.getOperand().getType())
+call    0 never executed
+call    1 never executed
+    #####:  664:            .Case<TokenType>([](Type) { return kSetTokenError; })
+call    0 never executed
+    #####:  665:            .Case<ValueType>([](Type) { return kSetValueError; });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  666:
+    #####:  667:    rewriter.replaceOpWithNewOp<func::CallOp>(op, apiFuncName, TypeRange(),
+call    0 never executed
+    #####:  668:                                              adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  669:
+    #####:  670:    return success();
+        -:  671:  }
+        -:  672:};
+        -:  673:} // namespace
+        -:  674:
+        -:  675://===----------------------------------------------------------------------===//
+        -:  676:// Convert async.runtime.is_error to the corresponding runtime API call.
+        -:  677://===----------------------------------------------------------------------===//
+        -:  678:
+        -:  679:namespace {
+        -:  680:class RuntimeIsErrorOpLowering : public OpConversionPattern<RuntimeIsErrorOp> {
+        -:  681:public:
+        -:  682:  using OpConversionPattern::OpConversionPattern;
+        -:  683:
+        -:  684:  LogicalResult
+function _ZNK12_GLOBAL__N_124RuntimeIsErrorOpLowering15matchAndRewriteEN4mlir5async16RuntimeIsErrorOpENS2_23RuntimeIsErrorOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  685:  matchAndRewrite(RuntimeIsErrorOp op, OpAdaptor adaptor,
+        -:  686:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  687:    StringRef apiFuncName =
+    #####:  688:        TypeSwitch<Type, StringRef>(op.getOperand().getType())
+call    0 never executed
+call    1 never executed
+    #####:  689:            .Case<TokenType>([](Type) { return kIsTokenError; })
+call    0 never executed
+    #####:  690:            .Case<GroupType>([](Type) { return kIsGroupError; })
+call    0 never executed
+    #####:  691:            .Case<ValueType>([](Type) { return kIsValueError; });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  692:
+    #####:  693:    rewriter.replaceOpWithNewOp<func::CallOp>(
+    #####:  694:        op, apiFuncName, rewriter.getI1Type(), adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  695:    return success();
+        -:  696:  }
+        -:  697:};
+        -:  698:} // namespace
+        -:  699:
+        -:  700://===----------------------------------------------------------------------===//
+        -:  701:// Convert async.runtime.await to the corresponding runtime API call.
+        -:  702://===----------------------------------------------------------------------===//
+        -:  703:
+        -:  704:namespace {
+        -:  705:class RuntimeAwaitOpLowering : public OpConversionPattern<RuntimeAwaitOp> {
+        -:  706:public:
+        -:  707:  using OpConversionPattern::OpConversionPattern;
+        -:  708:
+        -:  709:  LogicalResult
+function _ZNK12_GLOBAL__N_122RuntimeAwaitOpLowering15matchAndRewriteEN4mlir5async14RuntimeAwaitOpENS2_21RuntimeAwaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  710:  matchAndRewrite(RuntimeAwaitOp op, OpAdaptor adaptor,
+        -:  711:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  712:    StringRef apiFuncName =
+    #####:  713:        TypeSwitch<Type, StringRef>(op.getOperand().getType())
+call    0 never executed
+call    1 never executed
+    #####:  714:            .Case<TokenType>([](Type) { return kAwaitToken; })
+call    0 never executed
+    #####:  715:            .Case<ValueType>([](Type) { return kAwaitValue; })
+call    0 never executed
+    #####:  716:            .Case<GroupType>([](Type) { return kAwaitGroup; });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  717:
+    #####:  718:    rewriter.create<func::CallOp>(op->getLoc(), apiFuncName, TypeRange(),
+call    0 never executed
+    #####:  719:                                  adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  720:    rewriter.eraseOp(op);
+call    0 never executed
+        -:  721:
+    #####:  722:    return success();
+        -:  723:  }
+        -:  724:};
+        -:  725:} // namespace
+        -:  726:
+        -:  727://===----------------------------------------------------------------------===//
+        -:  728:// Convert async.runtime.await_and_resume to the corresponding runtime API call.
+        -:  729://===----------------------------------------------------------------------===//
+        -:  730:
+        -:  731:namespace {
+        -:  732:class RuntimeAwaitAndResumeOpLowering
+        -:  733:    : public OpConversionPattern<RuntimeAwaitAndResumeOp> {
+        -:  734:public:
+        -:  735:  using OpConversionPattern::OpConversionPattern;
+        -:  736:
+        -:  737:  LogicalResult
+function _ZNK12_GLOBAL__N_131RuntimeAwaitAndResumeOpLowering15matchAndRewriteEN4mlir5async23RuntimeAwaitAndResumeOpENS2_30RuntimeAwaitAndResumeOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  738:  matchAndRewrite(RuntimeAwaitAndResumeOp op, OpAdaptor adaptor,
+        -:  739:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  740:    StringRef apiFuncName =
+    #####:  741:        TypeSwitch<Type, StringRef>(op.getOperand().getType())
+call    0 never executed
+call    1 never executed
+    #####:  742:            .Case<TokenType>([](Type) { return kAwaitTokenAndExecute; })
+call    0 never executed
+    #####:  743:            .Case<ValueType>([](Type) { return kAwaitValueAndExecute; })
+call    0 never executed
+    #####:  744:            .Case<GroupType>([](Type) { return kAwaitAllAndExecute; });
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  745:
+    #####:  746:    Value operand = adaptor.getOperand();
+call    0 never executed
+    #####:  747:    Value handle = adaptor.getHandle();
+call    0 never executed
+        -:  748:
+        -:  749:    // A pointer to coroutine resume intrinsic wrapper.
+    #####:  750:    addResumeFunction(op->getParentOfType<ModuleOp>());
+call    0 never executed
+call    1 never executed
+    #####:  751:    auto resumeFnTy = AsyncAPI::resumeFunctionType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  752:    auto resumePtr = rewriter.create<LLVM::AddressOfOp>(
+    #####:  753:        op->getLoc(), LLVM::LLVMPointerType::get(resumeFnTy), kResume);
+call    0 never executed
+call    1 never executed
+        -:  754:
+    #####:  755:    rewriter.create<func::CallOp>(
+    #####:  756:        op->getLoc(), apiFuncName, TypeRange(),
+call    0 never executed
+    #####:  757:        ValueRange({operand, handle, resumePtr.getRes()}));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####:  758:    rewriter.eraseOp(op);
+call    0 never executed
+        -:  759:
+    #####:  760:    return success();
+        -:  761:  }
+        -:  762:};
+        -:  763:} // namespace
+        -:  764:
+        -:  765://===----------------------------------------------------------------------===//
+        -:  766:// Convert async.runtime.resume to the corresponding runtime API call.
+        -:  767://===----------------------------------------------------------------------===//
+        -:  768:
+        -:  769:namespace {
+        -:  770:class RuntimeResumeOpLowering : public OpConversionPattern<RuntimeResumeOp> {
+        -:  771:public:
+        -:  772:  using OpConversionPattern::OpConversionPattern;
+        -:  773:
+        -:  774:  LogicalResult
+function _ZNK12_GLOBAL__N_123RuntimeResumeOpLowering15matchAndRewriteEN4mlir5async15RuntimeResumeOpENS2_22RuntimeResumeOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  775:  matchAndRewrite(RuntimeResumeOp op, OpAdaptor adaptor,
+        -:  776:                  ConversionPatternRewriter &rewriter) const override {
+        -:  777:    // A pointer to coroutine resume intrinsic wrapper.
+    #####:  778:    addResumeFunction(op->getParentOfType<ModuleOp>());
+call    0 never executed
+call    1 never executed
+    #####:  779:    auto resumeFnTy = AsyncAPI::resumeFunctionType(op->getContext());
+call    0 never executed
+call    1 never executed
+    #####:  780:    auto resumePtr = rewriter.create<LLVM::AddressOfOp>(
+    #####:  781:        op->getLoc(), LLVM::LLVMPointerType::get(resumeFnTy), kResume);
+call    0 never executed
+call    1 never executed
+        -:  782:
+        -:  783:    // Call async runtime API to execute a coroutine in the managed thread.
+    #####:  784:    auto coroHdl = adaptor.getHandle();
+call    0 never executed
+    #####:  785:    rewriter.replaceOpWithNewOp<func::CallOp>(
+    #####:  786:        op, TypeRange(), kExecute, ValueRange({coroHdl, resumePtr.getRes()}));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+        -:  787:
+    #####:  788:    return success();
+        -:  789:  }
+        -:  790:};
+        -:  791:} // namespace
+        -:  792:
+        -:  793://===----------------------------------------------------------------------===//
+        -:  794:// Convert async.runtime.store to the corresponding runtime API call.
+        -:  795://===----------------------------------------------------------------------===//
+        -:  796:
+        -:  797:namespace {
+        -:  798:class RuntimeStoreOpLowering : public OpConversionPattern<RuntimeStoreOp> {
+        -:  799:public:
+        -:  800:  using OpConversionPattern::OpConversionPattern;
+        -:  801:
+        -:  802:  LogicalResult
+function _ZNK12_GLOBAL__N_122RuntimeStoreOpLowering15matchAndRewriteEN4mlir5async14RuntimeStoreOpENS2_21RuntimeStoreOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  803:  matchAndRewrite(RuntimeStoreOp op, OpAdaptor adaptor,
+        -:  804:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  805:    Location loc = op->getLoc();
+call    0 never executed
+        -:  806:
+        -:  807:    // Get a pointer to the async value storage from the runtime.
+    #####:  808:    auto i8Ptr = AsyncAPI::opaquePointerType(rewriter.getContext());
+call    0 never executed
+    #####:  809:    auto storage = adaptor.getStorage();
+call    0 never executed
+    #####:  810:    auto storagePtr = rewriter.create<func::CallOp>(loc, kGetValueStorage,
+    #####:  811:                                                    TypeRange(i8Ptr), storage);
+call    0 never executed
+call    1 never executed
+        -:  812:
+        -:  813:    // Cast from i8* to the LLVM pointer type.
+    #####:  814:    auto valueType = op.getValue().getType();
+call    0 never executed
+call    1 never executed
+    #####:  815:    auto llvmValueType = getTypeConverter()->convertType(valueType);
+call    0 never executed
+    #####:  816:    if (!llvmValueType)
+branch  0 never executed
+branch  1 never executed
+    #####:  817:      return rewriter.notifyMatchFailure(
+    #####:  818:          op, "failed to convert stored value type to LLVM type");
+call    0 never executed
+        -:  819:
+    #####:  820:    auto castedStoragePtr = rewriter.create<LLVM::BitcastOp>(
+    #####:  821:        loc, LLVM::LLVMPointerType::get(llvmValueType),
+call    0 never executed
+    #####:  822:        storagePtr.getResult(0));
+call    0 never executed
+call    1 never executed
+        -:  823:
+        -:  824:    // Store the yielded value into the async value storage.
+    #####:  825:    auto value = adaptor.getValue();
+call    0 never executed
+    #####:  826:    rewriter.create<LLVM::StoreOp>(loc, value, castedStoragePtr.getResult());
+call    0 never executed
+        -:  827:
+        -:  828:    // Erase the original runtime store operation.
+    #####:  829:    rewriter.eraseOp(op);
+call    0 never executed
+        -:  830:
+    #####:  831:    return success();
+        -:  832:  }
+        -:  833:};
+        -:  834:} // namespace
+        -:  835:
+        -:  836://===----------------------------------------------------------------------===//
+        -:  837:// Convert async.runtime.load to the corresponding runtime API call.
+        -:  838://===----------------------------------------------------------------------===//
+        -:  839:
+        -:  840:namespace {
+        -:  841:class RuntimeLoadOpLowering : public OpConversionPattern<RuntimeLoadOp> {
+        -:  842:public:
+        -:  843:  using OpConversionPattern::OpConversionPattern;
+        -:  844:
+        -:  845:  LogicalResult
+function _ZNK12_GLOBAL__N_121RuntimeLoadOpLowering15matchAndRewriteEN4mlir5async13RuntimeLoadOpENS2_20RuntimeLoadOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  846:  matchAndRewrite(RuntimeLoadOp op, OpAdaptor adaptor,
+        -:  847:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  848:    Location loc = op->getLoc();
+call    0 never executed
+        -:  849:
+        -:  850:    // Get a pointer to the async value storage from the runtime.
+    #####:  851:    auto i8Ptr = AsyncAPI::opaquePointerType(rewriter.getContext());
+call    0 never executed
+    #####:  852:    auto storage = adaptor.getStorage();
+call    0 never executed
+    #####:  853:    auto storagePtr = rewriter.create<func::CallOp>(loc, kGetValueStorage,
+    #####:  854:                                                    TypeRange(i8Ptr), storage);
+call    0 never executed
+call    1 never executed
+        -:  855:
+        -:  856:    // Cast from i8* to the LLVM pointer type.
+    #####:  857:    auto valueType = op.getResult().getType();
+call    0 never executed
+call    1 never executed
+    #####:  858:    auto llvmValueType = getTypeConverter()->convertType(valueType);
+call    0 never executed
+    #####:  859:    if (!llvmValueType)
+branch  0 never executed
+branch  1 never executed
+    #####:  860:      return rewriter.notifyMatchFailure(
+    #####:  861:          op, "failed to convert loaded value type to LLVM type");
+call    0 never executed
+        -:  862:
+    #####:  863:    auto castedStoragePtr = rewriter.create<LLVM::BitcastOp>(
+    #####:  864:        loc, LLVM::LLVMPointerType::get(llvmValueType),
+call    0 never executed
+    #####:  865:        storagePtr.getResult(0));
+call    0 never executed
+call    1 never executed
+        -:  866:
+        -:  867:    // Load from the casted pointer.
+    #####:  868:    rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, castedStoragePtr.getResult());
+call    0 never executed
+        -:  869:
+    #####:  870:    return success();
+        -:  871:  }
+        -:  872:};
+        -:  873:} // namespace
+        -:  874:
+        -:  875://===----------------------------------------------------------------------===//
+        -:  876:// Convert async.runtime.add_to_group to the corresponding runtime API call.
+        -:  877://===----------------------------------------------------------------------===//
+        -:  878:
+        -:  879:namespace {
+        -:  880:class RuntimeAddToGroupOpLowering
+        -:  881:    : public OpConversionPattern<RuntimeAddToGroupOp> {
+        -:  882:public:
+        -:  883:  using OpConversionPattern::OpConversionPattern;
+        -:  884:
+        -:  885:  LogicalResult
+function _ZNK12_GLOBAL__N_127RuntimeAddToGroupOpLowering15matchAndRewriteEN4mlir5async19RuntimeAddToGroupOpENS2_26RuntimeAddToGroupOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  886:  matchAndRewrite(RuntimeAddToGroupOp op, OpAdaptor adaptor,
+        -:  887:                  ConversionPatternRewriter &rewriter) const override {
+        -:  888:    // Currently we can only add tokens to the group.
+    #####:  889:    if (!op.getOperand().getType().isa<TokenType>())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  890:      return rewriter.notifyMatchFailure(op, "only token type is supported");
+call    0 never executed
+        -:  891:
+        -:  892:    // Replace with a runtime API function call.
+    #####:  893:    rewriter.replaceOpWithNewOp<func::CallOp>(
+    #####:  894:        op, kAddTokenToGroup, rewriter.getI64Type(), adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  895:
+    #####:  896:    return success();
+        -:  897:  }
+        -:  898:};
+        -:  899:} // namespace
+        -:  900:
+        -:  901://===----------------------------------------------------------------------===//
+        -:  902:// Convert async.runtime.num_worker_threads to the corresponding runtime API
+        -:  903:// call.
+        -:  904://===----------------------------------------------------------------------===//
+        -:  905:
+        -:  906:namespace {
+        -:  907:class RuntimeNumWorkerThreadsOpLowering
+        -:  908:    : public OpConversionPattern<RuntimeNumWorkerThreadsOp> {
+        -:  909:public:
+        -:  910:  using OpConversionPattern::OpConversionPattern;
+        -:  911:
+        -:  912:  LogicalResult
+function _ZNK12_GLOBAL__N_133RuntimeNumWorkerThreadsOpLowering15matchAndRewriteEN4mlir5async25RuntimeNumWorkerThreadsOpENS2_32RuntimeNumWorkerThreadsOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  913:  matchAndRewrite(RuntimeNumWorkerThreadsOp op, OpAdaptor adaptor,
+        -:  914:                  ConversionPatternRewriter &rewriter) const override {
+        -:  915:
+        -:  916:    // Replace with a runtime API function call.
+    #####:  917:    rewriter.replaceOpWithNewOp<func::CallOp>(op, kGetNumWorkerThreads,
+    #####:  918:                                              rewriter.getIndexType());
+call    0 never executed
+call    1 never executed
+        -:  919:
+    #####:  920:    return success();
+        -:  921:  }
+        -:  922:};
+        -:  923:} // namespace
+        -:  924:
+        -:  925://===----------------------------------------------------------------------===//
+        -:  926:// Async reference counting ops lowering (`async.runtime.add_ref` and
+        -:  927:// `async.runtime.drop_ref` to the corresponding API calls).
+        -:  928://===----------------------------------------------------------------------===//
+        -:  929:
+        -:  930:namespace {
+        -:  931:template <typename RefCountingOp>
+        -:  932:class RefCountingOpLowering : public OpConversionPattern<RefCountingOp> {
+        -:  933:public:
+      838:  934:  explicit RefCountingOpLowering(TypeConverter &converter, MLIRContext *ctx,
+        -:  935:                                 StringRef apiFunctionName)
+        -:  936:      : OpConversionPattern<RefCountingOp>(converter, ctx),
+      838:  937:        apiFunctionName(apiFunctionName) {}
+------------------
+_ZN12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async16RuntimeDropRefOpEEC2ERNS1_13TypeConverterEPNS1_11MLIRContextEN4llvm9StringRefE:
+function _ZN12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async16RuntimeDropRefOpEEC2ERNS1_13TypeConverterEPNS1_11MLIRContextEN4llvm9StringRefE called 419 returned 100% blocks executed 100%
+      419:  934:  explicit RefCountingOpLowering(TypeConverter &converter, MLIRContext *ctx,
+        -:  935:                                 StringRef apiFunctionName)
+        -:  936:      : OpConversionPattern<RefCountingOp>(converter, ctx),
+      419:  937:        apiFunctionName(apiFunctionName) {}
+call    0 returned 100%
+call    1 returned 100%
+------------------
+_ZN12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async15RuntimeAddRefOpEEC2ERNS1_13TypeConverterEPNS1_11MLIRContextEN4llvm9StringRefE:
+function _ZN12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async15RuntimeAddRefOpEEC2ERNS1_13TypeConverterEPNS1_11MLIRContextEN4llvm9StringRefE called 419 returned 100% blocks executed 100%
+      419:  934:  explicit RefCountingOpLowering(TypeConverter &converter, MLIRContext *ctx,
+        -:  935:                                 StringRef apiFunctionName)
+        -:  936:      : OpConversionPattern<RefCountingOp>(converter, ctx),
+      419:  937:        apiFunctionName(apiFunctionName) {}
+call    0 returned 100%
+call    1 returned 100%
+------------------
+        -:  938:
+        -:  939:  LogicalResult
+    #####:  940:  matchAndRewrite(RefCountingOp op, typename RefCountingOp::Adaptor adaptor,
+        -:  941:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  942:    auto count = rewriter.create<arith::ConstantOp>(
+    #####:  943:        op->getLoc(), rewriter.getI64Type(),
+        -:  944:        rewriter.getI64IntegerAttr(op.getCount()));
+        -:  945:
+    #####:  946:    auto operand = adaptor.getOperand();
+    #####:  947:    rewriter.replaceOpWithNewOp<func::CallOp>(op, TypeRange(), apiFunctionName,
+    #####:  948:                                              ValueRange({operand, count}));
+        -:  949:
+    #####:  950:    return success();
+        -:  951:  }
+------------------
+_ZNK12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async15RuntimeAddRefOpEE15matchAndRewriteES3_NS2_22RuntimeAddRefOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async15RuntimeAddRefOpEE15matchAndRewriteES3_NS2_22RuntimeAddRefOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  940:  matchAndRewrite(RefCountingOp op, typename RefCountingOp::Adaptor adaptor,
+        -:  941:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  942:    auto count = rewriter.create<arith::ConstantOp>(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  943:        op->getLoc(), rewriter.getI64Type(),
+call    0 never executed
+        -:  944:        rewriter.getI64IntegerAttr(op.getCount()));
+        -:  945:
+    #####:  946:    auto operand = adaptor.getOperand();
+call    0 never executed
+    #####:  947:    rewriter.replaceOpWithNewOp<func::CallOp>(op, TypeRange(), apiFunctionName,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  948:                                              ValueRange({operand, count}));
+call    0 never executed
+        -:  949:
+    #####:  950:    return success();
+        -:  951:  }
+------------------
+_ZNK12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async16RuntimeDropRefOpEE15matchAndRewriteES3_NS2_23RuntimeDropRefOpAdaptorERNS1_25ConversionPatternRewriterE:
+function _ZNK12_GLOBAL__N_121RefCountingOpLoweringIN4mlir5async16RuntimeDropRefOpEE15matchAndRewriteES3_NS2_23RuntimeDropRefOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  940:  matchAndRewrite(RefCountingOp op, typename RefCountingOp::Adaptor adaptor,
+        -:  941:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  942:    auto count = rewriter.create<arith::ConstantOp>(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  943:        op->getLoc(), rewriter.getI64Type(),
+call    0 never executed
+        -:  944:        rewriter.getI64IntegerAttr(op.getCount()));
+        -:  945:
+    #####:  946:    auto operand = adaptor.getOperand();
+call    0 never executed
+    #####:  947:    rewriter.replaceOpWithNewOp<func::CallOp>(op, TypeRange(), apiFunctionName,
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  948:                                              ValueRange({operand, count}));
+call    0 never executed
+        -:  949:
+    #####:  950:    return success();
+        -:  951:  }
+------------------
+        -:  952:
+        -:  953:private:
+        -:  954:  StringRef apiFunctionName;
+        -:  955:};
+        -:  956:
+        -:  957:class RuntimeAddRefOpLowering : public RefCountingOpLowering<RuntimeAddRefOp> {
+        -:  958:public:
+        -:  959:  explicit RuntimeAddRefOpLowering(TypeConverter &converter, MLIRContext *ctx)
+        -:  960:      : RefCountingOpLowering(converter, ctx, kAddRef) {}
+        -:  961:};
+        -:  962:
+        -:  963:class RuntimeDropRefOpLowering
+        -:  964:    : public RefCountingOpLowering<RuntimeDropRefOp> {
+        -:  965:public:
+        -:  966:  explicit RuntimeDropRefOpLowering(TypeConverter &converter, MLIRContext *ctx)
+        -:  967:      : RefCountingOpLowering(converter, ctx, kDropRef) {}
+        -:  968:};
+        -:  969:} // namespace
+        -:  970:
+        -:  971://===----------------------------------------------------------------------===//
+        -:  972:// Convert return operations that return async values from async regions.
+        -:  973://===----------------------------------------------------------------------===//
+        -:  974:
+        -:  975:namespace {
+        -:  976:class ReturnOpOpConversion : public OpConversionPattern<func::ReturnOp> {
+        -:  977:public:
+        -:  978:  using OpConversionPattern::OpConversionPattern;
+        -:  979:
+        -:  980:  LogicalResult
+function _ZNK12_GLOBAL__N_120ReturnOpOpConversion15matchAndRewriteEN4mlir4func8ReturnOpENS2_15ReturnOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####:  981:  matchAndRewrite(func::ReturnOp op, OpAdaptor adaptor,
+        -:  982:                  ConversionPatternRewriter &rewriter) const override {
+    #####:  983:    rewriter.replaceOpWithNewOp<func::ReturnOp>(op, adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####:  984:    return success();
+        -:  985:  }
+        -:  986:};
+        -:  987:} // namespace
+        -:  988:
+        -:  989://===----------------------------------------------------------------------===//
+        -:  990:
+        -:  991:namespace {
+  116697*:  992:struct ConvertAsyncToLLVMPass
+call    0 never executed
+call    1 returned 100%
+        -:  993:    : public impl::ConvertAsyncToLLVMBase<ConvertAsyncToLLVMPass> {
+        -:  994:  void runOnOperation() override;
+        -:  995:};
+        -:  996:} // namespace
+        -:  997:
+function _ZN12_GLOBAL__N_122ConvertAsyncToLLVMPass14runOnOperationEv called 419 returned 100% blocks executed 100%
+      419:  998:void ConvertAsyncToLLVMPass::runOnOperation() {
+      419:  999:  ModuleOp module = getOperation();
+call    0 returned 100%
+      419: 1000:  MLIRContext *ctx = module->getContext();
+call    0 returned 100%
+        -: 1001:
+        -: 1002:  // Add declarations for most functions required by the coroutines lowering.
+        -: 1003:  // We delay adding the resume function until it's needed because it currently
+        -: 1004:  // fails to compile unless '-O0' is specified.
+      419: 1005:  addAsyncRuntimeApiDeclarations(module);
+call    0 returned 100%
+        -: 1006:
+        -: 1007:  // Lower async.runtime and async.coro operations to Async Runtime API and
+        -: 1008:  // LLVM coroutine intrinsics.
+        -: 1009:
+        -: 1010:  // Convert async dialect types and operations to LLVM dialect.
+      419: 1011:  AsyncRuntimeTypeConverter converter;
+call    0 returned 100%
+      838: 1012:  RewritePatternSet patterns(ctx);
+call    0 returned 100%
+call    1 returned 100%
+        -: 1013:
+        -: 1014:  // We use conversion to LLVM type to lower async.runtime load and store
+        -: 1015:  // operations.
+      838: 1016:  LLVMTypeConverter llvmConverter(ctx);
+call    0 returned 100%
+call    1 returned 100%
+      419: 1017:  llvmConverter.addConversion(AsyncRuntimeTypeConverter::convertAsyncTypes);
+call    0 returned 100%
+        -: 1018:
+        -: 1019:  // Convert async types in function signatures and function calls.
+      419: 1020:  populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
+call    0 returned 100%
+        -: 1021:                                                                 converter);
+      419: 1022:  populateCallOpTypeConversionPattern(patterns, converter);
+call    0 returned 100%
+        -: 1023:
+        -: 1024:  // Convert return operations inside async.execute regions.
+      419: 1025:  patterns.add<ReturnOpOpConversion>(converter, ctx);
+call    0 returned 100%
+        -: 1026:
+        -: 1027:  // Lower async.runtime operations to the async runtime API calls.
+      419: 1028:  patterns.add<RuntimeSetAvailableOpLowering, RuntimeSetErrorOpLowering,
+        -: 1029:               RuntimeIsErrorOpLowering, RuntimeAwaitOpLowering,
+        -: 1030:               RuntimeAwaitAndResumeOpLowering, RuntimeResumeOpLowering,
+        -: 1031:               RuntimeAddToGroupOpLowering, RuntimeNumWorkerThreadsOpLowering,
+        -: 1032:               RuntimeAddRefOpLowering, RuntimeDropRefOpLowering>(converter,
+      419: 1033:                                                                  ctx);
+call    0 returned 100%
+        -: 1034:
+        -: 1035:  // Lower async.runtime operations that rely on LLVM type converter to convert
+        -: 1036:  // from async value payload type to the LLVM type.
+      419: 1037:  patterns.add<RuntimeCreateOpLowering, RuntimeCreateGroupOpLowering,
+        -: 1038:               RuntimeStoreOpLowering, RuntimeLoadOpLowering>(llvmConverter,
+      419: 1039:                                                              ctx);
+call    0 returned 100%
+        -: 1040:
+        -: 1041:  // Lower async coroutine operations to LLVM coroutine intrinsics.
+      419: 1042:  patterns
+        -: 1043:      .add<CoroIdOpConversion, CoroBeginOpConversion, CoroFreeOpConversion,
+        -: 1044:           CoroEndOpConversion, CoroSaveOpConversion, CoroSuspendOpConversion>(
+      419: 1045:          converter, ctx);
+call    0 returned 100%
+        -: 1046:
+      838: 1047:  ConversionTarget target(*ctx);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      419: 1048:  target.addLegalOp<arith::ConstantOp, func::ConstantOp,
+      419: 1049:                    UnrealizedConversionCastOp>();
+call    0 returned 100%
+      419: 1050:  target.addLegalDialect<LLVM::LLVMDialect>();
+call    0 returned 100%
+        -: 1051:
+        -: 1052:  // All operations from Async dialect must be lowered to the runtime API and
+        -: 1053:  // LLVM intrinsics calls.
+      419: 1054:  target.addIllegalDialect<AsyncDialect>();
+call    0 returned 100%
+        -: 1055:
+        -: 1056:  // Add dynamic legality constraints to apply conversions defined above.
+      419: 1057:  target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+call    0 returned 100%
+    23813: 1058:    return converter.isSignatureLegal(op.getFunctionType());
+call    0 returned 100%
+call    1 returned 100%
+        -: 1059:  });
+function _ZZN12_GLOBAL__N_122ConvertAsyncToLLVMPass14runOnOperationEvENKUlN4mlir4func8ReturnOpEE0_clES3_.isra.0 called 894 returned 100% blocks executed 100%
+     1313: 1060:  target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
+call    0 returned 100%
+      894: 1061:    return converter.isLegal(op.getOperandTypes());
+call    0 returned 100%
+call    1 returned 100%
+        -: 1062:  });
+      419: 1063:  target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
+call    0 returned 100%
+       78: 1064:    return converter.isSignatureLegal(op.getCalleeType());
+call    0 returned 100%
+call    1 returned 100%
+        -: 1065:  });
+        -: 1066:
+      419: 1067:  if (failed(applyPartialConversion(module, target, std::move(patterns))))
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 1% (fallthrough)
+branch  4 taken 99%
+        4: 1068:    signalPassFailure();
+call    0 returned 100%
+      419: 1069:}
+        -: 1070:
+        -: 1071://===----------------------------------------------------------------------===//
+        -: 1072:// Patterns for structural type conversions for the Async dialect operations.
+        -: 1073://===----------------------------------------------------------------------===//
+        -: 1074:
+        -: 1075:namespace {
+        -: 1076:class ConvertExecuteOpTypes : public OpConversionPattern<ExecuteOp> {
+        -: 1077:public:
+        -: 1078:  using OpConversionPattern::OpConversionPattern;
+        -: 1079:  LogicalResult
+function _ZNK12_GLOBAL__N_121ConvertExecuteOpTypes15matchAndRewriteEN4mlir5async9ExecuteOpENS2_16ExecuteOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1080:  matchAndRewrite(ExecuteOp op, OpAdaptor adaptor,
+        -: 1081:                  ConversionPatternRewriter &rewriter) const override {
+    #####: 1082:    ExecuteOp newOp =
+    #####: 1083:        cast<ExecuteOp>(rewriter.cloneWithoutRegions(*op.getOperation()));
+call    0 never executed
+call    1 never executed
+    #####: 1084:    rewriter.inlineRegionBefore(op.getRegion(), newOp.getRegion(),
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1085:                                newOp.getRegion().end());
+call    0 never executed
+        -: 1086:
+        -: 1087:    // Set operands and update block argument and result types.
+    #####: 1088:    newOp->setOperands(adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####: 1089:    if (failed(rewriter.convertRegionTypes(&newOp.getRegion(), *typeConverter)))
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1090:      return failure();
+    #####: 1091:    for (auto result : newOp.getResults())
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+    #####: 1092:      result.setType(typeConverter->convertType(result.getType()));
+call    0 never executed
+call    1 never executed
+        -: 1093:
+    #####: 1094:    rewriter.replaceOp(op, newOp.getResults());
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+    #####: 1095:    return success();
+        -: 1096:  }
+        -: 1097:};
+        -: 1098:
+        -: 1099:// Dummy pattern to trigger the appropriate type conversion / materialization.
+        -: 1100:class ConvertAwaitOpTypes : public OpConversionPattern<AwaitOp> {
+        -: 1101:public:
+        -: 1102:  using OpConversionPattern::OpConversionPattern;
+        -: 1103:  LogicalResult
+function _ZNK12_GLOBAL__N_119ConvertAwaitOpTypes15matchAndRewriteEN4mlir5async7AwaitOpENS2_14AwaitOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1104:  matchAndRewrite(AwaitOp op, OpAdaptor adaptor,
+        -: 1105:                  ConversionPatternRewriter &rewriter) const override {
+    #####: 1106:    rewriter.replaceOpWithNewOp<AwaitOp>(op, adaptor.getOperands().front());
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1107:    return success();
+        -: 1108:  }
+        -: 1109:};
+        -: 1110:
+        -: 1111:// Dummy pattern to trigger the appropriate type conversion / materialization.
+        -: 1112:class ConvertYieldOpTypes : public OpConversionPattern<async::YieldOp> {
+        -: 1113:public:
+        -: 1114:  using OpConversionPattern::OpConversionPattern;
+        -: 1115:  LogicalResult
+function _ZNK12_GLOBAL__N_119ConvertYieldOpTypes15matchAndRewriteEN4mlir5async7YieldOpENS2_14YieldOpAdaptorERNS1_25ConversionPatternRewriterE called 0 returned 0% blocks executed 0%
+    #####: 1116:  matchAndRewrite(async::YieldOp op, OpAdaptor adaptor,
+        -: 1117:                  ConversionPatternRewriter &rewriter) const override {
+    #####: 1118:    rewriter.replaceOpWithNewOp<async::YieldOp>(op, adaptor.getOperands());
+call    0 never executed
+call    1 never executed
+    #####: 1119:    return success();
+        -: 1120:  }
+        -: 1121:};
+        -: 1122:} // namespace
+        -: 1123:
+function _ZN4mlir28createConvertAsyncToLLVMPassEv called 116697 returned 100% blocks executed 100%
+   116697: 1124:std::unique_ptr<OperationPass<ModuleOp>> mlir::createConvertAsyncToLLVMPass() {
+   116697: 1125:  return std::make_unique<ConvertAsyncToLLVMPass>();
+call    0 returned 100%
+        -: 1126:}
+        -: 1127:
+function _ZN4mlir49populateAsyncStructuralTypeConversionsAndLegalityERNS_13TypeConverterERNS_17RewritePatternSetERNS_16ConversionTargetE called 380 returned 100% blocks executed 100%
+      380: 1128:void mlir::populateAsyncStructuralTypeConversionsAndLegality(
+        -: 1129:    TypeConverter &typeConverter, RewritePatternSet &patterns,
+        -: 1130:    ConversionTarget &target) {
+      381: 1131:  typeConverter.addConversion([&](TokenType type) { return type; });
+call    0 returned 100%
+call    1 returned 100%
+function _ZZN4mlir49populateAsyncStructuralTypeConversionsAndLegalityERNS_13TypeConverterERNS_17RewritePatternSetERNS_16ConversionTargetEENKUlNS_5async9ValueTypeEE0_clES7_.isra.0 called 0 returned 0% blocks executed 0%
+     380*: 1132:  typeConverter.addConversion([&](ValueType type) {
+call    0 returned 100%
+    #####: 1133:    Type converted = typeConverter.convertType(type.getValueType());
+call    0 never executed
+call    1 never executed
+    #####: 1134:    return converted ? ValueType::get(converted) : converted;
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -: 1135:  });
+        -: 1136:
+      380: 1137:  patterns.add<ConvertExecuteOpTypes, ConvertAwaitOpTypes, ConvertYieldOpTypes>(
+      380: 1138:      typeConverter, patterns.getContext());
+call    0 returned 100%
+        -: 1139:
+      380: 1140:  target.addDynamicallyLegalOp<AwaitOp, ExecuteOp, async::YieldOp>(
+call    0 returned 100%
+branch  1 taken 100% (fallthrough)
+branch  2 taken 0%
+        8: 1141:      [&](Operation *op) { return typeConverter.isLegal(op); });
+call    0 returned 100%
+      380: 1142:}

@@ -1,0 +1,1301 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-1/llvm/include/llvm/IR/Attributes.h
+        -:    0:Graph:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Target/LLVMIR/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMToLLVMIRTranslation.dir/LLVMToLLVMIRTranslation.cpp.gcda
+        -:    0:Runs:325580
+        -:    1://===- llvm/Attributes.h - Container for Attributes -------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:/// \file
+        -:   10:/// This file contains the simple types necessary to represent the
+        -:   11:/// attributes associated with functions and their calls.
+        -:   12://
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#ifndef LLVM_IR_ATTRIBUTES_H
+        -:   16:#define LLVM_IR_ATTRIBUTES_H
+        -:   17:
+        -:   18:#include "llvm-c/Types.h"
+        -:   19:#include "llvm/ADT/ArrayRef.h"
+        -:   20:#include "llvm/ADT/BitmaskEnum.h"
+        -:   21:#include "llvm/ADT/Optional.h"
+        -:   22:#include "llvm/ADT/SmallString.h"
+        -:   23:#include "llvm/ADT/StringRef.h"
+        -:   24:#include "llvm/Config/llvm-config.h"
+        -:   25:#include "llvm/Support/Alignment.h"
+        -:   26:#include "llvm/Support/CodeGen.h"
+        -:   27:#include "llvm/Support/PointerLikeTypeTraits.h"
+        -:   28:#include <bitset>
+        -:   29:#include <cassert>
+        -:   30:#include <cstdint>
+        -:   31:#include <set>
+        -:   32:#include <string>
+        -:   33:#include <utility>
+        -:   34:
+        -:   35:namespace llvm {
+        -:   36:
+        -:   37:class AttrBuilder;
+        -:   38:class AttributeMask;
+        -:   39:class AttributeImpl;
+        -:   40:class AttributeListImpl;
+        -:   41:class AttributeSetNode;
+        -:   42:class FoldingSetNodeID;
+        -:   43:class Function;
+        -:   44:class LLVMContext;
+        -:   45:class MemoryEffects;
+        -:   46:class Type;
+        -:   47:
+        -:   48:enum class AllocFnKind : uint64_t {
+        -:   49:  Unknown = 0,
+        -:   50:  Alloc = 1 << 0,         // Allocator function returns a new allocation
+        -:   51:  Realloc = 1 << 1,       // Allocator function resizes the `allocptr` argument
+        -:   52:  Free = 1 << 2,          // Allocator function frees the `allocptr` argument
+        -:   53:  Uninitialized = 1 << 3, // Allocator function returns uninitialized memory
+        -:   54:  Zeroed = 1 << 4,        // Allocator function returns zeroed memory
+        -:   55:  Aligned = 1 << 5,       // Allocator function aligns allocations per the
+        -:   56:                          // `allocalign` argument
+        -:   57:  LLVM_MARK_AS_BITMASK_ENUM(/* LargestValue = */ Aligned)
+        -:   58:};
+        -:   59:
+        -:   60://===----------------------------------------------------------------------===//
+        -:   61:/// \class
+        -:   62:/// Functions, function parameters, and return types can have attributes
+        -:   63:/// to indicate how they should be treated by optimizations and code
+        -:   64:/// generation. This class represents one of those attributes. It's light-weight
+        -:   65:/// and should be passed around by-value.
+        -:   66:class Attribute {
+        -:   67:public:
+        -:   68:  /// This enumeration lists the attributes that can be associated with
+        -:   69:  /// parameters, function results, or the function itself.
+        -:   70:  ///
+        -:   71:  /// Note: The `uwtable' attribute is about the ABI or the user mandating an
+        -:   72:  /// entry in the unwind table. The `nounwind' attribute is about an exception
+        -:   73:  /// passing by the function.
+        -:   74:  ///
+        -:   75:  /// In a theoretical system that uses tables for profiling and SjLj for
+        -:   76:  /// exceptions, they would be fully independent. In a normal system that uses
+        -:   77:  /// tables for both, the semantics are:
+        -:   78:  ///
+        -:   79:  /// nil                = Needs an entry because an exception might pass by.
+        -:   80:  /// nounwind           = No need for an entry
+        -:   81:  /// uwtable            = Needs an entry because the ABI says so and because
+        -:   82:  ///                      an exception might pass by.
+        -:   83:  /// uwtable + nounwind = Needs an entry because the ABI says so.
+        -:   84:
+        -:   85:  enum AttrKind {
+        -:   86:    // IR-Level Attributes
+        -:   87:    None,                  ///< No attributes have been set
+        -:   88:    #define GET_ATTR_ENUM
+        -:   89:    #include "llvm/IR/Attributes.inc"
+        -:   90:    EndAttrKinds,          ///< Sentinal value useful for loops
+        -:   91:    EmptyKey,              ///< Use as Empty key for DenseMap of AttrKind
+        -:   92:    TombstoneKey,          ///< Use as Tombstone key for DenseMap of AttrKind
+        -:   93:  };
+        -:   94:
+        -:   95:  static const unsigned NumIntAttrKinds = LastIntAttr - FirstIntAttr + 1;
+        -:   96:  static const unsigned NumTypeAttrKinds = LastTypeAttr - FirstTypeAttr + 1;
+        -:   97:
+        -:   98:  static bool isEnumAttrKind(AttrKind Kind) {
+        -:   99:    return Kind >= FirstEnumAttr && Kind <= LastEnumAttr;
+        -:  100:  }
+        -:  101:  static bool isIntAttrKind(AttrKind Kind) {
+        -:  102:    return Kind >= FirstIntAttr && Kind <= LastIntAttr;
+        -:  103:  }
+        -:  104:  static bool isTypeAttrKind(AttrKind Kind) {
+        -:  105:    return Kind >= FirstTypeAttr && Kind <= LastTypeAttr;
+        -:  106:  }
+        -:  107:
+        -:  108:  static bool canUseAsFnAttr(AttrKind Kind);
+        -:  109:  static bool canUseAsParamAttr(AttrKind Kind);
+        -:  110:  static bool canUseAsRetAttr(AttrKind Kind);
+        -:  111:
+        -:  112:private:
+        -:  113:  AttributeImpl *pImpl = nullptr;
+        -:  114:
+        -:  115:  Attribute(AttributeImpl *A) : pImpl(A) {}
+        -:  116:
+        -:  117:public:
+        -:  118:  Attribute() = default;
+        -:  119:
+        -:  120:  //===--------------------------------------------------------------------===//
+        -:  121:  // Attribute Construction
+        -:  122:  //===--------------------------------------------------------------------===//
+        -:  123:
+        -:  124:  /// Return a uniquified Attribute object.
+        -:  125:  static Attribute get(LLVMContext &Context, AttrKind Kind, uint64_t Val = 0);
+        -:  126:  static Attribute get(LLVMContext &Context, StringRef Kind,
+        -:  127:                       StringRef Val = StringRef());
+        -:  128:  static Attribute get(LLVMContext &Context, AttrKind Kind, Type *Ty);
+        -:  129:
+        -:  130:  /// Return a uniquified Attribute object that has the specific
+        -:  131:  /// alignment set.
+        -:  132:  static Attribute getWithAlignment(LLVMContext &Context, Align Alignment);
+        -:  133:  static Attribute getWithStackAlignment(LLVMContext &Context, Align Alignment);
+        -:  134:  static Attribute getWithDereferenceableBytes(LLVMContext &Context,
+        -:  135:                                              uint64_t Bytes);
+        -:  136:  static Attribute getWithDereferenceableOrNullBytes(LLVMContext &Context,
+        -:  137:                                                     uint64_t Bytes);
+        -:  138:  static Attribute getWithAllocSizeArgs(LLVMContext &Context,
+        -:  139:                                        unsigned ElemSizeArg,
+        -:  140:                                        const Optional<unsigned> &NumElemsArg);
+        -:  141:  static Attribute getWithVScaleRangeArgs(LLVMContext &Context,
+        -:  142:                                          unsigned MinValue, unsigned MaxValue);
+        -:  143:  static Attribute getWithByValType(LLVMContext &Context, Type *Ty);
+        -:  144:  static Attribute getWithStructRetType(LLVMContext &Context, Type *Ty);
+        -:  145:  static Attribute getWithByRefType(LLVMContext &Context, Type *Ty);
+        -:  146:  static Attribute getWithPreallocatedType(LLVMContext &Context, Type *Ty);
+        -:  147:  static Attribute getWithInAllocaType(LLVMContext &Context, Type *Ty);
+        -:  148:  static Attribute getWithUWTableKind(LLVMContext &Context, UWTableKind Kind);
+        -:  149:  static Attribute getWithMemoryEffects(LLVMContext &Context, MemoryEffects ME);
+        -:  150:
+        -:  151:  /// For a typed attribute, return the equivalent attribute with the type
+        -:  152:  /// changed to \p ReplacementTy.
+        -:  153:  Attribute getWithNewType(LLVMContext &Context, Type *ReplacementTy) {
+        -:  154:    assert(isTypeAttribute() && "this requires a typed attribute");
+        -:  155:    return get(Context, getKindAsEnum(), ReplacementTy);
+        -:  156:  }
+        -:  157:
+        -:  158:  static Attribute::AttrKind getAttrKindFromName(StringRef AttrName);
+        -:  159:
+        -:  160:  static StringRef getNameFromAttrKind(Attribute::AttrKind AttrKind);
+        -:  161:
+        -:  162:  /// Return true if the provided string matches the IR name of an attribute.
+        -:  163:  /// example: "noalias" return true but not "NoAlias"
+        -:  164:  static bool isExistingAttribute(StringRef Name);
+        -:  165:
+        -:  166:  //===--------------------------------------------------------------------===//
+        -:  167:  // Attribute Accessors
+        -:  168:  //===--------------------------------------------------------------------===//
+        -:  169:
+        -:  170:  /// Return true if the attribute is an Attribute::AttrKind type.
+        -:  171:  bool isEnumAttribute() const;
+        -:  172:
+        -:  173:  /// Return true if the attribute is an integer attribute.
+        -:  174:  bool isIntAttribute() const;
+        -:  175:
+        -:  176:  /// Return true if the attribute is a string (target-dependent)
+        -:  177:  /// attribute.
+        -:  178:  bool isStringAttribute() const;
+        -:  179:
+        -:  180:  /// Return true if the attribute is a type attribute.
+        -:  181:  bool isTypeAttribute() const;
+        -:  182:
+        -:  183:  /// Return true if the attribute is any kind of attribute.
+        -:  184:  bool isValid() const { return pImpl; }
+        -:  185:
+        -:  186:  /// Return true if the attribute is present.
+        -:  187:  bool hasAttribute(AttrKind Val) const;
+        -:  188:
+        -:  189:  /// Return true if the target-dependent attribute is present.
+        -:  190:  bool hasAttribute(StringRef Val) const;
+        -:  191:
+        -:  192:  /// Return the attribute's kind as an enum (Attribute::AttrKind). This
+        -:  193:  /// requires the attribute to be an enum, integer, or type attribute.
+        -:  194:  Attribute::AttrKind getKindAsEnum() const;
+        -:  195:
+        -:  196:  /// Return the attribute's value as an integer. This requires that the
+        -:  197:  /// attribute be an integer attribute.
+        -:  198:  uint64_t getValueAsInt() const;
+        -:  199:
+        -:  200:  /// Return the attribute's value as a boolean. This requires that the
+        -:  201:  /// attribute be a string attribute.
+        -:  202:  bool getValueAsBool() const;
+        -:  203:
+        -:  204:  /// Return the attribute's kind as a string. This requires the
+        -:  205:  /// attribute to be a string attribute.
+        -:  206:  StringRef getKindAsString() const;
+        -:  207:
+        -:  208:  /// Return the attribute's value as a string. This requires the
+        -:  209:  /// attribute to be a string attribute.
+        -:  210:  StringRef getValueAsString() const;
+        -:  211:
+        -:  212:  /// Return the attribute's value as a Type. This requires the attribute to be
+        -:  213:  /// a type attribute.
+        -:  214:  Type *getValueAsType() const;
+        -:  215:
+        -:  216:  /// Returns the alignment field of an attribute as a byte alignment
+        -:  217:  /// value.
+        -:  218:  MaybeAlign getAlignment() const;
+        -:  219:
+        -:  220:  /// Returns the stack alignment field of an attribute as a byte
+        -:  221:  /// alignment value.
+        -:  222:  MaybeAlign getStackAlignment() const;
+        -:  223:
+        -:  224:  /// Returns the number of dereferenceable bytes from the
+        -:  225:  /// dereferenceable attribute.
+        -:  226:  uint64_t getDereferenceableBytes() const;
+        -:  227:
+        -:  228:  /// Returns the number of dereferenceable_or_null bytes from the
+        -:  229:  /// dereferenceable_or_null attribute.
+        -:  230:  uint64_t getDereferenceableOrNullBytes() const;
+        -:  231:
+        -:  232:  /// Returns the argument numbers for the allocsize attribute.
+        -:  233:  std::pair<unsigned, Optional<unsigned>> getAllocSizeArgs() const;
+        -:  234:
+        -:  235:  /// Returns the minimum value for the vscale_range attribute.
+        -:  236:  unsigned getVScaleRangeMin() const;
+        -:  237:
+        -:  238:  /// Returns the maximum value for the vscale_range attribute or None when
+        -:  239:  /// unknown.
+        -:  240:  Optional<unsigned> getVScaleRangeMax() const;
+        -:  241:
+        -:  242:  // Returns the unwind table kind.
+        -:  243:  UWTableKind getUWTableKind() const;
+        -:  244:
+        -:  245:  // Returns the allocator function kind.
+        -:  246:  AllocFnKind getAllocKind() const;
+        -:  247:
+        -:  248:  /// Returns memory effects.
+        -:  249:  MemoryEffects getMemoryEffects() const;
+        -:  250:
+        -:  251:  /// The Attribute is converted to a string of equivalent mnemonic. This
+        -:  252:  /// is, presumably, for writing out the mnemonics for the assembly writer.
+        -:  253:  std::string getAsString(bool InAttrGrp = false) const;
+        -:  254:
+        -:  255:  /// Return true if this attribute belongs to the LLVMContext.
+        -:  256:  bool hasParentContext(LLVMContext &C) const;
+        -:  257:
+        -:  258:  /// Equality and non-equality operators.
+        -:  259:  bool operator==(Attribute A) const { return pImpl == A.pImpl; }
+        -:  260:  bool operator!=(Attribute A) const { return pImpl != A.pImpl; }
+        -:  261:
+        -:  262:  /// Less-than operator. Useful for sorting the attributes list.
+        -:  263:  bool operator<(Attribute A) const;
+        -:  264:
+        -:  265:  void Profile(FoldingSetNodeID &ID) const;
+        -:  266:
+        -:  267:  /// Return a raw pointer that uniquely identifies this attribute.
+        -:  268:  void *getRawPointer() const {
+        -:  269:    return pImpl;
+        -:  270:  }
+        -:  271:
+        -:  272:  /// Get an attribute from a raw pointer created by getRawPointer.
+        -:  273:  static Attribute fromRawPointer(void *RawPtr) {
+        -:  274:    return Attribute(reinterpret_cast<AttributeImpl*>(RawPtr));
+        -:  275:  }
+        -:  276:};
+        -:  277:
+        -:  278:// Specialized opaque value conversions.
+        -:  279:inline LLVMAttributeRef wrap(Attribute Attr) {
+        -:  280:  return reinterpret_cast<LLVMAttributeRef>(Attr.getRawPointer());
+        -:  281:}
+        -:  282:
+        -:  283:// Specialized opaque value conversions.
+        -:  284:inline Attribute unwrap(LLVMAttributeRef Attr) {
+        -:  285:  return Attribute::fromRawPointer(Attr);
+        -:  286:}
+        -:  287:
+        -:  288://===----------------------------------------------------------------------===//
+        -:  289:/// \class
+        -:  290:/// This class holds the attributes for a particular argument, parameter,
+        -:  291:/// function, or return value. It is an immutable value type that is cheap to
+        -:  292:/// copy. Adding and removing enum attributes is intended to be fast, but adding
+        -:  293:/// and removing string or integer attributes involves a FoldingSet lookup.
+        -:  294:class AttributeSet {
+        -:  295:  friend AttributeListImpl;
+        -:  296:  template <typename Ty, typename Enable> friend struct DenseMapInfo;
+        -:  297:
+        -:  298:  // TODO: Extract AvailableAttrs from AttributeSetNode and store them here.
+        -:  299:  // This will allow an efficient implementation of addAttribute and
+        -:  300:  // removeAttribute for enum attrs.
+        -:  301:
+        -:  302:  /// Private implementation pointer.
+        -:  303:  AttributeSetNode *SetNode = nullptr;
+        -:  304:
+        -:  305:private:
+        -:  306:  explicit AttributeSet(AttributeSetNode *ASN) : SetNode(ASN) {}
+        -:  307:
+        -:  308:public:
+        -:  309:  /// AttributeSet is a trivially copyable value type.
+        -:  310:  AttributeSet() = default;
+        -:  311:  AttributeSet(const AttributeSet &) = default;
+        -:  312:  ~AttributeSet() = default;
+        -:  313:
+        -:  314:  static AttributeSet get(LLVMContext &C, const AttrBuilder &B);
+        -:  315:  static AttributeSet get(LLVMContext &C, ArrayRef<Attribute> Attrs);
+        -:  316:
+        -:  317:  bool operator==(const AttributeSet &O) const { return SetNode == O.SetNode; }
+        -:  318:  bool operator!=(const AttributeSet &O) const { return !(*this == O); }
+        -:  319:
+        -:  320:  /// Add an argument attribute. Returns a new set because attribute sets are
+        -:  321:  /// immutable.
+        -:  322:  [[nodiscard]] AttributeSet addAttribute(LLVMContext &C,
+        -:  323:                                          Attribute::AttrKind Kind) const;
+        -:  324:
+        -:  325:  /// Add a target-dependent attribute. Returns a new set because attribute sets
+        -:  326:  /// are immutable.
+        -:  327:  [[nodiscard]] AttributeSet addAttribute(LLVMContext &C, StringRef Kind,
+        -:  328:                                          StringRef Value = StringRef()) const;
+        -:  329:
+        -:  330:  /// Add attributes to the attribute set. Returns a new set because attribute
+        -:  331:  /// sets are immutable.
+        -:  332:  [[nodiscard]] AttributeSet addAttributes(LLVMContext &C,
+        -:  333:                                           AttributeSet AS) const;
+        -:  334:
+        -:  335:  /// Remove the specified attribute from this set. Returns a new set because
+        -:  336:  /// attribute sets are immutable.
+        -:  337:  [[nodiscard]] AttributeSet removeAttribute(LLVMContext &C,
+        -:  338:                                             Attribute::AttrKind Kind) const;
+        -:  339:
+        -:  340:  /// Remove the specified attribute from this set. Returns a new set because
+        -:  341:  /// attribute sets are immutable.
+        -:  342:  [[nodiscard]] AttributeSet removeAttribute(LLVMContext &C,
+        -:  343:                                             StringRef Kind) const;
+        -:  344:
+        -:  345:  /// Remove the specified attributes from this set. Returns a new set because
+        -:  346:  /// attribute sets are immutable.
+        -:  347:  [[nodiscard]] AttributeSet
+        -:  348:  removeAttributes(LLVMContext &C, const AttributeMask &AttrsToRemove) const;
+        -:  349:
+        -:  350:  /// Return the number of attributes in this set.
+        -:  351:  unsigned getNumAttributes() const;
+        -:  352:
+        -:  353:  /// Return true if attributes exists in this set.
+        -:  354:  bool hasAttributes() const { return SetNode != nullptr; }
+        -:  355:
+        -:  356:  /// Return true if the attribute exists in this set.
+        -:  357:  bool hasAttribute(Attribute::AttrKind Kind) const;
+        -:  358:
+        -:  359:  /// Return true if the attribute exists in this set.
+        -:  360:  bool hasAttribute(StringRef Kind) const;
+        -:  361:
+        -:  362:  /// Return the attribute object.
+        -:  363:  Attribute getAttribute(Attribute::AttrKind Kind) const;
+        -:  364:
+        -:  365:  /// Return the target-dependent attribute object.
+        -:  366:  Attribute getAttribute(StringRef Kind) const;
+        -:  367:
+        -:  368:  MaybeAlign getAlignment() const;
+        -:  369:  MaybeAlign getStackAlignment() const;
+        -:  370:  uint64_t getDereferenceableBytes() const;
+        -:  371:  uint64_t getDereferenceableOrNullBytes() const;
+        -:  372:  Type *getByValType() const;
+        -:  373:  Type *getStructRetType() const;
+        -:  374:  Type *getByRefType() const;
+        -:  375:  Type *getPreallocatedType() const;
+        -:  376:  Type *getInAllocaType() const;
+        -:  377:  Type *getElementType() const;
+        -:  378:  Optional<std::pair<unsigned, Optional<unsigned>>> getAllocSizeArgs() const;
+        -:  379:  unsigned getVScaleRangeMin() const;
+        -:  380:  Optional<unsigned> getVScaleRangeMax() const;
+        -:  381:  UWTableKind getUWTableKind() const;
+        -:  382:  AllocFnKind getAllocKind() const;
+        -:  383:  MemoryEffects getMemoryEffects() const;
+        -:  384:  std::string getAsString(bool InAttrGrp = false) const;
+        -:  385:
+        -:  386:  /// Return true if this attribute set belongs to the LLVMContext.
+        -:  387:  bool hasParentContext(LLVMContext &C) const;
+        -:  388:
+        -:  389:  using iterator = const Attribute *;
+        -:  390:
+        -:  391:  iterator begin() const;
+        -:  392:  iterator end() const;
+        -:  393:#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+        -:  394:  void dump() const;
+        -:  395:#endif
+        -:  396:};
+        -:  397:
+        -:  398://===----------------------------------------------------------------------===//
+        -:  399:/// \class
+        -:  400:/// Provide DenseMapInfo for AttributeSet.
+        -:  401:template <> struct DenseMapInfo<AttributeSet, void> {
+        -:  402:  static AttributeSet getEmptyKey() {
+        -:  403:    auto Val = static_cast<uintptr_t>(-1);
+        -:  404:    Val <<= PointerLikeTypeTraits<void *>::NumLowBitsAvailable;
+        -:  405:    return AttributeSet(reinterpret_cast<AttributeSetNode *>(Val));
+        -:  406:  }
+        -:  407:
+        -:  408:  static AttributeSet getTombstoneKey() {
+        -:  409:    auto Val = static_cast<uintptr_t>(-2);
+        -:  410:    Val <<= PointerLikeTypeTraits<void *>::NumLowBitsAvailable;
+        -:  411:    return AttributeSet(reinterpret_cast<AttributeSetNode *>(Val));
+        -:  412:  }
+        -:  413:
+        -:  414:  static unsigned getHashValue(AttributeSet AS) {
+        -:  415:    return (unsigned((uintptr_t)AS.SetNode) >> 4) ^
+        -:  416:           (unsigned((uintptr_t)AS.SetNode) >> 9);
+        -:  417:  }
+        -:  418:
+        -:  419:  static bool isEqual(AttributeSet LHS, AttributeSet RHS) { return LHS == RHS; }
+        -:  420:};
+        -:  421:
+        -:  422://===----------------------------------------------------------------------===//
+        -:  423:/// \class
+        -:  424:/// This class holds the attributes for a function, its return value, and
+        -:  425:/// its parameters. You access the attributes for each of them via an index into
+        -:  426:/// the AttributeList object. The function attributes are at index
+        -:  427:/// `AttributeList::FunctionIndex', the return value is at index
+        -:  428:/// `AttributeList::ReturnIndex', and the attributes for the parameters start at
+        -:  429:/// index `AttributeList::FirstArgIndex'.
+        -:  430:class AttributeList {
+        -:  431:public:
+        -:  432:  enum AttrIndex : unsigned {
+        -:  433:    ReturnIndex = 0U,
+        -:  434:    FunctionIndex = ~0U,
+        -:  435:    FirstArgIndex = 1,
+        -:  436:  };
+        -:  437:
+        -:  438:private:
+        -:  439:  friend class AttrBuilder;
+        -:  440:  friend class AttributeListImpl;
+        -:  441:  friend class AttributeSet;
+        -:  442:  friend class AttributeSetNode;
+        -:  443:  template <typename Ty, typename Enable> friend struct DenseMapInfo;
+        -:  444:
+        -:  445:  /// The attributes that we are managing. This can be null to represent
+        -:  446:  /// the empty attributes list.
+        -:  447:  AttributeListImpl *pImpl = nullptr;
+        -:  448:
+        -:  449:public:
+        -:  450:  /// Create an AttributeList with the specified parameters in it.
+        -:  451:  static AttributeList get(LLVMContext &C,
+        -:  452:                           ArrayRef<std::pair<unsigned, Attribute>> Attrs);
+        -:  453:  static AttributeList get(LLVMContext &C,
+        -:  454:                           ArrayRef<std::pair<unsigned, AttributeSet>> Attrs);
+        -:  455:
+        -:  456:  /// Create an AttributeList from attribute sets for a function, its
+        -:  457:  /// return value, and all of its arguments.
+        -:  458:  static AttributeList get(LLVMContext &C, AttributeSet FnAttrs,
+        -:  459:                           AttributeSet RetAttrs,
+        -:  460:                           ArrayRef<AttributeSet> ArgAttrs);
+        -:  461:
+        -:  462:private:
+        -:  463:  explicit AttributeList(AttributeListImpl *LI) : pImpl(LI) {}
+        -:  464:
+        -:  465:  static AttributeList getImpl(LLVMContext &C, ArrayRef<AttributeSet> AttrSets);
+        -:  466:
+        -:  467:  AttributeList setAttributesAtIndex(LLVMContext &C, unsigned Index,
+        -:  468:                                     AttributeSet Attrs) const;
+        -:  469:
+        -:  470:public:
+    #####:  471:  AttributeList() = default;
+call    0 never executed
+call    1 never executed
+        -:  472:
+        -:  473:  //===--------------------------------------------------------------------===//
+        -:  474:  // AttributeList Construction and Mutation
+        -:  475:  //===--------------------------------------------------------------------===//
+        -:  476:
+        -:  477:  /// Return an AttributeList with the specified parameters in it.
+        -:  478:  static AttributeList get(LLVMContext &C, ArrayRef<AttributeList> Attrs);
+        -:  479:  static AttributeList get(LLVMContext &C, unsigned Index,
+        -:  480:                           ArrayRef<Attribute::AttrKind> Kinds);
+        -:  481:  static AttributeList get(LLVMContext &C, unsigned Index,
+        -:  482:                           ArrayRef<Attribute::AttrKind> Kinds,
+        -:  483:                           ArrayRef<uint64_t> Values);
+        -:  484:  static AttributeList get(LLVMContext &C, unsigned Index,
+        -:  485:                           ArrayRef<StringRef> Kind);
+        -:  486:  static AttributeList get(LLVMContext &C, unsigned Index,
+        -:  487:                           AttributeSet Attrs);
+        -:  488:  static AttributeList get(LLVMContext &C, unsigned Index,
+        -:  489:                           const AttrBuilder &B);
+        -:  490:
+        -:  491:  // TODO: remove non-AtIndex versions of these methods.
+        -:  492:  /// Add an attribute to the attribute set at the given index.
+        -:  493:  /// Returns a new list because attribute lists are immutable.
+        -:  494:  [[nodiscard]] AttributeList
+        -:  495:  addAttributeAtIndex(LLVMContext &C, unsigned Index,
+        -:  496:                      Attribute::AttrKind Kind) const;
+        -:  497:
+        -:  498:  /// Add an attribute to the attribute set at the given index.
+        -:  499:  /// Returns a new list because attribute lists are immutable.
+        -:  500:  [[nodiscard]] AttributeList
+        -:  501:  addAttributeAtIndex(LLVMContext &C, unsigned Index, StringRef Kind,
+        -:  502:                      StringRef Value = StringRef()) const;
+        -:  503:
+        -:  504:  /// Add an attribute to the attribute set at the given index.
+        -:  505:  /// Returns a new list because attribute lists are immutable.
+        -:  506:  [[nodiscard]] AttributeList
+        -:  507:  addAttributeAtIndex(LLVMContext &C, unsigned Index, Attribute A) const;
+        -:  508:
+        -:  509:  /// Add attributes to the attribute set at the given index.
+        -:  510:  /// Returns a new list because attribute lists are immutable.
+        -:  511:  [[nodiscard]] AttributeList addAttributesAtIndex(LLVMContext &C,
+        -:  512:                                                   unsigned Index,
+        -:  513:                                                   const AttrBuilder &B) const;
+        -:  514:
+        -:  515:  /// Add a function attribute to the list. Returns a new list because
+        -:  516:  /// attribute lists are immutable.
+    #####:  517:  [[nodiscard]] AttributeList addFnAttribute(LLVMContext &C,
+        -:  518:                                             Attribute::AttrKind Kind) const {
+    #####:  519:    return addAttributeAtIndex(C, FunctionIndex, Kind);
+call    0 never executed
+        -:  520:  }
+        -:  521:
+        -:  522:  /// Add a function attribute to the list. Returns a new list because
+        -:  523:  /// attribute lists are immutable.
+        -:  524:  [[nodiscard]] AttributeList addFnAttribute(LLVMContext &C,
+        -:  525:                                             Attribute Attr) const {
+        -:  526:    return addAttributeAtIndex(C, FunctionIndex, Attr);
+        -:  527:  }
+        -:  528:
+        -:  529:  /// Add a function attribute to the list. Returns a new list because
+        -:  530:  /// attribute lists are immutable.
+        -:  531:  [[nodiscard]] AttributeList
+        -:  532:  addFnAttribute(LLVMContext &C, StringRef Kind,
+        -:  533:                 StringRef Value = StringRef()) const {
+        -:  534:    return addAttributeAtIndex(C, FunctionIndex, Kind, Value);
+        -:  535:  }
+        -:  536:
+        -:  537:  /// Add function attribute to the list. Returns a new list because
+        -:  538:  /// attribute lists are immutable.
+        -:  539:  [[nodiscard]] AttributeList addFnAttributes(LLVMContext &C,
+        -:  540:                                              const AttrBuilder &B) const {
+        -:  541:    return addAttributesAtIndex(C, FunctionIndex, B);
+        -:  542:  }
+        -:  543:
+        -:  544:  /// Add a return value attribute to the list. Returns a new list because
+        -:  545:  /// attribute lists are immutable.
+        -:  546:  [[nodiscard]] AttributeList addRetAttribute(LLVMContext &C,
+        -:  547:                                              Attribute::AttrKind Kind) const {
+        -:  548:    return addAttributeAtIndex(C, ReturnIndex, Kind);
+        -:  549:  }
+        -:  550:
+        -:  551:  /// Add a return value attribute to the list. Returns a new list because
+        -:  552:  /// attribute lists are immutable.
+        -:  553:  [[nodiscard]] AttributeList addRetAttribute(LLVMContext &C,
+        -:  554:                                              Attribute Attr) const {
+        -:  555:    return addAttributeAtIndex(C, ReturnIndex, Attr);
+        -:  556:  }
+        -:  557:
+        -:  558:  /// Add a return value attribute to the list. Returns a new list because
+        -:  559:  /// attribute lists are immutable.
+        -:  560:  [[nodiscard]] AttributeList addRetAttributes(LLVMContext &C,
+        -:  561:                                               const AttrBuilder &B) const {
+        -:  562:    return addAttributesAtIndex(C, ReturnIndex, B);
+        -:  563:  }
+        -:  564:
+        -:  565:  /// Add an argument attribute to the list. Returns a new list because
+        -:  566:  /// attribute lists are immutable.
+        -:  567:  [[nodiscard]] AttributeList
+        -:  568:  addParamAttribute(LLVMContext &C, unsigned ArgNo,
+        -:  569:                    Attribute::AttrKind Kind) const {
+        -:  570:    return addAttributeAtIndex(C, ArgNo + FirstArgIndex, Kind);
+        -:  571:  }
+        -:  572:
+        -:  573:  /// Add an argument attribute to the list. Returns a new list because
+        -:  574:  /// attribute lists are immutable.
+        -:  575:  [[nodiscard]] AttributeList
+        -:  576:  addParamAttribute(LLVMContext &C, unsigned ArgNo, StringRef Kind,
+        -:  577:                    StringRef Value = StringRef()) const {
+        -:  578:    return addAttributeAtIndex(C, ArgNo + FirstArgIndex, Kind, Value);
+        -:  579:  }
+        -:  580:
+        -:  581:  /// Add an attribute to the attribute list at the given arg indices. Returns a
+        -:  582:  /// new list because attribute lists are immutable.
+        -:  583:  [[nodiscard]] AttributeList addParamAttribute(LLVMContext &C,
+        -:  584:                                                ArrayRef<unsigned> ArgNos,
+        -:  585:                                                Attribute A) const;
+        -:  586:
+        -:  587:  /// Add an argument attribute to the list. Returns a new list because
+        -:  588:  /// attribute lists are immutable.
+        -:  589:  [[nodiscard]] AttributeList addParamAttributes(LLVMContext &C, unsigned ArgNo,
+        -:  590:                                                 const AttrBuilder &B) const {
+        -:  591:    return addAttributesAtIndex(C, ArgNo + FirstArgIndex, B);
+        -:  592:  }
+        -:  593:
+        -:  594:  /// Remove the specified attribute at the specified index from this
+        -:  595:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  596:  [[nodiscard]] AttributeList
+        -:  597:  removeAttributeAtIndex(LLVMContext &C, unsigned Index,
+        -:  598:                         Attribute::AttrKind Kind) const;
+        -:  599:
+        -:  600:  /// Remove the specified attribute at the specified index from this
+        -:  601:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  602:  [[nodiscard]] AttributeList
+        -:  603:  removeAttributeAtIndex(LLVMContext &C, unsigned Index, StringRef Kind) const;
+        -:  604:  [[nodiscard]] AttributeList removeAttribute(LLVMContext &C, unsigned Index,
+        -:  605:                                              StringRef Kind) const {
+        -:  606:    return removeAttributeAtIndex(C, Index, Kind);
+        -:  607:  }
+        -:  608:
+        -:  609:  /// Remove the specified attributes at the specified index from this
+        -:  610:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  611:  [[nodiscard]] AttributeList
+        -:  612:  removeAttributesAtIndex(LLVMContext &C, unsigned Index,
+        -:  613:                          const AttributeMask &AttrsToRemove) const;
+        -:  614:
+        -:  615:  /// Remove all attributes at the specified index from this
+        -:  616:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  617:  [[nodiscard]] AttributeList removeAttributesAtIndex(LLVMContext &C,
+        -:  618:                                                      unsigned Index) const;
+        -:  619:
+        -:  620:  /// Remove the specified attribute at the function index from this
+        -:  621:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  622:  [[nodiscard]] AttributeList
+        -:  623:  removeFnAttribute(LLVMContext &C, Attribute::AttrKind Kind) const {
+        -:  624:    return removeAttributeAtIndex(C, FunctionIndex, Kind);
+        -:  625:  }
+        -:  626:
+        -:  627:  /// Remove the specified attribute at the function index from this
+        -:  628:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  629:  [[nodiscard]] AttributeList removeFnAttribute(LLVMContext &C,
+        -:  630:                                                StringRef Kind) const {
+        -:  631:    return removeAttributeAtIndex(C, FunctionIndex, Kind);
+        -:  632:  }
+        -:  633:
+        -:  634:  /// Remove the specified attribute at the function index from this
+        -:  635:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  636:  [[nodiscard]] AttributeList
+        -:  637:  removeFnAttributes(LLVMContext &C, const AttributeMask &AttrsToRemove) const {
+        -:  638:    return removeAttributesAtIndex(C, FunctionIndex, AttrsToRemove);
+        -:  639:  }
+        -:  640:
+        -:  641:  /// Remove the attributes at the function index from this
+        -:  642:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  643:  [[nodiscard]] AttributeList removeFnAttributes(LLVMContext &C) const {
+        -:  644:    return removeAttributesAtIndex(C, FunctionIndex);
+        -:  645:  }
+        -:  646:
+        -:  647:  /// Remove the specified attribute at the return value index from this
+        -:  648:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  649:  [[nodiscard]] AttributeList
+        -:  650:  removeRetAttribute(LLVMContext &C, Attribute::AttrKind Kind) const {
+        -:  651:    return removeAttributeAtIndex(C, ReturnIndex, Kind);
+        -:  652:  }
+        -:  653:
+        -:  654:  /// Remove the specified attribute at the return value index from this
+        -:  655:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  656:  [[nodiscard]] AttributeList removeRetAttribute(LLVMContext &C,
+        -:  657:                                                 StringRef Kind) const {
+        -:  658:    return removeAttributeAtIndex(C, ReturnIndex, Kind);
+        -:  659:  }
+        -:  660:
+        -:  661:  /// Remove the specified attribute at the return value index from this
+        -:  662:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  663:  [[nodiscard]] AttributeList
+        -:  664:  removeRetAttributes(LLVMContext &C,
+        -:  665:                      const AttributeMask &AttrsToRemove) const {
+        -:  666:    return removeAttributesAtIndex(C, ReturnIndex, AttrsToRemove);
+        -:  667:  }
+        -:  668:
+        -:  669:  /// Remove the specified attribute at the specified arg index from this
+        -:  670:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  671:  [[nodiscard]] AttributeList
+        -:  672:  removeParamAttribute(LLVMContext &C, unsigned ArgNo,
+        -:  673:                       Attribute::AttrKind Kind) const {
+        -:  674:    return removeAttributeAtIndex(C, ArgNo + FirstArgIndex, Kind);
+        -:  675:  }
+        -:  676:
+        -:  677:  /// Remove the specified attribute at the specified arg index from this
+        -:  678:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  679:  [[nodiscard]] AttributeList
+        -:  680:  removeParamAttribute(LLVMContext &C, unsigned ArgNo, StringRef Kind) const {
+        -:  681:    return removeAttributeAtIndex(C, ArgNo + FirstArgIndex, Kind);
+        -:  682:  }
+        -:  683:
+        -:  684:  /// Remove the specified attribute at the specified arg index from this
+        -:  685:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  686:  [[nodiscard]] AttributeList
+        -:  687:  removeParamAttributes(LLVMContext &C, unsigned ArgNo,
+        -:  688:                        const AttributeMask &AttrsToRemove) const {
+        -:  689:    return removeAttributesAtIndex(C, ArgNo + FirstArgIndex, AttrsToRemove);
+        -:  690:  }
+        -:  691:
+        -:  692:  /// Remove all attributes at the specified arg index from this
+        -:  693:  /// attribute list. Returns a new list because attribute lists are immutable.
+        -:  694:  [[nodiscard]] AttributeList removeParamAttributes(LLVMContext &C,
+        -:  695:                                                    unsigned ArgNo) const {
+        -:  696:    return removeAttributesAtIndex(C, ArgNo + FirstArgIndex);
+        -:  697:  }
+        -:  698:
+        -:  699:  /// Replace the type contained by attribute \p AttrKind at index \p ArgNo wih
+        -:  700:  /// \p ReplacementTy, preserving all other attributes.
+        -:  701:  [[nodiscard]] AttributeList
+        -:  702:  replaceAttributeTypeAtIndex(LLVMContext &C, unsigned ArgNo,
+        -:  703:                              Attribute::AttrKind Kind,
+        -:  704:                              Type *ReplacementTy) const {
+        -:  705:    Attribute Attr = getAttributeAtIndex(ArgNo, Kind);
+        -:  706:    auto Attrs = removeAttributeAtIndex(C, ArgNo, Kind);
+        -:  707:    return Attrs.addAttributeAtIndex(C, ArgNo,
+        -:  708:                                     Attr.getWithNewType(C, ReplacementTy));
+        -:  709:  }
+        -:  710:
+        -:  711:  /// \brief Add the dereferenceable attribute to the attribute set at the given
+        -:  712:  /// index. Returns a new list because attribute lists are immutable.
+        -:  713:  [[nodiscard]] AttributeList addDereferenceableRetAttr(LLVMContext &C,
+        -:  714:                                                        uint64_t Bytes) const;
+        -:  715:
+        -:  716:  /// \brief Add the dereferenceable attribute to the attribute set at the given
+        -:  717:  /// arg index. Returns a new list because attribute lists are immutable.
+        -:  718:  [[nodiscard]] AttributeList addDereferenceableParamAttr(LLVMContext &C,
+        -:  719:                                                          unsigned ArgNo,
+        -:  720:                                                          uint64_t Bytes) const;
+        -:  721:
+        -:  722:  /// Add the dereferenceable_or_null attribute to the attribute set at
+        -:  723:  /// the given arg index. Returns a new list because attribute lists are
+        -:  724:  /// immutable.
+        -:  725:  [[nodiscard]] AttributeList
+        -:  726:  addDereferenceableOrNullParamAttr(LLVMContext &C, unsigned ArgNo,
+        -:  727:                                    uint64_t Bytes) const;
+        -:  728:
+        -:  729:  /// Add the allocsize attribute to the attribute set at the given arg index.
+        -:  730:  /// Returns a new list because attribute lists are immutable.
+        -:  731:  [[nodiscard]] AttributeList
+        -:  732:  addAllocSizeParamAttr(LLVMContext &C, unsigned ArgNo, unsigned ElemSizeArg,
+        -:  733:                        const Optional<unsigned> &NumElemsArg);
+        -:  734:
+        -:  735:  //===--------------------------------------------------------------------===//
+        -:  736:  // AttributeList Accessors
+        -:  737:  //===--------------------------------------------------------------------===//
+        -:  738:
+        -:  739:  /// The attributes for the specified index are returned.
+        -:  740:  AttributeSet getAttributes(unsigned Index) const;
+        -:  741:
+        -:  742:  /// The attributes for the argument or parameter at the given index are
+        -:  743:  /// returned.
+        -:  744:  AttributeSet getParamAttrs(unsigned ArgNo) const;
+        -:  745:
+        -:  746:  /// The attributes for the ret value are returned.
+        -:  747:  AttributeSet getRetAttrs() const;
+        -:  748:
+        -:  749:  /// The function attributes are returned.
+        -:  750:  AttributeSet getFnAttrs() const;
+        -:  751:
+        -:  752:  /// Return true if the attribute exists at the given index.
+        -:  753:  bool hasAttributeAtIndex(unsigned Index, Attribute::AttrKind Kind) const;
+        -:  754:
+        -:  755:  /// Return true if the attribute exists at the given index.
+        -:  756:  bool hasAttributeAtIndex(unsigned Index, StringRef Kind) const;
+        -:  757:
+        -:  758:  /// Return true if attribute exists at the given index.
+        -:  759:  bool hasAttributesAtIndex(unsigned Index) const;
+        -:  760:
+        -:  761:  /// Return true if the attribute exists for the given argument
+        -:  762:  bool hasParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) const {
+        -:  763:    return hasAttributeAtIndex(ArgNo + FirstArgIndex, Kind);
+        -:  764:  }
+        -:  765:
+        -:  766:  /// Return true if the attribute exists for the given argument
+        -:  767:  bool hasParamAttr(unsigned ArgNo, StringRef Kind) const {
+        -:  768:    return hasAttributeAtIndex(ArgNo + FirstArgIndex, Kind);
+        -:  769:  }
+        -:  770:
+        -:  771:  /// Return true if attributes exists for the given argument
+        -:  772:  bool hasParamAttrs(unsigned ArgNo) const {
+        -:  773:    return hasAttributesAtIndex(ArgNo + FirstArgIndex);
+        -:  774:  }
+        -:  775:
+        -:  776:  /// Return true if the attribute exists for the return value.
+        -:  777:  bool hasRetAttr(Attribute::AttrKind Kind) const {
+        -:  778:    return hasAttributeAtIndex(ReturnIndex, Kind);
+        -:  779:  }
+        -:  780:
+        -:  781:  /// Return true if the attribute exists for the return value.
+        -:  782:  bool hasRetAttr(StringRef Kind) const {
+        -:  783:    return hasAttributeAtIndex(ReturnIndex, Kind);
+        -:  784:  }
+        -:  785:
+        -:  786:  /// Return true if attributes exist for the return value.
+        -:  787:  bool hasRetAttrs() const { return hasAttributesAtIndex(ReturnIndex); }
+        -:  788:
+        -:  789:  /// Return true if the attribute exists for the function.
+        -:  790:  bool hasFnAttr(Attribute::AttrKind Kind) const;
+        -:  791:
+        -:  792:  /// Return true if the attribute exists for the function.
+        -:  793:  bool hasFnAttr(StringRef Kind) const;
+        -:  794:
+        -:  795:  /// Return true the attributes exist for the function.
+        -:  796:  bool hasFnAttrs() const { return hasAttributesAtIndex(FunctionIndex); }
+        -:  797:
+        -:  798:  /// Return true if the specified attribute is set for at least one
+        -:  799:  /// parameter or for the return value. If Index is not nullptr, the index
+        -:  800:  /// of a parameter with the specified attribute is provided.
+        -:  801:  bool hasAttrSomewhere(Attribute::AttrKind Kind,
+        -:  802:                        unsigned *Index = nullptr) const;
+        -:  803:
+        -:  804:  /// Return the attribute object that exists at the given index.
+        -:  805:  Attribute getAttributeAtIndex(unsigned Index, Attribute::AttrKind Kind) const;
+        -:  806:
+        -:  807:  /// Return the attribute object that exists at the given index.
+        -:  808:  Attribute getAttributeAtIndex(unsigned Index, StringRef Kind) const;
+        -:  809:
+        -:  810:  /// Return the attribute object that exists at the arg index.
+        -:  811:  Attribute getParamAttr(unsigned ArgNo, Attribute::AttrKind Kind) const {
+        -:  812:    return getAttributeAtIndex(ArgNo + FirstArgIndex, Kind);
+        -:  813:  }
+        -:  814:
+        -:  815:  /// Return the attribute object that exists at the given index.
+        -:  816:  Attribute getParamAttr(unsigned ArgNo, StringRef Kind) const {
+        -:  817:    return getAttributeAtIndex(ArgNo + FirstArgIndex, Kind);
+        -:  818:  }
+        -:  819:
+        -:  820:  /// Return the attribute object that exists for the function.
+        -:  821:  Attribute getFnAttr(Attribute::AttrKind Kind) const {
+        -:  822:    return getAttributeAtIndex(FunctionIndex, Kind);
+        -:  823:  }
+        -:  824:
+        -:  825:  /// Return the attribute object that exists for the function.
+        -:  826:  Attribute getFnAttr(StringRef Kind) const {
+        -:  827:    return getAttributeAtIndex(FunctionIndex, Kind);
+        -:  828:  }
+        -:  829:
+        -:  830:  /// Return the alignment of the return value.
+        -:  831:  MaybeAlign getRetAlignment() const;
+        -:  832:
+        -:  833:  /// Return the alignment for the specified function parameter.
+        -:  834:  MaybeAlign getParamAlignment(unsigned ArgNo) const;
+        -:  835:
+        -:  836:  /// Return the stack alignment for the specified function parameter.
+        -:  837:  MaybeAlign getParamStackAlignment(unsigned ArgNo) const;
+        -:  838:
+        -:  839:  /// Return the byval type for the specified function parameter.
+        -:  840:  Type *getParamByValType(unsigned ArgNo) const;
+        -:  841:
+        -:  842:  /// Return the sret type for the specified function parameter.
+        -:  843:  Type *getParamStructRetType(unsigned ArgNo) const;
+        -:  844:
+        -:  845:  /// Return the byref type for the specified function parameter.
+        -:  846:  Type *getParamByRefType(unsigned ArgNo) const;
+        -:  847:
+        -:  848:  /// Return the preallocated type for the specified function parameter.
+        -:  849:  Type *getParamPreallocatedType(unsigned ArgNo) const;
+        -:  850:
+        -:  851:  /// Return the inalloca type for the specified function parameter.
+        -:  852:  Type *getParamInAllocaType(unsigned ArgNo) const;
+        -:  853:
+        -:  854:  /// Return the elementtype type for the specified function parameter.
+        -:  855:  Type *getParamElementType(unsigned ArgNo) const;
+        -:  856:
+        -:  857:  /// Get the stack alignment of the function.
+        -:  858:  MaybeAlign getFnStackAlignment() const;
+        -:  859:
+        -:  860:  /// Get the stack alignment of the return value.
+        -:  861:  MaybeAlign getRetStackAlignment() const;
+        -:  862:
+        -:  863:  /// Get the number of dereferenceable bytes (or zero if unknown) of the return
+        -:  864:  /// value.
+        -:  865:  uint64_t getRetDereferenceableBytes() const;
+        -:  866:
+        -:  867:  /// Get the number of dereferenceable bytes (or zero if unknown) of an arg.
+        -:  868:  uint64_t getParamDereferenceableBytes(unsigned Index) const;
+        -:  869:
+        -:  870:  /// Get the number of dereferenceable_or_null bytes (or zero if unknown) of
+        -:  871:  /// the return value.
+        -:  872:  uint64_t getRetDereferenceableOrNullBytes() const;
+        -:  873:
+        -:  874:  /// Get the number of dereferenceable_or_null bytes (or zero if unknown) of an
+        -:  875:  /// arg.
+        -:  876:  uint64_t getParamDereferenceableOrNullBytes(unsigned ArgNo) const;
+        -:  877:
+        -:  878:  /// Get the unwind table kind requested for the function.
+        -:  879:  UWTableKind getUWTableKind() const;
+        -:  880:
+        -:  881:  AllocFnKind getAllocKind() const;
+        -:  882:
+        -:  883:  /// Returns memory effects of the function.
+        -:  884:  MemoryEffects getMemoryEffects() const;
+        -:  885:
+        -:  886:  /// Return the attributes at the index as a string.
+        -:  887:  std::string getAsString(unsigned Index, bool InAttrGrp = false) const;
+        -:  888:
+        -:  889:  /// Return true if this attribute list belongs to the LLVMContext.
+        -:  890:  bool hasParentContext(LLVMContext &C) const;
+        -:  891:
+        -:  892:  //===--------------------------------------------------------------------===//
+        -:  893:  // AttributeList Introspection
+        -:  894:  //===--------------------------------------------------------------------===//
+        -:  895:
+        -:  896:  using iterator = const AttributeSet *;
+        -:  897:
+        -:  898:  iterator begin() const;
+        -:  899:  iterator end() const;
+        -:  900:
+        -:  901:  unsigned getNumAttrSets() const;
+        -:  902:
+        -:  903:  // Implementation of indexes(). Produces iterators that wrap an index. Mostly
+        -:  904:  // to hide the awkwardness of unsigned wrapping when iterating over valid
+        -:  905:  // indexes.
+        -:  906:  struct index_iterator {
+        -:  907:    unsigned NumAttrSets;
+        -:  908:    index_iterator(int NumAttrSets) : NumAttrSets(NumAttrSets) {}
+        -:  909:    struct int_wrapper {
+        -:  910:      int_wrapper(unsigned i) : i(i) {}
+        -:  911:      unsigned i;
+        -:  912:      unsigned operator*() { return i; }
+        -:  913:      bool operator!=(const int_wrapper &Other) { return i != Other.i; }
+        -:  914:      int_wrapper &operator++() {
+        -:  915:        // This is expected to undergo unsigned wrapping since FunctionIndex is
+        -:  916:        // ~0 and that's where we start.
+        -:  917:        ++i;
+        -:  918:        return *this;
+        -:  919:      }
+        -:  920:    };
+        -:  921:
+        -:  922:    int_wrapper begin() { return int_wrapper(AttributeList::FunctionIndex); }
+        -:  923:
+        -:  924:    int_wrapper end() { return int_wrapper(NumAttrSets - 1); }
+        -:  925:  };
+        -:  926:
+        -:  927:  /// Use this to iterate over the valid attribute indexes.
+        -:  928:  index_iterator indexes() const { return index_iterator(getNumAttrSets()); }
+        -:  929:
+        -:  930:  /// operator==/!= - Provide equality predicates.
+        -:  931:  bool operator==(const AttributeList &RHS) const { return pImpl == RHS.pImpl; }
+        -:  932:  bool operator!=(const AttributeList &RHS) const { return pImpl != RHS.pImpl; }
+        -:  933:
+        -:  934:  /// Return a raw pointer that uniquely identifies this attribute list.
+        -:  935:  void *getRawPointer() const {
+        -:  936:    return pImpl;
+        -:  937:  }
+        -:  938:
+        -:  939:  /// Return true if there are no attributes.
+        -:  940:  bool isEmpty() const { return pImpl == nullptr; }
+        -:  941:
+        -:  942:  void print(raw_ostream &O) const;
+        -:  943:
+        -:  944:  void dump() const;
+        -:  945:};
+        -:  946:
+        -:  947://===----------------------------------------------------------------------===//
+        -:  948:/// \class
+        -:  949:/// Provide DenseMapInfo for AttributeList.
+        -:  950:template <> struct DenseMapInfo<AttributeList, void> {
+        -:  951:  static AttributeList getEmptyKey() {
+        -:  952:    auto Val = static_cast<uintptr_t>(-1);
+        -:  953:    Val <<= PointerLikeTypeTraits<void*>::NumLowBitsAvailable;
+        -:  954:    return AttributeList(reinterpret_cast<AttributeListImpl *>(Val));
+        -:  955:  }
+        -:  956:
+        -:  957:  static AttributeList getTombstoneKey() {
+        -:  958:    auto Val = static_cast<uintptr_t>(-2);
+        -:  959:    Val <<= PointerLikeTypeTraits<void*>::NumLowBitsAvailable;
+        -:  960:    return AttributeList(reinterpret_cast<AttributeListImpl *>(Val));
+        -:  961:  }
+        -:  962:
+        -:  963:  static unsigned getHashValue(AttributeList AS) {
+        -:  964:    return (unsigned((uintptr_t)AS.pImpl) >> 4) ^
+        -:  965:           (unsigned((uintptr_t)AS.pImpl) >> 9);
+        -:  966:  }
+        -:  967:
+        -:  968:  static bool isEqual(AttributeList LHS, AttributeList RHS) {
+        -:  969:    return LHS == RHS;
+        -:  970:  }
+        -:  971:};
+        -:  972:
+        -:  973://===----------------------------------------------------------------------===//
+        -:  974:/// \class
+        -:  975:/// This class stores enough information to efficiently remove some attributes
+        -:  976:/// from an existing AttrBuilder, AttributeSet or AttributeList.
+        -:  977:class AttributeMask {
+        -:  978:  std::bitset<Attribute::EndAttrKinds> Attrs;
+        -:  979:  std::set<SmallString<32>, std::less<>> TargetDepAttrs;
+        -:  980:
+        -:  981:public:
+        -:  982:  AttributeMask() = default;
+        -:  983:  AttributeMask(const AttributeMask &) = delete;
+        -:  984:  AttributeMask(AttributeMask &&) = default;
+        -:  985:
+        -:  986:  AttributeMask(AttributeSet AS) {
+        -:  987:    for (Attribute A : AS)
+        -:  988:      addAttribute(A);
+        -:  989:  }
+        -:  990:
+        -:  991:  /// Add an attribute to the mask.
+        -:  992:  AttributeMask &addAttribute(Attribute::AttrKind Val) {
+        -:  993:    assert((unsigned)Val < Attribute::EndAttrKinds &&
+        -:  994:           "Attribute out of range!");
+        -:  995:    Attrs[Val] = true;
+        -:  996:    return *this;
+        -:  997:  }
+        -:  998:
+        -:  999:  /// Add the Attribute object to the builder.
+        -: 1000:  AttributeMask &addAttribute(Attribute A) {
+        -: 1001:    if (A.isStringAttribute())
+        -: 1002:      addAttribute(A.getKindAsString());
+        -: 1003:    else
+        -: 1004:      addAttribute(A.getKindAsEnum());
+        -: 1005:    return *this;
+        -: 1006:  }
+        -: 1007:
+        -: 1008:  /// Add the target-dependent attribute to the builder.
+        -: 1009:  AttributeMask &addAttribute(StringRef A) {
+        -: 1010:    TargetDepAttrs.insert(A);
+        -: 1011:    return *this;
+        -: 1012:  }
+        -: 1013:
+        -: 1014:  /// Return true if the builder has the specified attribute.
+        -: 1015:  bool contains(Attribute::AttrKind A) const {
+        -: 1016:    assert((unsigned)A < Attribute::EndAttrKinds && "Attribute out of range!");
+        -: 1017:    return Attrs[A];
+        -: 1018:  }
+        -: 1019:
+        -: 1020:  /// Return true if the builder has the specified target-dependent
+        -: 1021:  /// attribute.
+        -: 1022:  bool contains(StringRef A) const { return TargetDepAttrs.count(A); }
+        -: 1023:
+        -: 1024:  /// Return true if the mask contains the specified attribute.
+        -: 1025:  bool contains(Attribute A) const {
+        -: 1026:    if (A.isStringAttribute())
+        -: 1027:      return contains(A.getKindAsString());
+        -: 1028:    return contains(A.getKindAsEnum());
+        -: 1029:  }
+        -: 1030:};
+        -: 1031:
+        -: 1032://===----------------------------------------------------------------------===//
+        -: 1033:/// \class
+        -: 1034:/// This class is used in conjunction with the Attribute::get method to
+        -: 1035:/// create an Attribute object. The object itself is uniquified. The Builder's
+        -: 1036:/// value, however, is not. So this can be used as a quick way to test for
+        -: 1037:/// equality, presence of attributes, etc.
+    #####: 1038:class AttrBuilder {
+branch  0 never executed
+branch  1 never executed
+        -: 1039:  LLVMContext &Ctx;
+        -: 1040:  SmallVector<Attribute, 8> Attrs;
+        -: 1041:
+        -: 1042:public:
+    #####: 1043:  AttrBuilder(LLVMContext &Ctx) : Ctx(Ctx) {}
+call    0 never executed
+        -: 1044:  AttrBuilder(const AttrBuilder &) = delete;
+        -: 1045:  AttrBuilder(AttrBuilder &&) = default;
+        -: 1046:
+        -: 1047:  AttrBuilder(LLVMContext &Ctx, const Attribute &A) : Ctx(Ctx) {
+        -: 1048:    addAttribute(A);
+        -: 1049:  }
+        -: 1050:
+        -: 1051:  AttrBuilder(LLVMContext &Ctx, AttributeSet AS);
+        -: 1052:
+        -: 1053:  void clear();
+        -: 1054:
+        -: 1055:  /// Add an attribute to the builder.
+        -: 1056:  AttrBuilder &addAttribute(Attribute::AttrKind Val);
+        -: 1057:
+        -: 1058:  /// Add the Attribute object to the builder.
+        -: 1059:  AttrBuilder &addAttribute(Attribute A);
+        -: 1060:
+        -: 1061:  /// Add the target-dependent attribute to the builder.
+        -: 1062:  AttrBuilder &addAttribute(StringRef A, StringRef V = StringRef());
+        -: 1063:
+        -: 1064:  /// Remove an attribute from the builder.
+        -: 1065:  AttrBuilder &removeAttribute(Attribute::AttrKind Val);
+        -: 1066:
+        -: 1067:  /// Remove the target-dependent attribute from the builder.
+        -: 1068:  AttrBuilder &removeAttribute(StringRef A);
+        -: 1069:
+        -: 1070:  /// Remove the target-dependent attribute from the builder.
+        -: 1071:  AttrBuilder &removeAttribute(Attribute A) {
+        -: 1072:    if (A.isStringAttribute())
+        -: 1073:      return removeAttribute(A.getKindAsString());
+        -: 1074:    else
+        -: 1075:      return removeAttribute(A.getKindAsEnum());
+        -: 1076:  }
+        -: 1077:
+        -: 1078:  /// Add the attributes from the builder. Attributes in the passed builder
+        -: 1079:  /// overwrite attributes in this builder if they have the same key.
+        -: 1080:  AttrBuilder &merge(const AttrBuilder &B);
+        -: 1081:
+        -: 1082:  /// Remove the attributes from the builder.
+        -: 1083:  AttrBuilder &remove(const AttributeMask &AM);
+        -: 1084:
+        -: 1085:  /// Return true if the builder has any attribute that's in the
+        -: 1086:  /// specified builder.
+        -: 1087:  bool overlaps(const AttributeMask &AM) const;
+        -: 1088:
+        -: 1089:  /// Return true if the builder has the specified attribute.
+        -: 1090:  bool contains(Attribute::AttrKind A) const;
+        -: 1091:
+        -: 1092:  /// Return true if the builder has the specified target-dependent
+        -: 1093:  /// attribute.
+        -: 1094:  bool contains(StringRef A) const;
+        -: 1095:
+        -: 1096:  /// Return true if the builder has IR-level attributes.
+        -: 1097:  bool hasAttributes() const { return !Attrs.empty(); }
+        -: 1098:
+        -: 1099:  /// Return Attribute with the given Kind. The returned attribute will be
+        -: 1100:  /// invalid if the Kind is not present in the builder.
+        -: 1101:  Attribute getAttribute(Attribute::AttrKind Kind) const;
+        -: 1102:
+        -: 1103:  /// Return Attribute with the given Kind. The returned attribute will be
+        -: 1104:  /// invalid if the Kind is not present in the builder.
+        -: 1105:  Attribute getAttribute(StringRef Kind) const;
+        -: 1106:
+        -: 1107:  /// Return raw (possibly packed/encoded) value of integer attribute or None if
+        -: 1108:  /// not set.
+        -: 1109:  Optional<uint64_t> getRawIntAttr(Attribute::AttrKind Kind) const;
+        -: 1110:
+        -: 1111:  /// Retrieve the alignment attribute, if it exists.
+        -: 1112:  MaybeAlign getAlignment() const {
+        -: 1113:    return MaybeAlign(getRawIntAttr(Attribute::Alignment).value_or(0));
+        -: 1114:  }
+        -: 1115:
+        -: 1116:  /// Retrieve the stack alignment attribute, if it exists.
+        -: 1117:  MaybeAlign getStackAlignment() const {
+        -: 1118:    return MaybeAlign(getRawIntAttr(Attribute::StackAlignment).value_or(0));
+        -: 1119:  }
+        -: 1120:
+        -: 1121:  /// Retrieve the number of dereferenceable bytes, if the
+        -: 1122:  /// dereferenceable attribute exists (zero is returned otherwise).
+        -: 1123:  uint64_t getDereferenceableBytes() const {
+        -: 1124:    return getRawIntAttr(Attribute::Dereferenceable).value_or(0);
+        -: 1125:  }
+        -: 1126:
+        -: 1127:  /// Retrieve the number of dereferenceable_or_null bytes, if the
+        -: 1128:  /// dereferenceable_or_null attribute exists (zero is returned otherwise).
+        -: 1129:  uint64_t getDereferenceableOrNullBytes() const {
+        -: 1130:    return getRawIntAttr(Attribute::DereferenceableOrNull).value_or(0);
+        -: 1131:  }
+        -: 1132:
+        -: 1133:  /// Retrieve type for the given type attribute.
+        -: 1134:  Type *getTypeAttr(Attribute::AttrKind Kind) const;
+        -: 1135:
+        -: 1136:  /// Retrieve the byval type.
+        -: 1137:  Type *getByValType() const { return getTypeAttr(Attribute::ByVal); }
+        -: 1138:
+        -: 1139:  /// Retrieve the sret type.
+        -: 1140:  Type *getStructRetType() const { return getTypeAttr(Attribute::StructRet); }
+        -: 1141:
+        -: 1142:  /// Retrieve the byref type.
+        -: 1143:  Type *getByRefType() const { return getTypeAttr(Attribute::ByRef); }
+        -: 1144:
+        -: 1145:  /// Retrieve the preallocated type.
+        -: 1146:  Type *getPreallocatedType() const {
+        -: 1147:    return getTypeAttr(Attribute::Preallocated);
+        -: 1148:  }
+        -: 1149:
+        -: 1150:  /// Retrieve the inalloca type.
+        -: 1151:  Type *getInAllocaType() const { return getTypeAttr(Attribute::InAlloca); }
+        -: 1152:
+        -: 1153:  /// Retrieve the allocsize args, or None if the attribute does not exist.
+        -: 1154:  Optional<std::pair<unsigned, Optional<unsigned>>> getAllocSizeArgs() const;
+        -: 1155:
+        -: 1156:  /// Add integer attribute with raw value (packed/encoded if necessary).
+        -: 1157:  AttrBuilder &addRawIntAttr(Attribute::AttrKind Kind, uint64_t Value);
+        -: 1158:
+        -: 1159:  /// This turns an alignment into the form used internally in Attribute.
+        -: 1160:  /// This call has no effect if Align is not set.
+        -: 1161:  AttrBuilder &addAlignmentAttr(MaybeAlign Align);
+        -: 1162:
+        -: 1163:  /// This turns an int alignment (which must be a power of 2) into the
+        -: 1164:  /// form used internally in Attribute.
+        -: 1165:  /// This call has no effect if Align is 0.
+        -: 1166:  /// Deprecated, use the version using a MaybeAlign.
+        -: 1167:  inline AttrBuilder &addAlignmentAttr(unsigned Align) {
+        -: 1168:    return addAlignmentAttr(MaybeAlign(Align));
+        -: 1169:  }
+        -: 1170:
+        -: 1171:  /// This turns a stack alignment into the form used internally in Attribute.
+        -: 1172:  /// This call has no effect if Align is not set.
+        -: 1173:  AttrBuilder &addStackAlignmentAttr(MaybeAlign Align);
+        -: 1174:
+        -: 1175:  /// This turns an int stack alignment (which must be a power of 2) into
+        -: 1176:  /// the form used internally in Attribute.
+        -: 1177:  /// This call has no effect if Align is 0.
+        -: 1178:  /// Deprecated, use the version using a MaybeAlign.
+        -: 1179:  inline AttrBuilder &addStackAlignmentAttr(unsigned Align) {
+        -: 1180:    return addStackAlignmentAttr(MaybeAlign(Align));
+        -: 1181:  }
+        -: 1182:
+        -: 1183:  /// This turns the number of dereferenceable bytes into the form used
+        -: 1184:  /// internally in Attribute.
+        -: 1185:  AttrBuilder &addDereferenceableAttr(uint64_t Bytes);
+        -: 1186:
+        -: 1187:  /// This turns the number of dereferenceable_or_null bytes into the
+        -: 1188:  /// form used internally in Attribute.
+        -: 1189:  AttrBuilder &addDereferenceableOrNullAttr(uint64_t Bytes);
+        -: 1190:
+        -: 1191:  /// This turns one (or two) ints into the form used internally in Attribute.
+        -: 1192:  AttrBuilder &addAllocSizeAttr(unsigned ElemSizeArg,
+        -: 1193:                                const Optional<unsigned> &NumElemsArg);
+        -: 1194:
+        -: 1195:  /// This turns two ints into the form used internally in Attribute.
+        -: 1196:  AttrBuilder &addVScaleRangeAttr(unsigned MinValue,
+        -: 1197:                                  Optional<unsigned> MaxValue);
+        -: 1198:
+        -: 1199:  /// Add a type attribute with the given type.
+        -: 1200:  AttrBuilder &addTypeAttr(Attribute::AttrKind Kind, Type *Ty);
+        -: 1201:
+        -: 1202:  /// This turns a byval type into the form used internally in Attribute.
+        -: 1203:  AttrBuilder &addByValAttr(Type *Ty);
+        -: 1204:
+        -: 1205:  /// This turns a sret type into the form used internally in Attribute.
+        -: 1206:  AttrBuilder &addStructRetAttr(Type *Ty);
+        -: 1207:
+        -: 1208:  /// This turns a byref type into the form used internally in Attribute.
+        -: 1209:  AttrBuilder &addByRefAttr(Type *Ty);
+        -: 1210:
+        -: 1211:  /// This turns a preallocated type into the form used internally in Attribute.
+        -: 1212:  AttrBuilder &addPreallocatedAttr(Type *Ty);
+        -: 1213:
+        -: 1214:  /// This turns an inalloca type into the form used internally in Attribute.
+        -: 1215:  AttrBuilder &addInAllocaAttr(Type *Ty);
+        -: 1216:
+        -: 1217:  /// Add an allocsize attribute, using the representation returned by
+        -: 1218:  /// Attribute.getIntValue().
+        -: 1219:  AttrBuilder &addAllocSizeAttrFromRawRepr(uint64_t RawAllocSizeRepr);
+        -: 1220:
+        -: 1221:  /// Add a vscale_range attribute, using the representation returned by
+        -: 1222:  /// Attribute.getIntValue().
+        -: 1223:  AttrBuilder &addVScaleRangeAttrFromRawRepr(uint64_t RawVScaleRangeRepr);
+        -: 1224:
+        -: 1225:  /// This turns the unwind table kind into the form used internally in
+        -: 1226:  /// Attribute.
+        -: 1227:  AttrBuilder &addUWTableAttr(UWTableKind Kind);
+        -: 1228:
+        -: 1229:  // This turns the allocator kind into the form used internally in Attribute.
+        -: 1230:  AttrBuilder &addAllocKindAttr(AllocFnKind Kind);
+        -: 1231:
+        -: 1232:  /// Add memory effect attribute.
+        -: 1233:  AttrBuilder &addMemoryAttr(MemoryEffects ME);
+        -: 1234:
+        -: 1235:  ArrayRef<Attribute> attrs() const { return Attrs; }
+        -: 1236:
+        -: 1237:  bool operator==(const AttrBuilder &B) const;
+        -: 1238:  bool operator!=(const AttrBuilder &B) const { return !(*this == B); }
+        -: 1239:};
+        -: 1240:
+        -: 1241:namespace AttributeFuncs {
+        -: 1242:
+        -: 1243:enum AttributeSafetyKind : uint8_t {
+        -: 1244:  ASK_SAFE_TO_DROP = 1,
+        -: 1245:  ASK_UNSAFE_TO_DROP = 2,
+        -: 1246:  ASK_ALL = ASK_SAFE_TO_DROP | ASK_UNSAFE_TO_DROP,
+        -: 1247:};
+        -: 1248:
+        -: 1249:/// Which attributes cannot be applied to a type. The argument \p ASK indicates,
+        -: 1250:/// if only attributes that are known to be safely droppable are contained in
+        -: 1251:/// the mask; only attributes that might be unsafe to drop (e.g., ABI-related
+        -: 1252:/// attributes) are in the mask; or both.
+        -: 1253:AttributeMask typeIncompatible(Type *Ty, AttributeSafetyKind ASK = ASK_ALL);
+        -: 1254:
+        -: 1255:/// Get param/return attributes which imply immediate undefined behavior if an
+        -: 1256:/// invalid value is passed. For example, this includes noundef (where undef
+        -: 1257:/// implies UB), but not nonnull (where null implies poison). It also does not
+        -: 1258:/// include attributes like nocapture, which constrain the function
+        -: 1259:/// implementation rather than the passed value.
+        -: 1260:AttributeMask getUBImplyingAttributes();
+        -: 1261:
+        -: 1262:/// \returns Return true if the two functions have compatible target-independent
+        -: 1263:/// attributes for inlining purposes.
+        -: 1264:bool areInlineCompatible(const Function &Caller, const Function &Callee);
+        -: 1265:
+        -: 1266:
+        -: 1267:/// Checks  if there are any incompatible function attributes between
+        -: 1268:/// \p A and \p B.
+        -: 1269:///
+        -: 1270:/// \param [in] A - The first function to be compared with.
+        -: 1271:/// \param [in] B - The second function to be compared with.
+        -: 1272:/// \returns true if the functions have compatible attributes.
+        -: 1273:bool areOutlineCompatible(const Function &A, const Function &B);
+        -: 1274:
+        -: 1275:/// Merge caller's and callee's attributes.
+        -: 1276:void mergeAttributesForInlining(Function &Caller, const Function &Callee);
+        -: 1277:
+        -: 1278:/// Merges the functions attributes from \p ToMerge into function \p Base.
+        -: 1279:///
+        -: 1280:/// \param [in,out] Base - The function being merged into.
+        -: 1281:/// \param [in] ToMerge - The function to merge attributes from.
+        -: 1282:void mergeAttributesForOutlining(Function &Base, const Function &ToMerge);
+        -: 1283:
+        -: 1284:/// Update min-legal-vector-width if it is in Attribute and less than Width.
+        -: 1285:void updateMinLegalVectorWidthAttr(Function &Fn, uint64_t Width);
+        -: 1286:
+        -: 1287:} // end namespace AttributeFuncs
+        -: 1288:
+        -: 1289:} // end namespace llvm
+        -: 1290:
+        -: 1291:#endif // LLVM_IR_ATTRIBUTES_H

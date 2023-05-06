@@ -1,0 +1,949 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5-2/mlir/include/mlir/Analysis/Presburger/Simplex.h
+        -:    0:Graph:../tools/mlir/lib/Analysis/Presburger/CMakeFiles/obj.MLIRPresburger.dir/PresburgerRelation.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Analysis/Presburger/CMakeFiles/obj.MLIRPresburger.dir/PresburgerRelation.cpp.gcda
+        -:    0:Runs:128654
+        -:    1://===- Simplex.h - MLIR Simplex Class ---------------------------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// Functionality to perform analysis on an IntegerRelation. In particular,
+        -:   10:// support for performing emptiness checks, redundancy checks and obtaining the
+        -:   11:// lexicographically minimum rational element in a set.
+        -:   12://
+        -:   13://===----------------------------------------------------------------------===//
+        -:   14:
+        -:   15:#ifndef MLIR_ANALYSIS_PRESBURGER_SIMPLEX_H
+        -:   16:#define MLIR_ANALYSIS_PRESBURGER_SIMPLEX_H
+        -:   17:
+        -:   18:#include "mlir/Analysis/Presburger/Fraction.h"
+        -:   19:#include "mlir/Analysis/Presburger/IntegerRelation.h"
+        -:   20:#include "mlir/Analysis/Presburger/Matrix.h"
+        -:   21:#include "mlir/Analysis/Presburger/PWMAFunction.h"
+        -:   22:#include "mlir/Analysis/Presburger/Utils.h"
+        -:   23:#include "mlir/Support/LogicalResult.h"
+        -:   24:#include "llvm/ADT/ArrayRef.h"
+        -:   25:#include "llvm/ADT/Optional.h"
+        -:   26:#include "llvm/ADT/SmallBitVector.h"
+        -:   27:#include "llvm/ADT/SmallVector.h"
+        -:   28:#include "llvm/Support/StringSaver.h"
+        -:   29:#include "llvm/Support/raw_ostream.h"
+        -:   30:
+        -:   31:namespace mlir {
+        -:   32:namespace presburger {
+        -:   33:
+        -:   34:class GBRSimplex;
+        -:   35:
+        -:   36:/// The Simplex class implements a version of the Simplex and Generalized Basis
+        -:   37:/// Reduction algorithms, which can perform analysis of integer sets with affine
+        -:   38:/// inequalities and equalities. A Simplex can be constructed
+        -:   39:/// by specifying the dimensionality of the set. It supports adding affine
+        -:   40:/// inequalities and equalities, and can perform emptiness checks, i.e., it can
+        -:   41:/// find a solution to the set of constraints if one exists, or say that the
+        -:   42:/// set is empty if no solution exists. Furthermore, it can find a subset of
+        -:   43:/// these constraints that are redundant, i.e. a subset of constraints that
+        -:   44:/// doesn't constrain the affine set further after adding the non-redundant
+        -:   45:/// constraints. The LexSimplex class provides support for computing the
+        -:   46:/// lexicographic minimum of an IntegerRelation. The SymbolicLexMin class
+        -:   47:/// provides support for computing symbolic lexicographic minimums. All of these
+        -:   48:/// classes can be constructed from an IntegerRelation, and all inherit common
+        -:   49:/// functionality from SimplexBase.
+        -:   50:///
+        -:   51:/// The implementations of the Simplex and SimplexBase classes, other than the
+        -:   52:/// functionality for obtaining an integer sample, are based on the paper
+        -:   53:/// "Simplify: A Theorem Prover for Program Checking"
+        -:   54:/// by D. Detlefs, G. Nelson, J. B. Saxe.
+        -:   55:///
+        -:   56:/// We define variables, constraints, and unknowns. Consider the example of a
+        -:   57:/// two-dimensional set defined by 1 + 2x + 3y >= 0 and 2x - 3y >= 0. Here,
+        -:   58:/// x, y, are variables while 1 + 2x + 3y >= 0, 2x - 3y >= 0 are constraints.
+        -:   59:/// Unknowns are either variables or constraints, i.e., x, y, 1 + 2x + 3y >= 0,
+        -:   60:/// 2x - 3y >= 0 are all unknowns.
+        -:   61:///
+        -:   62:/// The implementation involves a matrix called a tableau, which can be thought
+        -:   63:/// of as a 2D matrix of rational numbers having number of rows equal to the
+        -:   64:/// number of constraints and number of columns equal to one plus the number of
+        -:   65:/// variables. In our implementation, instead of storing rational numbers, we
+        -:   66:/// store a common denominator for each row, so it is in fact a matrix of
+        -:   67:/// integers with number of rows equal to number of constraints and number of
+        -:   68:/// columns equal to _two_ plus the number of variables. For example, instead of
+        -:   69:/// storing a row of three rationals [1/2, 2/3, 3], we would store [6, 3, 4, 18]
+        -:   70:/// since 3/6 = 1/2, 4/6 = 2/3, and 18/6 = 3.
+        -:   71:///
+        -:   72:/// Every row and column except the first and second columns is associated with
+        -:   73:/// an unknown and every unknown is associated with a row or column. An unknown
+        -:   74:/// associated with a row or column is said to be in row or column orientation
+        -:   75:/// respectively. As described above, the first column is the common
+        -:   76:/// denominator. The second column represents the constant term, explained in
+        -:   77:/// more detail below. These two are _fixed columns_; they always retain their
+        -:   78:/// position as the first and second columns. Additionally, LexSimplexBase
+        -:   79:/// stores a so-call big M parameter (explained below) in the third column, so
+        -:   80:/// LexSimplexBase has three fixed columns. Finally, SymbolicLexSimplex has
+        -:   81:/// `nSymbol` variables designated as symbols. These occupy the next `nSymbol`
+        -:   82:/// columns, viz. the columns [3, 3 + nSymbol). For more information on symbols,
+        -:   83:/// see LexSimplexBase and SymbolicLexSimplex.
+        -:   84:///
+        -:   85:/// LexSimplexBase does not directly support variables which can be negative, so
+        -:   86:/// we introduce the so-called big M parameter, an artificial variable that is
+        -:   87:/// considered to have an arbitrarily large value. We then transform the
+        -:   88:/// variables, say x, y, z, ... to M, M + x, M + y, M + z. Since M has been
+        -:   89:/// added to these variables, they are now known to have non-negative values.
+        -:   90:/// For more details, see the documentation for LexSimplexBase. The big M
+        -:   91:/// parameter is not considered a real unknown and is not stored in the `var`
+        -:   92:/// data structure; rather the tableau just has an extra fixed column for it
+        -:   93:/// just like the constant term.
+        -:   94:///
+        -:   95:/// The vectors var and con store information about the variables and
+        -:   96:/// constraints respectively, namely, whether they are in row or column
+        -:   97:/// position, which row or column they are associated with, and whether they
+        -:   98:/// correspond to a variable or a constraint.
+        -:   99:///
+        -:  100:/// An unknown is addressed by its index. If the index i is non-negative, then
+        -:  101:/// the variable var[i] is being addressed. If the index i is negative, then
+        -:  102:/// the constraint con[~i] is being addressed. Effectively this maps
+        -:  103:/// 0 -> var[0], 1 -> var[1], -1 -> con[0], -2 -> con[1], etc. rowUnknown[r] and
+        -:  104:/// colUnknown[c] are the indexes of the unknowns associated with row r and
+        -:  105:/// column c, respectively.
+        -:  106:///
+        -:  107:/// The unknowns in column position are together called the basis. Initially the
+        -:  108:/// basis is the set of variables -- in our example above, the initial basis is
+        -:  109:/// x, y.
+        -:  110:///
+        -:  111:/// The unknowns in row position are represented in terms of the basis unknowns.
+        -:  112:/// If the basis unknowns are u_1, u_2, ... u_m, and a row in the tableau is
+        -:  113:/// d, c, a_1, a_2, ... a_m, this represents the unknown for that row as
+        -:  114:/// (c + a_1*u_1 + a_2*u_2 + ... + a_m*u_m)/d. In our running example, if the
+        -:  115:/// basis is the initial basis of x, y, then the constraint 1 + 2x + 3y >= 0
+        -:  116:/// would be represented by the row [1, 1, 2, 3].
+        -:  117:///
+        -:  118:/// The association of unknowns to rows and columns can be changed by a process
+        -:  119:/// called pivoting, where a row unknown and a column unknown exchange places
+        -:  120:/// and the remaining row variables' representation is changed accordingly
+        -:  121:/// by eliminating the old column unknown in favour of the new column unknown.
+        -:  122:/// If we had pivoted the column for x with the row for 2x - 3y >= 0,
+        -:  123:/// the new row for x would be [2, 1, 3] since x = (1*(2x - 3y) + 3*y)/2.
+        -:  124:/// See the documentation for the pivot member function for details.
+        -:  125:///
+        -:  126:/// The association of unknowns to rows and columns is called the _tableau
+        -:  127:/// configuration_. The _sample value_ of an unknown in a particular tableau
+        -:  128:/// configuration is its value if all the column unknowns were set to zero.
+        -:  129:/// Concretely, for unknowns in column position the sample value is zero; when
+        -:  130:/// the big M parameter is not used, for unknowns in row position the sample
+        -:  131:/// value is the constant term divided by the common denominator. When the big M
+        -:  132:/// parameter is used, if d is the denominator, p is the big M coefficient, and
+        -:  133:/// c is the constant term, then the sample value is (p*M + c)/d. Since M is
+        -:  134:/// considered to be positive infinity, this is positive (negative) infinity
+        -:  135:/// when p is positive or negative, and c/d when p is zero.
+        -:  136:///
+        -:  137:/// The tableau configuration is called _consistent_ if the sample value of all
+        -:  138:/// restricted unknowns is non-negative. Initially there are no constraints, and
+        -:  139:/// the tableau is consistent. When a new constraint is added, its sample value
+        -:  140:/// in the current tableau configuration may be negative. In that case, we try
+        -:  141:/// to find a series of pivots to bring us to a consistent tableau
+        -:  142:/// configuration, i.e. we try to make the new constraint's sample value
+        -:  143:/// non-negative without making that of any other constraints negative. (See
+        -:  144:/// findPivot and findPivotRow for details.) If this is not possible, then the
+        -:  145:/// set of constraints is mutually contradictory and the tableau is marked
+        -:  146:/// _empty_, which means the set of constraints has no solution.
+        -:  147:///
+        -:  148:/// This SimplexBase class also supports taking snapshots of the current state
+        -:  149:/// and rolling back to prior snapshots. This works by maintaining an undo log
+        -:  150:/// of operations. Snapshots are just pointers to a particular location in the
+        -:  151:/// log, and rolling back to a snapshot is done by reverting each log entry's
+        -:  152:/// operation from the end until we reach the snapshot's location. SimplexBase
+        -:  153:/// also supports taking a snapshot including the exact set of basis unknowns;
+        -:  154:/// if this functionality is used, then on rolling back the exact basis will
+        -:  155:/// also be restored. This is used by LexSimplexBase because the lex algorithm,
+        -:  156:/// unlike `Simplex`, is sensitive to the exact basis used at a point.
+        -:  157:class SimplexBase {
+        -:  158:public:
+        -:  159:  SimplexBase() = delete;
+    #####:  160:  virtual ~SimplexBase() = default;
+------------------
+_ZN4mlir10presburger11SimplexBaseD0Ev:
+function _ZN4mlir10presburger11SimplexBaseD0Ev called 0 returned 0% blocks executed 0%
+    #####:  160:  virtual ~SimplexBase() = default;
+call    0 never executed
+call    1 never executed
+------------------
+_ZN4mlir10presburger11SimplexBaseD2Ev:
+function _ZN4mlir10presburger11SimplexBaseD2Ev called 0 returned 0% blocks executed 0%
+    #####:  160:  virtual ~SimplexBase() = default;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+call    8 never executed
+branch  9 never executed
+branch 10 never executed
+call   11 never executed
+------------------
+        -:  161:
+        -:  162:  /// Returns true if the tableau is empty (has conflicting constraints),
+        -:  163:  /// false otherwise.
+        -:  164:  bool isEmpty() const;
+        -:  165:
+        -:  166:  /// Add an inequality to the tableau. If coeffs is c_0, c_1, ... c_n, where n
+        -:  167:  /// is the current number of variables, then the corresponding inequality is
+        -:  168:  /// c_n + c_0*x_0 + c_1*x_1 + ... + c_{n-1}*x_{n-1} >= 0.
+        -:  169:  virtual void addInequality(ArrayRef<MPInt> coeffs) = 0;
+        -:  170:
+        -:  171:  /// Returns the number of variables in the tableau.
+        -:  172:  unsigned getNumVariables() const;
+        -:  173:
+        -:  174:  /// Returns the number of constraints in the tableau.
+        -:  175:  unsigned getNumConstraints() const;
+        -:  176:
+        -:  177:  /// Add an equality to the tableau. If coeffs is c_0, c_1, ... c_n, where n
+        -:  178:  /// is the current number of variables, then the corresponding equality is
+        -:  179:  /// c_n + c_0*x_0 + c_1*x_1 + ... + c_{n-1}*x_{n-1} == 0.
+        -:  180:  void addEquality(ArrayRef<MPInt> coeffs);
+        -:  181:
+        -:  182:  /// Add new variables to the end of the list of variables.
+        -:  183:  void appendVariable(unsigned count = 1);
+        -:  184:
+        -:  185:  /// Append a new variable to the simplex and constrain it such that its only
+        -:  186:  /// integer value is the floor div of `coeffs` and `denom`.
+        -:  187:  ///
+        -:  188:  /// `denom` must be positive.
+        -:  189:  void addDivisionVariable(ArrayRef<MPInt> coeffs, const MPInt &denom);
+        -:  190:
+        -:  191:  /// Mark the tableau as being empty.
+        -:  192:  void markEmpty();
+        -:  193:
+        -:  194:  /// Get a snapshot of the current state. This is used for rolling back.
+        -:  195:  /// The same basis will not necessarily be restored on rolling back.
+        -:  196:  /// The snapshot only captures the set of variables and constraints present
+        -:  197:  /// in the Simplex.
+        -:  198:  unsigned getSnapshot() const;
+        -:  199:
+        -:  200:  /// Get a snapshot of the current state including the basis. When rolling
+        -:  201:  /// back, the exact basis will be restored.
+        -:  202:  unsigned getSnapshotBasis();
+        -:  203:
+        -:  204:  /// Rollback to a snapshot. This invalidates all later snapshots.
+        -:  205:  void rollback(unsigned snapshot);
+        -:  206:
+        -:  207:  /// Add all the constraints from the given IntegerRelation.
+        -:  208:  void intersectIntegerRelation(const IntegerRelation &rel);
+        -:  209:
+        -:  210:  /// Print the tableau's internal state.
+        -:  211:  void print(raw_ostream &os) const;
+        -:  212:  void dump() const;
+        -:  213:
+        -:  214:protected:
+        -:  215:  /// Construct a SimplexBase with the specified number of variables and fixed
+        -:  216:  /// columns. The first overload should be used when there are nosymbols.
+        -:  217:  /// With the second overload, the specified range of vars will be marked
+        -:  218:  /// as symbols. With the third overload, `isSymbol` is a bitmask denoting
+        -:  219:  /// which vars are symbols. The size of `isSymbol` must be `nVar`.
+        -:  220:  ///
+        -:  221:  /// For example, Simplex uses two fixed columns: the denominator and the
+        -:  222:  /// constant term, whereas LexSimplex has an extra fixed column for the
+        -:  223:  /// so-called big M parameter. For more information see the documentation for
+        -:  224:  /// LexSimplex.
+        -:  225:  SimplexBase(unsigned nVar, bool mustUseBigM);
+        -:  226:  SimplexBase(unsigned nVar, bool mustUseBigM,
+        -:  227:              const llvm::SmallBitVector &isSymbol);
+        -:  228:
+        -:  229:  enum class Orientation { Row, Column };
+        -:  230:
+        -:  231:  /// An Unknown is either a variable or a constraint. It is always associated
+        -:  232:  /// with either a row or column. Whether it's a row or a column is specified
+        -:  233:  /// by the orientation and pos identifies the specific row or column it is
+        -:  234:  /// associated with. If the unknown is restricted, then it has a
+        -:  235:  /// non-negativity constraint associated with it, i.e., its sample value must
+        -:  236:  /// always be non-negative and if it cannot be made non-negative without
+        -:  237:  /// violating other constraints, the tableau is empty.
+        -:  238:  struct Unknown {
+        -:  239:    Unknown(Orientation oOrientation, bool oRestricted, unsigned oPos,
+        -:  240:            bool oIsSymbol = false)
+        -:  241:        : pos(oPos), orientation(oOrientation), restricted(oRestricted),
+        -:  242:          isSymbol(oIsSymbol) {}
+        -:  243:    unsigned pos;
+        -:  244:    Orientation orientation;
+        -:  245:    bool restricted : 1;
+        -:  246:    bool isSymbol : 1;
+        -:  247:
+        -:  248:    void print(raw_ostream &os) const {
+        -:  249:      os << (orientation == Orientation::Row ? "r" : "c");
+        -:  250:      os << pos;
+        -:  251:      if (restricted)
+        -:  252:        os << " [>=0]";
+        -:  253:    }
+        -:  254:  };
+        -:  255:
+        -:  256:  struct Pivot {
+        -:  257:    unsigned row, column;
+        -:  258:  };
+        -:  259:
+        -:  260:  /// Return any row that this column can be pivoted with, ignoring tableau
+        -:  261:  /// consistency.
+        -:  262:  ///
+        -:  263:  /// Returns an empty optional if no pivot is possible, which happens only when
+        -:  264:  /// the column unknown is a variable and no constraint has a non-zero
+        -:  265:  /// coefficient for it.
+        -:  266:  Optional<unsigned> findAnyPivotRow(unsigned col);
+        -:  267:
+        -:  268:  /// Swap the row with the column in the tableau's data structures but not the
+        -:  269:  /// tableau itself. This is used by pivot.
+        -:  270:  void swapRowWithCol(unsigned row, unsigned col);
+        -:  271:
+        -:  272:  /// Pivot the row with the column.
+        -:  273:  void pivot(unsigned row, unsigned col);
+        -:  274:  void pivot(Pivot pair);
+        -:  275:
+        -:  276:  /// Returns the unknown associated with index.
+        -:  277:  const Unknown &unknownFromIndex(int index) const;
+        -:  278:  /// Returns the unknown associated with col.
+        -:  279:  const Unknown &unknownFromColumn(unsigned col) const;
+        -:  280:  /// Returns the unknown associated with row.
+        -:  281:  const Unknown &unknownFromRow(unsigned row) const;
+        -:  282:  /// Returns the unknown associated with index.
+        -:  283:  Unknown &unknownFromIndex(int index);
+        -:  284:  /// Returns the unknown associated with col.
+        -:  285:  Unknown &unknownFromColumn(unsigned col);
+        -:  286:  /// Returns the unknown associated with row.
+        -:  287:  Unknown &unknownFromRow(unsigned row);
+        -:  288:
+        -:  289:  /// Add a new row to the tableau and the associated data structures. The row
+        -:  290:  /// is initialized to zero. Returns the index of the added row.
+        -:  291:  unsigned addZeroRow(bool makeRestricted = false);
+        -:  292:
+        -:  293:  /// Add a new row to the tableau and the associated data structures.
+        -:  294:  /// The new row is considered to be a constraint; the new Unknown lives in
+        -:  295:  /// con.
+        -:  296:  ///
+        -:  297:  /// Returns the index of the new Unknown in con.
+        -:  298:  unsigned addRow(ArrayRef<MPInt> coeffs, bool makeRestricted = false);
+        -:  299:
+        -:  300:  /// Swap the two rows/columns in the tableau and associated data structures.
+        -:  301:  void swapRows(unsigned i, unsigned j);
+        -:  302:  void swapColumns(unsigned i, unsigned j);
+        -:  303:
+        -:  304:  /// Enum to denote operations that need to be undone during rollback.
+        -:  305:  enum class UndoLogEntry {
+        -:  306:    RemoveLastConstraint,
+        -:  307:    RemoveLastVariable,
+        -:  308:    UnmarkEmpty,
+        -:  309:    UnmarkLastRedundant,
+        -:  310:    RestoreBasis
+        -:  311:  };
+        -:  312:
+        -:  313:  /// Undo the addition of the last constraint. This will only be called from
+        -:  314:  /// undo, when rolling back.
+        -:  315:  virtual void undoLastConstraint() = 0;
+        -:  316:
+        -:  317:  /// Remove the last constraint, which must be in row orientation.
+        -:  318:  void removeLastConstraintRowOrientation();
+        -:  319:
+        -:  320:  /// Undo the operation represented by the log entry.
+        -:  321:  void undo(UndoLogEntry entry);
+        -:  322:
+        -:  323:  /// Return the number of fixed columns, as described in the constructor above,
+        -:  324:  /// this is the number of columns beyond those for the variables in var.
+        -:  325:  unsigned getNumFixedCols() const { return usingBigM ? 3u : 2u; }
+        -:  326:  unsigned getNumRows() const { return tableau.getNumRows(); }
+        -:  327:  unsigned getNumColumns() const { return tableau.getNumColumns(); }
+        -:  328:
+        -:  329:  /// Stores whether or not a big M column is present in the tableau.
+        -:  330:  bool usingBigM;
+        -:  331:
+        -:  332:  /// The number of redundant rows in the tableau. These are the first
+        -:  333:  /// nRedundant rows.
+        -:  334:  unsigned nRedundant;
+        -:  335:
+        -:  336:  /// The number of parameters. This must be consistent with the number of
+        -:  337:  /// Unknowns in `var` below that have `isSymbol` set to true.
+        -:  338:  unsigned nSymbol;
+        -:  339:
+        -:  340:  /// The matrix representing the tableau.
+        -:  341:  Matrix tableau;
+        -:  342:
+        -:  343:  /// This is true if the tableau has been detected to be empty, false
+        -:  344:  /// otherwise.
+        -:  345:  bool empty;
+        -:  346:
+        -:  347:  /// Holds a log of operations, used for rolling back to a previous state.
+        -:  348:  SmallVector<UndoLogEntry, 8> undoLog;
+        -:  349:
+        -:  350:  /// Holds a vector of bases. The ith saved basis is the basis that should be
+        -:  351:  /// restored when processing the ith occurrance of UndoLogEntry::RestoreBasis
+        -:  352:  /// in undoLog. This is used by getSnapshotBasis.
+        -:  353:  SmallVector<SmallVector<int, 8>, 8> savedBases;
+        -:  354:
+        -:  355:  /// These hold the indexes of the unknown at a given row or column position.
+        -:  356:  /// We keep these as signed integers since that makes it convenient to check
+        -:  357:  /// if an index corresponds to a variable or a constraint by checking the
+        -:  358:  /// sign.
+        -:  359:  ///
+        -:  360:  /// colUnknown is padded with two null indexes at the front since the first
+        -:  361:  /// two columns don't correspond to any unknowns.
+        -:  362:  SmallVector<int, 8> rowUnknown, colUnknown;
+        -:  363:
+        -:  364:  /// These hold information about each unknown.
+        -:  365:  SmallVector<Unknown, 8> con, var;
+        -:  366:};
+        -:  367:
+        -:  368:/// Simplex class using the lexicographic pivot rule. Used for lexicographic
+        -:  369:/// optimization. The implementation of this class is based on the paper
+        -:  370:/// "Parametric Integer Programming" by Paul Feautrier.
+        -:  371:///
+        -:  372:/// This does not directly support negative-valued variables, so it uses the big
+        -:  373:/// M parameter trick to make all the variables non-negative. Basically we
+        -:  374:/// introduce an artifical variable M that is considered to have a value of
+        -:  375:/// +infinity and instead of the variables x, y, z, we internally use variables
+        -:  376:/// M + x, M + y, M + z, which are now guaranteed to be non-negative. See the
+        -:  377:/// documentation for SimplexBase for more details. M is also considered to be
+        -:  378:/// an integer that is divisible by everything.
+        -:  379:///
+        -:  380:/// The whole algorithm is performed with M treated as a symbol;
+        -:  381:/// it is just considered to be infinite throughout and it never appears in the
+        -:  382:/// final outputs. We will deal with sample values throughout that may in
+        -:  383:/// general be some affine expression involving M, like pM + q or aM + b. We can
+        -:  384:/// compare these with each other. They have a total order:
+        -:  385:///
+        -:  386:/// aM + b < pM + q iff  a < p or (a == p and b < q).
+        -:  387:/// In particular, aM + b < 0 iff a < 0 or (a == 0 and b < 0).
+        -:  388:///
+        -:  389:/// When performing symbolic optimization, sample values will be affine
+        -:  390:/// expressions in M and the symbols. For example, we could have sample values
+        -:  391:/// aM + bS + c and pM + qS + r, where S is a symbol. Now we have
+        -:  392:/// aM + bS + c < pM + qS + r iff (a < p) or (a == p and bS + c < qS + r).
+        -:  393:/// bS + c < qS + r can be always true, always false, or neither,
+        -:  394:/// depending on the set of values S can take. The symbols are always stored
+        -:  395:/// in columns [3, 3 + nSymbols). For more details, see the
+        -:  396:/// documentation for SymbolicLexSimplex.
+        -:  397:///
+        -:  398:/// Initially all the constraints to be added are added as rows, with no attempt
+        -:  399:/// to keep the tableau consistent. Pivots are only performed when some query
+        -:  400:/// is made, such as a call to getRationalLexMin. Care is taken to always
+        -:  401:/// maintain a lexicopositive basis transform, explained below.
+        -:  402:///
+        -:  403:/// Let the variables be x = (x_1, ... x_n).
+        -:  404:/// Let the symbols be   s = (s_1, ... s_m). Let the basis unknowns at a
+        -:  405:/// particular point be  y = (y_1, ... y_n). We know that x = A*y + T*s + b for
+        -:  406:/// some n x n matrix A, n x m matrix s, and n x 1 column vector b. We want
+        -:  407:/// every column in A to be lexicopositive, i.e., have at least one non-zero
+        -:  408:/// element, with the first such element being positive. This property is
+        -:  409:/// preserved throughout the operation of LexSimplexBase. Note that on
+        -:  410:/// construction, the basis transform A is the identity matrix and so every
+        -:  411:/// column is lexicopositive. Note that for LexSimplexBase, for the tableau to
+        -:  412:/// be consistent we must have non-negative sample values not only for the
+        -:  413:/// constraints but also for the variables. So if the tableau is consistent then
+        -:  414:/// x >= 0 and y >= 0, by which we mean every element in these vectors is
+        -:  415:/// non-negative. (note that this is a different concept from lexicopositivity!)
+        -:  416:class LexSimplexBase : public SimplexBase {
+        -:  417:public:
+        -:  418:  ~LexSimplexBase() override = default;
+        -:  419:
+        -:  420:  /// Add an inequality to the tableau. If coeffs is c_0, c_1, ... c_n, where n
+        -:  421:  /// is the current number of variables, then the corresponding inequality is
+        -:  422:  /// c_n + c_0*x_0 + c_1*x_1 + ... + c_{n-1}*x_{n-1} >= 0.
+        -:  423:  ///
+        -:  424:  /// This just adds the inequality to the tableau and does not try to create a
+        -:  425:  /// consistent tableau configuration.
+        -:  426:  void addInequality(ArrayRef<MPInt> coeffs) final;
+        -:  427:
+        -:  428:  /// Get a snapshot of the current state. This is used for rolling back.
+        -:  429:  unsigned getSnapshot() { return SimplexBase::getSnapshotBasis(); }
+        -:  430:
+        -:  431:protected:
+        -:  432:  LexSimplexBase(unsigned nVar) : SimplexBase(nVar, /*mustUseBigM=*/true) {}
+        -:  433:  LexSimplexBase(unsigned nVar, const llvm::SmallBitVector &isSymbol)
+        -:  434:      : SimplexBase(nVar, /*mustUseBigM=*/true, isSymbol) {}
+        -:  435:  explicit LexSimplexBase(const IntegerRelation &constraints)
+        -:  436:      : LexSimplexBase(constraints.getNumVars()) {
+        -:  437:    intersectIntegerRelation(constraints);
+        -:  438:  }
+        -:  439:  explicit LexSimplexBase(const IntegerRelation &constraints,
+        -:  440:                          const llvm::SmallBitVector &isSymbol)
+        -:  441:      : LexSimplexBase(constraints.getNumVars(), isSymbol) {
+        -:  442:    intersectIntegerRelation(constraints);
+        -:  443:  }
+        -:  444:
+        -:  445:  /// Add new symbolic variables to the end of the list of variables.
+        -:  446:  void appendSymbol();
+        -:  447:
+        -:  448:  /// Try to move the specified row to column orientation while preserving the
+        -:  449:  /// lexicopositivity of the basis transform. The row must have a non-positive
+        -:  450:  /// sample value. If this is not possible, return failure. This occurs when
+        -:  451:  /// the constraints have no solution or the sample value is zero.
+        -:  452:  LogicalResult moveRowUnknownToColumn(unsigned row);
+        -:  453:
+        -:  454:  /// Given a row that has a non-integer sample value, add an inequality to cut
+        -:  455:  /// away this fractional sample value from the polytope without removing any
+        -:  456:  /// integer points. The integer lexmin, if one existed, remains the same on
+        -:  457:  /// return.
+        -:  458:  ///
+        -:  459:  /// This assumes that the symbolic part of the sample is integral,
+        -:  460:  /// i.e., if the symbolic sample is (c + aM + b_1*s_1 + ... b_n*s_n)/d,
+        -:  461:  /// where s_1, ... s_n are symbols, this assumes that
+        -:  462:  /// (b_1*s_1 + ... + b_n*s_n)/s is integral.
+        -:  463:  ///
+        -:  464:  /// Return failure if the tableau became empty, and success if it didn't.
+        -:  465:  /// Failure status indicates that the polytope was integer empty.
+        -:  466:  LogicalResult addCut(unsigned row);
+        -:  467:
+        -:  468:  /// Undo the addition of the last constraint. This is only called while
+        -:  469:  /// rolling back.
+        -:  470:  void undoLastConstraint() final;
+        -:  471:
+        -:  472:  /// Given two potential pivot columns for a row, return the one that results
+        -:  473:  /// in the lexicographically smallest sample vector. The row's sample value
+        -:  474:  /// must be negative. If symbols are involved, the sample value must be
+        -:  475:  /// negative for all possible assignments to the symbols.
+        -:  476:  unsigned getLexMinPivotColumn(unsigned row, unsigned colA,
+        -:  477:                                unsigned colB) const;
+        -:  478:};
+        -:  479:
+        -:  480:/// A class for lexicographic optimization without any symbols. This also
+        -:  481:/// provides support for integer-exact redundancy and separateness checks.
+        -:  482:class LexSimplex : public LexSimplexBase {
+        -:  483:public:
+        -:  484:  explicit LexSimplex(unsigned nVar) : LexSimplexBase(nVar) {}
+        -:  485:  // Note that LexSimplex does NOT support symbolic lexmin;
+        -:  486:  // use SymbolicLexSimplex if that is required. LexSimplex ignores the VarKinds
+        -:  487:  // of the passed IntegerRelation. Symbols will be treated as ordinary vars.
+        -:  488:  explicit LexSimplex(const IntegerRelation &constraints)
+        -:  489:      : LexSimplexBase(constraints) {}
+        -:  490:
+        -:  491:  /// Return the lexicographically minimum rational solution to the constraints.
+        -:  492:  MaybeOptimum<SmallVector<Fraction, 8>> findRationalLexMin();
+        -:  493:
+        -:  494:  /// Return the lexicographically minimum integer solution to the constraints.
+        -:  495:  ///
+        -:  496:  /// Note: this should be used only when the lexmin is really needed. To obtain
+        -:  497:  /// any integer sample, use Simplex::findIntegerSample as that is more robust.
+        -:  498:  MaybeOptimum<SmallVector<MPInt, 8>> findIntegerLexMin();
+        -:  499:
+        -:  500:  /// Return whether the specified inequality is redundant/separate for the
+        -:  501:  /// polytope. Redundant means every point satisfies the given inequality, and
+        -:  502:  /// separate means no point satisfies it.
+        -:  503:  ///
+        -:  504:  /// These checks are integer-exact.
+        -:  505:  bool isSeparateInequality(ArrayRef<MPInt> coeffs);
+        -:  506:  bool isRedundantInequality(ArrayRef<MPInt> coeffs);
+        -:  507:
+        -:  508:private:
+        -:  509:  /// Returns the current sample point, which may contain non-integer (rational)
+        -:  510:  /// coordinates. Returns an empty optimum when the tableau is empty.
+        -:  511:  ///
+        -:  512:  /// Returns an unbounded optimum when the big M parameter is used and a
+        -:  513:  /// variable has a non-zero big M coefficient, meaning its value is infinite
+        -:  514:  /// or unbounded.
+        -:  515:  MaybeOptimum<SmallVector<Fraction, 8>> getRationalSample() const;
+        -:  516:
+        -:  517:  /// Make the tableau configuration consistent.
+        -:  518:  LogicalResult restoreRationalConsistency();
+        -:  519:
+        -:  520:  /// Return whether the specified row is violated;
+        -:  521:  bool rowIsViolated(unsigned row) const;
+        -:  522:
+        -:  523:  /// Get a constraint row that is violated, if one exists.
+        -:  524:  /// Otherwise, return an empty optional.
+        -:  525:  Optional<unsigned> maybeGetViolatedRow() const;
+        -:  526:
+        -:  527:  /// Get a row corresponding to a var that has a non-integral sample value, if
+        -:  528:  /// one exists. Otherwise, return an empty optional.
+        -:  529:  Optional<unsigned> maybeGetNonIntegralVarRow() const;
+        -:  530:};
+        -:  531:
+        -:  532:/// Represents the result of a symbolic lexicographic minimization computation.
+        -:  533:struct SymbolicLexMin {
+        -:  534:  SymbolicLexMin(const PresburgerSpace &space)
+        -:  535:      : lexmin(space),
+        -:  536:        unboundedDomain(PresburgerSet::getEmpty(space.getDomainSpace())) {}
+        -:  537:
+        -:  538:  /// This maps assignments of symbols to the corresponding lexmin.
+        -:  539:  /// Takes no value when no integer sample exists for the assignment or if the
+        -:  540:  /// lexmin is unbounded.
+        -:  541:  PWMAFunction lexmin;
+        -:  542:  /// Contains all assignments to the symbols that made the lexmin unbounded.
+        -:  543:  /// Note that the symbols of the input set to the symbolic lexmin are dims
+        -:  544:  /// of this PrebsurgerSet.
+        -:  545:  PresburgerSet unboundedDomain;
+        -:  546:};
+        -:  547:
+        -:  548:/// A class to perform symbolic lexicographic optimization,
+        -:  549:/// i.e., to find, for every assignment to the symbols the specified
+        -:  550:/// `symbolDomain`, the lexicographically minimum value integer value attained
+        -:  551:/// by the non-symbol variables.
+        -:  552:///
+        -:  553:/// The input is a set parametrized by some symbols, i.e., the constant terms
+        -:  554:/// of the constraints in the set are affine expressions in the symbols, and
+        -:  555:/// every assignment to the symbols defines a non-symbolic set.
+        -:  556:///
+        -:  557:/// Accordingly, the sample values of the rows in our tableau will be affine
+        -:  558:/// expressions in the symbols, and every assignment to the symbols will define
+        -:  559:/// a non-symbolic LexSimplex. We then run the algorithm of
+        -:  560:/// LexSimplex::findIntegerLexMin simultaneously for every value of the symbols
+        -:  561:/// in the domain.
+        -:  562:///
+        -:  563:/// Often, the pivot to be performed is the same for all values of the symbols,
+        -:  564:/// in which case we just do it. For example, if the symbolic sample of a row is
+        -:  565:/// negative for all values in the symbol domain, the row needs to be pivoted
+        -:  566:/// irrespective of the precise value of the symbols. To answer queries like
+        -:  567:/// "Is this symbolic sample always negative in the symbol domain?", we maintain
+        -:  568:/// a `LexSimplex domainSimplex` correponding to the symbol domain.
+        -:  569:///
+        -:  570:/// In other cases, it may be that the symbolic sample is violated at some
+        -:  571:/// values in the symbol domain and not violated at others. In this case,
+        -:  572:/// the pivot to be performed does depend on the value of the symbols. We
+        -:  573:/// handle this by splitting the symbol domain. We run the algorithm for the
+        -:  574:/// case where the row isn't violated, and then come back and run the case
+        -:  575:/// where it is.
+        -:  576:class SymbolicLexSimplex : public LexSimplexBase {
+        -:  577:public:
+        -:  578:  /// `constraints` is the set for which the symbolic lexmin will be computed.
+        -:  579:  /// `symbolDomain` is the set of values of the symbols for which the lexmin
+        -:  580:  /// will be computed. `symbolDomain` should have a dim var for every symbol in
+        -:  581:  /// `constraints`, and no other vars. `isSymbol` specifies which vars of
+        -:  582:  /// `constraints` should be considered as symbols.
+        -:  583:  ///
+        -:  584:  /// The resulting SymbolicLexMin's space will be compatible with that of
+        -:  585:  /// symbolDomain.
+        -:  586:  SymbolicLexSimplex(const IntegerRelation &constraints,
+        -:  587:                     const IntegerPolyhedron &symbolDomain,
+        -:  588:                     const llvm::SmallBitVector &isSymbol)
+        -:  589:      : LexSimplexBase(constraints, isSymbol), domainPoly(symbolDomain),
+        -:  590:        domainSimplex(symbolDomain) {
+        -:  591:    // TODO consider supporting this case. It amounts
+        -:  592:    // to just returning the input constraints.
+        -:  593:    assert(domainPoly.getNumVars() > 0 &&
+        -:  594:           "there must be some non-symbols to optimize!");
+        -:  595:  }
+        -:  596:
+        -:  597:  /// An overload to select some subrange of ids as symbols for lexmin.
+        -:  598:  /// The symbol ids are the range of ids with absolute index
+        -:  599:  /// [symbolOffset, symbolOffset + symbolDomain.getNumVars())
+        -:  600:  SymbolicLexSimplex(const IntegerRelation &constraints, unsigned symbolOffset,
+        -:  601:                     const IntegerPolyhedron &symbolDomain)
+        -:  602:      : SymbolicLexSimplex(constraints, symbolDomain,
+        -:  603:                           getSubrangeBitVector(constraints.getNumVars(),
+        -:  604:                                                symbolOffset,
+        -:  605:                                                symbolDomain.getNumVars())) {}
+        -:  606:
+        -:  607:  /// An overload to select the symbols of `constraints` as symbols for lexmin.
+        -:  608:  SymbolicLexSimplex(const IntegerRelation &constraints,
+        -:  609:                     const IntegerPolyhedron &symbolDomain)
+        -:  610:      : SymbolicLexSimplex(constraints,
+        -:  611:                           constraints.getVarKindOffset(VarKind::Symbol),
+        -:  612:                           symbolDomain) {
+        -:  613:    assert(constraints.getNumSymbolVars() == symbolDomain.getNumVars() &&
+        -:  614:           "symbolDomain must have as many vars as constraints has symbols!");
+        -:  615:  }
+        -:  616:
+        -:  617:  /// The lexmin will be stored as a function `lexmin` from symbols to
+        -:  618:  /// non-symbols in the result.
+        -:  619:  ///
+        -:  620:  /// For some values of the symbols, the lexmin may be unbounded.
+        -:  621:  /// These parts of the symbol domain will be stored in `unboundedDomain`.
+        -:  622:  ///
+        -:  623:  /// The spaces of the sets in the result are compatible with the symbolDomain
+        -:  624:  /// passed in the SymbolicLexSimplex constructor.
+        -:  625:  SymbolicLexMin computeSymbolicIntegerLexMin();
+        -:  626:
+        -:  627:private:
+        -:  628:  /// Perform all pivots that do not require branching.
+        -:  629:  ///
+        -:  630:  /// Return failure if the tableau became empty, indicating that the polytope
+        -:  631:  /// is always integer empty in the current symbol domain.
+        -:  632:  /// Return success otherwise.
+        -:  633:  LogicalResult doNonBranchingPivots();
+        -:  634:
+        -:  635:  /// Get a row that is always violated in the current domain, if one exists.
+        -:  636:  Optional<unsigned> maybeGetAlwaysViolatedRow();
+        -:  637:
+        -:  638:  /// Get a row corresponding to a variable with non-integral sample value, if
+        -:  639:  /// one exists.
+        -:  640:  Optional<unsigned> maybeGetNonIntegralVarRow();
+        -:  641:
+        -:  642:  /// Given a row that has a non-integer sample value, cut away this fractional
+        -:  643:  /// sample value witahout removing any integer points, i.e., the integer
+        -:  644:  /// lexmin, if it exists, remains the same after a call to this function. This
+        -:  645:  /// may add constraints or local variables to the tableau, as well as to the
+        -:  646:  /// domain.
+        -:  647:  ///
+        -:  648:  /// Returns whether the cut constraint could be enforced, i.e. failure if the
+        -:  649:  /// cut made the polytope empty, and success if it didn't. Failure status
+        -:  650:  /// indicates that the polytope is always integer empty in the symbol domain
+        -:  651:  /// at the time of the call. (This function may modify the symbol domain, but
+        -:  652:  /// failure statu indicates that the polytope was empty for all symbol values
+        -:  653:  /// in the initial domain.)
+        -:  654:  LogicalResult addSymbolicCut(unsigned row);
+        -:  655:
+        -:  656:  /// Get the numerator of the symbolic sample of the specific row.
+        -:  657:  /// This is an affine expression in the symbols with integer coefficients.
+        -:  658:  /// The last element is the constant term. This ignores the big M coefficient.
+        -:  659:  SmallVector<MPInt, 8> getSymbolicSampleNumerator(unsigned row) const;
+        -:  660:
+        -:  661:  /// Get an affine inequality in the symbols with integer coefficients that
+        -:  662:  /// holds iff the symbolic sample of the specified row is non-negative.
+        -:  663:  SmallVector<MPInt, 8> getSymbolicSampleIneq(unsigned row) const;
+        -:  664:
+        -:  665:  /// Return whether all the coefficients of the symbolic sample are integers.
+        -:  666:  ///
+        -:  667:  /// This does not consult the domain to check if the specified expression
+        -:  668:  /// is always integral despite coefficients being fractional.
+        -:  669:  bool isSymbolicSampleIntegral(unsigned row) const;
+        -:  670:
+        -:  671:  /// Record a lexmin. The tableau must be consistent with all variables
+        -:  672:  /// having symbolic samples with integer coefficients.
+        -:  673:  void recordOutput(SymbolicLexMin &result) const;
+        -:  674:
+        -:  675:  /// The symbol domain.
+        -:  676:  IntegerPolyhedron domainPoly;
+        -:  677:  /// Simplex corresponding to the symbol domain.
+        -:  678:  LexSimplex domainSimplex;
+        -:  679:};
+        -:  680:
+        -:  681:/// The Simplex class uses the Normal pivot rule and supports integer emptiness
+        -:  682:/// checks as well as detecting redundancies.
+        -:  683:///
+        -:  684:/// The Simplex class supports redundancy checking via detectRedundant and
+        -:  685:/// isMarkedRedundant. A redundant constraint is one which is never violated as
+        -:  686:/// long as the other constraints are not violated, i.e., removing a redundant
+        -:  687:/// constraint does not change the set of solutions to the constraints. As a
+        -:  688:/// heuristic, constraints that have been marked redundant can be ignored for
+        -:  689:/// most operations. Therefore, these constraints are kept in rows 0 to
+        -:  690:/// nRedundant - 1, where nRedundant is a member variable that tracks the number
+        -:  691:/// of constraints that have been marked redundant.
+        -:  692:///
+        -:  693:/// Finding an integer sample is done with the Generalized Basis Reduction
+        -:  694:/// algorithm. See the documentation for findIntegerSample and reduceBasis.
+    #####:  695:class Simplex : public SimplexBase {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+        -:  696:public:
+        -:  697:  enum class Direction { Up, Down };
+        -:  698:
+        -:  699:  Simplex() = delete;
+    #####:  700:  explicit Simplex(unsigned nVar) : SimplexBase(nVar, /*mustUseBigM=*/false) {}
+call    0 never executed
+function _ZN4mlir10presburger7SimplexC2ERKNS0_15IntegerRelationE called 0 returned 0% blocks executed 0%
+    #####:  701:  explicit Simplex(const IntegerRelation &constraints)
+    #####:  702:      : Simplex(constraints.getNumVars()) {
+call    0 never executed
+    #####:  703:    intersectIntegerRelation(constraints);
+call    0 never executed
+    #####:  704:  }
+    #####:  705:  ~Simplex() override = default;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+------------------
+_ZN4mlir10presburger7SimplexD0Ev:
+function _ZN4mlir10presburger7SimplexD0Ev called 0 returned 0% blocks executed 0%
+    #####:  705:  ~Simplex() override = default;
+call    0 never executed
+call    1 never executed
+------------------
+_ZN4mlir10presburger7SimplexD2Ev:
+function _ZN4mlir10presburger7SimplexD2Ev called 0 returned 0% blocks executed 0%
+    #####:  705:  ~Simplex() override = default;
+call    0 never executed
+------------------
+        -:  706:
+        -:  707:  /// Add an inequality to the tableau. If coeffs is c_0, c_1, ... c_n, where n
+        -:  708:  /// is the current number of variables, then the corresponding inequality is
+        -:  709:  /// c_n + c_0*x_0 + c_1*x_1 + ... + c_{n-1}*x_{n-1} >= 0.
+        -:  710:  ///
+        -:  711:  /// This also tries to restore the tableau configuration to a consistent
+        -:  712:  /// state and marks the Simplex empty if this is not possible.
+        -:  713:  void addInequality(ArrayRef<MPInt> coeffs) final;
+        -:  714:
+        -:  715:  /// Compute the maximum or minimum value of the given row, depending on
+        -:  716:  /// direction. The specified row is never pivoted. On return, the row may
+        -:  717:  /// have a negative sample value if the direction is down.
+        -:  718:  ///
+        -:  719:  /// Returns a Fraction denoting the optimum, or a null value if no optimum
+        -:  720:  /// exists, i.e., if the expression is unbounded in this direction.
+        -:  721:  MaybeOptimum<Fraction> computeRowOptimum(Direction direction, unsigned row);
+        -:  722:
+        -:  723:  /// Compute the maximum or minimum value of the given expression, depending on
+        -:  724:  /// direction. Should not be called when the Simplex is empty.
+        -:  725:  ///
+        -:  726:  /// Returns a Fraction denoting the optimum, or a null value if no optimum
+        -:  727:  /// exists, i.e., if the expression is unbounded in this direction.
+        -:  728:  MaybeOptimum<Fraction> computeOptimum(Direction direction,
+        -:  729:                                        ArrayRef<MPInt> coeffs);
+        -:  730:
+        -:  731:  /// Returns whether the perpendicular of the specified constraint is a
+        -:  732:  /// is a direction along which the polytope is bounded.
+        -:  733:  bool isBoundedAlongConstraint(unsigned constraintIndex);
+        -:  734:
+        -:  735:  /// Returns whether the specified constraint has been marked as redundant.
+        -:  736:  /// Constraints are numbered from 0 starting at the first added inequality.
+        -:  737:  /// Equalities are added as a pair of inequalities and so correspond to two
+        -:  738:  /// inequalities with successive indices.
+        -:  739:  bool isMarkedRedundant(unsigned constraintIndex) const;
+        -:  740:
+        -:  741:  /// Finds a subset of constraints that is redundant, i.e., such that
+        -:  742:  /// the set of solutions does not change if these constraints are removed.
+        -:  743:  /// Marks these constraints as redundant. Whether a specific constraint has
+        -:  744:  /// been marked redundant can be queried using isMarkedRedundant.
+        -:  745:  ///
+        -:  746:  /// The first overload only tries to find redundant constraints with indices
+        -:  747:  /// in the range [offset, offset + count), by scanning constraints from left
+        -:  748:  /// to right in this range. If `count` is not provided, all constraints
+        -:  749:  /// starting at `offset` are scanned, and if neither are provided, all
+        -:  750:  /// constraints are scanned, starting from 0 and going to the last constraint.
+        -:  751:  ///
+        -:  752:  /// As an example, in the set (x) : (x >= 0, x >= 0, x >= 0), calling
+        -:  753:  /// `detectRedundant` with no parameters will result in the first two
+        -:  754:  /// constraints being marked redundant. All copies cannot be marked redundant
+        -:  755:  /// because removing all the constraints changes the set. The first two are
+        -:  756:  /// the ones marked redundant because we scan from left to right. Thus, when
+        -:  757:  /// there is some preference among the constraints as to which should be
+        -:  758:  /// marked redundant with priority when there are multiple possibilities, this
+        -:  759:  /// could be accomplished by succesive calls to detectRedundant(offset,
+        -:  760:  /// count).
+        -:  761:  void detectRedundant(unsigned offset, unsigned count);
+        -:  762:  void detectRedundant(unsigned offset) {
+        -:  763:    assert(offset <= con.size() && "invalid offset!");
+        -:  764:    detectRedundant(offset, con.size() - offset);
+        -:  765:  }
+        -:  766:  void detectRedundant() { detectRedundant(0, con.size()); }
+        -:  767:
+        -:  768:  /// Returns a (min, max) pair denoting the minimum and maximum integer values
+        -:  769:  /// of the given expression. If no integer value exists, both results will be
+        -:  770:  /// of kind Empty.
+        -:  771:  std::pair<MaybeOptimum<MPInt>, MaybeOptimum<MPInt>>
+        -:  772:  computeIntegerBounds(ArrayRef<MPInt> coeffs);
+        -:  773:
+        -:  774:  /// Returns true if the polytope is unbounded, i.e., extends to infinity in
+        -:  775:  /// some direction. Otherwise, returns false.
+        -:  776:  bool isUnbounded();
+        -:  777:
+        -:  778:  /// Make a tableau to represent a pair of points in the given tableaus, one in
+        -:  779:  /// tableau A and one in B.
+        -:  780:  static Simplex makeProduct(const Simplex &a, const Simplex &b);
+        -:  781:
+        -:  782:  /// Returns an integer sample point if one exists, or None
+        -:  783:  /// otherwise. This should only be called for bounded sets.
+        -:  784:  Optional<SmallVector<MPInt, 8>> findIntegerSample();
+        -:  785:
+        -:  786:  enum class IneqType { Redundant, Cut, Separate };
+        -:  787:
+        -:  788:  /// Returns the type of the inequality with coefficients `coeffs`.
+        -:  789:  ///
+        -:  790:  /// Possible types are:
+        -:  791:  /// Redundant   The inequality is satisfied in the polytope
+        -:  792:  /// Cut         The inequality is satisfied by some points, but not by others
+        -:  793:  /// Separate    The inequality is not satisfied by any point
+        -:  794:  IneqType findIneqType(ArrayRef<MPInt> coeffs);
+        -:  795:
+        -:  796:  /// Check if the specified inequality already holds in the polytope.
+        -:  797:  bool isRedundantInequality(ArrayRef<MPInt> coeffs);
+        -:  798:
+        -:  799:  /// Check if the specified equality already holds in the polytope.
+        -:  800:  bool isRedundantEquality(ArrayRef<MPInt> coeffs);
+        -:  801:
+        -:  802:  /// Returns true if this Simplex's polytope is a rational subset of `rel`.
+        -:  803:  /// Otherwise, returns false.
+        -:  804:  bool isRationalSubsetOf(const IntegerRelation &rel);
+        -:  805:
+        -:  806:  /// Returns the current sample point if it is integral. Otherwise, returns
+        -:  807:  /// None.
+        -:  808:  Optional<SmallVector<MPInt, 8>> getSamplePointIfIntegral() const;
+        -:  809:
+        -:  810:  /// Returns the current sample point, which may contain non-integer (rational)
+        -:  811:  /// coordinates. Returns an empty optional when the tableau is empty.
+        -:  812:  Optional<SmallVector<Fraction, 8>> getRationalSample() const;
+        -:  813:
+        -:  814:private:
+        -:  815:  friend class GBRSimplex;
+        -:  816:
+        -:  817:  /// Restore the unknown to a non-negative sample value.
+        -:  818:  ///
+        -:  819:  /// Returns success if the unknown was successfully restored to a non-negative
+        -:  820:  /// sample value, failure otherwise.
+        -:  821:  LogicalResult restoreRow(Unknown &u);
+        -:  822:
+        -:  823:  /// Find a pivot to change the sample value of row in the specified
+        -:  824:  /// direction while preserving tableau consistency, except that if the
+        -:  825:  /// direction is down then the pivot may make the specified row take a
+        -:  826:  /// negative value. The returned pivot row will be row if and only if the
+        -:  827:  /// unknown is unbounded in the specified direction.
+        -:  828:  ///
+        -:  829:  /// Returns a (row, col) pair denoting a pivot, or an empty Optional if
+        -:  830:  /// no valid pivot exists.
+        -:  831:  Optional<Pivot> findPivot(int row, Direction direction) const;
+        -:  832:
+        -:  833:  /// Find a row that can be used to pivot the column in the specified
+        -:  834:  /// direction. If skipRow is not null, then this row is excluded
+        -:  835:  /// from consideration. The returned pivot will maintain all constraints
+        -:  836:  /// except the column itself and skipRow, if it is set. (if these unknowns
+        -:  837:  /// are restricted).
+        -:  838:  ///
+        -:  839:  /// Returns the row to pivot to, or an empty Optional if the column
+        -:  840:  /// is unbounded in the specified direction.
+        -:  841:  Optional<unsigned> findPivotRow(Optional<unsigned> skipRow,
+        -:  842:                                  Direction direction, unsigned col) const;
+        -:  843:
+        -:  844:  /// Undo the addition of the last constraint while preserving tableau
+        -:  845:  /// consistency.
+        -:  846:  void undoLastConstraint() final;
+        -:  847:
+        -:  848:  /// Compute the maximum or minimum of the specified Unknown, depending on
+        -:  849:  /// direction. The specified unknown may be pivoted. If the unknown is
+        -:  850:  /// restricted, it will have a non-negative sample value on return.
+        -:  851:  /// Should not be called if the Simplex is empty.
+        -:  852:  ///
+        -:  853:  /// Returns a Fraction denoting the optimum, or a null value if no optimum
+        -:  854:  /// exists, i.e., if the expression is unbounded in this direction.
+        -:  855:  MaybeOptimum<Fraction> computeOptimum(Direction direction, Unknown &u);
+        -:  856:
+        -:  857:  /// Mark the specified unknown redundant. This operation is added to the undo
+        -:  858:  /// log and will be undone by rollbacks. The specified unknown must be in row
+        -:  859:  /// orientation.
+        -:  860:  void markRowRedundant(Unknown &u);
+        -:  861:
+        -:  862:  /// Reduce the given basis, starting at the specified level, using general
+        -:  863:  /// basis reduction.
+        -:  864:  void reduceBasis(Matrix &basis, unsigned level);
+        -:  865:};
+        -:  866:
+        -:  867:/// Takes a snapshot of the simplex state on construction and rolls back to the
+        -:  868:/// snapshot on destruction.
+        -:  869:///
+        -:  870:/// Useful for performing operations in a "transient context", all changes from
+        -:  871:/// which get rolled back on scope exit.
+        -:  872:class SimplexRollbackScopeExit {
+        -:  873:public:
+    #####:  874:  SimplexRollbackScopeExit(SimplexBase &simplex) : simplex(simplex) {
+    #####:  875:    snapshot = simplex.getSnapshot();
+call    0 never executed
+call    1 never executed
+        -:  876:  };
+    #####:  877:  ~SimplexRollbackScopeExit() { simplex.rollback(snapshot); }
+call    0 never executed
+        -:  878:
+        -:  879:private:
+        -:  880:  SimplexBase &simplex;
+        -:  881:  unsigned snapshot;
+        -:  882:};
+        -:  883:
+        -:  884:} // namespace presburger
+        -:  885:} // namespace mlir
+        -:  886:
+        -:  887:#endif // MLIR_ANALYSIS_PRESBURGER_SIMPLEX_H

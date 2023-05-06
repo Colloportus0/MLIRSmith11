@@ -1,0 +1,1729 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/llvm/include/llvm/Support/Error.h
+        -:    0:Graph:../tools/mlir/lib/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMDialect.dir/IR/LLVMDialect.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/LLVMIR/CMakeFiles/obj.MLIRLLVMDialect.dir/IR/LLVMDialect.cpp.gcda
+        -:    0:Runs:116159
+        -:    1://===- llvm/Support/Error.h - Recoverable error handling --------*- C++ -*-===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file defines an API used to report recoverable errors.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#ifndef LLVM_SUPPORT_ERROR_H
+        -:   14:#define LLVM_SUPPORT_ERROR_H
+        -:   15:
+        -:   16:#include "llvm-c/Error.h"
+        -:   17:#include "llvm/ADT/SmallVector.h"
+        -:   18:#include "llvm/ADT/StringExtras.h"
+        -:   19:#include "llvm/ADT/Twine.h"
+        -:   20:#include "llvm/Config/abi-breaking.h"
+        -:   21:#include "llvm/Support/AlignOf.h"
+        -:   22:#include "llvm/Support/Compiler.h"
+        -:   23:#include "llvm/Support/Debug.h"
+        -:   24:#include "llvm/Support/ErrorHandling.h"
+        -:   25:#include "llvm/Support/ErrorOr.h"
+        -:   26:#include "llvm/Support/Format.h"
+        -:   27:#include "llvm/Support/raw_ostream.h"
+        -:   28:#include <cassert>
+        -:   29:#include <cstdint>
+        -:   30:#include <cstdlib>
+        -:   31:#include <functional>
+        -:   32:#include <memory>
+        -:   33:#include <new>
+        -:   34:#include <string>
+        -:   35:#include <system_error>
+        -:   36:#include <type_traits>
+        -:   37:#include <utility>
+        -:   38:#include <vector>
+        -:   39:
+        -:   40:namespace llvm {
+        -:   41:
+        -:   42:class ErrorSuccess;
+        -:   43:
+        -:   44:/// Base class for error info classes. Do not extend this directly: Extend
+        -:   45:/// the ErrorInfo template subclass instead.
+    #####:   46:class ErrorInfoBase {
+        -:   47:public:
+        -:   48:  virtual ~ErrorInfoBase() = default;
+        -:   49:
+        -:   50:  /// Print an error message to an output stream.
+        -:   51:  virtual void log(raw_ostream &OS) const = 0;
+        -:   52:
+        -:   53:  /// Return the error message as a string.
+function _ZNK4llvm13ErrorInfoBase7messageB5cxx11Ev called 0 returned 0% blocks executed 0%
+    #####:   54:  virtual std::string message() const {
+    #####:   55:    std::string Msg;
+call    0 never executed
+    #####:   56:    raw_string_ostream OS(Msg);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   57:    log(OS);
+call    0 never executed
+    #####:   58:    return OS.str();
+call    0 never executed
+call    1 never executed
+        -:   59:  }
+        -:   60:
+        -:   61:  /// Convert this error to a std::error_code.
+        -:   62:  ///
+        -:   63:  /// This is a temporary crutch to enable interaction with code still
+        -:   64:  /// using std::error_code. It will be removed in the future.
+        -:   65:  virtual std::error_code convertToErrorCode() const = 0;
+        -:   66:
+        -:   67:  // Returns the class ID for this type.
+    #####:   68:  static const void *classID() { return &ID; }
+        -:   69:
+        -:   70:  // Returns the class ID for the dynamic type of this ErrorInfoBase instance.
+        -:   71:  virtual const void *dynamicClassID() const = 0;
+        -:   72:
+        -:   73:  // Check whether this instance is a subclass of the class identified by
+        -:   74:  // ClassID.
+function _ZNK4llvm13ErrorInfoBase3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:   75:  virtual bool isA(const void *const ClassID) const {
+    #####:   76:    return ClassID == classID();
+        -:   77:  }
+        -:   78:
+        -:   79:  // Check whether this instance is a subclass of ErrorInfoT.
+    #####:   80:  template <typename ErrorInfoT> bool isA() const {
+    #####:   81:    return isA(ErrorInfoT::classID());
+        -:   82:  }
+        -:   83:
+        -:   84:private:
+        -:   85:  virtual void anchor();
+        -:   86:
+        -:   87:  static char ID;
+        -:   88:};
+        -:   89:
+        -:   90:/// Lightweight error class with error context and mandatory checking.
+        -:   91:///
+        -:   92:/// Instances of this class wrap a ErrorInfoBase pointer. Failure states
+        -:   93:/// are represented by setting the pointer to a ErrorInfoBase subclass
+        -:   94:/// instance containing information describing the failure. Success is
+        -:   95:/// represented by a null pointer value.
+        -:   96:///
+        -:   97:/// Instances of Error also contains a 'Checked' flag, which must be set
+        -:   98:/// before the destructor is called, otherwise the destructor will trigger a
+        -:   99:/// runtime error. This enforces at runtime the requirement that all Error
+        -:  100:/// instances be checked or returned to the caller.
+        -:  101:///
+        -:  102:/// There are two ways to set the checked flag, depending on what state the
+        -:  103:/// Error instance is in. For Error instances indicating success, it
+        -:  104:/// is sufficient to invoke the boolean conversion operator. E.g.:
+        -:  105:///
+        -:  106:///   @code{.cpp}
+        -:  107:///   Error foo(<...>);
+        -:  108:///
+        -:  109:///   if (auto E = foo(<...>))
+        -:  110:///     return E; // <- Return E if it is in the error state.
+        -:  111:///   // We have verified that E was in the success state. It can now be safely
+        -:  112:///   // destroyed.
+        -:  113:///   @endcode
+        -:  114:///
+        -:  115:/// A success value *can not* be dropped. For example, just calling 'foo(<...>)'
+        -:  116:/// without testing the return value will raise a runtime error, even if foo
+        -:  117:/// returns success.
+        -:  118:///
+        -:  119:/// For Error instances representing failure, you must use either the
+        -:  120:/// handleErrors or handleAllErrors function with a typed handler. E.g.:
+        -:  121:///
+        -:  122:///   @code{.cpp}
+        -:  123:///   class MyErrorInfo : public ErrorInfo<MyErrorInfo> {
+        -:  124:///     // Custom error info.
+        -:  125:///   };
+        -:  126:///
+        -:  127:///   Error foo(<...>) { return make_error<MyErrorInfo>(...); }
+        -:  128:///
+        -:  129:///   auto E = foo(<...>); // <- foo returns failure with MyErrorInfo.
+        -:  130:///   auto NewE =
+        -:  131:///     handleErrors(E,
+        -:  132:///       [](const MyErrorInfo &M) {
+        -:  133:///         // Deal with the error.
+        -:  134:///       },
+        -:  135:///       [](std::unique_ptr<OtherError> M) -> Error {
+        -:  136:///         if (canHandle(*M)) {
+        -:  137:///           // handle error.
+        -:  138:///           return Error::success();
+        -:  139:///         }
+        -:  140:///         // Couldn't handle this error instance. Pass it up the stack.
+        -:  141:///         return Error(std::move(M));
+        -:  142:///       );
+        -:  143:///   // Note - we must check or return NewE in case any of the handlers
+        -:  144:///   // returned a new error.
+        -:  145:///   @endcode
+        -:  146:///
+        -:  147:/// The handleAllErrors function is identical to handleErrors, except
+        -:  148:/// that it has a void return type, and requires all errors to be handled and
+        -:  149:/// no new errors be returned. It prevents errors (assuming they can all be
+        -:  150:/// handled) from having to be bubbled all the way to the top-level.
+        -:  151:///
+        -:  152:/// *All* Error instances must be checked before destruction, even if
+        -:  153:/// they're moved-assigned or constructed from Success values that have already
+        -:  154:/// been checked. This enforces checking through all levels of the call stack.
+        -:  155:class [[nodiscard]] Error {
+        -:  156:  // ErrorList needs to be able to yank ErrorInfoBase pointers out of Errors
+        -:  157:  // to add to the error list. It can't rely on handleErrors for this, since
+        -:  158:  // handleErrors does not support ErrorList handlers.
+        -:  159:  friend class ErrorList;
+        -:  160:
+        -:  161:  // handleErrors needs to be able to set the Checked flag.
+        -:  162:  template <typename... HandlerTs>
+        -:  163:  friend Error handleErrors(Error E, HandlerTs &&... Handlers);
+        -:  164:
+        -:  165:  // Expected<T> needs to be able to steal the payload when constructed from an
+        -:  166:  // error.
+        -:  167:  template <typename T> friend class Expected;
+        -:  168:
+        -:  169:  // wrap needs to be able to steal the payload.
+        -:  170:  friend LLVMErrorRef wrap(Error);
+        -:  171:
+        -:  172:protected:
+        -:  173:  /// Create a success value. Prefer using 'Error::success()' for readability
+ 2668583*:  174:  Error() {
+ 2668583*:  175:    setPtr(nullptr);
+ 2668583*:  176:    setChecked(false);
+        -:  177:  }
+        -:  178:
+        -:  179:public:
+        -:  180:  /// Create a success value.
+        -:  181:  static ErrorSuccess success();
+        -:  182:
+        -:  183:  // Errors are not copy-constructable.
+        -:  184:  Error(const Error &Other) = delete;
+        -:  185:
+        -:  186:  /// Move-construct an error value. The newly constructed error is considered
+        -:  187:  /// unchecked, even if the source error had been checked. The original error
+        -:  188:  /// becomes a checked Success value, regardless of its original state.
+ 2668587*:  189:  Error(Error &&Other) {
+ 2668587*:  190:    setChecked(true);
+ 5337174*:  191:    *this = std::move(Other);
+    #####:  192:  }
+        -:  193:
+        -:  194:  /// Create an error value. Prefer using the 'make_error' function, but
+        -:  195:  /// this constructor can be useful when "re-throwing" errors from handlers.
+    #####:  196:  Error(std::unique_ptr<ErrorInfoBase> Payload) {
+    #####:  197:    setPtr(Payload.release());
+    #####:  198:    setChecked(false);
+        -:  199:  }
+        -:  200:
+        -:  201:  // Errors are not copy-assignable.
+        -:  202:  Error &operator=(const Error &Other) = delete;
+        -:  203:
+        -:  204:  /// Move-assign an error value. The current error must represent success, you
+        -:  205:  /// you cannot overwrite an unhandled error. The current error is then
+        -:  206:  /// considered unchecked. The source error becomes a checked success value,
+        -:  207:  /// regardless of its original state.
+ 2668587*:  208:  Error &operator=(Error &&Other) {
+        -:  209:    // Don't allow overwriting of unchecked values.
+ 2668583*:  210:    assertIsChecked();
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 returned 100%
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+ 2668587*:  211:    setPtr(Other.getPtr());
+        -:  212:
+        -:  213:    // This Error is unchecked, even if the source error was checked.
+ 2668587*:  214:    setChecked(false);
+        -:  215:
+        -:  216:    // Null out Other's payload and set its checked bit.
+ 2668587*:  217:    Other.setPtr(nullptr);
+ 2668587*:  218:    Other.setChecked(true);
+        -:  219:
+ 2668587*:  220:    return *this;
+        -:  221:  }
+        -:  222:
+        -:  223:  /// Destroy a Error. Fails with a call to abort() if the error is
+        -:  224:  /// unchecked.
+function _ZN4llvm5ErrorD2Ev called 2668583 returned 100% blocks executed 75%
+  5337167:  225:  ~Error() {
+  2668583:  226:    assertIsChecked();
+call    0 returned 100%
+    #####:  227:    delete getPtr();
+call    0 never executed
+  2668584:  228:  }
+        -:  229:
+        -:  230:  /// Bool conversion. Returns true if this Error is in a failure state,
+        -:  231:  /// and false if it is in an accept state. If the error is in a Success state
+        -:  232:  /// it will be considered checked.
+ 2668584*:  233:  explicit operator bool() {
+ 5337168*:  234:    setChecked(getPtr() == nullptr);
+ 2668584*:  235:    return getPtr() != nullptr;
+        -:  236:  }
+        -:  237:
+        -:  238:  /// Check whether one error is a subclass of another.
+    #####:  239:  template <typename ErrT> bool isA() const {
+    #####:  240:    return getPtr() && getPtr()->isA(ErrT::classID());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  241:  }
+        -:  242:
+        -:  243:  /// Returns the dynamic class id of this error, or null if this is a success
+        -:  244:  /// value.
+        -:  245:  const void* dynamicClassID() const {
+        -:  246:    if (!getPtr())
+        -:  247:      return nullptr;
+        -:  248:    return getPtr()->dynamicClassID();
+        -:  249:  }
+        -:  250:
+        -:  251:private:
+        -:  252:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  253:  // assertIsChecked() happens very frequently, but under normal circumstances
+        -:  254:  // is supposed to be a no-op.  So we want it to be inlined, but having a bunch
+        -:  255:  // of debug prints can cause the function to be too large for inlining.  So
+        -:  256:  // it's important that we define this function out of line so that it can't be
+        -:  257:  // inlined.
+        -:  258:  [[noreturn]] void fatalUncheckedError() const;
+        -:  259:#endif
+        -:  260:
+function _ZN4llvm5Error15assertIsCheckedEv called 5337176 returned 100% blocks executed 75%
+  5337176:  261:  void assertIsChecked() {
+        -:  262:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+ 10674352:  263:    if (LLVM_UNLIKELY(!getChecked() || getPtr()))
+    #####:  264:      fatalUncheckedError();
+call    0 never executed
+        -:  265:#endif
+  5337176:  266:  }
+        -:  267:
+16011515*:  268:  ErrorInfoBase *getPtr() const {
+        -:  269:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+16011515*:  270:    return reinterpret_cast<ErrorInfoBase*>(
+ 5337176*:  271:             reinterpret_cast<uintptr_t>(Payload) &
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+ 2668584*:  272:             ~static_cast<uintptr_t>(0x1));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  273:#else
+        -:  274:    return Payload;
+        -:  275:#endif
+        -:  276:  }
+        -:  277:
+ 5337170*:  278:  void setPtr(ErrorInfoBase *EI) {
+        -:  279:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+ 5337170*:  280:    Payload = reinterpret_cast<ErrorInfoBase*>(
+    #####:  281:                (reinterpret_cast<uintptr_t>(EI) &
+    #####:  282:                 ~static_cast<uintptr_t>(0x1)) |
+    #####:  283:                (reinterpret_cast<uintptr_t>(Payload) & 0x1));
+        -:  284:#else
+        -:  285:    Payload = EI;
+        -:  286:#endif
+        -:  287:  }
+        -:  288:
+  5337176:  289:  bool getChecked() const {
+        -:  290:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+  5337176:  291:    return (reinterpret_cast<uintptr_t>(Payload) & 0x1) == 0;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  292:#else
+        -:  293:    return true;
+        -:  294:#endif
+        -:  295:  }
+        -:  296:
+ 8005758*:  297:  void setChecked(bool V) {
+        -:  298:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+ 2668587*:  299:    Payload = reinterpret_cast<ErrorInfoBase*>(
+call    0 never executed
+call    1 returned 100%
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 returned 100%
+call    6 never executed
+    #####:  300:                (reinterpret_cast<uintptr_t>(Payload) &
+ 2668588*:  301:                  ~static_cast<uintptr_t>(0x1)) |
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+ 2668584*:  302:                  (V ? 0 : 1));
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+        -:  303:#endif
+        -:  304:  }
+        -:  305:
+    #####:  306:  std::unique_ptr<ErrorInfoBase> takePayload() {
+    #####:  307:    std::unique_ptr<ErrorInfoBase> Tmp(getPtr());
+call    0 never executed
+    #####:  308:    setPtr(nullptr);
+    #####:  309:    setChecked(true);
+    #####:  310:    return Tmp;
+call    0 never executed
+call    1 never executed
+        -:  311:  }
+        -:  312:
+function _ZN4llvmlsERNS_11raw_ostreamERKNS_5ErrorE called 0 returned 0% blocks executed 0%
+    #####:  313:  friend raw_ostream &operator<<(raw_ostream &OS, const Error &E) {
+    #####:  314:    if (auto *P = E.getPtr())
+branch  0 never executed
+branch  1 never executed
+    #####:  315:      P->log(OS);
+call    0 never executed
+        -:  316:    else
+    #####:  317:      OS << "success";
+call    0 never executed
+    #####:  318:    return OS;
+        -:  319:  }
+        -:  320:
+        -:  321:  ErrorInfoBase *Payload = nullptr;
+        -:  322:};
+        -:  323:
+        -:  324:/// Subclass of Error for the sole purpose of identifying the success path in
+        -:  325:/// the type system. This allows to catch invalid conversion to Expected<T> at
+        -:  326:/// compile time.
+ 2668583*:  327:class ErrorSuccess final : public Error {};
+call    0 never executed
+call    1 returned 100%
+        -:  328:
+ 2668583*:  329:inline ErrorSuccess Error::success() { return ErrorSuccess(); }
+call    0 never executed
+call    1 returned 100%
+        -:  330:
+        -:  331:/// Make a Error instance representing failure using the given error info
+        -:  332:/// type.
+    #####:  333:template <typename ErrT, typename... ArgTs> Error make_error(ArgTs &&... Args) {
+call    0 never executed
+call    1 never executed
+    #####:  334:  return Error(std::make_unique<ErrT>(std::forward<ArgTs>(Args)...));
+call    0 never executed
+call    1 never executed
+        -:  335:}
+        -:  336:
+        -:  337:/// Base class for user error types. Users should declare their error types
+        -:  338:/// like:
+        -:  339:///
+        -:  340:/// class MyError : public ErrorInfo<MyError> {
+        -:  341:///   ....
+        -:  342:/// };
+        -:  343:///
+        -:  344:/// This class provides an implementation of the ErrorInfoBase::kind
+        -:  345:/// method, which is used by the Error RTTI system.
+        -:  346:template <typename ThisErrT, typename ParentErrT = ErrorInfoBase>
+    #####:  347:class ErrorInfo : public ParentErrT {
+        -:  348:public:
+    #####:  349:  using ParentErrT::ParentErrT; // inherit constructors
+        -:  350:
+    #####:  351:  static const void *classID() { return &ThisErrT::ID; }
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  352:
+    #####:  353:  const void *dynamicClassID() const override { return &ThisErrT::ID; }
+------------------
+_ZNK4llvm9ErrorInfoIN12_GLOBAL__N_123GEPIndexOutOfBoundErrorENS1_13GEPIndexErrorEE14dynamicClassIDEv:
+function _ZNK4llvm9ErrorInfoIN12_GLOBAL__N_123GEPIndexOutOfBoundErrorENS1_13GEPIndexErrorEE14dynamicClassIDEv called 0 returned 0% blocks executed 0%
+    #####:  353:  const void *dynamicClassID() const override { return &ThisErrT::ID; }
+------------------
+_ZNK4llvm9ErrorInfoIN12_GLOBAL__N_119GEPStaticIndexErrorENS1_13GEPIndexErrorEE14dynamicClassIDEv:
+function _ZNK4llvm9ErrorInfoIN12_GLOBAL__N_119GEPStaticIndexErrorENS1_13GEPIndexErrorEE14dynamicClassIDEv called 0 returned 0% blocks executed 0%
+    #####:  353:  const void *dynamicClassID() const override { return &ThisErrT::ID; }
+------------------
+        -:  354:
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+        -:  357:  }
+------------------
+_ZNK4llvm9ErrorInfoINS_9ErrorListENS_13ErrorInfoBaseEE3isAEPKv:
+function _ZNK4llvm9ErrorInfoINS_9ErrorListENS_13ErrorInfoBaseEE3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  357:  }
+------------------
+_ZNK4llvm9ErrorInfoINS_7ECErrorENS_13ErrorInfoBaseEE3isAEPKv:
+function _ZNK4llvm9ErrorInfoINS_7ECErrorENS_13ErrorInfoBaseEE3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  357:  }
+------------------
+_ZNK4llvm9ErrorInfoINS_9FileErrorENS_13ErrorInfoBaseEE3isAEPKv:
+function _ZNK4llvm9ErrorInfoINS_9FileErrorENS_13ErrorInfoBaseEE3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  357:  }
+------------------
+_ZNK4llvm9ErrorInfoIN12_GLOBAL__N_123GEPIndexOutOfBoundErrorENS1_13GEPIndexErrorEE3isAEPKv:
+function _ZNK4llvm9ErrorInfoIN12_GLOBAL__N_123GEPIndexOutOfBoundErrorENS1_13GEPIndexErrorEE3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  357:  }
+------------------
+_ZNK4llvm9ErrorInfoIN12_GLOBAL__N_119GEPStaticIndexErrorENS1_13GEPIndexErrorEE3isAEPKv:
+function _ZNK4llvm9ErrorInfoIN12_GLOBAL__N_119GEPStaticIndexErrorENS1_13GEPIndexErrorEE3isAEPKv called 0 returned 0% blocks executed 0%
+    #####:  355:  bool isA(const void *const ClassID) const override {
+    #####:  356:    return ClassID == classID() || ParentErrT::isA(ClassID);
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  357:  }
+------------------
+        -:  358:};
+        -:  359:
+        -:  360:/// Special ErrorInfo subclass representing a list of ErrorInfos.
+        -:  361:/// Instances of this class are constructed by joinError.
+        -:  362:class ErrorList final : public ErrorInfo<ErrorList> {
+        -:  363:  // handleErrors needs to be able to iterate the payload list of an
+        -:  364:  // ErrorList.
+        -:  365:  template <typename... HandlerTs>
+        -:  366:  friend Error handleErrors(Error E, HandlerTs &&... Handlers);
+        -:  367:
+        -:  368:  // joinErrors is implemented in terms of join.
+        -:  369:  friend Error joinErrors(Error, Error);
+        -:  370:
+        -:  371:public:
+function _ZNK4llvm9ErrorList3logERNS_11raw_ostreamE called 0 returned 0% blocks executed 0%
+    #####:  372:  void log(raw_ostream &OS) const override {
+    #####:  373:    OS << "Multiple errors:\n";
+call    0 never executed
+    #####:  374:    for (const auto &ErrPayload : Payloads) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  375:      ErrPayload->log(OS);
+call    0 never executed
+    #####:  376:      OS << "\n";
+call    0 never executed
+        -:  377:    }
+    #####:  378:  }
+        -:  379:
+        -:  380:  std::error_code convertToErrorCode() const override;
+        -:  381:
+        -:  382:  // Used by ErrorInfo::classID.
+        -:  383:  static char ID;
+        -:  384:
+        -:  385:private:
+function _ZN4llvm9ErrorListC2ESt10unique_ptrINS_13ErrorInfoBaseESt14default_deleteIS2_EES5_ called 0 returned 0% blocks executed 0%
+    #####:  386:  ErrorList(std::unique_ptr<ErrorInfoBase> Payload1,
+    #####:  387:            std::unique_ptr<ErrorInfoBase> Payload2) {
+call    0 never executed
+    #####:  388:    assert(!Payload1->isA<ErrorList>() && !Payload2->isA<ErrorList>() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+branch  4 never executed
+branch  5 never executed
+call    6 never executed
+        -:  389:           "ErrorList constructor payloads should be singleton errors");
+    #####:  390:    Payloads.push_back(std::move(Payload1));
+call    0 never executed
+    #####:  391:    Payloads.push_back(std::move(Payload2));
+call    0 never executed
+    #####:  392:  }
+        -:  393:
+function _ZN4llvm9ErrorList4joinENS_5ErrorES1_ called 0 returned 0% blocks executed 0%
+    #####:  394:  static Error join(Error E1, Error E2) {
+    #####:  395:    if (!E1)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  396:      return E2;
+call    0 never executed
+    #####:  397:    if (!E2)
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  398:      return E1;
+call    0 never executed
+    #####:  399:    if (E1.isA<ErrorList>()) {
+call    0 never executed
+    #####:  400:      auto &E1List = static_cast<ErrorList &>(*E1.getPtr());
+    #####:  401:      if (E2.isA<ErrorList>()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  402:        auto E2Payload = E2.takePayload();
+call    0 never executed
+    #####:  403:        auto &E2List = static_cast<ErrorList &>(*E2Payload);
+    #####:  404:        for (auto &Payload : E2List.Payloads)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  405:          E1List.Payloads.push_back(std::move(Payload));
+call    0 never executed
+        -:  406:      } else
+    #####:  407:        E1List.Payloads.push_back(E2.takePayload());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  408:
+    #####:  409:      return E1;
+call    0 never executed
+        -:  410:    }
+    #####:  411:    if (E2.isA<ErrorList>()) {
+branch  0 never executed
+branch  1 never executed
+    #####:  412:      auto &E2List = static_cast<ErrorList &>(*E2.getPtr());
+    #####:  413:      E2List.Payloads.insert(E2List.Payloads.begin(), E1.takePayload());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  414:      return E2;
+call    0 never executed
+        -:  415:    }
+    #####:  416:    return Error(std::unique_ptr<ErrorList>(
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  417:        new ErrorList(E1.takePayload(), E2.takePayload())));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+        -:  418:  }
+        -:  419:
+        -:  420:  std::vector<std::unique_ptr<ErrorInfoBase>> Payloads;
+        -:  421:};
+        -:  422:
+        -:  423:/// Concatenate errors. The resulting Error is unchecked, and contains the
+        -:  424:/// ErrorInfo(s), if any, contained in E1, followed by the
+        -:  425:/// ErrorInfo(s), if any, contained in E2.
+        -:  426:inline Error joinErrors(Error E1, Error E2) {
+        -:  427:  return ErrorList::join(std::move(E1), std::move(E2));
+        -:  428:}
+        -:  429:
+        -:  430:/// Tagged union holding either a T or a Error.
+        -:  431:///
+        -:  432:/// This class parallels ErrorOr, but replaces error_code with Error. Since
+        -:  433:/// Error cannot be copied, this class replaces getError() with
+        -:  434:/// takeError(). It also adds an bool errorIsA<ErrT>() method for testing the
+        -:  435:/// error class type.
+        -:  436:///
+        -:  437:/// Example usage of 'Expected<T>' as a function return type:
+        -:  438:///
+        -:  439:///   @code{.cpp}
+        -:  440:///     Expected<int> myDivide(int A, int B) {
+        -:  441:///       if (B == 0) {
+        -:  442:///         // return an Error
+        -:  443:///         return createStringError(inconvertibleErrorCode(),
+        -:  444:///                                  "B must not be zero!");
+        -:  445:///       }
+        -:  446:///       // return an integer
+        -:  447:///       return A / B;
+        -:  448:///     }
+        -:  449:///   @endcode
+        -:  450:///
+        -:  451:///   Checking the results of to a function returning 'Expected<T>':
+        -:  452:///   @code{.cpp}
+        -:  453:///     if (auto E = Result.takeError()) {
+        -:  454:///       // We must consume the error. Typically one of:
+        -:  455:///       // - return the error to our caller
+        -:  456:///       // - toString(), when logging
+        -:  457:///       // - consumeError(), to silently swallow the error
+        -:  458:///       // - handleErrors(), to distinguish error types
+        -:  459:///       errs() << "Problem with division " << toString(std::move(E)) << "\n";
+        -:  460:///       return;
+        -:  461:///     }
+        -:  462:///     // use the result
+        -:  463:///     outs() << "The answer is " << *Result << "\n";
+        -:  464:///   @endcode
+        -:  465:///
+        -:  466:///  For unit-testing a function returning an 'Expected<T>', see the
+        -:  467:///  'EXPECT_THAT_EXPECTED' macros in llvm/Testing/Support/Error.h
+        -:  468:
+        -:  469:template <class T> class [[nodiscard]] Expected {
+        -:  470:  template <class T1> friend class ExpectedAsOutParameter;
+        -:  471:  template <class OtherT> friend class Expected;
+        -:  472:
+        -:  473:  static constexpr bool isRef = std::is_reference<T>::value;
+        -:  474:
+        -:  475:  using wrap = std::reference_wrapper<std::remove_reference_t<T>>;
+        -:  476:
+        -:  477:  using error_type = std::unique_ptr<ErrorInfoBase>;
+        -:  478:
+        -:  479:public:
+        -:  480:  using storage_type = std::conditional_t<isRef, wrap, T>;
+        -:  481:  using value_type = T;
+        -:  482:
+        -:  483:private:
+        -:  484:  using reference = std::remove_reference_t<T> &;
+        -:  485:  using const_reference = const std::remove_reference_t<T> &;
+        -:  486:  using pointer = std::remove_reference_t<T> *;
+        -:  487:  using const_pointer = const std::remove_reference_t<T> *;
+        -:  488:
+        -:  489:public:
+        -:  490:  /// Create an Expected<T> error value from the given Error.
+        -:  491:  Expected(Error Err)
+        -:  492:      : HasError(true)
+        -:  493:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  494:        // Expected is unchecked upon construction in Debug builds.
+        -:  495:        , Unchecked(true)
+        -:  496:#endif
+        -:  497:  {
+        -:  498:    assert(Err && "Cannot create Expected<T> from Error success value.");
+        -:  499:    new (getErrorStorage()) error_type(Err.takePayload());
+        -:  500:  }
+        -:  501:
+        -:  502:  /// Forbid to convert from Error::success() implicitly, this avoids having
+        -:  503:  /// Expected<T> foo() { return Error::success(); } which compiles otherwise
+        -:  504:  /// but triggers the assertion above.
+        -:  505:  Expected(ErrorSuccess) = delete;
+        -:  506:
+        -:  507:  /// Create an Expected<T> success value from the given OtherT value, which
+        -:  508:  /// must be convertible to T.
+        -:  509:  template <typename OtherT>
+        -:  510:  Expected(OtherT &&Val,
+        -:  511:           std::enable_if_t<std::is_convertible<OtherT, T>::value> * = nullptr)
+        -:  512:      : HasError(false)
+        -:  513:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  514:        // Expected is unchecked upon construction in Debug builds.
+        -:  515:        ,
+        -:  516:        Unchecked(true)
+        -:  517:#endif
+        -:  518:  {
+        -:  519:    new (getStorage()) storage_type(std::forward<OtherT>(Val));
+        -:  520:  }
+        -:  521:
+        -:  522:  /// Move construct an Expected<T> value.
+        -:  523:  Expected(Expected &&Other) { moveConstruct(std::move(Other)); }
+        -:  524:
+        -:  525:  /// Move construct an Expected<T> value from an Expected<OtherT>, where OtherT
+        -:  526:  /// must be convertible to T.
+        -:  527:  template <class OtherT>
+        -:  528:  Expected(
+        -:  529:      Expected<OtherT> &&Other,
+        -:  530:      std::enable_if_t<std::is_convertible<OtherT, T>::value> * = nullptr) {
+        -:  531:    moveConstruct(std::move(Other));
+        -:  532:  }
+        -:  533:
+        -:  534:  /// Move construct an Expected<T> value from an Expected<OtherT>, where OtherT
+        -:  535:  /// isn't convertible to T.
+        -:  536:  template <class OtherT>
+        -:  537:  explicit Expected(
+        -:  538:      Expected<OtherT> &&Other,
+        -:  539:      std::enable_if_t<!std::is_convertible<OtherT, T>::value> * = nullptr) {
+        -:  540:    moveConstruct(std::move(Other));
+        -:  541:  }
+        -:  542:
+        -:  543:  /// Move-assign from another Expected<T>.
+        -:  544:  Expected &operator=(Expected &&Other) {
+        -:  545:    moveAssign(std::move(Other));
+        -:  546:    return *this;
+        -:  547:  }
+        -:  548:
+        -:  549:  /// Destroy an Expected<T>.
+function _ZN4llvm8ExpectedINS_10DataLayoutEED2Ev called 936 returned 100% blocks executed 44%
+      936:  550:  ~Expected() {
+      936:  551:    assertIsChecked();
+      936:  552:    if (!HasError)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+      936:  553:      getStorage()->~storage_type();
+        -:  554:    else
+     936*:  555:      getErrorStorage()->~error_type();
+      936:  556:  }
+        -:  557:
+        -:  558:  /// Return false if there is an error.
+      936:  559:  explicit operator bool() {
+        -:  560:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+      936:  561:    Unchecked = HasError;
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  562:#endif
+        -:  563:    return !HasError;
+        -:  564:  }
+        -:  565:
+        -:  566:  /// Returns a reference to the stored T value.
+        -:  567:  reference get() {
+        -:  568:    assertIsChecked();
+        -:  569:    return *getStorage();
+        -:  570:  }
+        -:  571:
+        -:  572:  /// Returns a const reference to the stored T value.
+        -:  573:  const_reference get() const {
+        -:  574:    assertIsChecked();
+        -:  575:    return const_cast<Expected<T> *>(this)->get();
+        -:  576:  }
+        -:  577:
+        -:  578:  /// Returns \a takeError() after moving the held T (if any) into \p V.
+        -:  579:  template <class OtherT>
+        -:  580:  Error moveInto(OtherT &Value,
+        -:  581:                 std::enable_if_t<std::is_assignable<OtherT &, T &&>::value> * =
+        -:  582:                     nullptr) && {
+        -:  583:    if (*this)
+        -:  584:      Value = std::move(get());
+        -:  585:    return takeError();
+        -:  586:  }
+        -:  587:
+        -:  588:  /// Check that this Expected<T> is an error of type ErrT.
+        -:  589:  template <typename ErrT> bool errorIsA() const {
+        -:  590:    return HasError && (*getErrorStorage())->template isA<ErrT>();
+        -:  591:  }
+        -:  592:
+        -:  593:  /// Take ownership of the stored error.
+        -:  594:  /// After calling this the Expected<T> is in an indeterminate state that can
+        -:  595:  /// only be safely destructed. No further calls (beside the destructor) should
+        -:  596:  /// be made on the Expected<T> value.
+function _ZN4llvm8ExpectedINS_10DataLayoutEE9takeErrorEv called 0 returned 0% blocks executed 0%
+    #####:  597:  Error takeError() {
+        -:  598:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    #####:  599:    Unchecked = false;
+        -:  600:#endif
+    #####:  601:    return HasError ? Error(std::move(*getErrorStorage())) : Error::success();
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+call    3 never executed
+        -:  602:  }
+        -:  603:
+        -:  604:  /// Returns a pointer to the stored T value.
+        -:  605:  pointer operator->() {
+        -:  606:    assertIsChecked();
+        -:  607:    return toPointer(getStorage());
+        -:  608:  }
+        -:  609:
+        -:  610:  /// Returns a const pointer to the stored T value.
+        -:  611:  const_pointer operator->() const {
+        -:  612:    assertIsChecked();
+        -:  613:    return toPointer(getStorage());
+        -:  614:  }
+        -:  615:
+        -:  616:  /// Returns a reference to the stored T value.
+        -:  617:  reference operator*() {
+        -:  618:    assertIsChecked();
+        -:  619:    return *getStorage();
+        -:  620:  }
+        -:  621:
+        -:  622:  /// Returns a const reference to the stored T value.
+        -:  623:  const_reference operator*() const {
+        -:  624:    assertIsChecked();
+        -:  625:    return *getStorage();
+        -:  626:  }
+        -:  627:
+        -:  628:private:
+        -:  629:  template <class T1>
+        -:  630:  static bool compareThisIfSameType(const T1 &a, const T1 &b) {
+        -:  631:    return &a == &b;
+        -:  632:  }
+        -:  633:
+        -:  634:  template <class T1, class T2>
+        -:  635:  static bool compareThisIfSameType(const T1 &, const T2 &) {
+        -:  636:    return false;
+        -:  637:  }
+        -:  638:
+        -:  639:  template <class OtherT> void moveConstruct(Expected<OtherT> &&Other) {
+        -:  640:    HasError = Other.HasError;
+        -:  641:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  642:    Unchecked = true;
+        -:  643:    Other.Unchecked = false;
+        -:  644:#endif
+        -:  645:
+        -:  646:    if (!HasError)
+        -:  647:      new (getStorage()) storage_type(std::move(*Other.getStorage()));
+        -:  648:    else
+        -:  649:      new (getErrorStorage()) error_type(std::move(*Other.getErrorStorage()));
+        -:  650:  }
+        -:  651:
+        -:  652:  template <class OtherT> void moveAssign(Expected<OtherT> &&Other) {
+        -:  653:    assertIsChecked();
+        -:  654:
+        -:  655:    if (compareThisIfSameType(*this, Other))
+        -:  656:      return;
+        -:  657:
+        -:  658:    this->~Expected();
+        -:  659:    new (this) Expected(std::move(Other));
+        -:  660:  }
+        -:  661:
+        -:  662:  pointer toPointer(pointer Val) { return Val; }
+        -:  663:
+        -:  664:  const_pointer toPointer(const_pointer Val) const { return Val; }
+        -:  665:
+        -:  666:  pointer toPointer(wrap *Val) { return &Val->get(); }
+        -:  667:
+        -:  668:  const_pointer toPointer(const wrap *Val) const { return &Val->get(); }
+        -:  669:
+      936:  670:  storage_type *getStorage() {
+        -:  671:    assert(!HasError && "Cannot get value when an error exists!");
+      936:  672:    return reinterpret_cast<storage_type *>(&TStorage);
+call    0 returned 100%
+        -:  673:  }
+        -:  674:
+        -:  675:  const storage_type *getStorage() const {
+        -:  676:    assert(!HasError && "Cannot get value when an error exists!");
+        -:  677:    return reinterpret_cast<const storage_type *>(&TStorage);
+        -:  678:  }
+        -:  679:
+    #####:  680:  error_type *getErrorStorage() {
+        -:  681:    assert(HasError && "Cannot get error when a value exists!");
+    #####:  682:    return reinterpret_cast<error_type *>(&ErrorStorage);
+branch  0 never executed
+branch  1 never executed
+        -:  683:  }
+        -:  684:
+    #####:  685:  const error_type *getErrorStorage() const {
+    #####:  686:    assert(HasError && "Cannot get error when a value exists!");
+call    0 never executed
+    #####:  687:    return reinterpret_cast<const error_type *>(&ErrorStorage);
+        -:  688:  }
+        -:  689:
+        -:  690:  // Used by ExpectedAsOutParameter to reset the checked flag.
+        -:  691:  void setUnchecked() {
+        -:  692:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  693:    Unchecked = true;
+        -:  694:#endif
+        -:  695:  }
+        -:  696:
+        -:  697:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+function _ZNK4llvm8ExpectedINS_10DataLayoutEE22fatalUncheckedExpectedEv called 0 returned 0% blocks executed 0%
+    #####:  698:  [[noreturn]] LLVM_ATTRIBUTE_NOINLINE void fatalUncheckedExpected() const {
+    #####:  699:    dbgs() << "Expected<T> must be checked before access or destruction.\n";
+call    0 never executed
+call    1 never executed
+    #####:  700:    if (HasError) {
+branch  0 never executed
+branch  1 never executed
+    #####:  701:      dbgs() << "Unchecked Expected<T> contained error:\n";
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  702:      (*getErrorStorage())->log(dbgs());
+call    0 never executed
+call    1 never executed
+        -:  703:    } else
+    #####:  704:      dbgs() << "Expected<T> value was in success state. (Note: Expected<T> "
+call    0 never executed
+call    1 never executed
+        -:  705:                "values in success mode must still be checked prior to being "
+        -:  706:                "destroyed).\n";
+    #####:  707:    abort();
+        -:  708:  }
+        -:  709:#endif
+        -:  710:
+      936:  711:  void assertIsChecked() const {
+        -:  712:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+      936:  713:    if (LLVM_UNLIKELY(Unchecked))
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+    #####:  714:      fatalUncheckedExpected();
+call    0 never executed
+        -:  715:#endif
+        -:  716:  }
+        -:  717:
+        -:  718:  union {
+        -:  719:    AlignedCharArrayUnion<storage_type> TStorage;
+        -:  720:    AlignedCharArrayUnion<error_type> ErrorStorage;
+        -:  721:  };
+        -:  722:  bool HasError : 1;
+        -:  723:#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+        -:  724:  bool Unchecked : 1;
+        -:  725:#endif
+        -:  726:};
+        -:  727:
+        -:  728:/// Report a serious error, calling any installed error handler. See
+        -:  729:/// ErrorHandling.h.
+        -:  730:[[noreturn]] void report_fatal_error(Error Err, bool gen_crash_diag = true);
+        -:  731:
+        -:  732:/// Report a fatal error if Err is a failure value.
+        -:  733:///
+        -:  734:/// This function can be used to wrap calls to fallible functions ONLY when it
+        -:  735:/// is known that the Error will always be a success value. E.g.
+        -:  736:///
+        -:  737:///   @code{.cpp}
+        -:  738:///   // foo only attempts the fallible operation if DoFallibleOperation is
+        -:  739:///   // true. If DoFallibleOperation is false then foo always returns
+        -:  740:///   // Error::success().
+        -:  741:///   Error foo(bool DoFallibleOperation);
+        -:  742:///
+        -:  743:///   cantFail(foo(false));
+        -:  744:///   @endcode
+function _ZN4llvm8cantFailENS_5ErrorEPKc called 0 returned 0% blocks executed 0%
+    #####:  745:inline void cantFail(Error Err, const char *Msg = nullptr) {
+    #####:  746:  if (Err) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  747:    if (!Msg)
+branch  0 never executed
+branch  1 never executed
+    #####:  748:      Msg = "Failure value returned from cantFail wrapped call";
+        -:  749:#ifndef NDEBUG
+    #####:  750:    std::string Str;
+call    0 never executed
+    #####:  751:    raw_string_ostream OS(Str);
+call    0 never executed
+    #####:  752:    OS << Msg << "\n" << Err;
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  753:    Msg = OS.str().c_str();
+call    0 never executed
+        -:  754:#endif
+    #####:  755:    llvm_unreachable(Msg);
+call    0 never executed
+        -:  756:  }
+    #####:  757:}
+        -:  758:
+        -:  759:/// Report a fatal error if ValOrErr is a failure value, otherwise unwraps and
+        -:  760:/// returns the contained value.
+        -:  761:///
+        -:  762:/// This function can be used to wrap calls to fallible functions ONLY when it
+        -:  763:/// is known that the Error will always be a success value. E.g.
+        -:  764:///
+        -:  765:///   @code{.cpp}
+        -:  766:///   // foo only attempts the fallible operation if DoFallibleOperation is
+        -:  767:///   // true. If DoFallibleOperation is false then foo always returns an int.
+        -:  768:///   Expected<int> foo(bool DoFallibleOperation);
+        -:  769:///
+        -:  770:///   int X = cantFail(foo(false));
+        -:  771:///   @endcode
+        -:  772:template <typename T>
+        -:  773:T cantFail(Expected<T> ValOrErr, const char *Msg = nullptr) {
+        -:  774:  if (ValOrErr)
+        -:  775:    return std::move(*ValOrErr);
+        -:  776:  else {
+        -:  777:    if (!Msg)
+        -:  778:      Msg = "Failure value returned from cantFail wrapped call";
+        -:  779:#ifndef NDEBUG
+        -:  780:    std::string Str;
+        -:  781:    raw_string_ostream OS(Str);
+        -:  782:    auto E = ValOrErr.takeError();
+        -:  783:    OS << Msg << "\n" << E;
+        -:  784:    Msg = OS.str().c_str();
+        -:  785:#endif
+        -:  786:    llvm_unreachable(Msg);
+        -:  787:  }
+        -:  788:}
+        -:  789:
+        -:  790:/// Report a fatal error if ValOrErr is a failure value, otherwise unwraps and
+        -:  791:/// returns the contained reference.
+        -:  792:///
+        -:  793:/// This function can be used to wrap calls to fallible functions ONLY when it
+        -:  794:/// is known that the Error will always be a success value. E.g.
+        -:  795:///
+        -:  796:///   @code{.cpp}
+        -:  797:///   // foo only attempts the fallible operation if DoFallibleOperation is
+        -:  798:///   // true. If DoFallibleOperation is false then foo always returns a Bar&.
+        -:  799:///   Expected<Bar&> foo(bool DoFallibleOperation);
+        -:  800:///
+        -:  801:///   Bar &X = cantFail(foo(false));
+        -:  802:///   @endcode
+        -:  803:template <typename T>
+        -:  804:T& cantFail(Expected<T&> ValOrErr, const char *Msg = nullptr) {
+        -:  805:  if (ValOrErr)
+        -:  806:    return *ValOrErr;
+        -:  807:  else {
+        -:  808:    if (!Msg)
+        -:  809:      Msg = "Failure value returned from cantFail wrapped call";
+        -:  810:#ifndef NDEBUG
+        -:  811:    std::string Str;
+        -:  812:    raw_string_ostream OS(Str);
+        -:  813:    auto E = ValOrErr.takeError();
+        -:  814:    OS << Msg << "\n" << E;
+        -:  815:    Msg = OS.str().c_str();
+        -:  816:#endif
+        -:  817:    llvm_unreachable(Msg);
+        -:  818:  }
+        -:  819:}
+        -:  820:
+        -:  821:/// Helper for testing applicability of, and applying, handlers for
+        -:  822:/// ErrorInfo types.
+        -:  823:template <typename HandlerT>
+        -:  824:class ErrorHandlerTraits
+        -:  825:    : public ErrorHandlerTraits<
+        -:  826:          decltype(&std::remove_reference_t<HandlerT>::operator())> {};
+        -:  827:
+        -:  828:// Specialization functions of the form 'Error (const ErrT&)'.
+        -:  829:template <typename ErrT> class ErrorHandlerTraits<Error (&)(ErrT &)> {
+        -:  830:public:
+        -:  831:  static bool appliesTo(const ErrorInfoBase &E) {
+        -:  832:    return E.template isA<ErrT>();
+        -:  833:  }
+        -:  834:
+        -:  835:  template <typename HandlerT>
+        -:  836:  static Error apply(HandlerT &&H, std::unique_ptr<ErrorInfoBase> E) {
+        -:  837:    assert(appliesTo(*E) && "Applying incorrect handler");
+        -:  838:    return H(static_cast<ErrT &>(*E));
+        -:  839:  }
+        -:  840:};
+        -:  841:
+        -:  842:// Specialization functions of the form 'void (const ErrT&)'.
+        -:  843:template <typename ErrT> class ErrorHandlerTraits<void (&)(ErrT &)> {
+        -:  844:public:
+    #####:  845:  static bool appliesTo(const ErrorInfoBase &E) {
+    #####:  846:    return E.template isA<ErrT>();
+        -:  847:  }
+        -:  848:
+        -:  849:  template <typename HandlerT>
+function _ZN4llvm18ErrorHandlerTraitsIRFvRNS_13ErrorInfoBaseEEE5applyIZNS_8toStringENS_5ErrorEEUlRKS1_E_EES7_OT_St10unique_ptrIS1_St14default_deleteIS1_EE called 0 returned 0% blocks executed 0%
+    #####:  850:  static Error apply(HandlerT &&H, std::unique_ptr<ErrorInfoBase> E) {
+call    0 never executed
+    #####:  851:    assert(appliesTo(*E) && "Applying incorrect handler");
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:  852:    H(static_cast<ErrT &>(*E));
+call    0 never executed
+    #####:  853:    return Error::success();
+call    0 never executed
+call    1 never executed
+        -:  854:  }
+        -:  855:};
+        -:  856:
+        -:  857:/// Specialization for functions of the form 'Error (std::unique_ptr<ErrT>)'.
+        -:  858:template <typename ErrT>
+        -:  859:class ErrorHandlerTraits<Error (&)(std::unique_ptr<ErrT>)> {
+        -:  860:public:
+        -:  861:  static bool appliesTo(const ErrorInfoBase &E) {
+        -:  862:    return E.template isA<ErrT>();
+        -:  863:  }
+        -:  864:
+        -:  865:  template <typename HandlerT>
+        -:  866:  static Error apply(HandlerT &&H, std::unique_ptr<ErrorInfoBase> E) {
+        -:  867:    assert(appliesTo(*E) && "Applying incorrect handler");
+        -:  868:    std::unique_ptr<ErrT> SubE(static_cast<ErrT *>(E.release()));
+        -:  869:    return H(std::move(SubE));
+        -:  870:  }
+        -:  871:};
+        -:  872:
+        -:  873:/// Specialization for functions of the form 'void (std::unique_ptr<ErrT>)'.
+        -:  874:template <typename ErrT>
+        -:  875:class ErrorHandlerTraits<void (&)(std::unique_ptr<ErrT>)> {
+        -:  876:public:
+        -:  877:  static bool appliesTo(const ErrorInfoBase &E) {
+        -:  878:    return E.template isA<ErrT>();
+        -:  879:  }
+        -:  880:
+        -:  881:  template <typename HandlerT>
+        -:  882:  static Error apply(HandlerT &&H, std::unique_ptr<ErrorInfoBase> E) {
+        -:  883:    assert(appliesTo(*E) && "Applying incorrect handler");
+        -:  884:    std::unique_ptr<ErrT> SubE(static_cast<ErrT *>(E.release()));
+        -:  885:    H(std::move(SubE));
+        -:  886:    return Error::success();
+        -:  887:  }
+        -:  888:};
+        -:  889:
+        -:  890:// Specialization for member functions of the form 'RetT (const ErrT&)'.
+        -:  891:template <typename C, typename RetT, typename ErrT>
+        -:  892:class ErrorHandlerTraits<RetT (C::*)(ErrT &)>
+        -:  893:    : public ErrorHandlerTraits<RetT (&)(ErrT &)> {};
+        -:  894:
+        -:  895:// Specialization for member functions of the form 'RetT (const ErrT&) const'.
+        -:  896:template <typename C, typename RetT, typename ErrT>
+        -:  897:class ErrorHandlerTraits<RetT (C::*)(ErrT &) const>
+        -:  898:    : public ErrorHandlerTraits<RetT (&)(ErrT &)> {};
+        -:  899:
+        -:  900:// Specialization for member functions of the form 'RetT (const ErrT&)'.
+        -:  901:template <typename C, typename RetT, typename ErrT>
+        -:  902:class ErrorHandlerTraits<RetT (C::*)(const ErrT &)>
+        -:  903:    : public ErrorHandlerTraits<RetT (&)(ErrT &)> {};
+        -:  904:
+        -:  905:// Specialization for member functions of the form 'RetT (const ErrT&) const'.
+        -:  906:template <typename C, typename RetT, typename ErrT>
+        -:  907:class ErrorHandlerTraits<RetT (C::*)(const ErrT &) const>
+        -:  908:    : public ErrorHandlerTraits<RetT (&)(ErrT &)> {};
+        -:  909:
+        -:  910:/// Specialization for member functions of the form
+        -:  911:/// 'RetT (std::unique_ptr<ErrT>)'.
+        -:  912:template <typename C, typename RetT, typename ErrT>
+        -:  913:class ErrorHandlerTraits<RetT (C::*)(std::unique_ptr<ErrT>)>
+        -:  914:    : public ErrorHandlerTraits<RetT (&)(std::unique_ptr<ErrT>)> {};
+        -:  915:
+        -:  916:/// Specialization for member functions of the form
+        -:  917:/// 'RetT (std::unique_ptr<ErrT>) const'.
+        -:  918:template <typename C, typename RetT, typename ErrT>
+        -:  919:class ErrorHandlerTraits<RetT (C::*)(std::unique_ptr<ErrT>) const>
+        -:  920:    : public ErrorHandlerTraits<RetT (&)(std::unique_ptr<ErrT>)> {};
+        -:  921:
+    #####:  922:inline Error handleErrorImpl(std::unique_ptr<ErrorInfoBase> Payload) {
+    #####:  923:  return Error(std::move(Payload));
+        -:  924:}
+        -:  925:
+        -:  926:template <typename HandlerT, typename... HandlerTs>
+function _ZN4llvm15handleErrorImplIZNS_8toStringENS_5ErrorEEUlRKNS_13ErrorInfoBaseEE_JEEES1_St10unique_ptrIS2_St14default_deleteIS2_EEOT_DpOT0_ called 0 returned 0% blocks executed 0%
+    #####:  927:Error handleErrorImpl(std::unique_ptr<ErrorInfoBase> Payload,
+call    0 never executed
+        -:  928:                      HandlerT &&Handler, HandlerTs &&... Handlers) {
+    #####:  929:  if (ErrorHandlerTraits<HandlerT>::appliesTo(*Payload))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  930:    return ErrorHandlerTraits<HandlerT>::apply(std::forward<HandlerT>(Handler),
+    #####:  931:                                               std::move(Payload));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  932:  return handleErrorImpl(std::move(Payload),
+    #####:  933:                         std::forward<HandlerTs>(Handlers)...);
+        -:  934:}
+        -:  935:
+        -:  936:/// Pass the ErrorInfo(s) contained in E to their respective handlers. Any
+        -:  937:/// unhandled errors (or Errors returned by handlers) are re-concatenated and
+        -:  938:/// returned.
+        -:  939:/// Because this function returns an error, its result must also be checked
+        -:  940:/// or returned. If you intend to handle all errors use handleAllErrors
+        -:  941:/// (which returns void, and will abort() on unhandled errors) instead.
+        -:  942:template <typename... HandlerTs>
+function _ZN4llvm12handleErrorsIJZNS_8toStringENS_5ErrorEEUlRKNS_13ErrorInfoBaseEE_EEES1_S1_DpOT_ called 0 returned 0% blocks executed 0%
+    #####:  943:Error handleErrors(Error E, HandlerTs &&... Hs) {
+branch  0 never executed
+branch  1 never executed
+    #####:  944:  if (!E)
+branch  0 never executed
+branch  1 never executed
+    #####:  945:    return Error::success();
+call    0 never executed
+call    1 never executed
+        -:  946:
+    #####:  947:  std::unique_ptr<ErrorInfoBase> Payload = E.takePayload();
+call    0 never executed
+        -:  948:
+    #####:  949:  if (Payload->isA<ErrorList>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  950:    ErrorList &List = static_cast<ErrorList &>(*Payload);
+    #####:  951:    Error R;
+    #####:  952:    for (auto &P : List.Payloads)
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####:  953:      R = ErrorList::join(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+call    5 never executed
+call    6 never executed
+branch  7 never executed
+branch  8 never executed
+    #####:  954:          std::move(R),
+call    0 never executed
+    #####:  955:          handleErrorImpl(std::move(P), std::forward<HandlerTs>(Hs)...));
+call    0 never executed
+    #####:  956:    return R;
+call    0 never executed
+        -:  957:  }
+        -:  958:
+    #####:  959:  return handleErrorImpl(std::move(Payload), std::forward<HandlerTs>(Hs)...);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  960:}
+        -:  961:
+        -:  962:/// Behaves the same as handleErrors, except that by contract all errors
+        -:  963:/// *must* be handled by the given handlers (i.e. there must be no remaining
+        -:  964:/// errors after running the handlers, or llvm_unreachable is called).
+        -:  965:template <typename... HandlerTs>
+function _ZN4llvm15handleAllErrorsIJZNS_8toStringENS_5ErrorEEUlRKNS_13ErrorInfoBaseEE_EEEvS1_DpOT_ called 0 returned 0% blocks executed 0%
+    #####:  966:void handleAllErrors(Error E, HandlerTs &&... Handlers) {
+call    0 never executed
+    #####:  967:  cantFail(handleErrors(std::move(E), std::forward<HandlerTs>(Handlers)...));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  968:}
+        -:  969:
+        -:  970:/// Check that E is a non-error, then drop it.
+        -:  971:/// If E is an error, llvm_unreachable will be called.
+        -:  972:inline void handleAllErrors(Error E) {
+        -:  973:  cantFail(std::move(E));
+        -:  974:}
+        -:  975:
+        -:  976:/// Handle any errors (if present) in an Expected<T>, then try a recovery path.
+        -:  977:///
+        -:  978:/// If the incoming value is a success value it is returned unmodified. If it
+        -:  979:/// is a failure value then it the contained error is passed to handleErrors.
+        -:  980:/// If handleErrors is able to handle the error then the RecoveryPath functor
+        -:  981:/// is called to supply the final result. If handleErrors is not able to
+        -:  982:/// handle all errors then the unhandled errors are returned.
+        -:  983:///
+        -:  984:/// This utility enables the follow pattern:
+        -:  985:///
+        -:  986:///   @code{.cpp}
+        -:  987:///   enum FooStrategy { Aggressive, Conservative };
+        -:  988:///   Expected<Foo> foo(FooStrategy S);
+        -:  989:///
+        -:  990:///   auto ResultOrErr =
+        -:  991:///     handleExpected(
+        -:  992:///       foo(Aggressive),
+        -:  993:///       []() { return foo(Conservative); },
+        -:  994:///       [](AggressiveStrategyError&) {
+        -:  995:///         // Implicitly conusme this - we'll recover by using a conservative
+        -:  996:///         // strategy.
+        -:  997:///       });
+        -:  998:///
+        -:  999:///   @endcode
+        -: 1000:template <typename T, typename RecoveryFtor, typename... HandlerTs>
+        -: 1001:Expected<T> handleExpected(Expected<T> ValOrErr, RecoveryFtor &&RecoveryPath,
+        -: 1002:                           HandlerTs &&... Handlers) {
+        -: 1003:  if (ValOrErr)
+        -: 1004:    return ValOrErr;
+        -: 1005:
+        -: 1006:  if (auto Err = handleErrors(ValOrErr.takeError(),
+        -: 1007:                              std::forward<HandlerTs>(Handlers)...))
+        -: 1008:    return std::move(Err);
+        -: 1009:
+        -: 1010:  return RecoveryPath();
+        -: 1011:}
+        -: 1012:
+        -: 1013:/// Log all errors (if any) in E to OS. If there are any errors, ErrorBanner
+        -: 1014:/// will be printed before the first one is logged. A newline will be printed
+        -: 1015:/// after each error.
+        -: 1016:///
+        -: 1017:/// This function is compatible with the helpers from Support/WithColor.h. You
+        -: 1018:/// can pass any of them as the OS. Please consider using them instead of
+        -: 1019:/// including 'error: ' in the ErrorBanner.
+        -: 1020:///
+        -: 1021:/// This is useful in the base level of your program to allow clean termination
+        -: 1022:/// (allowing clean deallocation of resources, etc.), while reporting error
+        -: 1023:/// information to the user.
+        -: 1024:void logAllUnhandledErrors(Error E, raw_ostream &OS, Twine ErrorBanner = {});
+        -: 1025:
+        -: 1026:/// Write all error messages (if any) in E to a string. The newline character
+        -: 1027:/// is used to separate error messages.
+function _ZN4llvm8toStringB5cxx11ENS_5ErrorE called 0 returned 0% blocks executed 0%
+    #####: 1028:inline std::string toString(Error E) {
+    #####: 1029:  SmallVector<std::string, 2> Errors;
+call    0 never executed
+function _ZZN4llvm8toStringB5cxx11ENS_5ErrorEENKUlRKNS_13ErrorInfoBaseEE_clES3_.isra.0 called 0 returned 0% blocks executed 0%
+    #####: 1030:  handleAllErrors(std::move(E), [&Errors](const ErrorInfoBase &EI) {
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1031:    Errors.push_back(EI.message());
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####: 1032:  });
+    #####: 1033:  return join(Errors.begin(), Errors.end(), "\n");
+call    0 never executed
+call    1 never executed
+        -: 1034:}
+        -: 1035:
+        -: 1036:/// Consume a Error without doing anything. This method should be used
+        -: 1037:/// only where an error can be considered a reasonable and expected return
+        -: 1038:/// value.
+        -: 1039:///
+        -: 1040:/// Uses of this method are potentially indicative of design problems: If it's
+        -: 1041:/// legitimate to do nothing while processing an "error", the error-producer
+        -: 1042:/// might be more clearly refactored to return an Optional<T>.
+        -: 1043:inline void consumeError(Error Err) {
+        -: 1044:  handleAllErrors(std::move(Err), [](const ErrorInfoBase &) {});
+        -: 1045:}
+        -: 1046:
+        -: 1047:/// Convert an Expected to an Optional without doing anything. This method
+        -: 1048:/// should be used only where an error can be considered a reasonable and
+        -: 1049:/// expected return value.
+        -: 1050:///
+        -: 1051:/// Uses of this method are potentially indicative of problems: perhaps the
+        -: 1052:/// error should be propagated further, or the error-producer should just
+        -: 1053:/// return an Optional in the first place.
+        -: 1054:template <typename T> Optional<T> expectedToOptional(Expected<T> &&E) {
+        -: 1055:  if (E)
+        -: 1056:    return std::move(*E);
+        -: 1057:  consumeError(E.takeError());
+        -: 1058:  return None;
+        -: 1059:}
+        -: 1060:
+        -: 1061:/// Helper for converting an Error to a bool.
+        -: 1062:///
+        -: 1063:/// This method returns true if Err is in an error state, or false if it is
+        -: 1064:/// in a success state.  Puts Err in a checked state in both cases (unlike
+        -: 1065:/// Error::operator bool(), which only does this for success states).
+        -: 1066:inline bool errorToBool(Error Err) {
+        -: 1067:  bool IsError = static_cast<bool>(Err);
+        -: 1068:  if (IsError)
+        -: 1069:    consumeError(std::move(Err));
+        -: 1070:  return IsError;
+        -: 1071:}
+        -: 1072:
+        -: 1073:/// Helper for Errors used as out-parameters.
+        -: 1074:///
+        -: 1075:/// This helper is for use with the Error-as-out-parameter idiom, where an error
+        -: 1076:/// is passed to a function or method by reference, rather than being returned.
+        -: 1077:/// In such cases it is helpful to set the checked bit on entry to the function
+        -: 1078:/// so that the error can be written to (unchecked Errors abort on assignment)
+        -: 1079:/// and clear the checked bit on exit so that clients cannot accidentally forget
+        -: 1080:/// to check the result. This helper performs these actions automatically using
+        -: 1081:/// RAII:
+        -: 1082:///
+        -: 1083:///   @code{.cpp}
+        -: 1084:///   Result foo(Error &Err) {
+        -: 1085:///     ErrorAsOutParameter ErrAsOutParam(&Err); // 'Checked' flag set
+        -: 1086:///     // <body of foo>
+        -: 1087:///     // <- 'Checked' flag auto-cleared when ErrAsOutParam is destructed.
+        -: 1088:///   }
+        -: 1089:///   @endcode
+        -: 1090:///
+        -: 1091:/// ErrorAsOutParameter takes an Error* rather than Error& so that it can be
+        -: 1092:/// used with optional Errors (Error pointers that are allowed to be null). If
+        -: 1093:/// ErrorAsOutParameter took an Error reference, an instance would have to be
+        -: 1094:/// created inside every condition that verified that Error was non-null. By
+        -: 1095:/// taking an Error pointer we can just create one instance at the top of the
+        -: 1096:/// function.
+        -: 1097:class ErrorAsOutParameter {
+        -: 1098:public:
+        -: 1099:  ErrorAsOutParameter(Error *Err) : Err(Err) {
+        -: 1100:    // Raise the checked bit if Err is success.
+        -: 1101:    if (Err)
+        -: 1102:      (void)!!*Err;
+        -: 1103:  }
+        -: 1104:
+        -: 1105:  ~ErrorAsOutParameter() {
+        -: 1106:    // Clear the checked bit.
+        -: 1107:    if (Err && !*Err)
+        -: 1108:      *Err = Error::success();
+        -: 1109:  }
+        -: 1110:
+        -: 1111:private:
+        -: 1112:  Error *Err;
+        -: 1113:};
+        -: 1114:
+        -: 1115:/// Helper for Expected<T>s used as out-parameters.
+        -: 1116:///
+        -: 1117:/// See ErrorAsOutParameter.
+        -: 1118:template <typename T>
+        -: 1119:class ExpectedAsOutParameter {
+        -: 1120:public:
+        -: 1121:  ExpectedAsOutParameter(Expected<T> *ValOrErr)
+        -: 1122:    : ValOrErr(ValOrErr) {
+        -: 1123:    if (ValOrErr)
+        -: 1124:      (void)!!*ValOrErr;
+        -: 1125:  }
+        -: 1126:
+        -: 1127:  ~ExpectedAsOutParameter() {
+        -: 1128:    if (ValOrErr)
+        -: 1129:      ValOrErr->setUnchecked();
+        -: 1130:  }
+        -: 1131:
+        -: 1132:private:
+        -: 1133:  Expected<T> *ValOrErr;
+        -: 1134:};
+        -: 1135:
+        -: 1136:/// This class wraps a std::error_code in a Error.
+        -: 1137:///
+        -: 1138:/// This is useful if you're writing an interface that returns a Error
+        -: 1139:/// (or Expected) and you want to call code that still returns
+        -: 1140:/// std::error_codes.
+        -: 1141:class ECError : public ErrorInfo<ECError> {
+        -: 1142:  friend Error errorCodeToError(std::error_code);
+        -: 1143:
+        -: 1144:  void anchor() override;
+        -: 1145:
+        -: 1146:public:
+        -: 1147:  void setErrorCode(std::error_code EC) { this->EC = EC; }
+        -: 1148:  std::error_code convertToErrorCode() const override { return EC; }
+function _ZNK4llvm7ECError3logERNS_11raw_ostreamE called 0 returned 0% blocks executed 0%
+    #####: 1149:  void log(raw_ostream &OS) const override { OS << EC.message(); }
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -: 1150:
+        -: 1151:  // Used by ErrorInfo::classID.
+        -: 1152:  static char ID;
+        -: 1153:
+        -: 1154:protected:
+        -: 1155:  ECError() = default;
+        -: 1156:  ECError(std::error_code EC) : EC(EC) {}
+        -: 1157:
+        -: 1158:  std::error_code EC;
+        -: 1159:};
+        -: 1160:
+        -: 1161:/// The value returned by this function can be returned from convertToErrorCode
+        -: 1162:/// for Error values where no sensible translation to std::error_code exists.
+        -: 1163:/// It should only be used in this situation, and should never be used where a
+        -: 1164:/// sensible conversion to std::error_code is available, as attempts to convert
+        -: 1165:/// to/from this error will result in a fatal error. (i.e. it is a programmatic
+        -: 1166:/// error to try to convert such a value).
+        -: 1167:std::error_code inconvertibleErrorCode();
+        -: 1168:
+        -: 1169:/// Helper for converting an std::error_code to a Error.
+        -: 1170:Error errorCodeToError(std::error_code EC);
+        -: 1171:
+        -: 1172:/// Helper for converting an ECError to a std::error_code.
+        -: 1173:///
+        -: 1174:/// This method requires that Err be Error() or an ECError, otherwise it
+        -: 1175:/// will trigger a call to abort().
+        -: 1176:std::error_code errorToErrorCode(Error Err);
+        -: 1177:
+        -: 1178:/// Convert an ErrorOr<T> to an Expected<T>.
+        -: 1179:template <typename T> Expected<T> errorOrToExpected(ErrorOr<T> &&EO) {
+        -: 1180:  if (auto EC = EO.getError())
+        -: 1181:    return errorCodeToError(EC);
+        -: 1182:  return std::move(*EO);
+        -: 1183:}
+        -: 1184:
+        -: 1185:/// Convert an Expected<T> to an ErrorOr<T>.
+        -: 1186:template <typename T> ErrorOr<T> expectedToErrorOr(Expected<T> &&E) {
+        -: 1187:  if (auto Err = E.takeError())
+        -: 1188:    return errorToErrorCode(std::move(Err));
+        -: 1189:  return std::move(*E);
+        -: 1190:}
+        -: 1191:
+        -: 1192:/// This class wraps a string in an Error.
+        -: 1193:///
+        -: 1194:/// StringError is useful in cases where the client is not expected to be able
+        -: 1195:/// to consume the specific error message programmatically (for example, if the
+        -: 1196:/// error message is to be presented to the user).
+        -: 1197:///
+        -: 1198:/// StringError can also be used when additional information is to be printed
+        -: 1199:/// along with a error_code message. Depending on the constructor called, this
+        -: 1200:/// class can either display:
+        -: 1201:///    1. the error_code message (ECError behavior)
+        -: 1202:///    2. a string
+        -: 1203:///    3. the error_code message and a string
+        -: 1204:///
+        -: 1205:/// These behaviors are useful when subtyping is required; for example, when a
+        -: 1206:/// specific library needs an explicit error type. In the example below,
+        -: 1207:/// PDBError is derived from StringError:
+        -: 1208:///
+        -: 1209:///   @code{.cpp}
+        -: 1210:///   Expected<int> foo() {
+        -: 1211:///      return llvm::make_error<PDBError>(pdb_error_code::dia_failed_loading,
+        -: 1212:///                                        "Additional information");
+        -: 1213:///   }
+        -: 1214:///   @endcode
+        -: 1215:///
+        -: 1216:class StringError : public ErrorInfo<StringError> {
+        -: 1217:public:
+        -: 1218:  static char ID;
+        -: 1219:
+        -: 1220:  // Prints EC + S and converts to EC
+        -: 1221:  StringError(std::error_code EC, const Twine &S = Twine());
+        -: 1222:
+        -: 1223:  // Prints S and converts to EC
+        -: 1224:  StringError(const Twine &S, std::error_code EC);
+        -: 1225:
+        -: 1226:  void log(raw_ostream &OS) const override;
+        -: 1227:  std::error_code convertToErrorCode() const override;
+        -: 1228:
+        -: 1229:  const std::string &getMessage() const { return Msg; }
+        -: 1230:
+        -: 1231:private:
+        -: 1232:  std::string Msg;
+        -: 1233:  std::error_code EC;
+        -: 1234:  const bool PrintMsgOnly = false;
+        -: 1235:};
+        -: 1236:
+        -: 1237:/// Create formatted StringError object.
+        -: 1238:template <typename... Ts>
+        -: 1239:inline Error createStringError(std::error_code EC, char const *Fmt,
+        -: 1240:                               const Ts &... Vals) {
+        -: 1241:  std::string Buffer;
+        -: 1242:  raw_string_ostream Stream(Buffer);
+        -: 1243:  Stream << format(Fmt, Vals...);
+        -: 1244:  return make_error<StringError>(Stream.str(), EC);
+        -: 1245:}
+        -: 1246:
+        -: 1247:Error createStringError(std::error_code EC, char const *Msg);
+        -: 1248:
+        -: 1249:inline Error createStringError(std::error_code EC, const Twine &S) {
+        -: 1250:  return createStringError(EC, S.str().c_str());
+        -: 1251:}
+        -: 1252:
+        -: 1253:template <typename... Ts>
+        -: 1254:inline Error createStringError(std::errc EC, char const *Fmt,
+        -: 1255:                               const Ts &... Vals) {
+        -: 1256:  return createStringError(std::make_error_code(EC), Fmt, Vals...);
+        -: 1257:}
+        -: 1258:
+        -: 1259:/// This class wraps a filename and another Error.
+        -: 1260:///
+        -: 1261:/// In some cases, an error needs to live along a 'source' name, in order to
+        -: 1262:/// show more detailed information to the user.
+        -: 1263:class FileError final : public ErrorInfo<FileError> {
+        -: 1264:
+        -: 1265:  friend Error createFileError(const Twine &, Error);
+        -: 1266:  friend Error createFileError(const Twine &, size_t, Error);
+        -: 1267:
+        -: 1268:public:
+function _ZNK4llvm9FileError3logERNS_11raw_ostreamE called 0 returned 0% blocks executed 0%
+    #####: 1269:  void log(raw_ostream &OS) const override {
+    #####: 1270:    assert(Err && "Trying to log after takeError().");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+    #####: 1271:    OS << "'" << FileName << "': ";
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####: 1272:    if (Line)
+branch  0 never executed
+branch  1 never executed
+    #####: 1273:      OS << "line " << Line.value() << ": ";
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+call    4 never executed
+    #####: 1274:    Err->log(OS);
+call    0 never executed
+    #####: 1275:  }
+        -: 1276:
+        -: 1277:  std::string messageWithoutFileInfo() const {
+        -: 1278:    std::string Msg;
+        -: 1279:    raw_string_ostream OS(Msg);
+        -: 1280:    Err->log(OS);
+        -: 1281:    return OS.str();
+        -: 1282:  }
+        -: 1283:
+        -: 1284:  StringRef getFileName() const { return FileName; }
+        -: 1285:
+        -: 1286:  Error takeError() { return Error(std::move(Err)); }
+        -: 1287:
+        -: 1288:  std::error_code convertToErrorCode() const override;
+        -: 1289:
+        -: 1290:  // Used by ErrorInfo::classID.
+        -: 1291:  static char ID;
+        -: 1292:
+        -: 1293:private:
+        -: 1294:  FileError(const Twine &F, Optional<size_t> LineNum,
+        -: 1295:            std::unique_ptr<ErrorInfoBase> E) {
+        -: 1296:    assert(E && "Cannot create FileError from Error success value.");
+        -: 1297:    FileName = F.str();
+        -: 1298:    Err = std::move(E);
+        -: 1299:    Line = std::move(LineNum);
+        -: 1300:  }
+        -: 1301:
+        -: 1302:  static Error build(const Twine &F, Optional<size_t> Line, Error E) {
+        -: 1303:    std::unique_ptr<ErrorInfoBase> Payload;
+        -: 1304:    handleAllErrors(std::move(E),
+        -: 1305:                    [&](std::unique_ptr<ErrorInfoBase> EIB) -> Error {
+        -: 1306:                      Payload = std::move(EIB);
+        -: 1307:                      return Error::success();
+        -: 1308:                    });
+        -: 1309:    return Error(
+        -: 1310:        std::unique_ptr<FileError>(new FileError(F, Line, std::move(Payload))));
+        -: 1311:  }
+        -: 1312:
+        -: 1313:  std::string FileName;
+        -: 1314:  Optional<size_t> Line;
+        -: 1315:  std::unique_ptr<ErrorInfoBase> Err;
+        -: 1316:};
+        -: 1317:
+        -: 1318:/// Concatenate a source file path and/or name with an Error. The resulting
+        -: 1319:/// Error is unchecked.
+        -: 1320:inline Error createFileError(const Twine &F, Error E) {
+        -: 1321:  return FileError::build(F, Optional<size_t>(), std::move(E));
+        -: 1322:}
+        -: 1323:
+        -: 1324:/// Concatenate a source file path and/or name with line number and an Error.
+        -: 1325:/// The resulting Error is unchecked.
+        -: 1326:inline Error createFileError(const Twine &F, size_t Line, Error E) {
+        -: 1327:  return FileError::build(F, Optional<size_t>(Line), std::move(E));
+        -: 1328:}
+        -: 1329:
+        -: 1330:/// Concatenate a source file path and/or name with a std::error_code 
+        -: 1331:/// to form an Error object.
+        -: 1332:inline Error createFileError(const Twine &F, std::error_code EC) {
+        -: 1333:  return createFileError(F, errorCodeToError(EC));
+        -: 1334:}
+        -: 1335:
+        -: 1336:/// Concatenate a source file path and/or name with line number and
+        -: 1337:/// std::error_code to form an Error object.
+        -: 1338:inline Error createFileError(const Twine &F, size_t Line, std::error_code EC) {
+        -: 1339:  return createFileError(F, Line, errorCodeToError(EC));
+        -: 1340:}
+        -: 1341:
+        -: 1342:Error createFileError(const Twine &F, ErrorSuccess) = delete;
+        -: 1343:
+        -: 1344:/// Helper for check-and-exit error handling.
+        -: 1345:///
+        -: 1346:/// For tool use only. NOT FOR USE IN LIBRARY CODE.
+        -: 1347:///
+        -: 1348:class ExitOnError {
+        -: 1349:public:
+        -: 1350:  /// Create an error on exit helper.
+        -: 1351:  ExitOnError(std::string Banner = "", int DefaultErrorExitCode = 1)
+        -: 1352:      : Banner(std::move(Banner)),
+        -: 1353:        GetExitCode([=](const Error &) { return DefaultErrorExitCode; }) {}
+        -: 1354:
+        -: 1355:  /// Set the banner string for any errors caught by operator().
+        -: 1356:  void setBanner(std::string Banner) { this->Banner = std::move(Banner); }
+        -: 1357:
+        -: 1358:  /// Set the exit-code mapper function.
+        -: 1359:  void setExitCodeMapper(std::function<int(const Error &)> GetExitCode) {
+        -: 1360:    this->GetExitCode = std::move(GetExitCode);
+        -: 1361:  }
+        -: 1362:
+        -: 1363:  /// Check Err. If it's in a failure state log the error(s) and exit.
+        -: 1364:  void operator()(Error Err) const { checkError(std::move(Err)); }
+        -: 1365:
+        -: 1366:  /// Check E. If it's in a success state then return the contained value. If
+        -: 1367:  /// it's in a failure state log the error(s) and exit.
+        -: 1368:  template <typename T> T operator()(Expected<T> &&E) const {
+        -: 1369:    checkError(E.takeError());
+        -: 1370:    return std::move(*E);
+        -: 1371:  }
+        -: 1372:
+        -: 1373:  /// Check E. If it's in a success state then return the contained reference. If
+        -: 1374:  /// it's in a failure state log the error(s) and exit.
+        -: 1375:  template <typename T> T& operator()(Expected<T&> &&E) const {
+        -: 1376:    checkError(E.takeError());
+        -: 1377:    return *E;
+        -: 1378:  }
+        -: 1379:
+        -: 1380:private:
+        -: 1381:  void checkError(Error Err) const {
+        -: 1382:    if (Err) {
+        -: 1383:      int ExitCode = GetExitCode(Err);
+        -: 1384:      logAllUnhandledErrors(std::move(Err), errs(), Banner);
+        -: 1385:      exit(ExitCode);
+        -: 1386:    }
+        -: 1387:  }
+        -: 1388:
+        -: 1389:  std::string Banner;
+        -: 1390:  std::function<int(const Error &)> GetExitCode;
+        -: 1391:};
+        -: 1392:
+        -: 1393:/// Conversion from Error to LLVMErrorRef for C error bindings.
+        -: 1394:inline LLVMErrorRef wrap(Error Err) {
+        -: 1395:  return reinterpret_cast<LLVMErrorRef>(Err.takePayload().release());
+        -: 1396:}
+        -: 1397:
+        -: 1398:/// Conversion from LLVMErrorRef to Error for C error bindings.
+        -: 1399:inline Error unwrap(LLVMErrorRef ErrRef) {
+        -: 1400:  return Error(std::unique_ptr<ErrorInfoBase>(
+        -: 1401:      reinterpret_cast<ErrorInfoBase *>(ErrRef)));
+        -: 1402:}
+        -: 1403:
+        -: 1404:} // end namespace llvm
+        -: 1405:
+        -: 1406:#endif // LLVM_SUPPORT_ERROR_H

@@ -1,0 +1,975 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/Linalg/Transforms/Fusion.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Fusion.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Linalg/Transforms/CMakeFiles/obj.MLIRLinalgTransforms.dir/Fusion.cpp.gcda
+        -:    0:Runs:116171
+        -:    1://===- Fusion.cpp - Implementation of linalg Fusion -----------------------===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements the linalg dialect Fusion pass.
+        -:   10://
+        -:   11://===----------------------------------------------------------------------===//
+        -:   12:
+        -:   13:#include "mlir/Dialect/Affine/IR/AffineOps.h"
+        -:   14:#include "mlir/Dialect/Arith/IR/Arith.h"
+        -:   15:#include "mlir/Dialect/Linalg/Analysis/DependenceAnalysis.h"
+        -:   16:#include "mlir/Dialect/Linalg/IR/Linalg.h"
+        -:   17:#include "mlir/Dialect/Linalg/Passes.h"
+        -:   18:#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+        -:   19:#include "mlir/Dialect/Linalg/Utils/Utils.h"
+        -:   20:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   21:#include "mlir/Dialect/Tensor/IR/Tensor.h"
+        -:   22:#include "mlir/IR/AffineExpr.h"
+        -:   23:#include "mlir/IR/AffineMap.h"
+        -:   24:#include "mlir/IR/Dominance.h"
+        -:   25:#include "mlir/Support/LLVM.h"
+        -:   26:#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+        -:   27:#include "mlir/Transforms/RegionUtils.h"
+        -:   28:#include "llvm/ADT/MapVector.h"
+        -:   29:#include "llvm/ADT/ScopeExit.h"
+        -:   30:#include "llvm/Support/CommandLine.h"
+        -:   31:#include "llvm/Support/Debug.h"
+        -:   32:
+        -:   33:#include <set>
+        -:   34:
+        -:   35:#define DEBUG_TYPE "linalg-fusion"
+        -:   36:
+        -:   37:using namespace mlir;
+        -:   38:using namespace mlir::linalg;
+        -:   39:
+        -:   40:/// Implements a simple high-level fusion pass on linalg structured operations.
+        -:   41:///
+        -:   42:/// In each block, linalg ops are processed in reverse textual order.
+        -:   43:/// Given a linalg op `O`, fusion occurs by:
+        -:   44:///   1. inspecting the linalg ops that write into the views read by `O`. There
+        -:   45:///      are 2 cases:
+        -:   46:///      a) buffer case: use the SSA value of the views and a simple alias
+        -:   47:///         analysis on subview ops to determine producer-consumer dependences;
+        -:   48:///      b) tensor case: use SSA use-def chains on extract_slice ops;
+        -:   49:///   2. greedily fuse the linalg ops that produce the subview/extract_slice.
+        -:   50:///   3. inspect the fused ops and determine whether they have other remaining
+        -:   51:///      LinalgOp uses. If not, then erase the original producing linalg op.
+        -:   52:///
+        -:   53:/// More advanced use cases, analyses as well as profitability heuristics are
+        -:   54:/// left for future work.
+        -:   55:
+        -:   56:struct ShapeDimension {
+        -:   57:  Value shape;
+        -:   58:  unsigned dimension;
+        -:   59:};
+        -:   60:
+        -:   61:// Given an `op`, returns the first (`shape`, `dimension`) pair that identifies
+        -:   62:// the loop range at `loopDepth`. The semantics of the loopToOperandRangesMaps
+        -:   63:// guarantees at least one such dimension is found. If multiple candidates exist
+        -:   64:// they must agree by construction (i.e. have the same size) and we just return
+        -:   65:// the first one.
+        -:   66:static ShapeDimension
+function _ZL25getShapeDefiningLoopRangeN4mlir6linalg8LinalgOpEjb called 0 returned 0% blocks executed 0%
+    #####:   67:getShapeDefiningLoopRange(LinalgOp op, unsigned loopDepth,
+        -:   68:                          bool fromSubViewOpOnly = false) {
+        -:   69:  // Iterate over the inputs and outputs in order.
+        -:   70:  // Extract the subranges from the linearized ranges.
+    #####:   71:  for (OpOperand &opOperand : op->getOpOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:   72:    // The method `getRangeFromOperandShape` requires using SubViewOp or
+        -:   73:    // ExtractSliceOps. If the value isn't defined from there continue.
+        -:   74:    // todo: The method should be adapted to get the values from
+        -:   75:    // `ViewInterface`. The interface needs a `getOrCreateRanges` method which
+        -:   76:    // currently returns a `linalg.range`. The fix here is to move this op to
+        -:   77:    // `std` dialect and add the method to `ViewInterface`.
+    #####:   78:    if (fromSubViewOpOnly &&
+branch  0 never executed
+branch  1 never executed
+    #####:   79:        !isa_and_nonnull<memref::SubViewOp, tensor::ExtractSliceOp>(
+branch  0 never executed
+branch  1 never executed
+    #####:   80:            opOperand.get().getDefiningOp()))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:   81:      continue;
+        -:   82:
+    #####:   83:    AffineMap map = op.getMatchingIndexingMap(&opOperand);
+call    0 never executed
+    #####:   84:    LLVM_DEBUG(llvm::dbgs() << "getShapeDefiningLoopRange I/O idx: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+        -:   85:                            << opOperand.getOperandNumber() << "\n");
+    #####:   86:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:   87:               << "getShapeDefiningLoopRange map: " << map << "\n");
+    #####:   88:    SmallVector<Value, 8> shapeRanges(map.getNumResults(), nullptr);
+call    0 never executed
+call    1 never executed
+    #####:   89:    for (const auto &en : llvm::enumerate(map.getResults())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+    #####:   90:      auto dimExpr = en.value().dyn_cast<AffineDimExpr>();
+call    0 never executed
+    #####:   91:      if (!dimExpr)
+branch  0 never executed
+branch  1 never executed
+    #####:   92:        continue;
+    #####:   93:      if (loopDepth == en.value().cast<AffineDimExpr>().getPosition()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:   94:        LLVM_DEBUG(llvm::dbgs() << "getShapeDefiningLoopRange loopDepth: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:   95:                                << loopDepth << "\n");
+    #####:   96:        LLVM_DEBUG(llvm::dbgs() << "getShapeDefiningLoopRange shape: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:   97:                                << opOperand.get() << "\n");
+    #####:   98:        return ShapeDimension{opOperand.get(),
+branch  0 never executed
+branch  1 never executed
+    #####:   99:                              static_cast<unsigned>(en.index())};
+branch  0 never executed
+branch  1 never executed
+        -:  100:      }
+        -:  101:    }
+        -:  102:  }
+    #####:  103:  llvm_unreachable("Expect to be able to extract a shape defining loop range");
+        -:  104:}
+        -:  105:
+        -:  106:static SmallVector<Value> getTiledOperands(LinalgOp producer) {
+        -:  107:  return producer->getOperands();
+        -:  108:}
+        -:  109:
+        -:  110:/// Fuses the producer by cloning the `producer`. The `fusedLoopsAndRanges`
+        -:  111:/// provides the loop range information for the fused loops. The rest are
+        -:  112:/// obtained from the producer itself, since they are not tiled + fused.
+function _ZL4fuseRN4mlir9OpBuilderENS_6linalg8LinalgOpERKN4llvm8DenseMapIjNS_5RangeENS4_12DenseMapInfoIjvEENS4_6detail12DenseMapPairIjS6_EEEE called 0 returned 0% blocks executed 0%
+    #####:  113:static LinalgOp fuse(OpBuilder &b, LinalgOp producer,
+        -:  114:                     const DenseMap<unsigned, Range> &fusedLoopsAndRanges) {
+    #####:  115:  SmallVector<OpFoldResult> ivs, tileSizes, sizeBounds;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  116:  SmallVector<Range> loopRanges;
+branch  0 never executed
+branch  1 never executed
+    #####:  117:  Location loc = producer.getLoc();
+call    0 never executed
+        -:  118:
+    #####:  119:  for (unsigned i = 0, e = producer.getNumLoops(); i < e; ++i) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  120:    auto shapeDim = getShapeDefiningLoopRange(producer, i);
+call    0 never executed
+    #####:  121:    OpFoldResult dim =
+    #####:  122:        createFoldedDimOp(b, loc, shapeDim.shape, shapeDim.dimension);
+call    0 never executed
+    #####:  123:    sizeBounds.push_back(dim);
+call    0 never executed
+    #####:  124:    auto it = fusedLoopsAndRanges.find(i);
+call    0 never executed
+    #####:  125:    if (it != fusedLoopsAndRanges.end()) {
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  126:      ivs.push_back(it->second.offset);
+call    0 never executed
+call    1 never executed
+    #####:  127:      tileSizes.push_back(it->second.size);
+call    0 never executed
+call    1 never executed
+    #####:  128:      loopRanges.push_back(it->second);
+call    0 never executed
+call    1 never executed
+    #####:  129:      LLVM_DEBUG(llvm::dbgs() << "tiled loop#" << i << " with LoopRange "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -:  130:                              << loopRanges.back() << "\n");
+        -:  131:    } else {
+    #####:  132:      tileSizes.push_back(b.getIndexAttr(0));
+call    0 never executed
+call    1 never executed
+call    2 never executed
+    #####:  133:      loopRanges.push_back(Range{b.getIndexAttr(0), dim, b.getIndexAttr(1)});
+call    0 never executed
+call    1 never executed
+call    2 never executed
+call    3 never executed
+call    4 never executed
+    #####:  134:      LLVM_DEBUG(llvm::dbgs() << "full loop#" << i << " with LoopRange "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+        -:  135:                              << loopRanges.back() << "\n");
+        -:  136:    }
+        -:  137:  }
+        -:  138:
+    #####:  139:  SmallVector<Value, 8> clonedShapes;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  140:  clonedShapes.reserve(producer->getNumOperands());
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  141:
+        -:  142:  // Compute subranges for all tensor input/output operands.
+    #####:  143:  clonedShapes.append(makeTiledShapes(
+call    0 never executed
+call    1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  144:      b, loc, producer, getTiledOperands(producer), ivs, tileSizes, sizeBounds,
+call    0 never executed
+call    1 never executed
+        -:  145:      /**omitPartialTileCheck=*/false));
+        -:  146:
+        -:  147:  // Iterate over the results in order.
+        -:  148:  // Extract the subtensor type from the linearized range.
+        -:  149:  // Since we do not enforce any canonicalizations on the fly, this is always
+        -:  150:  // fully dynamic at construction time.
+    #####:  151:  SmallVector<Type, 4> resultTypes;
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  152:  resultTypes.reserve(producer->getNumResults());
+branch  0 never executed
+branch  1 never executed
+    #####:  153:  for (OpOperand *operand : producer.getDpsInitOperands()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  154:    auto tensorType = operand->get().getType().dyn_cast<RankedTensorType>();
+call    0 never executed
+    #####:  155:    if (!tensorType)
+branch  0 never executed
+branch  1 never executed
+    #####:  156:      continue;
+    #####:  157:    unsigned rank = tensorType.getRank();
+call    0 never executed
+    #####:  158:    SmallVector<int64_t, 4> staticOffsetsVector(
+    #####:  159:        rank, ShapedType::kDynamicStrideOrOffset);
+call    0 never executed
+    #####:  160:    SmallVector<int64_t, 4> staticSizesVector(rank, ShapedType::kDynamicSize);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  161:    SmallVector<int64_t, 4> staticStridesVector(
+    #####:  162:        rank, ShapedType::kDynamicStrideOrOffset);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  163:    resultTypes.push_back(tensor::ExtractSliceOp::inferResultType(
+call    0 never executed
+call    1 never executed
+        -:  164:        tensorType, staticOffsetsVector, staticSizesVector,
+    #####:  165:        staticStridesVector));
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  166:  }
+        -:  167:
+    #####:  168:  Operation *clonedOp = producer.clone(b, loc, resultTypes, clonedShapes);
+call    0 never executed
+call    1 never executed
+call    2 never executed
+        -:  169:
+        -:  170:  // Shift all IndexOp results by the tile offset.
+    #####:  171:  SmallVector<OpFoldResult> allIvs = llvm::to_vector(
+    #####:  172:      llvm::map_range(loopRanges, [&](Range range) { return range.offset; }));
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  173:  offsetIndices(b, clonedOp, allIvs);
+call    0 never executed
+call    1 never executed
+        -:  174:
+    #####:  175:  return clonedOp;
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  176:}
+        -:  177:
+        -:  178:/// Get the loop range for a dimension `dim` based on the `shapedOperand`. It is
+        -:  179:/// expected to be defined by a subview op or an extract_slice op.
+function _ZL24getRangeFromOperandShapeRN4mlir9OpBuilderENS_8LocationENS_5ValueEj called 0 returned 0% blocks executed 0%
+    #####:  180:static Range getRangeFromOperandShape(OpBuilder &b, Location loc,
+        -:  181:                                      Value shapedOperand, unsigned dim) {
+    #####:  182:  Operation *shapeProducingOp = shapedOperand.getDefiningOp();
+call    0 never executed
+    #####:  183:  if (auto subViewOp = dyn_cast<memref::SubViewOp>(shapeProducingOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  184:    return subViewOp.getOrCreateRanges(b, loc)[dim];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  185:  if (auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(shapeProducingOp))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  186:    return sliceOp.getOrCreateRanges(b, loc)[dim];
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  187:  llvm_unreachable("SubviewOp or ExtractSliceOp expected");
+call    0 never executed
+        -:  188:}
+        -:  189:
+        -:  190:/// Fuses the producer into the loop immediately enclosing the consumer.
+        -:  191:/// This is achieved by "recomputing" the producer at the time it
+        -:  192:/// is needed just before the consumer.
+function _ZL4fuseRN4mlir9OpBuilderENS_6linalg8LinalgOpENS_9AffineMapERNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  193:static LinalgOp fuse(OpBuilder &b, LinalgOp producerOp, AffineMap producerMap,
+        -:  194:                     OpOperand &consumerOpOperand) {
+    #####:  195:  LLVM_DEBUG(llvm::dbgs() << "Producer map: " << producerMap << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  196:  DenseMap<unsigned, Range> fusedLoopsAndRanges;
+call    0 never executed
+    #####:  197:  Value shapedOperand = consumerOpOperand.get();
+call    0 never executed
+    #####:  198:  for (const auto &en : llvm::enumerate(producerMap.getResults())) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  199:    unsigned posInProducerLoop = en.value().cast<AffineDimExpr>().getPosition();
+call    0 never executed
+call    1 never executed
+    #####:  200:    fusedLoopsAndRanges[posInProducerLoop] = getRangeFromOperandShape(
+call    0 never executed
+    #####:  201:        b, consumerOpOperand.getOwner()->getLoc(), shapedOperand, en.index());
+call    0 never executed
+call    1 never executed
+        -:  202:  }
+    #####:  203:  return fuse(b, producerOp, fusedLoopsAndRanges);
+call    0 never executed
+call    1 never executed
+        -:  204:}
+        -:  205:
+        -:  206:// Encode structural fusion safety preconditions.
+        -:  207:// Some of these will be lifted in the future with better analysis.
+        -:  208:static bool isStructurallyFusableProducer(LinalgOp producer, Value consumedView,
+        -:  209:                                          LinalgOp consumer) {
+        -:  210:  assert(producer.hasBufferSemantics() &&
+        -:  211:         "expected linalg op with buffer semantics");
+        -:  212:  assert(consumer.hasBufferSemantics() &&
+        -:  213:         "expected linalg op with buffer semantics");
+        -:  214:  if (producer.getNumDpsInits() != 1) {
+        -:  215:    LLVM_DEBUG(llvm::dbgs() << "\nNot structurally fusable (multi-output)");
+        -:  216:    return false;
+        -:  217:  }
+        -:  218:  // Only fuse when the producer block dominates.
+        -:  219:  DominanceInfo dom(producer.getOperation());
+        -:  220:  if (!dom.dominates(producer->getBlock(), consumer->getBlock())) {
+        -:  221:    LLVM_DEBUG(
+        -:  222:        llvm::dbgs()
+        -:  223:        << "\nNot structurally fusable (producer block does not dominate)");
+        -:  224:    return false;
+        -:  225:  }
+        -:  226:  return true;
+        -:  227:}
+        -:  228:
+function _ZN4mlir6linalg25isProducerLastWriteOfViewERKNS0_21LinalgDependenceGraphENS0_8LinalgOpENS_5ValueES4_ called 0 returned 0% blocks executed 0%
+    #####:  229:bool mlir::linalg::isProducerLastWriteOfView(const LinalgDependenceGraph &graph,
+        -:  230:                                             LinalgOp consumer,
+        -:  231:                                             Value consumedView,
+        -:  232:                                             LinalgOp producer) {
+    #####:  233:  assert(producer.hasBufferSemantics() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  234:         "expected linalg op with buffer semantics");
+    #####:  235:  assert(consumer.hasBufferSemantics() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  236:         "expected linalg op with buffer semantics");
+        -:  237:  // Make some simple structural checks that alleviate the need for more
+        -:  238:  // complex analyses.
+    #####:  239:  if (!isStructurallyFusableProducer(producer, consumedView, consumer)) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  240:    LLVM_DEBUG(llvm::dbgs() << "\n***Not static last write due to structure:\t"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  241:                            << *producer.getOperation());
+    #####:  242:    return false;
+        -:  243:  }
+        -:  244:  // Check for any interleaved write to consumedView.
+    #####:  245:  if (!graph.findCoveringWrites(producer, consumer, consumedView).empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  246:    LLVM_DEBUG(llvm::dbgs() << "\n***Not fusable due to interleaved write:\t"
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  247:                            << *producer.getOperation());
+    #####:  248:    return false;
+        -:  249:  }
+        -:  250:  return true;
+        -:  251:}
+        -:  252:
+function _ZN4mlir6linalg13isFusableIntoERKNS0_21LinalgDependenceGraphENS0_8LinalgOpENS_5ValueES4_ called 0 returned 0% blocks executed 0%
+    #####:  253:bool mlir::linalg::isFusableInto(const LinalgDependenceGraph &graph,
+        -:  254:                                 LinalgOp consumer, Value consumedView,
+        -:  255:                                 LinalgOp producer) {
+    #####:  256:  assert(producer.hasBufferSemantics() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  257:         "expected linalg op with buffer semantics");
+    #####:  258:  assert(consumer.hasBufferSemantics() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+call    3 never executed
+        -:  259:         "expected linalg op with buffer semantics");
+    #####:  260:  if (!isProducerLastWriteOfView(graph, consumer, consumedView, producer))
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  261:    return false;
+        -:  262:  // Check for any fusion-preventing dependence to any shape read/written that
+        -:  263:  // would violate dependences.
+    #####:  264:  if (!graph.findCoveringDependences(producer, consumer).empty()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  265:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  266:               << "\n***Not fusable due to an interleaved dependence:\t"
+        -:  267:               << *producer.getOperation());
+    #####:  268:    return false;
+        -:  269:  }
+        -:  270:  return true;
+        -:  271:}
+        -:  272:
+        -:  273:/// For `consumer` with buffer semantics, find the Linalg operation on buffers
+        -:  274:/// that is the last writer of `consumerOpOperand`. For now the fusable
+        -:  275:/// dependence is returned as an instance of the `dependenceGraph`.
+        -:  276:static FailureOr<LinalgDependenceGraph::LinalgDependenceGraphElem>
+function _ZL19findFusableProducerRN4mlir9OpOperandERKNS_6linalg21LinalgDependenceGraphE called 20 returned 100% blocks executed 19%
+       20:  277:findFusableProducer(OpOperand &consumerOpOperand,
+        -:  278:                    const LinalgDependenceGraph &dependenceGraph) {
+      20*:  279:  LLVM_DEBUG(llvm::dbgs() << "findFusableProducer for: "
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+        -:  280:                          << consumerOpOperand.get() << " @"
+        -:  281:                          << consumerOpOperand.getOperandNumber() << " in "
+        -:  282:                          << *consumerOpOperand.getOwner() << "\n");
+       20:  283:  LinalgOp consumerOp = dyn_cast<LinalgOp>(consumerOpOperand.getOwner());
+call    0 returned 100%
+       20:  284:  if (!consumerOp)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    #####:  285:    return failure();
+        -:  286:
+        -:  287:  // Only consider RAW and WAW atm.
+       40:  288:  for (auto depType : {
+        -:  289:           LinalgDependenceGraph::DependenceType::RAW,
+        -:  290:           LinalgDependenceGraph::DependenceType::WAW,
+       60:  291:       }) {
+branch  0 taken 67% (fallthrough)
+branch  1 taken 33%
+      40*:  292:    LLVM_DEBUG(llvm::dbgs()
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  293:               << "Dependencies into: " << *consumerOp.getOperation() << "\n");
+    #####:  294:    for (auto dependence : llvm::make_filter_range(
+call    0 never executed
+       80:  295:             dependenceGraph.getDependencesInto(consumerOp, depType),
+function _ZZL19findFusableProducerRN4mlir9OpOperandERKNS_6linalg21LinalgDependenceGraphEENKUlNS3_25LinalgDependenceGraphElemEE_clES6_.isra.0 called 0 returned 0% blocks executed 0%
+    #####:  296:             [&](LinalgDependenceGraph::LinalgDependenceGraphElem elem) {
+    #####:  297:               LLVM_DEBUG(llvm::dbgs() << "Inspect dependence btw: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+        -:  298:                                       << elem.getIndexingValue() << " and "
+        -:  299:                                       << elem.getDependentValue() << "\n");
+    #####:  300:               Value v = elem.getIndexingValue();
+call    0 never executed
+    #####:  301:               Optional<unsigned> operandNum =
+    #####:  302:                   elem.getIndexingOpViewOperandNum();
+call    0 never executed
+    #####:  303:               return isa<LinalgOp>(elem.getDependentOp()) &&
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  304:                      v == consumerOpOperand.get() && operandNum &&
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+branch  7 never executed
+    #####:  305:                      *operandNum == consumerOpOperand.getOperandNumber();
+call    0 never executed
+      40*:  306:             })) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  307:      // Consumer consumes this view, `isStructurallyFusableProducer` also
+        -:  308:      // checks whether it is a strict subview of the producer view.
+    #####:  309:      auto producer = cast<LinalgOp>(dependence.getDependentOp());
+call    0 never executed
+call    1 never executed
+    #####:  310:      LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+call    9 never executed
+call   10 never executed
+call   11 never executed
+call   12 never executed
+call   13 never executed
+call   14 never executed
+call   15 never executed
+        -:  311:                 << "\n"
+        -:  312:                 << LinalgDependenceGraph::getDependenceTypeStr(depType)
+        -:  313:                 << "producer: " << *dependence.getDependentOp()
+        -:  314:                 << " view: " << dependence.getDependentValue() << "\n");
+        -:  315:
+        -:  316:      // If the producer and consumer have tensor semantics, the only dependence
+        -:  317:      // between them is through a RAW dependence and they are fusable by
+        -:  318:      // construction. For buffer semantics need additional checks.
+    #####:  319:      if (producer.hasBufferSemantics() && consumerOp.hasBufferSemantics() &&
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+branch  5 never executed
+branch  6 never executed
+    #####:  320:          isFusableInto(dependenceGraph, consumerOp, consumerOpOperand.get(),
+call    0 never executed
+        -:  321:                        producer))
+    #####:  322:        return dependence;
+    #####:  323:      if (producer.hasTensorSemantics() && consumerOp.hasTensorSemantics()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+branch  4 never executed
+    #####:  324:        assert(dependence.dependenceType ==
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+        -:  325:               LinalgDependenceGraph::DependenceType::RAW);
+    #####:  326:        return dependence;
+        -:  327:      }
+        -:  328:    }
+        -:  329:  }
+       20:  330:  return failure();
+        -:  331:}
+        -:  332:
+        -:  333:FailureOr<FusionInfo>
+function _ZN4mlir6linalg20fuseProducerOfBufferERNS_9OpBuilderERNS_9OpOperandERKNS0_21LinalgDependenceGraphE called 20 returned 100% blocks executed 11%
+       20:  334:mlir::linalg::fuseProducerOfBuffer(OpBuilder &b, OpOperand &consumerOpOperand,
+        -:  335:                                   const LinalgDependenceGraph &graph) {
+       20:  336:  Optional<LinalgDependenceGraph::LinalgDependenceGraphElem> fusableDependence =
+       20:  337:      findFusableProducer(consumerOpOperand, graph);
+call    0 returned 100%
+       20:  338:  if (!fusableDependence)
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+       20:  339:    return failure();
+        -:  340:
+    #####:  341:  LinalgOp producerOp = dyn_cast<LinalgOp>(fusableDependence->getDependentOp());
+call    0 never executed
+call    1 never executed
+    #####:  342:  if (!producerOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  343:    return failure();
+        -:  344:
+        -:  345:  // If producer is already in the same block as consumer, we are done.
+    #####:  346:  if (consumerOpOperand.get().getParentBlock() ==
+call    0 never executed
+call    1 never executed
+    #####:  347:      fusableDependence->getDependentValue().getParentBlock())
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  348:    return failure();
+        -:  349:
+    #####:  350:  Optional<AffineMap> producerMap =
+call    0 never executed
+    #####:  351:      fusableDependence->getDependentOpViewIndexingMap();
+call    0 never executed
+    #####:  352:  if (!producerMap)
+branch  0 never executed
+branch  1 never executed
+    #####:  353:    return failure();
+        -:  354:
+        -:  355:  // Must be a subview or an extract_slice to guarantee there are loops we can
+        -:  356:  // fuse into.
+    #####:  357:  auto subView = consumerOpOperand.get().getDefiningOp<memref::SubViewOp>();
+call    0 never executed
+    #####:  358:  if (!subView) {
+branch  0 never executed
+branch  1 never executed
+    #####:  359:    LLVM_DEBUG(llvm::dbgs() << "\nNot fusable (not a subview)");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+    #####:  360:    return failure();
+        -:  361:  }
+        -:  362:
+        -:  363:  // Fuse `producer` just before `consumer`.
+    #####:  364:  OpBuilder::InsertionGuard g(b);
+call    0 never executed
+    #####:  365:  b.setInsertionPoint(consumerOpOperand.getOwner());
+call    0 never executed
+    #####:  366:  LLVM_DEBUG(llvm::dbgs() << "Fuse into consumer: "
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+        -:  367:                          << *consumerOpOperand.getOwner() << "\n");
+        -:  368:
+    #####:  369:  auto fusedProducer = fuse(b, producerOp, *producerMap, consumerOpOperand);
+call    0 never executed
+    #####:  370:  return FusionInfo{producerOp, fusedProducer};
+branch  0 never executed
+branch  1 never executed
+        -:  371:}
+        -:  372:
+        -:  373:/// Walk back use-def chain through scf::For yields.
+        -:  374:/// Sets `producer` and `outputIndex` if it finds a producer LinalgOp
+        -:  375:
+        -:  376:// TODO(ravishankarm, ntv): This can be moved into the dependence graphs
+        -:  377:// dependence tracking since the dependence tracking is similar to what is done
+        -:  378:// w.r.t to buffers.
+function _ZL19getProducerOfTensorN4mlir5ValueERNS_8OpResultE called 16 returned 100% blocks executed 41%
+       16:  379:static void getProducerOfTensor(Value tensor, OpResult &opResult) {
+       16:  380:  if (!tensor.getType().isa<RankedTensorType>())
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0%
+        -:  381:    return;
+        -:  382:
+       16:  383:  while (true) {
+      16*:  384:    LLVM_DEBUG(llvm::dbgs() << "\ngetProducerOfTensor: " << tensor);
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+       16:  385:    if (auto linalgOp = tensor.getDefiningOp<LinalgOp>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  386:      opResult = tensor.cast<OpResult>();
+call    0 never executed
+    #####:  387:      return;
+        -:  388:    }
+      16*:  389:    if (auto sliceOp = tensor.getDefiningOp<tensor::ExtractSliceOp>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  390:      tensor = sliceOp.getSource();
+call    0 never executed
+    #####:  391:      continue;
+        -:  392:    }
+       16:  393:    if (auto blockArg = tensor.dyn_cast<BlockArgument>()) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  394:      if (auto forOp = blockArg.getDefiningOp<scf::ForOp>()) {
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  395:        tensor = *(forOp.getIterOperands().begin() + blockArg.getArgNumber());
+call    0 never executed
+    #####:  396:        continue;
+        -:  397:      }
+        -:  398:    }
+       16:  399:    return;
+        -:  400:  }
+        -:  401:}
+        -:  402:
+        -:  403:FailureOr<FusionInfo>
+function _ZN4mlir6linalg20fuseProducerOfTensorERNS_9OpBuilderERNS_9OpOperandE called 16 returned 100% blocks executed 50%
+       16:  404:mlir::linalg::fuseProducerOfTensor(OpBuilder &b, OpOperand &consumerOpOperand) {
+       16:  405:  Value inputTensor = consumerOpOperand.get();
+call    0 returned 100%
+       16:  406:  OpResult producerOpResult;
+       16:  407:  getProducerOfTensor(inputTensor, producerOpResult);
+call    0 returned 100%
+       16:  408:  if (!producerOpResult) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+      16*:  409:    LLVM_DEBUG(llvm::dbgs() << "\nUnable to find producer");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+       16:  410:    return failure();
+        -:  411:  }
+    #####:  412:  return fuseProducerOfTensor(b, producerOpResult, consumerOpOperand);
+call    0 never executed
+        -:  413:}
+        -:  414:
+        -:  415:FailureOr<FusionInfo>
+function _ZN4mlir6linalg20fuseProducerOfTensorERNS_9OpBuilderENS_8OpResultERNS_9OpOperandE called 0 returned 0% blocks executed 0%
+    #####:  416:mlir::linalg::fuseProducerOfTensor(OpBuilder &b, OpResult producerOpResult,
+        -:  417:                                   OpOperand &consumerOpOperand) {
+    #####:  418:  auto producerOp = dyn_cast<LinalgOp>(producerOpResult.getOwner());
+call    0 never executed
+call    1 never executed
+    #####:  419:  if (!producerOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  420:    return failure();
+        -:  421:
+    #####:  422:  LinalgOp consumerOp = dyn_cast<LinalgOp>(consumerOpOperand.getOwner());
+call    0 never executed
+    #####:  423:  if (!consumerOp)
+branch  0 never executed
+branch  1 never executed
+    #####:  424:    return failure();
+        -:  425:
+    #####:  426:  Value inputTensor = consumerOpOperand.get();
+call    0 never executed
+        -:  427:
+        -:  428:  // Must be an extract_slice op to guarantee there are loops we can fuse into.
+    #####:  429:  auto sliceOp = inputTensor.getDefiningOp<tensor::ExtractSliceOp>();
+call    0 never executed
+    #####:  430:  if (!sliceOp) {
+branch  0 never executed
+branch  1 never executed
+    #####:  431:    LLVM_DEBUG(llvm::dbgs()
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+        -:  432:               << "\nNot fusable, not an extract_slice op: " << inputTensor);
+    #####:  433:    return failure();
+        -:  434:  }
+        -:  435:
+        -:  436:  // If producer is already in the same block as consumer, we are done.
+    #####:  437:  if (consumerOpOperand.get().getParentBlock() ==
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  438:      producerOpResult.getParentBlock())
+call    0 never executed
+    #####:  439:    return failure();
+        -:  440:
+        -:  441:  // Insert fused `producer` just before `consumer`.
+    #####:  442:  OpBuilder::InsertionGuard g(b);
+call    0 never executed
+    #####:  443:  b.setInsertionPoint(consumerOp);
+call    0 never executed
+    #####:  444:  LLVM_DEBUG(llvm::dbgs() << "Fuse into consumer: " << *consumerOp << "\n");
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+call    5 never executed
+call    6 never executed
+call    7 never executed
+call    8 never executed
+    #####:  445:  OpOperand *opOperand =
+call    0 never executed
+    #####:  446:      producerOp.getDpsInitOperand(producerOpResult.getResultNumber());
+call    0 never executed
+    #####:  447:  LinalgOp fusedProducer =
+        -:  448:      fuse(b, producerOp, producerOp.getMatchingIndexingMap(opOperand),
+    #####:  449:           consumerOpOperand);
+call    0 never executed
+call    1 never executed
+        -:  450:
+        -:  451:  // Replace use.
+        -:  452:  // Canonicalizations are not guaranteed to have happened before constructing
+        -:  453:  // `fusedProducer`. In the tensor case this can result in temporary type
+        -:  454:  // mismatches. Insert a `tensor.cast` op to propagate the transformation
+        -:  455:  // invariant that types are compatible.
+    #####:  456:  Value def = fusedProducer->getResult(producerOpResult.getResultNumber());
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  457:  Type consumerType = consumerOpOperand.get().getType();
+branch  0 never executed
+branch  1 never executed
+    #####:  458:  if (consumerType != def.getType())
+branch  0 never executed
+branch  1 never executed
+    #####:  459:    def = b.create<tensor::CastOp>(fusedProducer.getLoc(), consumerType, def);
+call    0 never executed
+    #####:  460:  consumerOpOperand.set(def);
+branch  0 never executed
+branch  1 never executed
+    #####:  461:  return FusionInfo{cast<LinalgOp>(producerOpResult.getOwner()), fusedProducer};
+call    0 never executed
+call    1 never executed
+branch  2 never executed
+branch  3 never executed
+        -:  462:}

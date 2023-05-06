@@ -1,0 +1,935 @@
+        -:    0:Source:/data/xcy/llvm-project-fdbc55a5/mlir/lib/Dialect/Bufferization/Transforms/BufferOptimizations.cpp
+        -:    0:Graph:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/BufferOptimizations.cpp.gcno
+        -:    0:Data:../tools/mlir/lib/Dialect/Bufferization/Transforms/CMakeFiles/obj.MLIRBufferizationTransforms.dir/BufferOptimizations.cpp.gcda
+        -:    0:Runs:116157
+        -:    1://===- BufferOptimizations.cpp - pre-pass optimizations for bufferization -===//
+        -:    2://
+        -:    3:// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+        -:    4:// See https://llvm.org/LICENSE.txt for license information.
+        -:    5:// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+        -:    6://
+        -:    7://===----------------------------------------------------------------------===//
+        -:    8://
+        -:    9:// This file implements logic for three optimization passes. The first two
+        -:   10:// passes try to move alloc nodes out of blocks to reduce the number of
+        -:   11:// allocations and copies during buffer deallocation. The third pass tries to
+        -:   12:// convert heap-based allocations to stack-based allocations, if possible.
+        -:   13:
+        -:   14:#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+        -:   15:
+        -:   16:#include "mlir/Dialect/Bufferization/Transforms/BufferUtils.h"
+        -:   17:#include "mlir/Dialect/Func/IR/FuncOps.h"
+        -:   18:#include "mlir/Dialect/MemRef/IR/MemRef.h"
+        -:   19:#include "mlir/IR/Operation.h"
+        -:   20:#include "mlir/Interfaces/LoopLikeInterface.h"
+        -:   21:#include "mlir/Pass/Pass.h"
+        -:   22:
+        -:   23:namespace mlir {
+        -:   24:namespace bufferization {
+        -:   25:#define GEN_PASS_DEF_BUFFERHOISTING
+        -:   26:#define GEN_PASS_DEF_BUFFERLOOPHOISTING
+        -:   27:#define GEN_PASS_DEF_PROMOTEBUFFERSTOSTACK
+        -:   28:#include "mlir/Dialect/Bufferization/Transforms/Passes.h.inc"
+        -:   29:} // namespace bufferization
+        -:   30:} // namespace mlir
+        -:   31:
+        -:   32:using namespace mlir;
+        -:   33:using namespace mlir::bufferization;
+        -:   34:
+        -:   35:/// Returns true if the given operation implements a known high-level region-
+        -:   36:/// based control-flow interface.
+    44992:   37:static bool isKnownControlFlowInterface(Operation *op) {
+    44992:   38:  return isa<LoopLikeOpInterface, RegionBranchOpInterface>(op);
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:   39:}
+        -:   40:
+        -:   41:/// Check if the size of the allocation is less than the given size. The
+        -:   42:/// transformation is only applied to small buffers since large buffers could
+        -:   43:/// exceed the stack space.
+function _ZL19defaultIsSmallAllocN4mlir5ValueEjj called 31458 returned 100% blocks executed 100%
+    31458:   44:static bool defaultIsSmallAlloc(Value alloc, unsigned maximumSizeInBytes,
+        -:   45:                                unsigned maxRankOfAllocatedMemRef) {
+    31458:   46:  auto type = alloc.getType().dyn_cast<ShapedType>();
+call    0 returned 100%
+    31457:   47:  if (!type || !alloc.getDefiningOp<memref::AllocOp>())
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+call    2 returned 100%
+branch  3 taken 28% (fallthrough)
+branch  4 taken 72%
+     8931:   48:    return false;
+    22526:   49:  if (!type.hasStaticShape()) {
+call    0 returned 100%
+branch  1 taken 1% (fallthrough)
+branch  2 taken 100%
+        -:   50:    // Check if the dynamic shape dimension of the alloc is produced by
+        -:   51:    // `memref.rank`. If this is the case, it is likely to be small.
+        -:   52:    // Furthermore, the dimension is limited to the maximum rank of the
+        -:   53:    // allocated memref to avoid large values by multiplying several small
+        -:   54:    // values.
+       13:   55:    if (type.getRank() <= maxRankOfAllocatedMemRef) {
+call    0 returned 100%
+branch  1 taken 46% (fallthrough)
+branch  2 taken 54%
+        6:   56:      return llvm::all_of(alloc.getDefiningOp()->getOperands(),
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+        -:   57:                          [&](Value operand) {
+        -:   58:                            return operand.getDefiningOp<memref::RankOp>();
+        -:   59:                          });
+        -:   60:    }
+        -:   61:    return false;
+        -:   62:  }
+    22513:   63:  unsigned bitwidth = mlir::DataLayout::closest(alloc.getDefiningOp())
+call    0 returned 100%
+call    1 returned 100%
+    22514:   64:                          .getTypeSizeInBits(type.getElementType());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+    22514:   65:  return type.getNumElements() * bitwidth <= maximumSizeInBytes * 8;
+call    0 returned 100%
+        -:   66:}
+        -:   67:
+        -:   68:/// Checks whether the given aliases leave the allocation scope.
+        -:   69:static bool
+function _ZL21leavesAllocationScopePN4mlir6RegionERKN4llvm11SmallPtrSetINS_5ValueELj16EEE called 16718 returned 100% blocks executed 100%
+    16718:   70:leavesAllocationScope(Region *parentRegion,
+        -:   71:                      const BufferViewFlowAnalysis::ValueSetT &aliases) {
+    38106:   72:  for (Value alias : aliases) {
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 57% (fallthrough)
+branch  3 taken 43%
+call    4 returned 100%
+call    5 returned 100%
+    96564:   73:    for (auto *use : alias.getUsers()) {
+branch  0 taken 78% (fallthrough)
+branch  1 taken 22%
+        -:   74:      // If there is at least one alias that leaves the parent region, we know
+        -:   75:      // that this alias escapes the whole region and hence the associated
+        -:   76:      // allocation leaves allocation scope.
+    80444:   77:      if (isRegionReturnLike(use) && use->getParentRegion() == parentRegion)
+call    0 returned 100%
+branch  1 taken 7% (fallthrough)
+branch  2 taken 93%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+branch  5 taken 3% (fallthrough)
+branch  6 taken 97%
+      159:   78:        return true;
+        -:   79:    }
+        -:   80:  }
+    16559:   81:  return false;
+        -:   82:}
+        -:   83:
+        -:   84:/// Checks, if an automated allocation scope for a given alloc value exists.
+function _ZL18hasAllocationScopeN4mlir5ValueERKNS_22BufferViewFlowAnalysisE called 19832 returned 100% blocks executed 95%
+    19832:   85:static bool hasAllocationScope(Value alloc,
+        -:   86:                               const BufferViewFlowAnalysis &aliasAnalysis) {
+    19832:   87:  Region *region = alloc.getParentRegion();
+call    0 returned 100%
+    30922:   88:  do {
+    30922:   89:    if (Operation *parentOp = region->getParentOp()) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:   90:      // Check if the operation is an automatic allocation scope and whether an
+        -:   91:      // alias leaves the scope. This means, an allocation yields out of
+        -:   92:      // this scope and can not be transformed in a stack-based allocation.
+    47640:   93:      if (parentOp->hasTrait<OpTrait::AutomaticAllocationScope>() &&
+call    0 returned 100%
+branch  1 taken 54% (fallthrough)
+branch  2 taken 46%
+branch  3 taken 1% (fallthrough)
+branch  4 taken 99%
+    47799:   94:          !leavesAllocationScope(region, aliasAnalysis.resolve(alloc)))
+call    0 returned 100%
+call    1 returned 100%
+branch  2 taken 1% (fallthrough)
+branch  3 taken 99%
+branch  4 taken 46% (fallthrough)
+branch  5 taken 54%
+        -:   95:        return true;
+        -:   96:      // Check if the operation is a known control flow interface and break the
+        -:   97:      // loop to avoid transformation in loops. Furthermore skip transformation
+        -:   98:      // if the operation does not implement a RegionBeanchOpInterface.
+    14363:   99:      if (BufferPlacementTransformationBase::isLoop(parentOp) ||
+call    0 returned 100%
+branch  1 taken 91% (fallthrough)
+branch  2 taken 9%
+    13073:  100:          !isKnownControlFlowInterface(parentOp))
+branch  0 taken 85% (fallthrough)
+branch  1 taken 15%
+        -:  101:        break;
+        -:  102:    }
+    11090:  103:  } while ((region = region->getParentRegion()));
+call    0 returned 100%
+branch  1 taken 100%
+branch  2 taken 0% (fallthrough)
+        -:  104:  return false;
+        -:  105:}
+        -:  106:
+        -:  107:namespace {
+        -:  108:
+        -:  109://===----------------------------------------------------------------------===//
+        -:  110:// BufferAllocationHoisting
+        -:  111://===----------------------------------------------------------------------===//
+        -:  112:
+        -:  113:/// A base implementation compatible with the `BufferAllocationHoisting` class.
+        -:  114:struct BufferAllocationHoistingStateBase {
+        -:  115:  /// A pointer to the current dominance info.
+        -:  116:  DominanceInfo *dominators;
+        -:  117:
+        -:  118:  /// The current allocation value.
+        -:  119:  Value allocValue;
+        -:  120:
+        -:  121:  /// The current placement block (if any).
+        -:  122:  Block *placementBlock;
+        -:  123:
+        -:  124:  /// Initializes the state base.
+    51384:  125:  BufferAllocationHoistingStateBase(DominanceInfo *dominators, Value allocValue,
+        -:  126:                                    Block *placementBlock)
+    51384:  127:      : dominators(dominators), allocValue(allocValue),
+    51384:  128:        placementBlock(placementBlock) {}
+        -:  129:};
+        -:  130:
+        -:  131:/// Implements the actual hoisting logic for allocation nodes.
+        -:  132:template <typename StateT>
+        -:  133:class BufferAllocationHoisting : public BufferPlacementTransformationBase {
+        -:  134:public:
+      915:  135:  BufferAllocationHoisting(Operation *op)
+        -:  136:      : BufferPlacementTransformationBase(op), dominators(op),
+      915:  137:        postDominators(op), scopeOp(op) {}
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEEC2EPN4mlir9OperationE:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEEC2EPN4mlir9OperationE called 455 returned 98% blocks executed 100%
+      455:  135:  BufferAllocationHoisting(Operation *op)
+        -:  136:      : BufferPlacementTransformationBase(op), dominators(op),
+      455:  137:        postDominators(op), scopeOp(op) {}
+call    0 returned 98%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEEC2EPN4mlir9OperationE:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEEC2EPN4mlir9OperationE called 460 returned 100% blocks executed 100%
+      460:  135:  BufferAllocationHoisting(Operation *op)
+        -:  136:      : BufferPlacementTransformationBase(op), dominators(op),
+      460:  137:        postDominators(op), scopeOp(op) {}
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+------------------
+        -:  138:
+        -:  139:  /// Moves allocations upwards.
+      904:  140:  void hoist() {
+     1811:  141:    SmallVector<Value> allocsAndAllocas;
+    65850:  142:    for (BufferPlacementAllocs::AllocEntry &entry : allocs)
+    64946:  143:      allocsAndAllocas.push_back(std::get<0>(entry));
+     9649:  144:    scopeOp->walk([&](memref::AllocaOp op) {
+     8744:  145:      allocsAndAllocas.push_back(op.getMemref());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+call    3 returned 100%
+        -:  146:    });
+        -:  147:
+    74596:  148:    for (auto allocValue : allocsAndAllocas) {
+   147379:  149:      if (!StateT::shouldHoistOpType(allocValue.getDefiningOp()))
+    22306:  150:        continue;
+    51384:  151:      Operation *definingOp = allocValue.getDefiningOp();
+   51384*:  152:      assert(definingOp && "No defining op");
+    51384:  153:      auto operands = definingOp->getOperands();
+   102768:  154:      auto resultAliases = aliases.resolve(allocValue);
+        -:  155:      // Determine the common dominator block of all aliases.
+        -:  156:      Block *dominatorBlock =
+    51384:  157:          findCommonDominator(allocValue, resultAliases, dominators);
+        -:  158:      // Init the initial hoisting state.
+    51384:  159:      StateT state(&dominators, allocValue, allocValue.getParentBlock());
+        -:  160:      // Check for additional allocation dependencies to compute an upper bound
+        -:  161:      // for hoisting.
+    51384:  162:      Block *dependencyBlock = nullptr;
+        -:  163:      // If this node has dependencies, check all dependent nodes. This ensures
+        -:  164:      // that all dependency values have been computed before allocating the
+        -:  165:      // buffer.
+    51426:  166:      for (Value depValue : operands) {
+       42:  167:        Block *depBlock = depValue.getParentBlock();
+       42:  168:        if (!dependencyBlock || dominators.dominates(dependencyBlock, depBlock))
+        -:  169:          dependencyBlock = depBlock;
+        -:  170:      }
+        -:  171:
+        -:  172:      // Find the actual placement block and determine the start operation using
+        -:  173:      // an upper placement-block boundary. The idea is that placement block
+        -:  174:      // cannot be moved any further upwards than the given upper bound.
+    79849:  175:      Block *placementBlock = findPlacementBlock(
+        -:  176:          state, state.computeUpperBound(dominatorBlock, dependencyBlock));
+   102768:  177:      Operation *startOperation = BufferPlacementAllocs::getStartOperation(
+    51384:  178:          allocValue, placementBlock, liveness);
+        -:  179:
+        -:  180:      // Move the alloc in front of the start operation.
+    51384:  181:      Operation *allocOperation = allocValue.getDefiningOp();
+    51384:  182:      allocOperation->moveBefore(startOperation);
+        -:  183:    }
+      907:  184:  }
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEE5hoistEv:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEE5hoistEv called 446 returned 100% blocks executed 87%
+      446:  140:  void hoist() {
+      894:  141:    SmallVector<Value> allocsAndAllocas;
+    33634:  142:    for (BufferPlacementAllocs::AllocEntry &entry : allocs)
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+    33188:  143:      allocsAndAllocas.push_back(std::get<0>(entry));
+call    0 returned 100%
+      447:  144:    scopeOp->walk([&](memref::AllocaOp op) {
+call    0 returned 100%
+        -:  145:      allocsAndAllocas.push_back(op.getMemref());
+        -:  146:    });
+        -:  147:
+    38167:  148:    for (auto allocValue : allocsAndAllocas) {
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    75439:  149:      if (!StateT::shouldHoistOpType(allocValue.getDefiningOp()))
+call    0 returned 100%
+branch  1 taken 25% (fallthrough)
+branch  2 taken 75%
+     9255:  150:        continue;
+    28465:  151:      Operation *definingOp = allocValue.getDefiningOp();
+call    0 returned 100%
+   28465*:  152:      assert(definingOp && "No defining op");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+    28465:  153:      auto operands = definingOp->getOperands();
+    56930:  154:      auto resultAliases = aliases.resolve(allocValue);
+call    0 returned 100%
+        -:  155:      // Determine the common dominator block of all aliases.
+        -:  156:      Block *dominatorBlock =
+    28465:  157:          findCommonDominator(allocValue, resultAliases, dominators);
+call    0 returned 100%
+        -:  158:      // Init the initial hoisting state.
+    28465:  159:      StateT state(&dominators, allocValue, allocValue.getParentBlock());
+call    0 returned 100%
+        -:  160:      // Check for additional allocation dependencies to compute an upper bound
+        -:  161:      // for hoisting.
+    28465:  162:      Block *dependencyBlock = nullptr;
+        -:  163:      // If this node has dependencies, check all dependent nodes. This ensures
+        -:  164:      // that all dependency values have been computed before allocating the
+        -:  165:      // buffer.
+    28490:  166:      for (Value depValue : operands) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+       25:  167:        Block *depBlock = depValue.getParentBlock();
+call    0 returned 100%
+       25:  168:        if (!dependencyBlock || dominators.dominates(dependencyBlock, depBlock))
+branch  0 taken 16% (fallthrough)
+branch  1 taken 84%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  169:          dependencyBlock = depBlock;
+        -:  170:      }
+        -:  171:
+        -:  172:      // Find the actual placement block and determine the start operation using
+        -:  173:      // an upper placement-block boundary. The idea is that placement block
+        -:  174:      // cannot be moved any further upwards than the given upper bound.
+    56930:  175:      Block *placementBlock = findPlacementBlock(
+        -:  176:          state, state.computeUpperBound(dominatorBlock, dependencyBlock));
+    56930:  177:      Operation *startOperation = BufferPlacementAllocs::getStartOperation(
+    28465:  178:          allocValue, placementBlock, liveness);
+call    0 returned 100%
+        -:  179:
+        -:  180:      // Move the alloc in front of the start operation.
+    28465:  181:      Operation *allocOperation = allocValue.getDefiningOp();
+call    0 returned 100%
+    28465:  182:      allocOperation->moveBefore(startOperation);
+call    0 returned 100%
+branch  1 taken 0%
+branch  2 taken 100%
+        -:  183:    }
+      448:  184:  }
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEE5hoistEv:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEE5hoistEv called 458 returned 100% blocks executed 88%
+      458:  140:  void hoist() {
+      917:  141:    SmallVector<Value> allocsAndAllocas;
+    32216:  142:    for (BufferPlacementAllocs::AllocEntry &entry : allocs)
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+    31758:  143:      allocsAndAllocas.push_back(std::get<0>(entry));
+call    0 returned 100%
+      458:  144:    scopeOp->walk([&](memref::AllocaOp op) {
+call    0 returned 100%
+        -:  145:      allocsAndAllocas.push_back(op.getMemref());
+        -:  146:    });
+        -:  147:
+    36429:  148:    for (auto allocValue : allocsAndAllocas) {
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    71940:  149:      if (!StateT::shouldHoistOpType(allocValue.getDefiningOp()))
+call    0 returned 100%
+branch  1 taken 36% (fallthrough)
+branch  2 taken 64%
+    13051:  150:        continue;
+    22919:  151:      Operation *definingOp = allocValue.getDefiningOp();
+call    0 returned 100%
+   22919*:  152:      assert(definingOp && "No defining op");
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+call    2 never executed
+    22919:  153:      auto operands = definingOp->getOperands();
+    45838:  154:      auto resultAliases = aliases.resolve(allocValue);
+call    0 returned 100%
+        -:  155:      // Determine the common dominator block of all aliases.
+        -:  156:      Block *dominatorBlock =
+    22919:  157:          findCommonDominator(allocValue, resultAliases, dominators);
+call    0 returned 100%
+        -:  158:      // Init the initial hoisting state.
+    22919:  159:      StateT state(&dominators, allocValue, allocValue.getParentBlock());
+call    0 returned 100%
+        -:  160:      // Check for additional allocation dependencies to compute an upper bound
+        -:  161:      // for hoisting.
+    22919:  162:      Block *dependencyBlock = nullptr;
+        -:  163:      // If this node has dependencies, check all dependent nodes. This ensures
+        -:  164:      // that all dependency values have been computed before allocating the
+        -:  165:      // buffer.
+    22936:  166:      for (Value depValue : operands) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 1%
+call    2 returned 100%
+       17:  167:        Block *depBlock = depValue.getParentBlock();
+call    0 returned 100%
+       17:  168:        if (!dependencyBlock || dominators.dominates(dependencyBlock, depBlock))
+branch  0 taken 24% (fallthrough)
+branch  1 taken 76%
+branch  2 taken 0% (fallthrough)
+branch  3 taken 100%
+        -:  169:          dependencyBlock = depBlock;
+        -:  170:      }
+        -:  171:
+        -:  172:      // Find the actual placement block and determine the start operation using
+        -:  173:      // an upper placement-block boundary. The idea is that placement block
+        -:  174:      // cannot be moved any further upwards than the given upper bound.
+    22919:  175:      Block *placementBlock = findPlacementBlock(
+call    0 returned 100%
+        -:  176:          state, state.computeUpperBound(dominatorBlock, dependencyBlock));
+    45838:  177:      Operation *startOperation = BufferPlacementAllocs::getStartOperation(
+    22919:  178:          allocValue, placementBlock, liveness);
+call    0 returned 100%
+        -:  179:
+        -:  180:      // Move the alloc in front of the start operation.
+    22919:  181:      Operation *allocOperation = allocValue.getDefiningOp();
+call    0 returned 100%
+    22919:  182:      allocOperation->moveBefore(startOperation);
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+        -:  183:    }
+      459:  184:  }
+------------------
+        -:  185:
+        -:  186:private:
+        -:  187:  /// Finds a valid placement block by walking upwards in the CFG until we
+        -:  188:  /// either cannot continue our walk due to constraints (given by the StateT
+        -:  189:  /// implementation) or we have reached the upper-most dominator block.
+    51384:  190:  Block *findPlacementBlock(StateT &state, Block *upperBound) {
+    51384:  191:    Block *currentBlock = state.placementBlock;
+        -:  192:    // Walk from the innermost regions/loops to the outermost regions/loops and
+        -:  193:    // find an appropriate placement block that satisfies the constraint of the
+        -:  194:    // current StateT implementation. Walk until we reach the upperBound block
+        -:  195:    // (if any).
+        -:  196:
+        -:  197:    // If we are not able to find a valid parent operation or an associated
+        -:  198:    // parent block, break the walk loop.
+        -:  199:    Operation *parentOp;
+        -:  200:    Block *parentBlock;
+    54853:  201:    while ((parentOp = currentBlock->getParentOp()) &&
+    54853:  202:           (parentBlock = parentOp->getBlock()) &&
+    24506:  203:           (!upperBound ||
+    24506:  204:            dominators.properlyDominates(upperBound, currentBlock))) {
+        -:  205:      // Try to find an immediate dominator and check whether the parent block
+        -:  206:      // is above the immediate dominator (if any).
+    31919:  207:      DominanceInfoNode *idom = nullptr;
+        -:  208:
+        -:  209:      // DominanceInfo doesn't support getNode queries for single-block regions.
+    31919:  210:      if (!currentBlock->isEntryBlock())
+    #####:  211:        idom = dominators.getNode(currentBlock)->getIDom();
+        -:  212:
+    #####:  213:      if (idom && dominators.properlyDominates(parentBlock, idom->getBlock())) {
+        -:  214:        // If the current immediate dominator is below the placement block, move
+        -:  215:        // to the immediate dominator block.
+    #####:  216:        currentBlock = idom->getBlock();
+   24485*:  217:        state.recordMoveToDominator(currentBlock);
+        -:  218:      } else {
+        -:  219:        // We have to move to our parent block since an immediate dominator does
+        -:  220:        // either not exist or is above our parent block. If we cannot move to
+        -:  221:        // our parent operation due to constraints given by the StateT
+        -:  222:        // implementation, break the walk loop. Furthermore, we should not move
+        -:  223:        // allocations out of unknown region-based control-flow operations.
+    48896:  224:        if (!isKnownControlFlowInterface(parentOp) ||
+    18543:  225:            !state.isLegalPlacement(parentOp))
+        -:  226:          break;
+        -:  227:        // Move to our parent block by notifying the current StateT
+        -:  228:        // implementation.
+     3469:  229:        currentBlock = parentBlock;
+    54853:  230:        state.recordMoveToParent(currentBlock);
+        -:  231:      }
+        -:  232:    }
+        -:  233:    // Return the finally determined placement block.
+    51384:  234:    return state.placementBlock;
+        -:  235:  }
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEE18findPlacementBlockERS1_PN4mlir5BlockE:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_33BufferAllocationLoopHoistingStateEE18findPlacementBlockERS1_PN4mlir5BlockE called 28465 returned 100% blocks executed 76%
+    28465:  190:  Block *findPlacementBlock(StateT &state, Block *upperBound) {
+    28465:  191:    Block *currentBlock = state.placementBlock;
+        -:  192:    // Walk from the innermost regions/loops to the outermost regions/loops and
+        -:  193:    // find an appropriate placement block that satisfies the constraint of the
+        -:  194:    // current StateT implementation. Walk until we reach the upperBound block
+        -:  195:    // (if any).
+        -:  196:
+        -:  197:    // If we are not able to find a valid parent operation or an associated
+        -:  198:    // parent block, break the walk loop.
+        -:  199:    Operation *parentOp;
+        -:  200:    Block *parentBlock;
+    30368:  201:    while ((parentOp = currentBlock->getParentOp()) &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    30368:  202:           (parentBlock = parentOp->getBlock()) &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 taken 1% (fallthrough)
+branch  5 taken 100%
+       21:  203:           (!upperBound ||
+       21:  204:            dominators.properlyDominates(upperBound, currentBlock))) {
+call    0 returned 100%
+branch  1 taken 29% (fallthrough)
+branch  2 taken 71%
+        -:  205:      // Try to find an immediate dominator and check whether the parent block
+        -:  206:      // is above the immediate dominator (if any).
+    30353:  207:      DominanceInfoNode *idom = nullptr;
+        -:  208:
+        -:  209:      // DominanceInfo doesn't support getNode queries for single-block regions.
+    30353:  210:      if (!currentBlock->isEntryBlock())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  211:        idom = dominators.getNode(currentBlock)->getIDom();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  212:
+    #####:  213:      if (idom && dominators.properlyDominates(parentBlock, idom->getBlock())) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  214:        // If the current immediate dominator is below the placement block, move
+        -:  215:        // to the immediate dominator block.
+    #####:  216:        currentBlock = idom->getBlock();
+    #####:  217:        state.recordMoveToDominator(currentBlock);
+        -:  218:      } else {
+        -:  219:        // We have to move to our parent block since an immediate dominator does
+        -:  220:        // either not exist or is above our parent block. If we cannot move to
+        -:  221:        // our parent operation due to constraints given by the StateT
+        -:  222:        // implementation, break the walk loop. Furthermore, we should not move
+        -:  223:        // allocations out of unknown region-based control-flow operations.
+    47330:  224:        if (!isKnownControlFlowInterface(parentOp) ||
+branch  0 taken 56%
+branch  1 taken 44%
+branch  2 taken 11% (fallthrough)
+branch  3 taken 89%
+    16977:  225:            !state.isLegalPlacement(parentOp))
+call    0 returned 100%
+        -:  226:          break;
+        -:  227:        // Move to our parent block by notifying the current StateT
+        -:  228:        // implementation.
+     1903:  229:        currentBlock = parentBlock;
+    30368:  230:        state.recordMoveToParent(currentBlock);
+call    0 returned 100%
+        -:  231:      }
+        -:  232:    }
+        -:  233:    // Return the finally determined placement block.
+    28465:  234:    return state.placementBlock;
+        -:  235:  }
+------------------
+_ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEE18findPlacementBlockERS1_PN4mlir5BlockE:
+function _ZN12_GLOBAL__N_124BufferAllocationHoistingINS_29BufferAllocationHoistingStateEE18findPlacementBlockERS1_PN4mlir5BlockE called 22919 returned 100% blocks executed 76%
+    22919:  190:  Block *findPlacementBlock(StateT &state, Block *upperBound) {
+    22919:  191:    Block *currentBlock = state.placementBlock;
+        -:  192:    // Walk from the innermost regions/loops to the outermost regions/loops and
+        -:  193:    // find an appropriate placement block that satisfies the constraint of the
+        -:  194:    // current StateT implementation. Walk until we reach the upperBound block
+        -:  195:    // (if any).
+        -:  196:
+        -:  197:    // If we are not able to find a valid parent operation or an associated
+        -:  198:    // parent block, break the walk loop.
+        -:  199:    Operation *parentOp;
+        -:  200:    Block *parentBlock;
+    24485:  201:    while ((parentOp = currentBlock->getParentOp()) &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    24485:  202:           (parentBlock = parentOp->getBlock()) &&
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+branch  2 taken 100% (fallthrough)
+branch  3 taken 0%
+branch  4 taken 100% (fallthrough)
+branch  5 taken 0%
+    24485:  203:           (!upperBound ||
+    24485:  204:            dominators.properlyDominates(upperBound, currentBlock))) {
+call    0 returned 100%
+branch  1 taken 6% (fallthrough)
+branch  2 taken 94%
+        -:  205:      // Try to find an immediate dominator and check whether the parent block
+        -:  206:      // is above the immediate dominator (if any).
+     1566:  207:      DominanceInfoNode *idom = nullptr;
+        -:  208:
+        -:  209:      // DominanceInfo doesn't support getNode queries for single-block regions.
+     1566:  210:      if (!currentBlock->isEntryBlock())
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+    #####:  211:        idom = dominators.getNode(currentBlock)->getIDom();
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  212:
+    #####:  213:      if (idom && dominators.properlyDominates(parentBlock, idom->getBlock())) {
+branch  0 never executed
+branch  1 never executed
+call    2 never executed
+branch  3 never executed
+branch  4 never executed
+        -:  214:        // If the current immediate dominator is below the placement block, move
+        -:  215:        // to the immediate dominator block.
+    #####:  216:        currentBlock = idom->getBlock();
+   24485*:  217:        state.recordMoveToDominator(currentBlock);
+        -:  218:      } else {
+        -:  219:        // We have to move to our parent block since an immediate dominator does
+        -:  220:        // either not exist or is above our parent block. If we cannot move to
+        -:  221:        // our parent operation due to constraints given by the StateT
+        -:  222:        // implementation, break the walk loop. Furthermore, we should not move
+        -:  223:        // allocations out of unknown region-based control-flow operations.
+     1566:  224:        if (!isKnownControlFlowInterface(parentOp) ||
+branch  0 taken 100%
+branch  1 taken 0%
+     1566:  225:            !state.isLegalPlacement(parentOp))
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  226:          break;
+        -:  227:        // Move to our parent block by notifying the current StateT
+        -:  228:        // implementation.
+     1566:  229:        currentBlock = parentBlock;
+    24485:  230:        state.recordMoveToParent(currentBlock);
+call    0 returned 100%
+        -:  231:      }
+        -:  232:    }
+        -:  233:    // Return the finally determined placement block.
+    22919:  234:    return state.placementBlock;
+        -:  235:  }
+------------------
+        -:  236:
+        -:  237:  /// The dominator info to find the appropriate start operation to move the
+        -:  238:  /// allocs.
+        -:  239:  DominanceInfo dominators;
+        -:  240:
+        -:  241:  /// The post dominator info to move the dependent allocs in the right
+        -:  242:  /// position.
+        -:  243:  PostDominanceInfo postDominators;
+        -:  244:
+        -:  245:  /// The map storing the final placement blocks of a given alloc value.
+        -:  246:  llvm::DenseMap<Value, Block *> placementBlocks;
+        -:  247:
+        -:  248:  /// The operation that this transformation is working on. It is used to also
+        -:  249:  /// gather allocas.
+        -:  250:  Operation *scopeOp;
+        -:  251:};
+        -:  252:
+        -:  253:/// A state implementation compatible with the `BufferAllocationHoisting` class
+        -:  254:/// that hoists allocations into dominator blocks while keeping them inside of
+        -:  255:/// loops.
+        -:  256:struct BufferAllocationHoistingState : BufferAllocationHoistingStateBase {
+    22919:  257:  using BufferAllocationHoistingStateBase::BufferAllocationHoistingStateBase;
+        -:  258:
+        -:  259:  /// Computes the upper bound for the placement block search.
+    22919:  260:  Block *computeUpperBound(Block *dominatorBlock, Block *dependencyBlock) {
+        -:  261:    // If we do not have a dependency block, the upper bound is given by the
+        -:  262:    // dominator block.
+    22919:  263:    if (!dependencyBlock)
+branch  0 taken 1%
+branch  1 taken 100%
+        -:  264:      return dominatorBlock;
+        -:  265:
+        -:  266:    // Find the "lower" block of the dominator and the dependency block to
+        -:  267:    // ensure that we do not move allocations above this block.
+       13:  268:    return dominators->properlyDominates(dominatorBlock, dependencyBlock)
+call    0 returned 100%
+       13:  269:               ? dependencyBlock
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+        -:  270:               : dominatorBlock;
+        -:  271:  }
+        -:  272:
+        -:  273:  /// Returns true if the given operation does not represent a loop.
+     1566:  274:  bool isLegalPlacement(Operation *op) {
+     1566:  275:    return !BufferPlacementTransformationBase::isLoop(op);
+call    0 returned 100%
+        -:  276:  }
+        -:  277:
+        -:  278:  /// Returns true if the given operation should be considered for hoisting.
+    35970:  279:  static bool shouldHoistOpType(Operation *op) {
+    35970:  280:    return llvm::isa<memref::AllocOp>(op);
+call    0 returned 100%
+        -:  281:  }
+        -:  282:
+        -:  283:  /// Sets the current placement block to the given block.
+    #####:  284:  void recordMoveToDominator(Block *block) { placementBlock = block; }
+        -:  285:
+        -:  286:  /// Sets the current placement block to the given block.
+     1566:  287:  void recordMoveToParent(Block *block) { recordMoveToDominator(block); }
+        -:  288:};
+        -:  289:
+        -:  290:/// A state implementation compatible with the `BufferAllocationHoisting` class
+        -:  291:/// that hoists allocations out of loops.
+        -:  292:struct BufferAllocationLoopHoistingState : BufferAllocationHoistingStateBase {
+    28465:  293:  using BufferAllocationHoistingStateBase::BufferAllocationHoistingStateBase;
+        -:  294:
+        -:  295:  /// Remembers the dominator block of all aliases.
+        -:  296:  Block *aliasDominatorBlock = nullptr;
+        -:  297:
+        -:  298:  /// Computes the upper bound for the placement block search.
+    28465:  299:  Block *computeUpperBound(Block *dominatorBlock, Block *dependencyBlock) {
+    28465:  300:    aliasDominatorBlock = dominatorBlock;
+        -:  301:    // If there is a dependency block, we have to use this block as an upper
+        -:  302:    // bound to satisfy all allocation value dependencies.
+    28465:  303:    return dependencyBlock ? dependencyBlock : nullptr;
+call    0 returned 100%
+        -:  304:  }
+        -:  305:
+        -:  306:  /// Returns true if the given operation represents a loop and one of the
+        -:  307:  /// aliases caused the `aliasDominatorBlock` to be "above" the block of the
+        -:  308:  /// given loop operation. If this is the case, it indicates that the
+        -:  309:  /// allocation is passed via a back edge.
+        -:  310:  bool isLegalPlacement(Operation *op) {
+        -:  311:    return BufferPlacementTransformationBase::isLoop(op) &&
+        -:  312:           !dominators->dominates(aliasDominatorBlock, op->getBlock());
+        -:  313:  }
+        -:  314:
+        -:  315:  /// Returns true if the given operation should be considered for hoisting.
+    37720:  316:  static bool shouldHoistOpType(Operation *op) {
+    37720:  317:    return llvm::isa<memref::AllocOp, memref::AllocaOp>(op);
+call    0 returned 100%
+        -:  318:  }
+        -:  319:
+        -:  320:  /// Does not change the internal placement block, as we want to move
+        -:  321:  /// operations out of loops only.
+    #####:  322:  void recordMoveToDominator(Block *block) {}
+        -:  323:
+        -:  324:  /// Sets the current placement block to the given block.
+     1903:  325:  void recordMoveToParent(Block *block) { placementBlock = block; }
+        -:  326:};
+        -:  327:
+        -:  328://===----------------------------------------------------------------------===//
+        -:  329:// BufferPlacementPromotion
+        -:  330://===----------------------------------------------------------------------===//
+        -:  331:
+        -:  332:/// Promotes heap-based allocations to stack-based allocations (if possible).
+      410:  333:class BufferPlacementPromotion : BufferPlacementTransformationBase {
+        -:  334:public:
+      410:  335:  BufferPlacementPromotion(Operation *op)
+      410:  336:      : BufferPlacementTransformationBase(op) {}
+call    0 returned 100%
+        -:  337:
+        -:  338:  /// Promote buffers to stack-based allocations.
+function _ZN12_GLOBAL__N_124BufferPlacementPromotion7promoteEN4llvm12function_refIFbN4mlir5ValueEEEE called 410 returned 100% blocks executed 100%
+      410:  339:  void promote(function_ref<bool(Value)> isSmallAlloc) {
+    31868:  340:    for (BufferPlacementAllocs::AllocEntry &entry : allocs) {
+branch  0 taken 99% (fallthrough)
+branch  1 taken 1%
+    31458:  341:      Value alloc = std::get<0>(entry);
+call    0 returned 100%
+    31458:  342:      Operation *dealloc = std::get<1>(entry);
+call    0 returned 100%
+        -:  343:      // Checking several requirements to transform an AllocOp into an AllocaOp.
+        -:  344:      // The transformation is done if the allocation is limited to a given
+        -:  345:      // size. Furthermore, a deallocation must not be defined for this
+        -:  346:      // allocation entry and a parent allocation scope must exist.
+    51290:  347:      if (!isSmallAlloc(alloc) || dealloc ||
+call    0 returned 100%
+branch  1 taken 63% (fallthrough)
+branch  2 taken 37%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 1%
+branch  5 taken 17% (fallthrough)
+branch  6 taken 83%
+    19832:  348:          !hasAllocationScope(alloc, aliases))
+call    0 returned 100%
+    14899:  349:        continue;
+        -:  350:
+    16559:  351:      Operation *startOperation = BufferPlacementAllocs::getStartOperation(
+call    0 returned 100%
+    16559:  352:          alloc, alloc.getParentBlock(), liveness);
+call    0 returned 100%
+        -:  353:      // Build a new alloca that is associated with its parent
+        -:  354:      // `AutomaticAllocationScope` determined during the initialization phase.
+    16559:  355:      OpBuilder builder(startOperation);
+call    0 returned 100%
+    16559:  356:      Operation *allocOp = alloc.getDefiningOp();
+call    0 returned 100%
+    16559:  357:      Operation *alloca = builder.create<memref::AllocaOp>(
+call    0 returned 100%
+    49677:  358:          alloc.getLoc(), alloc.getType().cast<MemRefType>(),
+    16559:  359:          allocOp->getOperands());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+branch  3 taken 100% (fallthrough)
+branch  4 taken 0%
+        -:  360:
+        -:  361:      // Replace the original alloc by a newly created alloca.
+    16559:  362:      allocOp->replaceAllUsesWith(alloca);
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    16559:  363:      allocOp->erase();
+call    0 returned 100%
+        -:  364:    }
+      410:  365:  }
+        -:  366:};
+        -:  367:
+        -:  368://===----------------------------------------------------------------------===//
+        -:  369:// BufferOptimizationPasses
+        -:  370://===----------------------------------------------------------------------===//
+        -:  371:
+        -:  372:/// The buffer hoisting pass that hoists allocation nodes into dominating
+        -:  373:/// blocks.
+   146133:  374:struct BufferHoistingPass
+call    0 returned 100%
+call    1 returned 100%
+        -:  375:    : public bufferization::impl::BufferHoistingBase<BufferHoistingPass> {
+        -:  376:
+function _ZN12_GLOBAL__N_118BufferHoistingPass14runOnOperationEv called 460 returned 100% blocks executed 100%
+      460:  377:  void runOnOperation() override {
+        -:  378:    // Hoist all allocations into dominator blocks.
+      460:  379:    BufferAllocationHoisting<BufferAllocationHoistingState> optimizer(
+      919:  380:        getOperation());
+call    0 returned 100%
+call    1 returned 100%
+call    2 returned 100%
+      458:  381:    optimizer.hoist();
+call    0 returned 100%
+      460:  382:  }
+        -:  383:};
+        -:  384:
+        -:  385:/// The buffer loop hoisting pass that hoists allocation nodes out of loops.
+   146164:  386:struct BufferLoopHoistingPass
+call    0 returned 100%
+call    1 returned 100%
+        -:  387:    : public bufferization::impl::BufferLoopHoistingBase<
+        -:  388:          BufferLoopHoistingPass> {
+        -:  389:
+function _ZN12_GLOBAL__N_122BufferLoopHoistingPass14runOnOperationEv called 455 returned 98% blocks executed 100%
+      455:  390:  void runOnOperation() override {
+        -:  391:    // Hoist all allocations out of loops.
+      455:  392:    BufferAllocationHoisting<BufferAllocationLoopHoistingState> optimizer(
+      903:  393:        getOperation());
+call    0 returned 100%
+call    1 returned 98%
+call    2 returned 100%
+      446:  394:    optimizer.hoist();
+call    0 returned 100%
+      446:  395:  }
+        -:  396:};
+        -:  397:
+        -:  398:/// The promote buffer to stack pass that tries to convert alloc nodes into
+        -:  399:/// alloca nodes.
+        -:  400:class PromoteBuffersToStackPass
+        -:  401:    : public bufferization::impl::PromoteBuffersToStackBase<
+        -:  402:          PromoteBuffersToStackPass> {
+        -:  403:public:
+function _ZN12_GLOBAL__N_125PromoteBuffersToStackPassC2Ejj called 116683 returned 100% blocks executed 75%
+   116683:  404:  PromoteBuffersToStackPass(unsigned maxAllocSizeInBytes,
+   116683:  405:                            unsigned maxRankOfAllocatedMemRef) {
+call    0 returned 100%
+branch  1 taken 0% (fallthrough)
+branch  2 taken 100%
+   116683:  406:    this->maxAllocSizeInBytes = maxAllocSizeInBytes;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   116683:  407:    this->maxRankOfAllocatedMemRef = maxRankOfAllocatedMemRef;
+branch  0 taken 0% (fallthrough)
+branch  1 taken 100%
+   116683:  408:  }
+        -:  409:
+function _ZN12_GLOBAL__N_125PromoteBuffersToStackPassC2ESt8functionIFbN4mlir5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  410:  explicit PromoteBuffersToStackPass(std::function<bool(Value)> isSmallAlloc)
+    #####:  411:      : isSmallAlloc(std::move(isSmallAlloc)) {}
+call    0 never executed
+        -:  412:
+function _ZN12_GLOBAL__N_125PromoteBuffersToStackPass10initializeEPN4mlir11MLIRContextE called 450 returned 100% blocks executed 100%
+      450:  413:  LogicalResult initialize(MLIRContext *context) override {
+      450:  414:    if (isSmallAlloc == nullptr) {
+branch  0 taken 100% (fallthrough)
+branch  1 taken 0%
+    31908:  415:      isSmallAlloc = [=](Value alloc) {
+    31458:  416:        return defaultIsSmallAlloc(alloc, maxAllocSizeInBytes,
+call    0 returned 100%
+        -:  417:                                   maxRankOfAllocatedMemRef);
+      450:  418:      };
+call    0 returned 100%
+        -:  419:    }
+      450:  420:    return success();
+        -:  421:  }
+        -:  422:
+function _ZN12_GLOBAL__N_125PromoteBuffersToStackPass14runOnOperationEv called 410 returned 100% blocks executed 100%
+      410:  423:  void runOnOperation() override {
+        -:  424:    // Move all allocation nodes and convert candidates into allocas.
+      410:  425:    BufferPlacementPromotion optimizer(getOperation());
+call    0 returned 100%
+call    1 returned 100%
+      410:  426:    optimizer.promote(isSmallAlloc);
+call    0 returned 100%
+call    1 returned 100%
+      410:  427:  }
+        -:  428:
+        -:  429:private:
+        -:  430:  std::function<bool(Value)> isSmallAlloc;
+        -:  431:};
+        -:  432:
+        -:  433:} // namespace
+        -:  434:
+function _ZN4mlir13bufferization24createBufferHoistingPassEv called 116685 returned 100% blocks executed 100%
+   116685:  435:std::unique_ptr<Pass> mlir::bufferization::createBufferHoistingPass() {
+   116685:  436:  return std::make_unique<BufferHoistingPass>();
+call    0 returned 100%
+        -:  437:}
+        -:  438:
+function _ZN4mlir13bufferization28createBufferLoopHoistingPassEv called 116716 returned 100% blocks executed 100%
+   116716:  439:std::unique_ptr<Pass> mlir::bufferization::createBufferLoopHoistingPass() {
+   116716:  440:  return std::make_unique<BufferLoopHoistingPass>();
+call    0 returned 100%
+        -:  441:}
+        -:  442:
+function _ZN4mlir13bufferization31createPromoteBuffersToStackPassEjj called 116683 returned 100% blocks executed 100%
+   116683:  443:std::unique_ptr<Pass> mlir::bufferization::createPromoteBuffersToStackPass(
+        -:  444:    unsigned maxAllocSizeInBytes, unsigned maxRankOfAllocatedMemRef) {
+   116683:  445:  return std::make_unique<PromoteBuffersToStackPass>(maxAllocSizeInBytes,
+call    0 returned 100%
+   116683:  446:                                                     maxRankOfAllocatedMemRef);
+        -:  447:}
+        -:  448:
+function _ZN4mlir13bufferization31createPromoteBuffersToStackPassESt8functionIFbNS_5ValueEEE called 0 returned 0% blocks executed 0%
+    #####:  449:std::unique_ptr<Pass> mlir::bufferization::createPromoteBuffersToStackPass(
+        -:  450:    std::function<bool(Value)> isSmallAlloc) {
+    #####:  451:  return std::make_unique<PromoteBuffersToStackPass>(std::move(isSmallAlloc));
+call    0 never executed
+        -:  452:}
