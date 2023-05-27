@@ -2,6 +2,8 @@
 
 MLIRSmith is a fuzzing technique for the MLIR compiler infrastructure, which can directly generate MLIR programs to fuzz the MLIR compiler infrastructure.
 
+## Note: The number of function, which is one of the hyperparameters, is set to be 1 in the evaluation. 
+
 ## Setting up MLIRSmith
 
 MLIRSmith runs natively on Linux. Detailed instructions are provided below. The following commands apply to build MLIRSmith from source.
